@@ -1353,7 +1353,7 @@ def _seed_profile_terminal(tmp_path, *, split_project_identity: bool = False):
             (epoch["epoch_id"],),
         )
     policy = _profile_snapshot_policy()
-    record = _profile_snapshot_record(20, "6841983153")
+    record = _profile_snapshot_record(20, "7019637554")
     if split_project_identity:
         policy = replace(
             policy,
@@ -1388,8 +1388,8 @@ def _seed_profile_terminal(tmp_path, *, split_project_identity: bool = False):
     control.quarantine_outbox(
         outbox_id=outbox.outbox_id,
         lease_token=outbox.lease_token,
-        error_code="business_profile_unsupported",
-        error_detail="official project option is not registered",
+        error_code="business_profile_adapter_not_ready",
+        error_detail="matched profile input adapter is not ready",
         now=NOW + timedelta(seconds=1),
     )
     store = RcaDeliveryStore(control.db_path)

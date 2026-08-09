@@ -115,6 +115,68 @@ def test_stored_adapter_pending_profile_is_terminal_before_preread(tmp_path):
     assert "input adapter is not ready" in error[1]
 
 
+@pytest.mark.parametrize(
+    ("option_ids", "expected_error"),
+    (
+        (("6841983153",), "business_profile_unsupported"),
+        (("6841983153", "7019637554"), "business_profile_conflict"),
+    ),
+)
+def test_unsupported_profile_dispatch_stops_before_all_execution_boundaries(
+    tmp_path,
+    option_ids,
+    expected_error,
+):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    record = _profile_snapshot_record(304, option_ids[0])
+    if len(option_ids) > 1:
+        payload = json.loads(record.value)
+        payload["fields"][0]["field_value"] = list(option_ids)
+        record = replace(
+            record,
+            value=json.dumps(payload, sort_keys=True).encode(),
+        )
+    result = store.ingest_record(
+        record,
+        policy=_profile_snapshot_policy(),
+        submit_enabled=True,
+    )
+    assert result.decision == "accepted"
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path, enabled=True),
+        hermes_home=tmp_path,
+    )
+    boundary_calls = []
+
+    def forbidden_boundary(name):
+        def invoke(*_args, **_kwargs):
+            boundary_calls.append(name)
+            raise AssertionError(f"{name} must not run for an outbox-only terminal")
+
+        return invoke
+
+    instance = dispatcher.OutboxDispatcher(
+        store=store,
+        config=config,
+        enrich=forbidden_boundary("enrich"),
+        storage_admission=forbidden_boundary("storage_admission"),
+        submit=forbidden_boundary("vm_submit"),
+        derived_capacity_reservation=forbidden_boundary("capacity_reservation"),
+        lease_owner="profile-outbox-only-test",
+    )
+    instance._delivery_backpressure_outcome = lambda: None
+
+    outcome = instance.dispatch_one()
+
+    assert outcome.status == "quarantined"
+    assert outcome.error_code == expected_error
+    assert boundary_calls == []
+    [outbox] = store.list_rows("rca_outbox")
+    assert outbox["status"] == "quarantined"
+    assert outbox["last_error_code"] == expected_error
+    assert outbox["result_json"] is None
+
+
 def _config_env(
     tmp_path, *, enabled: bool = False, canonical_layout: bool = False
 ) -> dict[str, str]:

@@ -132,6 +132,10 @@ OUTBOX_PROFILE_TERMINAL_WRITE_ERROR_CODES = frozenset({
     "business_profile_conflict",
     "business_profile_adapter_not_ready",
 })
+OUTBOX_SILENT_PROFILE_TERMINAL_ERROR_CODES = frozenset({
+    "business_profile_unsupported",
+    "business_profile_conflict",
+})
 OUTBOX_PUBLIC_PROFILE_ERROR_CODES = frozenset({
     "business_profile_unresolved",
     *OUTBOX_PROFILE_TERMINAL_WRITE_ERROR_CODES,
@@ -169,7 +173,10 @@ PRE_W3_EFFECT_DISPOSITION_COMMAND = "quarantine-exact-pre-w3-effects"
 PRE_W3_EFFECT_DISPOSITION_ERROR_CODE = "external_write_fence_missing"
 PRE_W3_EFFECT_DISPOSITION_MAX_EFFECTS = 32
 PRE_W3_EFFECT_DISPOSITION_MAX_AUDIT_BYTES = 512 * 1024
-_NON_PIPELINE_QUARANTINE_CODES = frozenset({"feishu_work_item_not_found"})
+_NON_PIPELINE_QUARANTINE_CODES = frozenset({
+    "feishu_work_item_not_found",
+    *OUTBOX_SILENT_PROFILE_TERMINAL_ERROR_CODES,
+})
 LEARNING_LANE_EXTERNAL_EFFECT_ERROR = "learning_lane_external_effect_forbidden"
 LEARNING_LANE_ADMISSION_MISSING_ERROR = "learning_lane_admission_missing"
 _W6_STOCK_CUTOFF = "2026-07-25T10:15:43.473251+00:00"
@@ -5000,6 +5007,15 @@ class RcaDeliveryStore:
         current: str,
         activation_enforced: bool = False,
     ) -> None:
+        source_error_code = str(row["last_error_code"] or "").strip()
+        if source_error_code in OUTBOX_SILENT_PROFILE_TERMINAL_ERROR_CODES:
+            self._materialize_silent_quarantined_outbox_in_transaction(
+                conn,
+                row=row,
+                current=current,
+                disposition_code=source_error_code,
+            )
+            return
         w3_binding: dict[str, Any] | None = None
         w3_issue_target = ""
         if activation_enforced:
@@ -5056,7 +5072,6 @@ class RcaDeliveryStore:
                         disposition_code=w3_disposition_code,
                     )
                     return
-        source_error_code = str(row["last_error_code"] or "").strip()
         public_error_code = (
             source_error_code
             if source_error_code in OUTBOX_PUBLIC_PROFILE_ERROR_CODES

@@ -882,6 +882,48 @@ def test_missing_work_item_quarantine_does_not_open_pipeline_circuit(tmp_path):
     assert store.list_rows("rca_delivery_effects")[0]["status"] == "quarantined"
 
 
+@pytest.mark.parametrize(
+    "profile_error_code",
+    ("business_profile_unsupported", "business_profile_conflict"),
+)
+def test_outbox_only_profile_quarantine_does_not_open_pipeline_circuit(
+    tmp_path,
+    profile_error_code,
+):
+    store, effect = _claimed_effect(tmp_path)
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        store._record_permanent_failure_in_transaction(
+            conn,
+            circuit_name=DELIVERY_EFFECT_KIND,
+            subject_key="prior-pipeline-failure",
+            failure_state="quarantined",
+            error_code="report_http_verification_mismatch",
+            error_detail="sealed report mismatch",
+            current=NOW.isoformat(),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert store.permanent_failure_circuit_state()["consecutive_failures"] == 1
+
+    store.quarantine_effect(
+        claim=effect,
+        error_code=profile_error_code,
+        error_detail="out-of-scope profile is an outbox terminal",
+        now=NOW,
+    )
+
+    assert store.delivery_dispatcher_circuit().is_open is False
+    assert store.permanent_failure_circuit_state() == {
+        "threshold": PERMANENT_FAILURE_CIRCUIT_THRESHOLD,
+        "consecutive_failures": 0,
+        "last_failure": {},
+    }
+    assert store.list_rows("rca_delivery_effects")[0]["status"] == "quarantined"
+
+
 def test_successful_required_delivery_breaks_permanent_failure_streak(tmp_path):
     store = _completed_cases(tmp_path, 3)
 
@@ -1709,8 +1751,13 @@ def test_current_epoch_valid_w3_quarantine_keeps_fenced_terminal_effect(tmp_path
     assert effect.issue_url == expected_issue_url
 
 
-def test_current_epoch_profile_terminal_without_w3_keeps_public_issue_target(
+@pytest.mark.parametrize(
+    "profile_error_code",
+    ("business_profile_unsupported", "business_profile_conflict"),
+)
+def test_current_epoch_unsupported_profile_stays_silent_at_outbox(
     tmp_path,
+    profile_error_code,
 ):
     from tests.gateway.test_pnc_rca_control_store import _create_activation_epoch
 
@@ -1740,7 +1787,7 @@ def test_current_epoch_profile_terminal_without_w3_keeps_public_issue_target(
     control.quarantine_outbox(
         outbox_id=claim.outbox_id,
         lease_token=claim.lease_token,
-        error_code="business_profile_unsupported",
+        error_code=profile_error_code,
         error_detail="official project option is not registered",
         now=NOW + timedelta(seconds=1),
     )
@@ -1754,78 +1801,12 @@ def test_current_epoch_profile_terminal_without_w3_keeps_public_issue_target(
         == 1
     )
     [watch] = store.list_rows("rca_execution_watch")
-    [job] = store.list_rows("rca_delivery_jobs")
-    assert watch["state"] == "delivery_created"
-    assert job["issue_url"].endswith("/t03o4q/issue/detail/7041712812")
-    assert job["project_key"] == REAL_G1Q3_PROJECT_KEY
-    assert job["target_key"] == (
-        f"feishu_project:{REAL_G1Q3_PROJECT_KEY}:issue:7041712812"
-    )
-    assert job["terminal_error_code"] == "business_profile_unsupported"
-    contract = json.loads(job["contract_json"])
-    assert contract["diagnostic_code"] == "business_route_unsupported"
-    assert "w3_execution_snapshot" not in contract
-    effect = store.claim_due_effect(
-        lease_owner="profile-terminal-fence-test",
-        now=NOW + timedelta(seconds=3),
-        activation_required=True,
-    )
-    assert effect is not None
-    binding = store.validate_profile_terminal_external_write_binding(
-        effect_key=effect.effect_key,
-        delivery_id=effect.delivery_id,
-        lease_token=effect.lease_token,
-        lease_fence=effect.fence,
-        operation="feishu_issue_comment",
-        issue_url=effect.issue_url,
-        target_key=effect.target_key,
-        business_key=effect.business_key,
-        submission_key=effect.submission_key,
-        generation=effect.generation,
-        require_write_started=False,
-        now=NOW + timedelta(seconds=3),
-    )
-    assert binding["source_error_code"] == "business_profile_unsupported"
-    assert binding["project_key"] == REAL_G1Q3_PROJECT_KEY
-    assert binding["project_simple_name"] == REAL_G1Q3_PROJECT_SIMPLE_NAME
-    with pytest.raises(
-        RuntimeError,
-        match="external_write_fence_operation_denied",
-    ):
-        store.validate_profile_terminal_external_write_binding(
-            effect_key=effect.effect_key,
-            delivery_id=effect.delivery_id,
-            lease_token=effect.lease_token,
-            lease_fence=effect.fence,
-            operation="feishu_issue_field_update",
-            issue_url=effect.issue_url,
-            target_key=effect.target_key,
-            business_key=effect.business_key,
-            submission_key=effect.submission_key,
-            generation=effect.generation,
-            require_write_started=False,
-            now=NOW + timedelta(seconds=3),
-        )
-    store.mark_effect_write_started(
-        claim=effect,
-        now=NOW + timedelta(seconds=4),
-        activation_required=True,
-    )
-    started = store.validate_profile_terminal_external_write_binding(
-        effect_key=effect.effect_key,
-        delivery_id=effect.delivery_id,
-        lease_token=effect.lease_token,
-        lease_fence=effect.fence,
-        operation="feishu_issue_comment",
-        issue_url=effect.issue_url,
-        target_key=effect.target_key,
-        business_key=effect.business_key,
-        submission_key=effect.submission_key,
-        generation=effect.generation,
-        require_write_started=True,
-        now=NOW + timedelta(seconds=4),
-    )
-    assert started["write_phase"] == "write_started"
+    assert watch["state"] == "quarantined"
+    assert watch["task_id"] is None
+    assert watch["delivery_id"] is None
+    assert watch["last_error_code"] == profile_error_code
+    assert store.list_rows("rca_delivery_jobs") == []
+    assert store.list_rows("rca_delivery_effects") == []
 
 
 def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_path, monkeypatch):
@@ -1845,7 +1826,7 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
             "WHERE epoch_id=? AND is_current=1",
             (epoch["epoch_id"],),
         )
-    policy, record = _real_g1q3_profile_snapshot(20, "6841983153")
+    policy, record = _real_g1q3_profile_snapshot(20, "7019637554")
     result = control.ingest_record(
         record,
         policy=policy,
@@ -1862,7 +1843,7 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
     control.quarantine_outbox(
         outbox_id=outbox.outbox_id,
         lease_token=outbox.lease_token,
-        error_code="business_profile_unsupported",
+        error_code="business_profile_adapter_not_ready",
         error_detail="profile provider claim fixture",
         now=provider_now + timedelta(seconds=1),
     )
@@ -2199,7 +2180,7 @@ def test_forged_profile_terminal_observation_is_silent_and_settled(
     ) == 1
     [watch] = store.list_rows("rca_execution_watch")
     assert watch["state"] == "quarantined"
-    assert watch["last_error_code"] == "profile_terminal_binding_invalid"
+    assert watch["last_error_code"] == "business_profile_unsupported"
     assert store.list_rows("rca_delivery_jobs") == []
     assert store.list_rows("rca_delivery_effects") == []
 
