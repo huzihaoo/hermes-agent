@@ -2866,6 +2866,71 @@ def test_delivery_health_observes_stalled_watch_without_blocking_readiness(tmp_p
     assert watch["state"] == "pending"
 
 
+def test_activation_health_does_not_block_on_historical_uncertain_effect(tmp_path):
+    control, result = _control(tmp_path)
+    store = RcaDeliveryStore(control.db_path)
+    assert store.backfill_completed_submissions(now=NOW) == 1
+    watch = store.claim_due_watch(
+        lease_owner="historical-effect-collector",
+        now=NOW,
+    )
+    assert watch is not None
+    store.create_delivery(
+        claim=watch,
+        delivery=_delivery(watch),
+        status={"success": True, "state": "completed"},
+        now=NOW,
+    )
+    with sqlite3.connect(control.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        delivery_id = str(
+            conn.execute("SELECT delivery_id FROM rca_delivery_jobs").fetchone()[0]
+        )
+        conn.execute("UPDATE rca_delivery_effects SET status = 'uncertain'")
+
+    legacy_health = store.health(now=NOW)
+    assert legacy_health["activation"]["required"] is False
+    assert legacy_health["business_blockers"]["uncertain_effects"] == 1
+    assert legacy_health["business_ready"] is False
+
+    with sqlite3.connect(control.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "UPDATE rca_delivery_effects "
+            "SET status = 'succeeded', write_phase = 'settled'"
+        )
+        store._aggregate_job_status(conn, delivery_id, NOW.isoformat())
+
+    _bind_activation_execution(control, result, state="steady_active")
+    _switch_activation_epoch(
+        control,
+        old_epoch="delivery-epoch-1",
+        new_epoch="delivery-epoch-2",
+    )
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET state = 'steady_active' "
+            "WHERE epoch_id = 'delivery-epoch-2' AND is_current = 1"
+        )
+        conn.execute(
+            "UPDATE rca_delivery_effects "
+            "SET status = 'uncertain', write_phase = 'write_started'"
+        )
+
+    health = store.health(
+        now=NOW + timedelta(seconds=2), activation_required=True
+    )
+
+    assert health["activation"]["current_epoch_id"] == "delivery-epoch-2"
+    assert health["activation"]["blocked_historical_counts"][
+        "dispatchable_effects"
+    ] == 1
+    assert health["delivery_effects"]["uncertain"] == 1
+    assert health["business_blockers"]["uncertain_effects"] == 0
+    assert health["production_blockers"]["uncertain_effects"] == 0
+    assert health["business_ready"] is True
+
+
 def test_concurrent_backfill_creates_exactly_one_watch(tmp_path):
     _control(tmp_path)
     db = tmp_path / "control.sqlite3"

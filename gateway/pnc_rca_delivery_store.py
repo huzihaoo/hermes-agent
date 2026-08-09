@@ -11560,6 +11560,32 @@ class RcaDeliveryStore:
                     "SELECT status, COUNT(*) AS count FROM rca_delivery_effects GROUP BY status"
                 ).fetchall()
             }
+            uncertain_effect_blockers = int(effects.get("uncertain", 0))
+            current_epoch_id = str(activation["current_epoch_id"] or "")
+            if (
+                activation["required"]
+                and activation["schema_ready"]
+                and current_epoch_id
+            ):
+                uncertain_activation_counts = self._activation_pipeline_count_tx(
+                    conn,
+                    from_sql="""
+                      FROM rca_delivery_effects AS e
+                      JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
+                      JOIN rca_execution_watch AS w
+                        ON w.submission_key = j.submission_key
+                      JOIN rca_outbox AS o
+                        ON o.outbox_id = w.submission_outbox_id
+                      JOIN business_triggers AS t
+                        ON t.business_key = o.business_key
+                       AND t.generation = o.generation
+                    """,
+                    where_sql="e.status = 'uncertain'",
+                )
+                uncertain_effect_blockers = sum(
+                    uncertain_activation_counts[key]
+                    for key in ("eligible", "held_current")
+                )
             attempts = {
                 row["outcome"]: int(row["count"])
                 for row in conn.execute(
@@ -11698,7 +11724,7 @@ class RcaDeliveryStore:
                 "terminal_failed_watches": int(watch.get("terminal_failed", 0)),
                 "quarantined_watches": int(watch.get("quarantined", 0)),
                 "quarantined_jobs": int(unacknowledged_quarantine["jobs"]),
-                "uncertain_effects": int(effects.get("uncertain", 0)),
+                "uncertain_effects": uncertain_effect_blockers,
                 "quarantined_effects": int(unacknowledged_quarantine["effects"]),
                 "quarantined_subscriptions": int(
                     unacknowledged_quarantine["subscriptions"]
