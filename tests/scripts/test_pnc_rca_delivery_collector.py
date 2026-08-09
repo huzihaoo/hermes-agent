@@ -828,7 +828,7 @@ def _real_terminal_collector(
     return instance
 
 
-def _age_work_start(instance, *, seconds):
+def _age_submission(instance, *, seconds):
     started_at = (NOW - timedelta(seconds=seconds)).isoformat()
     with sqlite3.connect(instance.store.db_path) as conn:
         conn.execute(
@@ -836,8 +836,20 @@ def _age_work_start(instance, *, seconds):
             (started_at,),
         )
         conn.execute(
-            "UPDATE rca_outbox SET created_at = ?, retry_window_started_at = ?",
-            (started_at, started_at),
+            """
+            UPDATE rca_outbox
+               SET created_at = ?, retry_window_started_at = ?, completed_at = ?
+            """,
+            (started_at, started_at, started_at),
+        )
+
+
+def _age_failure_window(instance, *, seconds):
+    first_seen_at = (NOW - timedelta(seconds=seconds)).isoformat()
+    with sqlite3.connect(instance.store.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_execution_watch SET terminal_first_seen_at = ?",
+            (first_seen_at,),
         )
 
 
@@ -894,7 +906,7 @@ def test_snapshot_required_collector_quarantines_missing_snapshot_without_effect
         ),
     ],
 )
-def test_all_failure_lanes_are_silent_until_admission_deadline_then_oracle_low(
+def test_all_failure_lanes_use_first_failure_observation_for_fallback_deadline(
     tmp_path, blocker, lane, route_kind, owner, error_code
 ):
     clock = [NOW]
@@ -1020,7 +1032,7 @@ def test_infra_remediation_crossing_deadline_falls_back_without_extra_hold(tmp_p
         clock=clock,
         infra_remediation_runner=crossing_remediation,
     )
-    _age_work_start(instance, seconds=1795)
+    _age_failure_window(instance, seconds=1795)
 
     fallback = instance.collect_one()
 
@@ -1052,7 +1064,11 @@ def test_unknown_code_is_held_fail_closed_then_persisted_as_taxonomy_gap(tmp_pat
     assert instance.store.list_rows("rca_delivery_effects") == []
 
 
-def test_forever_running_falls_back_at_admission_deadline(tmp_path):
+@pytest.mark.parametrize(
+    "vm_state",
+    ["pending", "submitted", "queued", "claimed", "running", "in_progress"],
+)
+def test_vm_queue_and_execution_states_are_not_host_deadlined(tmp_path, vm_state):
     clock = [NOW]
     instance = _real_terminal_collector(
         tmp_path,
@@ -1060,19 +1076,22 @@ def test_forever_running_falls_back_at_admission_deadline(tmp_path):
         status_reader=lambda task_id: {
             "success": True,
             "task_id": task_id,
-            "state": "running",
+            "state": vm_state,
         },
     )
+    _age_submission(instance, seconds=6 * 60 * 60)
 
     assert instance.collect_one().status == "running"
     assert instance.store.list_rows("rca_failure_routes") == []
     assert instance.store.list_rows("rca_delivery_effects") == []
-    clock[0] = NOW + timedelta(seconds=1800)
-    fallback = instance.collect_one()
+    clock[0] = NOW + timedelta(seconds=8 * 60 * 60)
+    still_active = instance.collect_one()
 
-    assert fallback.status == "terminal_failed"
-    assert fallback.error_code == "rca_work_deadline_exceeded"
-    assert instance.store.list_rows("rca_failure_routes")[0]["lane"] == "hard_defect"
+    assert still_active.status == "running"
+    assert instance.store.list_rows("rca_failure_routes") == []
+    [watch] = instance.store.list_rows("rca_execution_watch")
+    assert watch["state"] == ("pending" if vm_state == "pending" else "running")
+    assert watch["terminal_first_seen_at"] is None
 
 
 @pytest.mark.parametrize(
@@ -1085,7 +1104,7 @@ def test_forever_running_falls_back_at_admission_deadline(tmp_path):
         (lambda _task_id: {"success": False, "state": "missing"}, "vm_status_missing"),
     ],
 )
-def test_status_missing_and_reader_error_use_same_admission_deadline(
+def test_status_missing_and_reader_error_use_same_failure_observation_deadline(
     tmp_path, status_reader, expected_code
 ):
     clock = [NOW]
@@ -1094,11 +1113,15 @@ def test_status_missing_and_reader_error_use_same_admission_deadline(
         clock=clock,
         status_reader=status_reader,
     )
+    _age_submission(instance, seconds=6 * 60 * 60)
 
     held = instance.collect_one()
     assert held.status == "failure_hold"
     assert held.error_code == expected_code
     assert instance.store.list_rows("rca_delivery_effects") == []
+    assert instance.store.list_rows("rca_execution_watch")[0][
+        "terminal_first_seen_at"
+    ] == NOW.isoformat()
     clock[0] = NOW + timedelta(seconds=1800)
     fallback = instance.collect_one()
 
@@ -1109,7 +1132,121 @@ def test_status_missing_and_reader_error_use_same_admission_deadline(
     }
 
 
-def test_invalid_submission_admission_is_silent_until_work_deadline(tmp_path):
+def test_healthy_vm_observation_clears_prior_failure_window(tmp_path):
+    clock = [NOW]
+    statuses = iter([
+        {"success": False, "state": "missing"},
+        {"success": True, "state": "pending"},
+        {"success": True, "state": "pending"},
+    ])
+    instance = _real_terminal_collector(
+        tmp_path,
+        clock=clock,
+        status_reader=lambda _task_id: next(statuses),
+    )
+
+    assert instance.collect_one().status == "failure_hold"
+    assert instance.store.list_rows("rca_execution_watch")[0][
+        "terminal_first_seen_at"
+    ] == NOW.isoformat()
+
+    clock[0] = NOW + timedelta(seconds=60)
+    assert instance.collect_one().status == "running"
+    assert instance.store.list_rows("rca_execution_watch")[0][
+        "terminal_first_seen_at"
+    ] is None
+
+    clock[0] = NOW + timedelta(seconds=3600)
+    assert instance.collect_one().status == "running"
+    assert instance.store.list_rows("rca_execution_watch")[0]["state"] == "pending"
+
+
+def test_failure_window_marker_survives_crash_after_route_commit(
+    tmp_path, monkeypatch
+):
+    clock = [NOW]
+    instance = _real_terminal_collector(
+        tmp_path,
+        clock=clock,
+        status_reader=lambda _task_id: {"success": False, "state": "missing"},
+    )
+    reschedule_watch = instance.store.reschedule_watch
+
+    def crash_before_reschedule(**_kwargs):
+        raise RuntimeError("simulated collector exit")
+
+    monkeypatch.setattr(instance.store, "reschedule_watch", crash_before_reschedule)
+    with pytest.raises(RuntimeError, match="simulated collector exit"):
+        instance.collect_one()
+
+    [watch] = instance.store.list_rows("rca_execution_watch")
+    assert watch["terminal_first_seen_at"] == NOW.isoformat()
+    assert len(instance.store.list_rows("rca_failure_routes")) == 1
+
+    monkeypatch.setattr(instance.store, "reschedule_watch", reschedule_watch)
+    clock[0] = NOW + timedelta(seconds=1800)
+    outcome = instance.collect_one()
+
+    assert outcome.status == "terminal_failed"
+    assert outcome.error_code == "vm_status_missing"
+
+
+def test_completed_delivery_clears_prior_failure_window(tmp_path, monkeypatch):
+    clock = [NOW]
+    statuses = iter([
+        {"success": False, "state": "missing"},
+        {"success": True, "state": "completed"},
+    ])
+    instance = _real_terminal_collector(
+        tmp_path,
+        clock=clock,
+        status_reader=lambda _task_id: next(statuses),
+    )
+
+    assert instance.collect_one().status == "failure_hold"
+    observed_claims = []
+    instance.artifact_bundle_reader = (
+        lambda claim: observed_claims.append(claim) or {}
+    )
+    monkeypatch.setattr(
+        collector,
+        "verify_delivery_bundle",
+        lambda **_kwargs: _delivery(observed_claims[0]),
+    )
+
+    clock[0] = NOW + timedelta(seconds=60)
+    assert instance.collect_one().status == "delivery_created"
+    [watch] = instance.store.list_rows("rca_execution_watch")
+    assert watch["terminal_first_seen_at"] is None
+
+
+def test_same_failure_after_recovery_restarts_route_window(tmp_path):
+    clock = [NOW]
+    statuses = iter([
+        {"success": False, "state": "missing"},
+        {"success": True, "state": "pending"},
+        {"success": False, "state": "missing"},
+    ])
+    instance = _real_terminal_collector(
+        tmp_path,
+        clock=clock,
+        status_reader=lambda _task_id: next(statuses),
+    )
+
+    assert instance.collect_one().status == "failure_hold"
+    clock[0] = NOW + timedelta(seconds=60)
+    assert instance.collect_one().status == "running"
+    clock[0] = NOW + timedelta(seconds=120)
+    assert instance.collect_one().status == "failure_hold"
+
+    [route] = instance.store.list_rows("rca_failure_routes")
+    assert route["work_started_at"] == clock[0].isoformat()
+    assert route["deadline_at"] == (
+        clock[0] + timedelta(seconds=1800)
+    ).isoformat()
+
+
+def test_invalid_submission_admission_uses_failure_observation_deadline(tmp_path):
     clock = [NOW]
     instance = _real_terminal_collector(
         tmp_path,
@@ -1133,7 +1270,7 @@ def test_invalid_submission_admission_is_silent_until_work_deadline(tmp_path):
     )
 
 
-def test_permanent_artifact_error_is_silent_until_work_deadline(tmp_path):
+def test_permanent_artifact_error_uses_failure_observation_deadline(tmp_path):
     clock = [NOW]
 
     def invalid_bundle(_claim):
@@ -1165,7 +1302,7 @@ def test_permanent_artifact_error_is_silent_until_work_deadline(tmp_path):
     assert fallback.error_code == "artifact_hash_mismatch"
 
 
-def test_admission_parsing_crossing_deadline_checks_status_before_fallback(
+def test_old_submission_crossing_host_time_does_not_deadline_running_vm_task(
     tmp_path, monkeypatch
 ):
     clock = [NOW]
@@ -1176,7 +1313,7 @@ def test_admission_parsing_crossing_deadline_checks_status_before_fallback(
         status_reader=lambda task_id: status_calls.append(task_id)
         or {"success": True, "task_id": task_id, "state": "running"},
     )
-    _age_work_start(instance, seconds=1799)
+    _age_submission(instance, seconds=6 * 60 * 60)
     original = collector._submission_admission
 
     def crossing_admission(claim):
@@ -1186,19 +1323,18 @@ def test_admission_parsing_crossing_deadline_checks_status_before_fallback(
 
     monkeypatch.setattr(collector, "_submission_admission", crossing_admission)
 
-    fallback = instance.collect_one()
+    outcome = instance.collect_one()
 
-    assert fallback.status == "terminal_failed"
-    assert fallback.error_code == "rca_work_deadline_exceeded"
+    assert outcome.status == "running"
     assert len(status_calls) == 1
     assert instance.store.list_rows("rca_delivery_jobs") == []
     assert instance.store.list_rows("rca_delivery_effects") == []
-    assert instance.store.list_rows("rca_execution_watch")[0]["state"] == (
-        "terminal_failed"
-    )
+    assert instance.store.list_rows("rca_execution_watch")[0]["state"] == "running"
 
 
-def test_status_read_crossing_deadline_skips_artifact_read(tmp_path):
+def test_old_submission_completed_result_is_verified_and_delivered(
+    tmp_path, monkeypatch
+):
     clock = [NOW]
     artifact_calls = []
 
@@ -1211,22 +1347,27 @@ def test_status_read_crossing_deadline_skips_artifact_read(tmp_path):
         clock=clock,
         status_reader=late_completed_status,
     )
-    _age_work_start(instance, seconds=1799)
-    instance.artifact_bundle_reader = lambda claim: artifact_calls.append(claim)
+    _age_submission(instance, seconds=6 * 60 * 60)
+    instance.artifact_bundle_reader = (
+        lambda claim: artifact_calls.append(claim) or {}
+    )
+    monkeypatch.setattr(
+        collector,
+        "verify_delivery_bundle",
+        lambda **_kwargs: _delivery(artifact_calls[0]),
+    )
 
-    fallback = instance.collect_one()
+    outcome = instance.collect_one()
 
-    assert fallback.status == "terminal_failed"
-    assert fallback.error_code == "rca_work_deadline_exceeded"
-    assert artifact_calls == []
-    assert instance.store.list_rows("rca_delivery_jobs") == []
-    assert instance.store.list_rows("rca_delivery_effects") == []
+    assert outcome.status == "delivery_created"
+    assert len(artifact_calls) == 1
+    assert len(instance.store.list_rows("rca_delivery_jobs")) == 1
     assert instance.store.list_rows("rca_execution_watch")[0]["state"] == (
-        "terminal_failed"
+        "delivery_created"
     )
 
 
-def test_late_host_observation_delivers_vm_result_completed_before_deadline(
+def test_late_host_observation_delivers_completed_vm_result(
     tmp_path, monkeypatch
 ):
     clock = [NOW]
@@ -1244,7 +1385,7 @@ def test_late_host_observation_delivers_vm_result_completed_before_deadline(
             },
         },
     )
-    _age_work_start(instance, seconds=1801)
+    _age_submission(instance, seconds=1801)
     observed_claims = []
     instance.artifact_bundle_reader = lambda claim: observed_claims.append(claim) or {}
     monkeypatch.setattr(
@@ -1261,8 +1402,8 @@ def test_late_host_observation_delivers_vm_result_completed_before_deadline(
     assert watch["last_error_code"] == ""
 
 
-def test_completed_status_with_mismatched_meta_time_still_hits_deadline(
-    tmp_path,
+def test_completed_status_does_not_use_meta_time_as_host_deadline(
+    tmp_path, monkeypatch
 ):
     clock = [NOW]
     instance = _real_terminal_collector(
@@ -1279,16 +1420,23 @@ def test_completed_status_with_mismatched_meta_time_still_hits_deadline(
             },
         },
     )
-    _age_work_start(instance, seconds=1801)
-    instance.artifact_bundle_reader = lambda _claim: {}
+    _age_submission(instance, seconds=6 * 60 * 60)
+    observed_claims = []
+    instance.artifact_bundle_reader = (
+        lambda claim: observed_claims.append(claim) or {}
+    )
+    monkeypatch.setattr(
+        collector,
+        "verify_delivery_bundle",
+        lambda **_kwargs: _delivery(observed_claims[0]),
+    )
 
     outcome = instance.collect_one()
 
-    assert outcome.status == "terminal_failed"
-    assert outcome.error_code == "rca_work_deadline_exceeded"
+    assert outcome.status == "delivery_created"
 
 
-def test_late_valid_completed_bundle_becomes_low_fallback_not_delivery(
+def test_valid_completed_bundle_crossing_old_host_deadline_is_delivered(
     tmp_path, monkeypatch
 ):
     clock = [NOW]
@@ -1302,7 +1450,7 @@ def test_late_valid_completed_bundle_becomes_low_fallback_not_delivery(
             "state": "completed",
         },
     )
-    _age_work_start(instance, seconds=1799)
+    _age_submission(instance, seconds=6 * 60 * 60)
 
     def bundle_reader(claim):
         observed_claim.append(claim)
@@ -1315,14 +1463,13 @@ def test_late_valid_completed_bundle_becomes_low_fallback_not_delivery(
     instance.artifact_bundle_reader = bundle_reader
     monkeypatch.setattr(collector, "verify_delivery_bundle", late_valid_delivery)
 
-    fallback = instance.collect_one()
+    outcome = instance.collect_one()
 
-    assert fallback.status == "terminal_failed"
-    assert fallback.error_code == "rca_work_deadline_exceeded"
-    assert instance.store.list_rows("rca_delivery_jobs") == []
-    assert instance.store.list_rows("rca_delivery_effects") == []
+    assert outcome.status == "delivery_created"
+    assert len(instance.store.list_rows("rca_delivery_jobs")) == 1
+    assert len(instance.store.list_rows("rca_delivery_effects")) == 1
     assert instance.store.list_rows("rca_execution_watch")[0]["state"] == (
-        "terminal_failed"
+        "delivery_created"
     )
 
 

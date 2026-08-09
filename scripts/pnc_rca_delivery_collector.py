@@ -233,57 +233,19 @@ def _work_window(
     claim: ExecutionWatchClaim,
     now: datetime,
 ) -> tuple[datetime, datetime, float]:
-    started = _utc_datetime(claim.work_started_at, field="work_started_at")
     if now.tzinfo is None or now.utcoffset() is None:
         raise RuntimeError("current time is invalid")
     current = now.astimezone(timezone.utc)
+    started = (
+        _utc_datetime(
+            claim.terminal_first_seen_at,
+            field="terminal_first_seen_at",
+        )
+        if claim.terminal_first_seen_at
+        else current
+    )
     deadline = started + timedelta(seconds=pnc_fault_taxonomy.TERMINAL_FALLBACK_SECONDS)
     return started, deadline, (current - started).total_seconds()
-
-
-def _completed_within_work_window(
-    claim: ExecutionWatchClaim,
-    status: Mapping[str, Any],
-    *,
-    state: str,
-) -> bool:
-    if status.get("success") is not True or state not in _COMPLETED_STATES:
-        return False
-    meta = status.get("meta")
-    meta = meta if isinstance(meta, Mapping) else {}
-    completed_at = status.get("completed_at") or meta.get("completed_at")
-    if completed_at is None:
-        # A generic top-level updated_at is not enough: bind it to the same
-        # completed state and timestamp carried by the canonical meta object.
-        meta_state = str(meta.get("state") or "").strip().lower()
-        status_updated_at = status.get("updated_at")
-        meta_updated_at = meta.get("updated_at")
-        if (
-            meta_state not in _COMPLETED_STATES
-            or status_updated_at in (None, "")
-            or meta_updated_at in (None, "")
-        ):
-            return False
-        try:
-            status_updated = _utc_datetime(
-                status_updated_at, field="status_updated_at"
-            )
-            meta_updated = _utc_datetime(meta_updated_at, field="meta_updated_at")
-        except RuntimeError:
-            return False
-        if status_updated != meta_updated:
-            return False
-        completed_at = status_updated
-    try:
-        observed = (
-            completed_at
-            if isinstance(completed_at, datetime)
-            else _utc_datetime(completed_at, field="status_completed_at")
-        )
-        started, deadline, _elapsed = _work_window(claim, observed)
-    except RuntimeError:
-        return False
-    return started <= observed <= deadline
 
 
 def default_infra_remediation_runner(
@@ -2816,59 +2778,6 @@ class DeliveryCollector:
             error_code=code,
         )
 
-    def _deadline_outcome(
-        self,
-        claim: ExecutionWatchClaim,
-        *,
-        status: dict[str, Any],
-        state: str,
-        source: str,
-    ) -> CollectOutcome | None:
-        now = self.now()
-        _started, _deadline, elapsed_seconds = _work_window(claim, now)
-        if elapsed_seconds < pnc_fault_taxonomy.TERMINAL_FALLBACK_SECONDS:
-            return None
-        route = self.store.failure_route_for_deadline(claim=claim, now=now)
-        if route is not None:
-            try:
-                decision = _durable_failure_decision(route)
-            except RuntimeError:
-                pass
-            else:
-                blocker: dict[str, Any] = {
-                    "kind": decision.raw_code,
-                    "retryable": decision.retryable,
-                }
-                if decision.audit:
-                    blocker["audit"] = decision.audit
-                taxonomy = {
-                    **decision.as_dict(),
-                    "observed_state": state,
-                    "source": "durable_failure_route_deadline",
-                    "source_conflict": False,
-                    "deadline_observation_source": source,
-                    "resumed_route_key": route.get("route_key"),
-                }
-                return self._handle_failure_until_deadline(
-                    claim,
-                    status=status,
-                    decision=decision,
-                    blocker=blocker,
-                    detail=(
-                        f"{decision.terminal_error_code} remained unresolved at "
-                        "the RCA work deadline"
-                    ),
-                    taxonomy=taxonomy,
-                )
-        return self._handle_observed_failure(
-            claim,
-            status=status,
-            code="rca_work_deadline_exceeded",
-            detail="RCA work did not produce a deliverable result within 30 minutes",
-            state=state,
-            source=source,
-        )
-
     def collect_one(self) -> CollectOutcome:
         self.stats.loops += 1
         if not self.config.enabled:
@@ -2925,14 +2834,6 @@ class DeliveryCollector:
                 admission = _submission_admission(claim)
                 issue_title = _submission_issue_title(claim)
             except Exception as exc:
-                deadline_outcome = self._deadline_outcome(
-                    claim,
-                    status=status,
-                    state=claim.state,
-                    source="submission_admission",
-                )
-                if deadline_outcome is not None:
-                    return deadline_outcome
                 code = (
                     exc.code
                     if isinstance(exc, DeliveryContractError)
@@ -2964,14 +2865,6 @@ class DeliveryCollector:
                     code=exc.code,
                     detail=exc.detail,
                 )
-            deadline_outcome = self._deadline_outcome(
-                claim,
-                status=status,
-                state=claim.state,
-                source="vm_status_reader",
-            )
-            if deadline_outcome is not None:
-                return deadline_outcome
             return self._handle_observed_failure(
                 claim,
                 status=status,
@@ -2982,20 +2875,6 @@ class DeliveryCollector:
             )
 
         state = _status_state(status)
-        completed_within_work_window = _completed_within_work_window(
-            claim,
-            status,
-            state=state,
-        )
-        if not completed_within_work_window:
-            deadline_outcome = self._deadline_outcome(
-                claim,
-                status=status,
-                state=state,
-                source="after_vm_status_read",
-            )
-            if deadline_outcome is not None:
-                return deadline_outcome
         if status.get("success") is not True:
             code = (
                 "vm_status_missing" if state == "missing" else "vm_status_unavailable"
@@ -3009,7 +2888,6 @@ class DeliveryCollector:
                 source="vm_status",
             )
         if state in _RUNNING_STATES:
-            _started, deadline, _elapsed_seconds = _work_window(claim, self.now())
             return self._retry(
                 claim,
                 status=status,
@@ -3017,7 +2895,6 @@ class DeliveryCollector:
                 error_code="",
                 error_detail="",
                 running=True,
-                not_after=deadline,
             )
         if state in _FAILED_TERMINAL_STATES:
             failure_receipt: Mapping[str, Any] | None = None
@@ -3130,14 +3007,6 @@ class DeliveryCollector:
                 report_issue_focus=bundle.get("report_issue_focus"),
             )
         except ArtifactBundleReadError as exc:
-            deadline_outcome = self._deadline_outcome(
-                claim,
-                status=status,
-                state=state,
-                source="artifact_bundle_reader",
-            )
-            if deadline_outcome is not None:
-                return deadline_outcome
             return self._handle_observed_failure(
                 claim,
                 status=status,
@@ -3155,14 +3024,6 @@ class DeliveryCollector:
                     code=exc.code,
                     detail=exc.detail,
                 )
-            deadline_outcome = self._deadline_outcome(
-                claim,
-                status=status,
-                state=state,
-                source="delivery_contract_verifier",
-            )
-            if deadline_outcome is not None:
-                return deadline_outcome
             return self._handle_observed_failure(
                 claim,
                 status=status,
@@ -3172,14 +3033,6 @@ class DeliveryCollector:
                 source="delivery_contract_verifier",
             )
         except Exception as exc:
-            deadline_outcome = self._deadline_outcome(
-                claim,
-                status=status,
-                state=state,
-                source="delivery_contract_verifier",
-            )
-            if deadline_outcome is not None:
-                return deadline_outcome
             return self._handle_observed_failure(
                 claim,
                 status=status,
@@ -3188,23 +3041,6 @@ class DeliveryCollector:
                 state=state,
                 source="delivery_contract_verifier",
             )
-        if not completed_within_work_window:
-            deadline_outcome = self._deadline_outcome(
-                claim,
-                status=status,
-                state=state,
-                source="after_artifact_verification",
-            )
-            if deadline_outcome is not None:
-                return deadline_outcome
-            deadline_outcome = self._deadline_outcome(
-                claim,
-                status=status,
-                state=state,
-                source="before_delivery_create",
-            )
-            if deadline_outcome is not None:
-                return deadline_outcome
         try:
             result = self.store.create_delivery(
                 claim=claim,

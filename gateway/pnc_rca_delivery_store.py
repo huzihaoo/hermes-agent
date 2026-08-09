@@ -5572,7 +5572,12 @@ class RcaDeliveryStore:
                 UPDATE rca_execution_watch
                    SET state = ?, next_poll_at = ?, last_observed_at = ?,
                        last_status_json = ?, last_error_code = ?,
-                       last_error_detail = ?, lease_token = NULL,
+                       last_error_detail = ?,
+                       terminal_first_seen_at = CASE
+                           WHEN ? = '' THEN NULL
+                           ELSE COALESCE(terminal_first_seen_at, ?)
+                       END,
+                       lease_token = NULL,
                        lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
                  WHERE submission_key = ? AND lease_token = ?
                 """,
@@ -5583,6 +5588,8 @@ class RcaDeliveryStore:
                     _canonical_json(status),
                     str(error_code or "")[:120],
                     str(error_detail or "")[:1000],
+                    str(error_code or "")[:120],
+                    current,
                     current,
                     submission_key,
                     lease_token,
@@ -5663,6 +5670,16 @@ class RcaDeliveryStore:
         try:
             conn.execute("BEGIN IMMEDIATE")
             self._current_claim(conn, claim.submission_key, claim.lease_token, current)
+            marker_updated = conn.execute(
+                """
+                UPDATE rca_execution_watch
+                   SET terminal_first_seen_at = COALESCE(terminal_first_seen_at, ?)
+                 WHERE submission_key = ? AND lease_token = ?
+                """,
+                (current, claim.submission_key, claim.lease_token),
+            )
+            if marker_updated.rowcount != 1:
+                raise StaleDeliveryWatchLeaseError(claim.submission_key)
             existing = conn.execute(
                 "SELECT route_key FROM rca_failure_routes WHERE route_key = ?",
                 (route_key,),
@@ -5678,6 +5695,7 @@ class RcaDeliveryStore:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(route_key) DO UPDATE SET
                     owner = excluded.owner,
+                    work_started_at = excluded.work_started_at,
                     deadline_at = excluded.deadline_at,
                     last_observed_at = excluded.last_observed_at,
                     observation_count = rca_failure_routes.observation_count + 1,
@@ -7188,6 +7206,7 @@ class RcaDeliveryStore:
                    SET state = 'delivery_created', delivery_id = ?, terminal_at = ?,
                        last_observed_at = ?, last_status_json = ?,
                        last_error_code = '', last_error_detail = '',
+                       terminal_first_seen_at = NULL,
                        lease_token = NULL, lease_owner = NULL,
                        lease_expires_at = NULL, updated_at = ?
                  WHERE submission_key = ? AND lease_token = ?
