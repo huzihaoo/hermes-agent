@@ -244,18 +244,42 @@ def _require_gate_a_identifier_binding(
                     raise RcaEvidenceProjectionError("gate_a_identifier_binding_mismatch")
 
 
-def _project_numeric_facts(value: Any, *, code: str) -> dict[str, int | float]:
+def _project_numeric_facts(
+    value: Any,
+    *,
+    code: str,
+    ignore_bool: bool = False,
+    ignore_numeric_sequences: bool = False,
+) -> dict[str, int | float]:
     if not isinstance(value, Mapping):
         raise RcaEvidenceProjectionError(code)
     projected: dict[str, int | float] = {}
     for raw_key, raw_value in value.items():
         key = _safe_public_evidence_identifier(raw_key)
-        if (
-            key is None
-            or isinstance(raw_value, bool)
-            or not isinstance(raw_value, (int, float))
-            or not math.isfinite(float(raw_value))
+        if key is None:
+            raise RcaEvidenceProjectionError(code)
+        if isinstance(raw_value, bool):
+            if ignore_bool:
+                continue
+            raise RcaEvidenceProjectionError(code)
+        elif isinstance(raw_value, (int, float)):
+            if not math.isfinite(float(raw_value)):
+                raise RcaEvidenceProjectionError(code)
+        elif (
+            ignore_numeric_sequences
+            and isinstance(raw_value, Sequence)
+            and not isinstance(raw_value, (str, bytes))
+            and 1 <= len(raw_value) <= 8
         ):
+            if any(
+                isinstance(item, bool)
+                or not isinstance(item, (int, float))
+                or not math.isfinite(float(item))
+                for item in raw_value
+            ):
+                raise RcaEvidenceProjectionError(code)
+            continue
+        else:
             raise RcaEvidenceProjectionError(code)
         projected[key] = raw_value
     return projected
@@ -276,6 +300,8 @@ def _project_checks(value: Any) -> list[dict[str, Any]]:
             entry["thresholds"] = _project_numeric_facts(
                 thresholds,
                 code="evaluator_check_thresholds_invalid",
+                ignore_bool=True,
+                ignore_numeric_sequences=True,
             )
         evidence = check.get("evidence")
         if evidence is not None:

@@ -565,7 +565,7 @@ def test_gate_a_quarantines_unbound_responsibility_bytes_from_every_public_surfa
                 "key": "object_track_quality",
                 "status": "refuted",
                 "evidence_refs": [{"signal": "OPK_PosX"}],
-                "checks": [{"thresholds": {"stable": True}}],
+                "checks": [{"thresholds": {"stable": "yes"}}],
             },
             "evaluator_check_thresholds_invalid",
         ),
@@ -587,6 +587,66 @@ def test_gate_a_invalid_only_rethrows_first_exact_projection_error(
             "input_materialized": True,
             "rca_evaluators": [evaluator],
         }, identifier_binding=binding)
+
+
+def test_gate_a_threshold_metadata_ignores_bounded_structural_facts():
+    evaluator = {
+        "key": "object_track_quality",
+        "status": "refuted",
+        "evidence_refs": [{"signal": "OPK_PosX"}],
+        "checks": [{
+            "thresholds": {
+                "must_cover_issue_time": True,
+                "min_presence_ratio": 0.3,
+                "event_window_s": [-5.0, 1.0],
+            },
+        }],
+    }
+    binding = build_gate_a_identifier_binding({
+        "actual_evaluators": [
+            {"evaluator_id": evaluator["key"], "status": evaluator["status"]},
+        ],
+        "actual_signals": ["OPK_PosX"],
+        "actual_fields": [],
+    })
+
+    projection = _project_gate_a_report(
+        {"input_materialized": True, "rca_evaluators": [evaluator]},
+        identifier_binding=binding,
+    )
+    assert projection["evaluator_projection"]["evaluators"][0]["checks"][0][
+        "thresholds"
+    ] == {
+        "min_presence_ratio": 0.3,
+    }
+
+
+@pytest.mark.parametrize(
+    "threshold_value",
+    ([0.0, "later"], [True, 1.0], [], [0.0] * 9),
+)
+def test_gate_a_threshold_metadata_rejects_unsafe_sequences(threshold_value):
+    evaluator = {
+        "key": "object_track_quality",
+        "status": "refuted",
+        "evidence_refs": [{"signal": "OPK_PosX"}],
+        "checks": [{"thresholds": {"event_window_s": threshold_value}}],
+    }
+    binding = build_gate_a_identifier_binding({
+        "actual_evaluators": [
+            {"evaluator_id": evaluator["key"], "status": evaluator["status"]},
+        ],
+        "actual_signals": ["OPK_PosX"],
+        "actual_fields": [],
+    })
+
+    with pytest.raises(
+        RcaEvidenceProjectionError, match="evaluator_check_thresholds_invalid"
+    ):
+        _project_gate_a_report(
+            {"input_materialized": True, "rca_evaluators": [evaluator]},
+            identifier_binding=binding,
+        )
 
 
 @pytest.mark.parametrize("identifier", ["ACC is at fault.", "规划 模块导致问题"])
