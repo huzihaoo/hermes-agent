@@ -274,12 +274,20 @@ def _rewrite_silent_terminal_error_code(
     [route] = delivery.list_rows("rca_failure_routes")
     status = json.loads(watch["last_status_json"])
     taxonomy = status["failure_taxonomy"]
-    taxonomy["raw_code"] = error_code
+    is_taxonomy_gap = error_code.startswith("taxonomy_gap:")
+    raw_code = error_code.removeprefix("taxonomy_gap:")
+    taxonomy["raw_code"] = raw_code
     taxonomy["terminal_error_code"] = error_code
+    taxonomy["known"] = not is_taxonomy_gap
+    taxonomy["contract_errors"] = ["unknown_blocker_kind"] if is_taxonomy_gap else []
     route_payload = json.loads(route["route_payload_json"])
-    route_payload["blocker"]["kind"] = error_code
-    route_payload["decision"]["raw_code"] = error_code
+    route_payload["blocker"]["kind"] = raw_code
+    route_payload["decision"]["raw_code"] = raw_code
     route_payload["decision"]["terminal_error_code"] = error_code
+    route_payload["decision"]["known"] = not is_taxonomy_gap
+    route_payload["decision"]["contract_errors"] = (
+        ["unknown_blocker_kind"] if is_taxonomy_gap else []
+    )
     conn = store._connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -630,6 +638,8 @@ def test_historical_epoch_batch_rerun_rejects_invalid_authority_without_mutation
         "delivery_lineage_unavailable",
         "failure_receipt_missing",
         "rca_work_deadline_exceeded",
+        "service_provenance_unavailable",
+        "taxonomy_gap:gate_a_projection_invalid",
     ],
 )
 def test_operator_silent_terminal_rerun_creates_new_generation_without_old_mutation(
@@ -902,8 +912,18 @@ def test_operator_silent_terminal_rerun_requires_settled_internal_outlet(
     assert len(store.list_rows("rca_outbox")) == 1
 
 
-def test_operator_silent_terminal_rerun_rejects_materialized_old_effect(tmp_path):
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "service_provenance_unavailable",
+        "taxonomy_gap:gate_a_projection_invalid",
+    ],
+)
+def test_operator_silent_terminal_rerun_rejects_materialized_old_effect(
+    tmp_path, error_code
+):
     store, terminal_at = _silent_deadline_terminal_store(tmp_path)
+    _rewrite_silent_terminal_error_code(store, error_code)
     request = _silent_batch_request()
     authority = _silent_batch_authority(store, request)
     [watch] = RcaDeliveryStore(store.db_path).list_rows("rca_execution_watch")

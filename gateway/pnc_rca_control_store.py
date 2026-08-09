@@ -393,6 +393,8 @@ SILENT_TERMINAL_RERUN_ERROR_CODES = frozenset({
     "delivery_lineage_unavailable",
     "failure_receipt_missing",
     "rca_work_deadline_exceeded",
+    "service_provenance_unavailable",
+    "taxonomy_gap:gate_a_projection_invalid",
 })
 SILENT_TERMINAL_RERUN_AUTHORITY_FIELDS = frozenset({
     "schema_version",
@@ -16896,12 +16898,21 @@ class RcaControlStore:
         taxonomy = status.get("failure_taxonomy")
         if not isinstance(taxonomy, Mapping):
             return False
+        taxonomy_gap_prefix = "taxonomy_gap:"
+        is_allowed_taxonomy_gap = silent_error_code.startswith(taxonomy_gap_prefix)
+        expected_raw_code = (
+            silent_error_code.removeprefix(taxonomy_gap_prefix)
+            if is_allowed_taxonomy_gap
+            else silent_error_code
+        )
+        expected_known = not is_allowed_taxonomy_gap
         if (
-            taxonomy.get("raw_code") != silent_error_code
+            not expected_raw_code
+            or taxonomy.get("raw_code") != expected_raw_code
             or taxonomy.get("terminal_error_code") != silent_error_code
             or taxonomy.get("internal_route") != "internal_alert"
             or taxonomy.get("lane") != "hard_defect"
-            or taxonomy.get("known") is not True
+            or taxonomy.get("known") is not expected_known
             or taxonomy.get("retryable") is not False
         ):
             return False
@@ -16978,10 +16989,11 @@ class RcaControlStore:
         if not isinstance(decision, Mapping) or (
             route_payload.get("schema_version")
             != "pnc_rca_failure_route_payload_v1"
-            or decision.get("raw_code") != silent_error_code
+            or decision.get("raw_code") != expected_raw_code
             or decision.get("terminal_error_code") != silent_error_code
             or decision.get("internal_route") != "internal_alert"
             or decision.get("lane") != "hard_defect"
+            or decision.get("known") is not expected_known
         ):
             return False
 

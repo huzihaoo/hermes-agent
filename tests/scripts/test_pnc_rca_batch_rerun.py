@@ -395,6 +395,8 @@ def test_approval_waits_for_required_effect_and_surfaces_terminal_failure():
         "delivery_lineage_unavailable",
         "failure_receipt_missing",
         "rca_work_deadline_exceeded",
+        "service_provenance_unavailable",
+        "taxonomy_gap:gate_a_projection_invalid",
     ],
 )
 def test_terminal_failure_surfaces_silent_watch_without_delivery_job(error_code):
@@ -452,6 +454,8 @@ def test_batch_request_is_operator_issue_only_and_deterministic():
         "delivery_lineage_unavailable",
         "failure_receipt_missing",
         "rca_work_deadline_exceeded",
+        "service_provenance_unavailable",
+        "taxonomy_gap:gate_a_projection_invalid",
     ],
 )
 def test_silent_terminal_authority_requires_exact_deadline_no_delivery(
