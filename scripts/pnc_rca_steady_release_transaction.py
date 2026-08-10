@@ -795,7 +795,7 @@ def _validate_candidate(
     env = base._env_map(env_raw)
     if (
         env.get("HERMES_RCA_PROD_RELEASE_ID") != release_id
-        or env.get("HERMES_RCA_PROD_CAPACITY_MODE") != "bootstrap"
+        or env.get("HERMES_RCA_PROD_CAPACITY_MODE") not in {"bootstrap", "steady"}
         or env.get("HERMES_OUTBOUND_MODE") != "record-only"
         or env.get("HERMES_RCA_OUTBOX_ALLOW_FEISHU_WRITEBACK") != "false"
         or env.get("HERMES_RCA_DELIVERY_DISPATCHER_ENABLED") != "false"
