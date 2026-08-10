@@ -679,6 +679,7 @@ def test_historical_epoch_batch_rerun_rejects_invalid_authority_without_mutation
         "taxonomy_gap:derived_capacity_reservation_activate_failed",
         "taxonomy_gap:gate_a_projection_invalid",
         "taxonomy_gap:viz_evidence_unavailable",
+        "remote_evidence_domain_unsupported",
     ],
 )
 def test_operator_silent_terminal_rerun_creates_new_generation_without_old_mutation(
@@ -1067,6 +1068,7 @@ def test_operator_silent_terminal_rerun_requires_settled_internal_outlet(
         "service_provenance_unavailable",
         "taxonomy_gap:gate_a_projection_invalid",
         "taxonomy_gap:viz_evidence_unavailable",
+        "remote_evidence_domain_unsupported",
     ],
 )
 def test_operator_silent_terminal_rerun_rejects_materialized_old_effect(
