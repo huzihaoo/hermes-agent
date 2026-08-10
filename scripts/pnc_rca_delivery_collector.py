@@ -189,6 +189,12 @@ _PUBLIC_TERMINAL_ERROR_CODES = frozenset({
     "terminal_artifact_grace_exceeded",
 })
 _PUBLIC_TERMINAL_FALLBACK_CODE = "taxonomy_gap:missing_terminal_error_code"
+_IMMEDIATE_TERMINAL_ERROR_CODES = frozenset({
+    "remote_evidence_domain_unsupported",
+    "taxonomy_gap:remote_evidence_domain_unsupported",
+    "viz_evidence_unavailable",
+    "taxonomy_gap:viz_evidence_unavailable",
+})
 
 
 StatusReader = Callable[[str], Mapping[str, Any]]
@@ -2500,7 +2506,10 @@ class DeliveryCollector:
             if not decision.known:
                 self.stats.taxonomy_gaps += 1
 
-        deadline_reached = elapsed_seconds >= decision.terminal_fallback_seconds
+        deadline_reached = (
+            elapsed_seconds >= decision.terminal_fallback_seconds
+            or decision.terminal_error_code in _IMMEDIATE_TERMINAL_ERROR_CODES
+        )
         if (
             not deadline_reached
             and decision.internal_route == pnc_fault_taxonomy.INFRA_REMEDIATION_HOLD
@@ -2552,7 +2561,10 @@ class DeliveryCollector:
                 now=now,
             )
             started, deadline, elapsed_seconds = _work_window(claim, now)
-            deadline_reached = elapsed_seconds >= decision.terminal_fallback_seconds
+            deadline_reached = (
+                elapsed_seconds >= decision.terminal_fallback_seconds
+                or decision.terminal_error_code in _IMMEDIATE_TERMINAL_ERROR_CODES
+            )
             projection["work_window"] = {
                 "work_started_at": _utc_iso(started),
                 "deadline_at": _utc_iso(deadline),

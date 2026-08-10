@@ -968,6 +968,33 @@ def test_all_failure_lanes_use_first_failure_observation_for_fallback_deadline(
     )
 
 
+@pytest.mark.parametrize(
+    "blocker_kind",
+    [
+        "remote_evidence_domain_unsupported",
+        "viz_evidence_unavailable",
+    ],
+)
+def test_known_production_terminal_is_not_held_for_fallback_window(
+    tmp_path, blocker_kind
+):
+    instance = _real_terminal_collector(
+        tmp_path,
+        clock=[NOW],
+        blocker={"kind": blocker_kind, "retryable": False},
+    )
+
+    outcome = instance.collect_one()
+
+    assert outcome.status == "terminal_failed"
+    assert outcome.error_code == (
+        f"taxonomy_gap:{blocker_kind}"
+        if blocker_kind == "viz_evidence_unavailable"
+        else blocker_kind
+    )
+    assert instance.store.list_rows("rca_delivery_jobs") == []
+
+
 def test_infra_remediation_runner_executes_once_for_same_task(tmp_path):
     clock = [NOW]
     marker = tmp_path / "remediation-ran"

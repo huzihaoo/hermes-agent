@@ -444,6 +444,7 @@ def test_approval_waits_for_required_effect_and_surfaces_terminal_failure():
         "taxonomy_gap:gate_a_projection_invalid",
         "taxonomy_gap:viz_evidence_unavailable",
         "remote_evidence_domain_unsupported",
+        "taxonomy_gap:remote_evidence_domain_unsupported",
     ],
 )
 def test_terminal_failure_surfaces_silent_watch_without_delivery_job(error_code):
@@ -505,6 +506,7 @@ def test_batch_request_is_operator_issue_only_and_deterministic():
         "taxonomy_gap:gate_a_projection_invalid",
         "taxonomy_gap:viz_evidence_unavailable",
         "remote_evidence_domain_unsupported",
+        "taxonomy_gap:remote_evidence_domain_unsupported",
     ],
 )
 def test_silent_terminal_authority_requires_exact_deadline_no_delivery(

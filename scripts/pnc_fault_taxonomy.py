@@ -89,6 +89,7 @@ NEEDS_HUMAN_INPUT_KINDS = frozenset({
 # Code, provenance, lineage, and publication-contract defects.  These are
 # operator-facing alerts and never requests to the issue originator.
 HARD_DEFECT_KINDS = frozenset({
+    "remote_evidence_domain_unsupported",
     "service_provenance_unavailable",
     "delivery_lineage_unavailable",
     "viz_mcap_build_failed",
