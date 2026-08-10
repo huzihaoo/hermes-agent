@@ -3053,6 +3053,18 @@ def test_unrecognized_quarantined_issue_comment_still_fails_closed(tmp_path):
         _build_core(store, effect_key, tmp_path)
 
 
+def test_w3_pre_delivery_terminal_is_covered_by_quarantine_snapshot(tmp_path):
+    store, effect_key = _seed_quarantine(tmp_path)
+    _mark_issue_comment_activation_deferred(
+        store, reason="w3_execution_snapshot_missing"
+    )
+
+    core, _receipt, _migration = _build_core(store, effect_key, tmp_path)
+
+    assert core["quarantine_snapshot"]["counts"]["subscriptions"] == 2
+    assert "activation_deferred_issue_comment_adjudication" not in core
+
+
 @pytest.mark.parametrize(
     ("column", "value_sql"),
     [

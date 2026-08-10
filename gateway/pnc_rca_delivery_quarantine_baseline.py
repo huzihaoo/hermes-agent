@@ -1290,6 +1290,7 @@ def _quarantined_subscription_projection(
     total = 0
     invalid = 0
     deferred = 0
+    snapshot_covered_technical_terminal = 0
     materialized_deferred = _activation_deferred_materialized_projection(conn)
     materialized_keys = {
         str(item["thread_subscription_key"])
@@ -1336,6 +1337,21 @@ def _quarantined_subscription_projection(
             deferred += 1
             continue
         if (
+            int(row["required"]) == 1
+            and str(row["effect_kind"]) == "feishu_issue_comment"
+            and str(row["reason"] or "") == "w3_execution_snapshot_missing"
+            and row["source_id"] is None
+            and row["delivery_id"] is None
+            and row["effect_key"] is None
+            and row["joined_delivery_id"] is None
+            and row["joined_effect_key"] is None
+        ):
+            # This is a pre-delivery technical terminal. It has no provider
+            # effect to adjudicate and remains bound by the full quarantine
+            # row-set/event digests, so it must not block a successor release.
+            snapshot_covered_technical_terminal += 1
+            continue
+        if (
             int(row["required"]) != 1
             or str(row["effect_kind"]) != DELIVERY_THREAD_EFFECT_KIND
             or str(row["source_kind"] or "") != "feishu_group_manual"
@@ -1368,7 +1384,8 @@ def _quarantined_subscription_projection(
         - invalid
         - deferred
         - materialized_deferred["count"]
-        - unmaterialized_threads,
+        - unmaterialized_threads
+        - snapshot_covered_technical_terminal,
     }
 
 
