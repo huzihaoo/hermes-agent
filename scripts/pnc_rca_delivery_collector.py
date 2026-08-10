@@ -56,6 +56,8 @@ from gateway.pnc_rca_delivery_contract import (
     DeliveryContractError,
     VerifiedDelivery,
     canonical_artifact_root,
+    is_trusted_v19_conclusion_contract,
+    normalize_v19_issue_focus_binding,
     verify_delivery_bundle,
 )
 from gateway.pnc_rca_abstention_projection import (
@@ -1094,21 +1096,6 @@ def _remote_bundle_script(submission_key: str) -> str:
             finally:
                 os.close(fd)
 
-        def public_report_projection(report_data):
-            # This VM-side result is a safe placeholder only. The host binds
-            # gate_a_source and recomputes the canonical projection before
-            # contract verification; no VM-side candidate text is trusted.
-            message = '当前无法证明远程读取完整；本次未取得可用于归因的分析数据。'
-            return {{
-                'summary': {{'short_conclusion': message}},
-                'responsibility': {{'status': 'not_attributed', 'candidate': '暂无法判断'}},
-                'causal_chain': {{'narrative': []}},
-                'evidence_summary': {{'refs': [], 'missing_evidence': [message]}},
-                'evidence_boundary': [message],
-                'evaluator_observations': [],
-                'gate_a_level': 'L0_abstain',
-            }}
-
         def read_text_artifact(path, expected):
             fd, info = open_regular(path, 'html_dependency_missing', MAX_TEXT_FILE_BYTES)
             with os.fdopen(fd, 'rb') as handle:
@@ -1637,7 +1624,6 @@ def _remote_bundle_script(submission_key: str) -> str:
                     html_path = path
             if not report_data_path or report_data is None:
                 raise RuntimeError('required_report_data_artifact_missing')
-            contract['public_result'] = public_report_projection(report_data)
             if not html_path:
                 raise RuntimeError('required_html_artifact_missing')
             dependencies = []
@@ -1688,7 +1674,11 @@ def _remote_bundle_script(submission_key: str) -> str:
                 'delivery_manifest': manifest,
                 'observed_files': observed,
                 'html_dependencies': dependencies,
-                'report_issue_focus': report_data.get('issue_focus'),
+                'report_issue_focus': report_data.get('issue_focus') or (
+                    (report_data.get('rca_receipt') or {{}}).get('issue_focus')
+                    if isinstance(report_data.get('rca_receipt'), dict)
+                    else None
+                ),
                 'gate_a_source': {{
                     'input_materialized': report_data.get('input_materialized'),
                     # The sealed report artifact was read through the
@@ -1797,6 +1787,20 @@ def _apply_gate_a_bundle_projection(bundle: Mapping[str, Any]) -> dict[str, Any]
             "gate_a_projection_invalid", f"gate_a_projection_invalid: {exc}"
         ) from exc
     contract = dict(contract)
+    if is_trusted_v19_conclusion_contract(contract):
+        # The v19 pipeline already sealed and cross-checked a primary
+        # conclusion. Keep it intact; Gate A remains available in the sealed
+        # report but must not overwrite a trusted primary projection.
+        report_issue_focus = bundle.get("report_issue_focus")
+        if not isinstance(report_issue_focus, Mapping):
+            raise DeliveryContractError("issue_focus_report_binding_missing")
+        issue_focus = normalize_v19_issue_focus_binding(report_issue_focus)
+        contract["issue_focus"] = issue_focus
+        return {
+            **dict(bundle),
+            "delivery_contract": contract,
+            "report_issue_focus": issue_focus,
+        }
     contract["gate_a_projection"] = projection
     contract["public_result"] = public_result
     contract["summary"] = dict(public_result["summary"])

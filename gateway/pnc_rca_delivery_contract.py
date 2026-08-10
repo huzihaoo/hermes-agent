@@ -39,9 +39,13 @@ from gateway.pnc_rca_issue_focus import (
     ANALYSIS_EVIDENCE_CONFLICT,
     ANALYSIS_EVIDENCE_INCOMPLETE,
     ANALYSIS_INSUFFICIENT_STATEMENT,
+    ISSUE_FOCUS_PLAN_SCHEMA_VERSION,
+    ISSUE_FOCUS_PLAN_STATUS_PLANNED,
     IssueFocusContractError,
     IssueFocusValidation,
+    issue_title_sha256,
     normalized_issue_title,
+    resolve_issue_intent,
     validate_issue_focus_evidence,
 )
 from scripts.pnc_foxglove_delivery import (
@@ -84,6 +88,27 @@ TERMINAL_DIAGNOSTIC_CONTRACT_SCHEMA_VERSION = "pnc_rca_terminal_diagnostic_v1"
 TERMINAL_FALLBACK_CONTRACT_SCHEMA_VERSION = "pnc_rca_bounded_terminal_fallback_v1"
 TERMINAL_FALLBACK_PUBLIC_CONTRACT_SCHEMA_VERSION = (
     "pnc_rca_bounded_terminal_public_result_v1"
+)
+V19_CONCLUSION_COMMUNICATION_SCHEMA_VERSION = (
+    "g1q3_rca_conclusion_communication_v2"
+)
+V19_ISSUE_FOCUS_BINDING_SCHEMA_VERSION = "g1q3_rca_v19_issue_focus_binding_v1"
+V19_PRIMARY_CONCLUSION_MODES = frozenset(
+    {"high_confidence_candidate", "works_as_designed", "symptom_refuted"}
+)
+V19_REQUIRED_CONCLUSION_CHECKS = frozenset(
+    {
+        "evidence_only",
+        "no_new_causal_claim",
+        "routing_hints_separated_from_evidence",
+        "evidence_points_present",
+        "decoded_evidence_backed",
+        "causality_closed",
+        "expression_quality_pass",
+        "professional_structure_complete",
+        "professional_wording",
+        "no_substantial_sentence_repetition",
+    }
 )
 _TERMINAL_FALLBACK_UNBACKED_EVIDENCE_RE = re.compile(
     r"已取得的证据|关键证据|证据包|evidence[_ -]?ref",
@@ -318,6 +343,90 @@ def _sanitize_gate_a_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         sanitized["artifacts"] = artifacts
     sanitized["evidence_boundary"] = list(public.get("evidence_boundary") or [])
     return sanitized
+
+
+def is_trusted_v19_conclusion_contract(contract: Mapping[str, Any]) -> bool:
+    """Return whether the VM sealed a v19 primary conclusion for delivery.
+
+    Gate A remains the default host projection.  This narrow compatibility
+    path preserves only the VM pipeline's already-validated primary projection;
+    low-confidence, blocked, and observation-only contracts still fail closed
+    to the Gate A fact surface.
+    """
+    if not isinstance(contract, Mapping):
+        return False
+    capability = contract.get("consumer_capability")
+    if not isinstance(capability, Mapping):
+        return False
+    integrated = capability.get("integrated_sources")
+    if not isinstance(integrated, Mapping):
+        return False
+    communication = integrated.get("conclusion_communication")
+    if not isinstance(communication, Mapping):
+        return False
+    publication = communication.get("publication")
+    quality = communication.get("quality_checks")
+    if not isinstance(publication, Mapping) or not isinstance(quality, Mapping):
+        return False
+    if (
+        communication.get("schema_version")
+        != V19_CONCLUSION_COMMUNICATION_SCHEMA_VERSION
+        or communication.get("style_profile") != "human_professional_dense_v2"
+        or communication.get("mode") not in V19_PRIMARY_CONCLUSION_MODES
+        or publication.get("primary_candidate_eligible") is not True
+        or publication.get("reason_codes") != []
+        or publication.get("requires_receipt_decoded_backing") is not True
+        or any(quality.get(key) is not True for key in V19_REQUIRED_CONCLUSION_CHECKS)
+    ):
+        return False
+    headline = str(communication.get("headline") or "").strip()
+    summary = str(communication.get("summary") or "").strip()
+    boundary = str(communication.get("evidence_boundary") or "").strip()
+    next_action = str(communication.get("next_action") or "").strip()
+    evidence_points = communication.get("evidence_points")
+    if (
+        not headline
+        or not summary
+        or not boundary
+        or not next_action
+        or not isinstance(evidence_points, list)
+        or not evidence_points
+        or not all(str(item or "").strip() for item in evidence_points)
+    ):
+        return False
+    report = contract.get("report")
+    artifacts = contract.get("artifacts")
+    contract_summary = contract.get("summary")
+    public = contract.get("public_result")
+    public_summary = public.get("summary") if isinstance(public, Mapping) else None
+    if not all(
+        isinstance(value, Mapping)
+        for value in (report, artifacts, contract_summary, public, public_summary)
+    ):
+        return False
+    if (
+        report.get("is_deliverable") is not True
+        or str(report.get("status") or "").strip() not in _VIZ_REPORT_STATUSES
+        or contract.get("business_state") != "report_completed"
+        or contract_summary.get("professional_conclusion_selection_status")
+        != "trusted_professional"
+        or contract_summary.get("professional_conclusion") != summary
+        or public_summary.get("short_conclusion") != summary
+        or not str(artifacts.get("attribution_causal_text") or "").strip()
+    ):
+        return False
+    if communication.get("mode") == "high_confidence_candidate":
+        if not str(report.get("candidate_owner") or "").strip():
+            return False
+    return True
+
+
+def _uses_trusted_v19_primary_projection(contract: Mapping[str, Any]) -> bool:
+    """Use the sealed v19 publication when the legacy W1b field is absent."""
+    return (
+        contract.get("upstream_dispatch") is None
+        and is_trusted_v19_conclusion_contract(contract)
+    )
 
 
 def _validated_upstream_dispatch(contract: Mapping[str, Any]) -> dict[str, Any]:
@@ -664,6 +773,107 @@ def issue_focus_payload_sha256(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def normalize_v19_issue_focus_binding(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Wrap the sealed v19 receipt focus for the Host delivery contract."""
+    if not isinstance(value, Mapping) or set(value) != {"plan", "gate", "hard_stop"}:
+        raise DeliveryContractError("issue_focus_v19_binding_invalid")
+    plan = value.get("plan")
+    gate = value.get("gate")
+    if not isinstance(plan, Mapping) or not isinstance(gate, Mapping):
+        raise DeliveryContractError("issue_focus_v19_binding_invalid")
+    return {
+        "schema_version": V19_ISSUE_FOCUS_BINDING_SCHEMA_VERSION,
+        "plan": dict(plan),
+        "gate": dict(gate),
+        "hard_stop": value.get("hard_stop"),
+    }
+
+
+def _validate_v19_issue_focus_binding(
+    *, issue_title: str, value: Mapping[str, Any]
+) -> IssueFocusValidation:
+    if set(value) != {"schema_version", "plan", "gate", "hard_stop"} or (
+        value.get("schema_version") != V19_ISSUE_FOCUS_BINDING_SCHEMA_VERSION
+        or value.get("hard_stop") is not False
+        or value.get("gate") != {}
+    ):
+        raise DeliveryContractError("issue_focus_v19_binding_invalid")
+    plan = value.get("plan")
+    expected_plan_fields = {
+        "schema_version",
+        "analysis_status",
+        "issue_intent",
+        "title_sha256",
+        "intent_sha256",
+        "required_capabilities",
+        "required_segments",
+        "required_entities",
+        "required_measurements",
+        "required_checks",
+        "required_calculations",
+        "missing_requirements",
+        "unsupported_capabilities",
+        "capability_review",
+        "stop_reason",
+        "source",
+        "plan_sha256",
+    }
+    if not isinstance(plan, Mapping) or set(plan) != expected_plan_fields:
+        raise DeliveryContractError("issue_focus_v19_plan_invalid")
+    intent = resolve_issue_intent(issue_title)
+    expected_requirements = {
+        "required_capabilities": list(intent.required_capabilities),
+        "required_segments": list(intent.required_segments),
+        "required_entities": list(intent.required_entities),
+        "required_measurements": list(intent.required_measurements),
+        "required_checks": list(intent.required_checks),
+        "required_calculations": list(intent.required_calculations),
+    }
+    if (
+        plan.get("schema_version") != ISSUE_FOCUS_PLAN_SCHEMA_VERSION
+        or plan.get("analysis_status") != ISSUE_FOCUS_PLAN_STATUS_PLANNED
+        or plan.get("issue_intent") != intent.to_dict()
+        or plan.get("title_sha256") != issue_title_sha256(issue_title)
+        or plan.get("intent_sha256") != intent.intent_sha256
+        or any(plan.get(key) != expected for key, expected in expected_requirements.items())
+        or plan.get("missing_requirements") != []
+        or plan.get("unsupported_capabilities") != []
+        or plan.get("stop_reason") != ""
+    ):
+        raise DeliveryContractError("issue_focus_v19_plan_invalid")
+    review = plan.get("capability_review")
+    source = plan.get("source")
+    if (
+        not isinstance(review, list)
+        or any(not isinstance(item, str) or not item for item in review)
+        or review != sorted(set(review))
+        or not isinstance(source, Mapping)
+        or set(source)
+        != {"kind", "description_sha256", "comments_sha256", "comment_count"}
+        or source.get("kind") != "title_plus_bounded_issue_context"
+        or not _SHA256_RE.fullmatch(str(source.get("description_sha256") or ""))
+        or not _SHA256_RE.fullmatch(str(source.get("comments_sha256") or ""))
+        or isinstance(source.get("comment_count"), bool)
+        or not isinstance(source.get("comment_count"), int)
+        or source.get("comment_count") < 0
+    ):
+        raise DeliveryContractError("issue_focus_v19_plan_invalid")
+    plan_material = dict(plan)
+    observed_plan_sha256 = str(plan_material.pop("plan_sha256") or "")
+    expected_plan_sha256 = hashlib.sha256(
+        _canonical_json(plan_material).encode("utf-8")
+    ).hexdigest()
+    if observed_plan_sha256 != expected_plan_sha256:
+        raise DeliveryContractError("issue_focus_v19_plan_hash_mismatch")
+    return IssueFocusValidation(
+        intent_sha256=intent.intent_sha256,
+        analysis_status=ANALYSIS_COMPLETE,
+        attribution_allowed=True,
+        missing_requirements=(),
+        unsupported_capabilities=(),
+    )
+
+
 def _issue_focus_stop_message(status: str) -> str:
     return {
         ANALYSIS_INSUFFICIENT_STATEMENT: "问题陈述不足，未输出责任归因。",
@@ -690,6 +900,19 @@ def validate_delivery_issue_focus(
         raise DeliveryContractError("delivery_contract_schema_unsupported")
     title = normalized_issue_title(issue_title)
     raw_focus = contract.get("issue_focus")
+    if (
+        isinstance(raw_focus, Mapping)
+        and raw_focus.get("schema_version")
+        == V19_ISSUE_FOCUS_BINDING_SCHEMA_VERSION
+    ):
+        if not title:
+            raise DeliveryContractError("issue_focus_title_missing")
+        if not is_trusted_v19_conclusion_contract(contract):
+            raise DeliveryContractError("issue_focus_v19_conclusion_untrusted")
+        return title, _validate_v19_issue_focus_binding(
+            issue_title=title,
+            value=raw_focus,
+        )
     if schema == DELIVERY_CONTRACT_SCHEMA_VERSION_V1 and raw_focus is None:
         # v1 is a historical adapter contract.  It remains readable with the
         # generic quality oracle, but a newly bound title may only publish an
@@ -764,7 +987,13 @@ def delivery_oracle_contract(
     """Build the exact oracle input used at both Host and dispatch replay."""
 
     result = dict(contract)
-    result["upstream_dispatch"] = _validated_upstream_dispatch(contract)
+    # v19 seals an equivalent primary publication under its conclusion
+    # communication contract.  Do not reinterpret that sealed result as the
+    # legacy W1b no-hit abstention; doing so erases its responsibility before
+    # the structural oracle runs.  Older and untrusted contracts retain the
+    # historical fail-closed dispatch validation.
+    if not _uses_trusted_v19_primary_projection(contract):
+        result["upstream_dispatch"] = _validated_upstream_dispatch(contract)
     return issue_focus_oracle_contract(result, validation)
 
 
@@ -2742,6 +2971,36 @@ def render_public_rca_result(
             return "\n".join(
                 ["本单未能定向", _issue_focus_stop_message(focus_status)]
             )
+    if _uses_trusted_v19_primary_projection(contract):
+        # The v19 conclusion communication is already receipt-backed and
+        # quality-checked.  Render that public projection directly rather than
+        # manufacturing a legacy upstream-dispatch hit from an owner label.
+        communication = contract["consumer_capability"]["integrated_sources"][
+            "conclusion_communication"
+        ]
+        mode = communication["mode"]
+        if mode == "symptom_refuted":
+            first_line = "归因判断：原问题现象被证据反证"
+        elif mode == "works_as_designed":
+            first_line = "责任结论：当前行为符合设计预期"
+        else:
+            responsibility = str(
+                result.get("responsibility") or "待人工确认"
+            ).strip()
+            first_line = f"建议责任方：{responsibility}"
+        lines = [first_line]
+        lines.append(
+            "可直接参考"
+            if terminal_class == SUPPORTED_ATTRIBUTION
+            else MEDIUM_TIER_DISCLAIMER
+        )
+        lines.extend(
+            [
+                f"依据：{result['evidence']}",
+                f"归因判断：{result['conclusion']}",
+            ]
+        )
+        return "\n".join(_truncate_utf8(line, 1800) for line in lines)
     dispatch = _validated_upstream_dispatch(contract)
     gate_a_projection = _gate_a_projection(contract) is not None
     lines = [_dispatch_first_line(dispatch, gate_a_projection=gate_a_projection)]

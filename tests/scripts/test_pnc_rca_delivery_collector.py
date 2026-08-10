@@ -16,7 +16,9 @@ from gateway.pnc_rca_delivery_contract import (
     DeliveryContractError,
     TERMINAL_FALLBACK_CONTRACT_SCHEMA_VERSION,
     TERMINAL_FALLBACK_DELIVERY_EFFECT_SCHEMA_VERSION,
+    render_public_rca_result,
 )
+from gateway.pnc_rca_issue_focus import build_issue_focus_plan
 from gateway.pnc_rca_control_store import RcaControlStore
 from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from scripts import pnc_rca_delivery_collector as collector
@@ -56,6 +58,79 @@ def _gate_a_capability(*, status="supported"):
         ],
         "actual_signals": ["AEBReq"],
         "actual_fields": [],
+    }
+
+
+def _trusted_v19_contract():
+    communication = {
+        "schema_version": "g1q3_rca_conclusion_communication_v2",
+        "style_profile": "human_professional_dense_v2",
+        "mode": "high_confidence_candidate",
+        "headline": "归因候选：ACC 控制请求异常",
+        "summary": "问题窗口内 ACC 控制请求异常并与减速度响应同窗。",
+        "next_action": "由 ACC 团队确认修复并完成同场景回归。",
+        "evidence_points": ["ACC 控制请求与减速度响应同窗"],
+        "evidence_boundary": "仅覆盖已解码控制请求与车辆响应",
+        "publication": {
+            "primary_candidate_eligible": True,
+            "reason_codes": [],
+            "requires_receipt_decoded_backing": True,
+        },
+        "quality_checks": {
+            "evidence_only": True,
+            "no_new_causal_claim": True,
+            "routing_hints_separated_from_evidence": True,
+            "evidence_points_present": True,
+            "decoded_evidence_backed": True,
+            "causality_closed": True,
+            "expression_quality_pass": True,
+            "professional_structure_complete": True,
+            "professional_wording": True,
+            "no_substantial_sentence_repetition": True,
+        },
+    }
+    capability = _gate_a_capability()
+    capability["integrated_sources"] = {
+        "conclusion_communication": communication,
+    }
+    return {
+        "business_state": "report_completed",
+        "consumer_capability": capability,
+        "summary": {
+            "short_conclusion": communication["summary"],
+            "professional_conclusion": communication["summary"],
+            "professional_conclusion_selection_status": "trusted_professional",
+        },
+        "report": {
+            "candidate_owner_domain": "ACC",
+            "candidate_owner": "ACC 控制模块",
+            "is_candidate": True,
+            "is_deliverable": True,
+            "status": "report_ready",
+        },
+        "artifacts": {
+            "attribution_causal_text": "ACC 控制请求异常导致减速度响应。",
+        },
+        "public_result": {
+            "summary": {"short_conclusion": communication["summary"]},
+            "responsibility": {"status": "confirmed", "candidate": "ACC 控制模块"},
+            "causal_chain": {
+                "narrative": [
+                {"role": "现象", "text": "窗口内出现异常减速度响应。"},
+                {"role": "证据", "text": "ACC 控制请求与减速度响应同窗。"},
+                {"role": "因果判断", "text": "ACC 控制请求异常导致减速度响应。"},
+                ]
+            },
+        },
+    }
+
+
+def _trusted_v19_focus():
+    title = "ACC-自车右转，ACC减速，报接管"
+    return {
+        "plan": build_issue_focus_plan(title=title),
+        "gate": {},
+        "hard_stop": False,
     }
 
 
@@ -410,9 +485,8 @@ def test_remote_bundle_reader_binds_gate_a_source_and_safe_projection():
     script = collector._remote_bundle_script("g1q3-rca-s1-" + "d" * 64)
 
     assert "'gate_a_source'" in script
-    assert "'gate_a_level': 'L0_abstain'" in script
-    assert "recomputes the canonical projection" in script
-    assert "responsibility_candidate" not in script.split("def public_report_projection", 1)[1].split("def read_text_artifact", 1)[0]
+    assert "def public_report_projection" not in script
+    assert "contract['public_result'] =" not in script
 
 
 def test_host_gate_a_projection_replaces_candidate_bearing_contract():
@@ -443,6 +517,140 @@ def test_host_gate_a_projection_replaces_candidate_bearing_contract():
     assert public["gate_a_level"] == "L1_observation"
     assert public["responsibility"]["candidate"] == "暂无法判断"
     assert "candidate_owner_domain" not in bundle["delivery_contract"]["report"]
+
+
+def test_host_keeps_only_a_trusted_v19_primary_conclusion():
+    contract = _trusted_v19_contract()
+
+    bundle = collector._apply_gate_a_bundle_projection({
+        "delivery_contract": contract,
+        "report_issue_focus": _trusted_v19_focus(),
+        "gate_a_source": {
+            "input_materialized": True,
+            "rca_evaluators": [
+                {
+                    "key": "aeb_trigger",
+                    "status": "supported",
+                    "evidence_refs": [{"signal": "AEBReq"}],
+                }
+            ],
+        },
+    })
+
+    preserved = bundle["delivery_contract"]
+    assert "gate_a_projection" not in preserved
+    assert preserved["public_result"] == contract["public_result"]
+    assert preserved["report"]["candidate_owner"] == "ACC 控制模块"
+    assert preserved["artifacts"]["attribution_causal_text"]
+    assert preserved["issue_focus"]["schema_version"] == (
+        "g1q3_rca_v19_issue_focus_binding_v1"
+    )
+
+
+def test_host_rejects_trusted_v19_without_report_focus_binding():
+    with pytest.raises(DeliveryContractError, match="issue_focus_report_binding_missing"):
+        collector._apply_gate_a_bundle_projection({
+            "delivery_contract": _trusted_v19_contract(),
+            "gate_a_source": {
+                "input_materialized": False,
+                "materialization_attested": True,
+                "failure_class": "remote_read_completeness_not_proven",
+                "rca_evaluators": [],
+            },
+        })
+
+
+def test_host_falls_back_to_gate_a_when_v19_primary_quality_is_not_trusted():
+    contract = _trusted_v19_contract()
+    contract["consumer_capability"]["integrated_sources"][
+        "conclusion_communication"
+    ]["quality_checks"]["causality_closed"] = False
+
+    bundle = collector._apply_gate_a_bundle_projection({
+        "delivery_contract": contract,
+        "gate_a_source": {
+            "input_materialized": True,
+            "rca_evaluators": [
+                {
+                    "key": "aeb_trigger",
+                    "status": "supported",
+                    "evidence_refs": [{"signal": "AEBReq"}],
+                }
+            ],
+        },
+    })
+
+    sanitized = bundle["delivery_contract"]
+    assert sanitized["public_result"]["gate_a_level"] == "L1_observation"
+    assert "candidate_owner" not in sanitized["report"]
+    assert "attribution_causal_text" not in sanitized["artifacts"]
+
+
+def test_trusted_v19_survives_full_delivery_verification(monkeypatch):
+    from gateway.pnc_rca_delivery_contract import verify_delivery_bundle
+    from tests.gateway.test_pnc_rca_delivery_contract import _bundle
+
+    monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", "https://viewer.internal")
+    admission, base, manifest, observed, dependencies = _bundle()
+    trusted = _trusted_v19_contract()
+    for key in ("summary", "report", "artifacts"):
+        base[key].update(trusted[key])
+    base["public_result"] = trusted["public_result"]
+    base["consumer_capability"]["integrated_sources"] = trusted[
+        "consumer_capability"
+    ]["integrated_sources"]
+    projected = collector._apply_gate_a_bundle_projection({
+        "delivery_contract": base,
+        "report_issue_focus": _trusted_v19_focus(),
+        "gate_a_source": {
+            "input_materialized": True,
+            "rca_evaluators": [
+                {
+                    "key": "aeb_trigger",
+                    "status": "supported",
+                    "evidence_refs": [{"signal": "AEBReq"}],
+                }
+            ],
+        },
+    })
+
+    delivery = verify_delivery_bundle(
+        admission=admission,
+        delivery_contract=projected["delivery_contract"],
+        delivery_manifest=manifest,
+        observed_files=observed,
+        html_dependencies=dependencies,
+        issue_title="ACC-自车右转，ACC减速，报接管",
+        report_issue_focus=projected["report_issue_focus"],
+    )
+
+    assert delivery.effect_payload["terminal_class"] == "candidate_hypothesis"
+    assert "ACC 功能链" in delivery.effect_payload["result_field_value"]
+    assert "ACC 控制请求异常" in delivery.conclusion
+    assert "本单未能定向" not in delivery.conclusion
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_first_line"),
+    [
+        ("symptom_refuted", "归因判断：原问题现象被证据反证"),
+        ("works_as_designed", "责任结论：当前行为符合设计预期"),
+    ],
+)
+def test_trusted_v19_non_candidate_modes_do_not_suggest_responsibility(
+    mode, expected_first_line
+):
+    contract = _trusted_v19_contract()
+    contract["consumer_capability"]["integrated_sources"][
+        "conclusion_communication"
+    ]["mode"] = mode
+
+    rendered = render_public_rca_result(
+        contract, terminal_class="candidate_hypothesis"
+    )
+
+    assert rendered.splitlines()[0] == expected_first_line
+    assert "建议责任方：" not in rendered
 
 
 def test_host_gate_a_projection_rejects_malformed_evaluator_source():
