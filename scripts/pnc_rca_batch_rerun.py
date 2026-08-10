@@ -36,19 +36,6 @@ from gateway.pnc_rca_control_store import (  # noqa: E402
     build_historical_epoch_rerun_authority,
     build_silent_terminal_rerun_authority,
 )
-from gateway.pnc_rca_abstention_projection import (  # noqa: E402
-    RcaEvidenceProjectionError,
-    build_gate_a_identifier_binding,
-    build_gate_a_public_result,
-    validate_gate_a_projection,
-)
-from gateway.pnc_rca_issue_focus import (  # noqa: E402
-    ANALYSIS_COMPLETE,
-    IssueFocusContractError,
-    validate_issue_focus_evidence,
-)
-
-
 SCHEMA_VERSION = "pnc_rca_batch_rerun_state_v4"
 DRY_RUN_SCHEMA_VERSION = "pnc_rca_batch_rerun_dry_run_receipt_v1"
 OWNER_RECEIPT_SCHEMA_VERSION = "pnc_rca_batch_owner_receipt_v2"
@@ -632,118 +619,6 @@ def _causal_delivery_quality(contract_raw: Any) -> dict[str, str] | None:
     }
 
 
-def _explicit_focus_stop_quality(
-    contract_raw: Any, *, issue_title: str
-) -> dict[str, str] | None:
-    contract = _json_object(contract_raw)
-    focus = contract.get("issue_focus")
-    if not isinstance(focus, Mapping):
-        return None
-    title = str(issue_title or "").strip()
-    if not title:
-        return None
-    try:
-        validation = validate_issue_focus_evidence(issue_title=title, value=focus)
-    except IssueFocusContractError:
-        return None
-    if validation.analysis_status == ANALYSIS_COMPLETE or validation.attribution_allowed:
-        return None
-    return {
-        "status": "explicit_focus_stop",
-        "analysis_status": validation.analysis_status,
-        "responsibility": "暂无法判断",
-        "causal_text_sha256": "",
-    }
-
-
-def _observational_non_attribution_quality(
-    contract_raw: Any,
-) -> dict[str, Any] | None:
-    """Accept only a canonical L1 observation after official delivery readback."""
-    contract = _json_object(contract_raw)
-    report = contract.get("report")
-    artifacts = contract.get("artifacts")
-    consumer_capability = contract.get("consumer_capability")
-    projection = contract.get("gate_a_projection")
-    public_result = contract.get("public_result")
-    if not all(
-        isinstance(value, Mapping)
-        for value in (report, artifacts, consumer_capability, projection, public_result)
-    ):
-        return None
-    if (
-        (
-            "diagnostic_only" in report
-            and report.get("diagnostic_only") is not False
-        )
-        or "candidate_owner" in report
-        or "candidate_responsibility" in report
-        or "candidate_owner_domain" in report
-        or "responsibility_candidate" in report
-        or "is_candidate" in report
-        or "attribution_causal_text" in artifacts
-        or any(
-            field in contract
-            for field in (
-                "quality_classification",
-                "terminal_class",
-                "confidence_tier",
-                "approval_ready",
-                "human_decision",
-            )
-        )
-        or "terminal_diagnostic" in contract
-        or "terminal_diagnostic" in report
-        or "terminal_diagnostic" in artifacts
-    ):
-        return None
-    try:
-        binding = build_gate_a_identifier_binding(consumer_capability)
-        canonical_projection = validate_gate_a_projection(
-            projection,
-            identifier_binding=binding,
-        )
-        canonical_public_result = build_gate_a_public_result(canonical_projection)
-    except RcaEvidenceProjectionError:
-        return None
-    if (
-        canonical_projection.get("level") != "L1_observation"
-        or dict(public_result) != canonical_public_result
-        or canonical_public_result.get("responsibility")
-        != {"status": "not_attributed", "candidate": "暂无法判断"}
-    ):
-        return None
-    observations = canonical_public_result.get("evaluator_observations")
-    observation_count = canonical_public_result.get("evaluator_observation_count")
-    if (
-        isinstance(observation_count, bool)
-        or not isinstance(observation_count, int)
-        or observation_count < 1
-        or not isinstance(observations, list)
-        or not observations
-        or len(observations) > observation_count
-        or canonical_public_result.get("evaluator_observation_omitted_count")
-        != observation_count - len(observations)
-    ):
-        return None
-    projection_sha256 = _sha256_bytes(
-        json.dumps(
-            canonical_projection,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    )
-    return {
-        "status": "observational_non_attribution",
-        "gate_a_level": "L1_observation",
-        "responsibility": "暂无法判断",
-        "observation_count": observation_count,
-        "projection_sha256": projection_sha256,
-        "causal_text_sha256": "",
-    }
-
-
 def _issue_snapshot(
     db_path: Path, issue_id: str, *, submission_key: str = ""
 ) -> dict[str, Any] | None:
@@ -927,14 +802,6 @@ def _approval(
         return None
     quality = _causal_delivery_quality(snapshot.get("contract_json"))
     if quality is None:
-        quality = _explicit_focus_stop_quality(
-            snapshot.get("contract_json"), issue_title=issue_title
-        )
-    if quality is None:
-        quality = _observational_non_attribution_quality(
-            snapshot.get("contract_json")
-        )
-    if quality is None:
         return None
     return {
         "generation": int(snapshot["generation"]),
@@ -956,60 +823,8 @@ def _approval(
 def _batch_completion(
     snapshot: Mapping[str, Any], *, issue_title: str = ""
 ) -> dict[str, Any] | None:
-    """Return a terminal batch result once the two issue fields were read back.
-
-    Quality classification remains visible, but it cannot trigger another
-    external write after the provider already confirmed both requested fields.
-    """
-    approved = _approval(snapshot, issue_title=issue_title)
-    if approved is not None:
-        return approved
-    if snapshot.get("job_status") != "delivered":
-        return None
-    if snapshot.get("job_outcome") != "success":
-        return None
-    required = [
-        effect
-        for effect in snapshot.get("effects", [])
-        if isinstance(effect, Mapping) and int(effect.get("required") or 0) == 1
-    ]
-    issue_effects = [
-        effect
-        for effect in required
-        if effect.get("effect_kind") == "feishu_issue_comment"
-    ]
-    if len(issue_effects) != 1 or any(
-        effect.get("status") != "succeeded" for effect in required
-    ):
-        return None
-    receipt = dict(issue_effects[0].get("remote_receipt") or {})
-    field_keys = sorted(str(value) for value in receipt.get("confirmed_field_keys", []))
-    if (
-        not receipt.get("remote_id")
-        or receipt.get("source") not in OFFICIAL_READBACK_SOURCES
-        or field_keys != ["field_8c912e", "field_9193cb"]
-    ):
-        return None
-    return {
-        "generation": int(snapshot["generation"]),
-        "submission_key": str(snapshot["submission_key"]),
-        "delivery_id": str(snapshot["delivery_id"]),
-        "outcome_key": str(snapshot.get("outcome_key") or ""),
-        "issue_url": str(snapshot.get("issue_url") or ""),
-        "report_url": str(snapshot.get("report_url") or ""),
-        "official_comment_id": str(receipt["remote_id"]),
-        "official_field_keys": field_keys,
-        "official_readback_source": str(receipt.get("source") or ""),
-        "quality": {
-            "status": "post_write_review_required",
-            "reason": "quality_contract_not_satisfied",
-            "responsibility": "暂无法判断",
-            "causal_text_sha256": "",
-        },
-        "manifest": _json_object(snapshot.get("manifest_json")),
-        "artifacts": _json_object(snapshot.get("artifacts_json")),
-        "completed_at": str(issue_effects[0].get("completed_at") or ""),
-    }
+    """Return only an officially read-back causal RCA result."""
+    return _approval(snapshot, issue_title=issue_title)
 
 
 def _terminal_failure(

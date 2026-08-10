@@ -237,20 +237,10 @@ def test_approval_rejects_delivered_noncausal_result():
     assert failure["job_status"] == "delivered"
 
 
-def test_batch_completion_does_not_repeat_a_confirmed_field_write():
+def test_batch_completion_rejects_confirmed_noncausal_field_write():
     snapshot = _snapshot(causal=False)
 
-    completion = _batch_completion(snapshot)
-
-    assert completion is not None
-    assert completion["official_field_keys"] == ["field_8c912e", "field_9193cb"]
-    assert completion["official_readback_source"] == "read_after_write"
-    assert completion["quality"] == {
-        "status": "post_write_review_required",
-        "reason": "quality_contract_not_satisfied",
-        "responsibility": "暂无法判断",
-        "causal_text_sha256": "",
-    }
+    assert _batch_completion(snapshot) is None
 
 
 def test_batch_completion_requires_provider_readback():
@@ -268,14 +258,11 @@ def test_batch_completion_requires_provider_readback():
         "recovery_read_before_write",
     ],
 )
-def test_batch_completion_accepts_canonical_reconciliation_readback(source):
+def test_batch_completion_rejects_noncausal_reconciliation_readback(source):
     snapshot = _snapshot(causal=False)
     snapshot["effects"][0]["remote_receipt"]["source"] = source
 
-    completion = _batch_completion(snapshot)
-
-    assert completion is not None
-    assert completion["official_readback_source"] == source
+    assert _batch_completion(snapshot) is None
 
 
 def test_approval_accepts_decoded_data_binding_conflict_as_a_cause():
@@ -297,7 +284,7 @@ def test_approval_accepts_decoded_data_binding_conflict_as_a_cause():
     assert approval["quality"]["responsibility"] == "问题数据/回灌链路"
 
 
-def test_approval_accepts_explicit_focus_stop_after_official_field_readback():
+def test_approval_rejects_explicit_focus_stop_as_attribution_completion():
     from tests.gateway.test_pnc_rca_delivery_contract import _focus_payload
 
     snapshot = _snapshot(causal=False)
@@ -308,15 +295,7 @@ def test_approval_accepts_explicit_focus_stop_after_official_field_readback():
         )
     })
 
-    approval = _approval(snapshot, issue_title="HMI-S弯")
-
-    assert approval is not None
-    assert approval["quality"] == {
-        "status": "explicit_focus_stop",
-        "analysis_status": ANALYSIS_INSUFFICIENT_STATEMENT,
-        "responsibility": "暂无法判断",
-        "causal_text_sha256": "",
-    }
+    assert _approval(snapshot, issue_title="HMI-S弯") is None
 
 
 def _observational_contract():
@@ -357,19 +336,11 @@ def _observational_contract():
     }
 
 
-def test_approval_accepts_canonical_l1_observation_after_official_readback():
+def test_approval_rejects_canonical_l1_observation_as_attribution_completion():
     snapshot = _snapshot(causal=False)
     snapshot["contract_json"] = json.dumps(_observational_contract())
 
-    approval = _approval(snapshot)
-
-    assert approval is not None
-    assert approval["quality"]["status"] == "observational_non_attribution"
-    assert approval["quality"]["gate_a_level"] == "L1_observation"
-    assert approval["quality"]["responsibility"] == "暂无法判断"
-    assert approval["quality"]["observation_count"] == 1
-    assert len(approval["quality"]["projection_sha256"]) == 64
-    assert approval["quality"]["causal_text_sha256"] == ""
+    assert _approval(snapshot) is None
 
 
 @pytest.mark.parametrize(
@@ -1590,7 +1561,7 @@ def test_run_refreshes_existing_success_instead_of_skipping_it(tmp_path, monkeyp
     assert result["status"] == "completed"
 
 
-def test_run_reconciles_failed_state_after_confirmed_field_readback(
+def test_run_retries_failed_state_after_noncausal_field_readback(
     tmp_path, monkeypatch
 ):
     queue_path, owner_path = _write_run_inputs(tmp_path, _queue_value())
@@ -1598,7 +1569,15 @@ def test_run_reconciles_failed_state_after_confirmed_field_readback(
         **_snapshot(causal=False),
         "generation": 2,
         "submission_key": "g1q3-rca-s1-" + "c" * 64,
+        "watch_state": "delivery_created",
+        "watch_delivery_id": "delivery-6",
     }
+    refreshed = {
+        **_snapshot(),
+        "generation": 3,
+        "submission_key": "g1q3-rca-s1-" + "d" * 64,
+    }
+    admitted = False
     state = {
         "schema_version": SCHEMA_VERSION,
         "batch_id": "gray-20260724",
@@ -1620,13 +1599,24 @@ def test_run_reconciles_failed_state_after_confirmed_field_readback(
         def __init__(self, _path):
             pass
 
-        def admit_manual_trigger(self, *_args, **_kwargs):
-            pytest.fail("confirmed field readback created a duplicate generation")
+        def admit_manual_trigger(self, _request, **kwargs):
+            nonlocal admitted
+            authority = kwargs.get("batch_terminal_rerun_authority")
+            assert authority is not None
+            assert authority["prior_submission_key"] == delivered["submission_key"]
+            admitted = True
+            return SimpleNamespace(
+                outcome="created",
+                generation=3,
+                submission_key=refreshed["submission_key"],
+                source_id="source-3",
+            )
 
     def snapshot(_path, _issue_id, *, submission_key=""):
-        if submission_key and submission_key != delivered["submission_key"]:
+        value = refreshed if admitted else delivered
+        if submission_key and submission_key != value["submission_key"]:
             return None
-        return delivered
+        return value
 
     monkeypatch.setattr(batch_rerun, "RcaControlStore", FakeStore)
     monkeypatch.setattr(batch_rerun, "_issue_snapshot", snapshot)
@@ -1640,11 +1630,13 @@ def test_run_reconciles_failed_state_after_confirmed_field_readback(
     result = batch_rerun.run(args)
 
     item = result["items"]["7048803418"]
+    assert admitted is True
     assert result["status"] == "completed"
     assert result["summary"] == {"accepted": 1, "total": 1}
     assert item["status"] == "accepted"
     assert "failure" not in item
-    assert item["approval"]["quality"]["status"] == "post_write_review_required"
+    assert item["generation"] == 3
+    assert item["approval"]["quality"]["status"] == "causal_candidate"
 
 
 def test_issue_snapshot_tracks_new_outbox_before_execution_watch_exists(tmp_path):
