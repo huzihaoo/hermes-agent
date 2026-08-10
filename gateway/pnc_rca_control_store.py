@@ -398,6 +398,7 @@ SILENT_TERMINAL_RERUN_ERROR_CODES = frozenset({
     "taxonomy_gap:derived_capacity_hfs_target_identity_mismatch",
     "taxonomy_gap:derived_capacity_reservation_activate_failed",
     "taxonomy_gap:gate_a_projection_invalid",
+    "taxonomy_gap:viz_evidence_unavailable",
 })
 PRE_W3_NO_WRITE_RERUN_OUTBOX_ERROR_CODES = frozenset({
     "host_issue_preread_failed",
