@@ -841,6 +841,7 @@ export const zhHant = defineLocale({
     noToolsetsDesc: '請嘗試更廣泛的搜尋詞。',
     noDescription: '無可用描述。',
     configured: '已設定',
+    dependenciesUnavailable: '依賴不可用',
     needsKeys: '需要金鑰',
     toolsetsEnabled: (enabled, total) => `已啟用 ${enabled}/${total} 個工具集`,
     configureToolset: label => `設定 ${label}`,

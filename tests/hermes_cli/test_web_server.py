@@ -4128,6 +4128,11 @@ class TestNewEndpoints:
             lambda ts_key, config=None: ts_key != "web",
         )
         monkeypatch.setattr(
+            tools_config,
+            "_toolset_dependencies_available",
+            lambda ts_key: True,
+        )
+        monkeypatch.setattr(
             toolsets_module,
             "resolve_toolset",
             lambda name: {
@@ -4171,6 +4176,49 @@ class TestNewEndpoints:
             },
         ]
 
+    def test_toolsets_list_does_not_claim_missing_sdk_is_available(self, monkeypatch):
+        import hermes_cli.tools_config as tools_config
+        import hermes_cli.web_server as web_server
+        import toolsets as toolsets_module
+
+        monkeypatch.setattr(
+            tools_config,
+            "_get_effective_configurable_toolsets",
+            lambda: [("feishu_aily", "Feishu Aily Knowledge", "knowledge Q&A")],
+        )
+        monkeypatch.setattr(
+            tools_config,
+            "_get_platform_tools",
+            lambda *args, **kwargs: {"feishu_aily"},
+        )
+        monkeypatch.setattr(tools_config, "_toolset_has_keys", lambda *args: True)
+        monkeypatch.setattr(
+            tools_config,
+            "_toolset_dependencies_available",
+            lambda name: False,
+        )
+        monkeypatch.setattr(
+            toolsets_module,
+            "resolve_toolset",
+            lambda name: ["feishu_aily_knowledge_ask"],
+        )
+        monkeypatch.setattr(web_server, "load_config", lambda: {})
+
+        resp = self.client.get("/api/tools/toolsets")
+
+        assert resp.status_code == 200
+        assert resp.json() == [
+            {
+                "name": "feishu_aily",
+                "label": "Feishu Aily Knowledge",
+                "description": "knowledge Q&A",
+                "enabled": True,
+                "available": False,
+                "configured": True,
+                "tools": ["feishu_aily_knowledge_ask"],
+            }
+        ]
+
     def test_toggle_toolset_enable_disable(self):
         """PUT /api/tools/toolsets/{name} round-trips through config and the list view."""
         # Enable a toolset that is off-by-default so the state change is observable.
@@ -4197,6 +4245,65 @@ class TestNewEndpoints:
             "/api/tools/toolsets/not_a_real_toolset", json={"enabled": True}
         )
         assert resp.status_code == 400
+
+    def test_toggle_feishu_aily_preflights_sdk_before_persisting(self, monkeypatch):
+        import hermes_cli.tools_config as tools_config
+        import hermes_cli.web_server as web_server
+        import threading
+        from hermes_constants import get_hermes_home
+
+        calls = []
+        request_thread = threading.get_ident()
+        profile_home = get_hermes_home() / "profiles" / "aily-worker"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setattr(
+            tools_config,
+            "tools_disable_enable_command",
+            lambda args: calls.append(
+                (
+                    args.tools_action,
+                    args.names,
+                    args.platform,
+                    threading.get_ident(),
+                    get_hermes_home(),
+                )
+            ) or {"successful": {"feishu_aily"}, "failures": {}},
+        )
+
+        resp = self.client.put(
+            "/api/tools/toolsets/feishu_aily",
+            json={"enabled": True, "profile": "aily-worker"},
+        )
+
+        assert resp.status_code == 200
+        assert calls[0][:3] == ("enable", ["feishu_aily"], "cli")
+        assert calls[0][3] != request_thread
+        assert calls[0][4] == profile_home
+
+    def test_toggle_feishu_aily_sdk_failure_is_not_persisted(self, monkeypatch):
+        import hermes_cli.tools_config as tools_config
+        import hermes_cli.web_server as web_server
+
+        config = {"platform_toolsets": {"cli": ["memory"]}}
+        saved = []
+        monkeypatch.setattr(tools_config, "load_config", lambda: config)
+        monkeypatch.setattr(tools_config, "save_config", lambda cfg: saved.append(cfg.copy()))
+        monkeypatch.setattr(web_server, "load_config", lambda: config)
+        monkeypatch.setattr(
+            "tools.lazy_deps.ensure",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("SDK unavailable")
+            ),
+        )
+
+        resp = self.client.put(
+            "/api/tools/toolsets/feishu_aily", json={"enabled": True}
+        )
+
+        assert resp.status_code == 409
+        assert "SDK unavailable" in resp.json()["detail"]
+        assert "feishu_aily" not in config["platform_toolsets"]["cli"]
+        assert saved and "feishu_aily" not in saved[-1]["platform_toolsets"]["cli"]
 
     def test_get_toolset_config_returns_provider_matrix(self):
         """GET .../config returns provider rows with structured env_vars."""

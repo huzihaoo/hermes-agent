@@ -16,11 +16,11 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set
 
 
 from hermes_cli.config import (
-    cfg_get,
+    OPTIONAL_ENV_VARS, cfg_get,
     load_config, save_config, get_env_value, save_env_value,
 )
 from hermes_cli.colors import Colors, color
@@ -81,6 +81,7 @@ CONFIGURABLE_TOOLSETS = [
     ("spotify",          "🎵 Spotify",                  "playback, search, playlists, library"),
     ("discord",         "💬 Discord (read/participate)", "fetch messages, search members, create thread"),
     ("discord_admin",   "🛡️  Discord Server Admin",    "list channels/roles, pin, assign roles"),
+    ("feishu_aily",     "🧠 Feishu Aily Knowledge",    "knowledge Q&A for a configured Aily app"),
     ("yuanbao",          "🤖 Yuanbao",                  "group info, member queries, DM"),
     ("computer_use",     "🖱️  Computer Use (macOS/Windows/Linux)", "background desktop control via cua-driver"),
 ]
@@ -115,7 +116,10 @@ def gui_toolset_label(label: str) -> str:
 # `hermes tools` → X (Twitter) Search setup walks users through credential
 # setup. The tool's check_fn means the schema still won't appear to the
 # model if the credential later goes missing or expires.
-_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search"}
+_DEFAULT_OFF_TOOLSETS = {
+    "homeassistant", "spotify", "discord", "discord_admin", "feishu_aily",
+    "video", "video_gen", "x_search",
+}
 
 
 def _xai_credentials_present() -> bool:
@@ -153,6 +157,14 @@ def _xai_credentials_present() -> bool:
 _TOOLSET_PLATFORM_RESTRICTIONS: Dict[str, Set[str]] = {
     "discord": {"discord"},
     "discord_admin": {"discord"},
+    "feishu_aily": {"cli", "feishu"},
+}
+
+# Optional SDKs that must be ready before the CLI persists a toolset enable.
+# Keep this mapping in the CLI layer: resolving toolsets and building model
+# schemas must remain side-effect free and must never trigger an install.
+_TOOLSET_LAZY_DEPENDENCIES: Dict[str, str] = {
+    "feishu_aily": "platform.feishu",
 }
 
 
@@ -163,6 +175,54 @@ def _toolset_allowed_for_platform(ts_key: str, platform: str) -> bool:
     """
     allowed = _TOOLSET_PLATFORM_RESTRICTIONS.get(ts_key)
     return allowed is None or platform in allowed
+
+
+def _toolset_dependencies_available(ts_key: str) -> bool:
+    """Return whether an opt-in toolset's managed dependencies are ready."""
+    feature = _TOOLSET_LAZY_DEPENDENCIES.get(ts_key)
+    if feature is None:
+        return True
+
+    from tools.lazy_deps import is_available
+
+    return is_available(feature)
+
+
+def _ensure_toolset_dependencies(ts_key: str, *, prompt: bool = True) -> None:
+    """Install or verify optional dependencies required by a CLI toolset."""
+    feature = _TOOLSET_LAZY_DEPENDENCIES.get(ts_key)
+    if feature is None:
+        return
+
+    from tools.lazy_deps import ensure
+
+    ensure(feature, prompt=prompt)
+    # A check_fn may have cached the missing SDK earlier in this TUI process.
+    # Make a successful install/verification immediately observable.
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    loaded_model_tools = sys.modules.get("model_tools")
+    if loaded_model_tools is not None:
+        clear_definitions = getattr(loaded_model_tools, "_clear_tool_defs_cache", None)
+        if clear_definitions is not None:
+            clear_definitions()
+
+
+def _preflight_toolset_enables(
+    toolset_names: Iterable[str],
+    *,
+    prompt: bool = True,
+) -> Dict[str, str]:
+    """Return dependency-preflight failures keyed by toolset name."""
+    failed: Dict[str, str] = {}
+    for ts_key in sorted(set(toolset_names)):
+        try:
+            _ensure_toolset_dependencies(ts_key, prompt=prompt)
+        except Exception as exc:
+            failed[ts_key] = str(exc)
+            _print_error(f"Cannot enable toolset '{ts_key}': {exc}")
+    return failed
 
 
 def _get_effective_configurable_toolsets():
@@ -581,7 +641,12 @@ TOOL_CATEGORIES = {
 # resolves via `resolve_vision_provider_client()`, so the tuple below is never
 # prompted or read for vision; it's purely a presence marker.
 TOOLSET_ENV_REQUIREMENTS = {
-    "vision":     [("OPENROUTER_API_KEY",   "https://openrouter.ai/keys")],
+    "vision": [("OPENROUTER_API_KEY", "https://openrouter.ai/keys")],
+    "feishu_aily": [
+        ("FEISHU_AILY_AUTH_APP_ID", "https://open.feishu.cn/"),
+        ("FEISHU_AILY_AUTH_APP_SECRET", "https://open.feishu.cn/"),
+        ("FEISHU_AILY_TARGET_APP_ID", "https://aily.feishu.cn/"),
+    ],
 }
 
 
@@ -2185,6 +2250,7 @@ def _configure_toolset(
     Uses TOOL_CATEGORIES for provider-aware config, falls back to simple
     env var prompts for toolsets not in TOOL_CATEGORIES.
     """
+    _ensure_toolset_dependencies(ts_key)
     cat = TOOL_CATEGORIES.get(ts_key)
 
     if cat:
@@ -3678,6 +3744,12 @@ def _reconfigure_tool(
     ts_key, ts_label = configurable[idx]
     cat = TOOL_CATEGORIES.get(ts_key)
 
+    try:
+        _ensure_toolset_dependencies(ts_key)
+    except Exception as exc:
+        _print_error(f"Cannot configure toolset '{ts_key}': {exc}")
+        return
+
     if cat:
         _configure_tool_category_for_reconfig(
             ts_key,
@@ -3944,7 +4016,9 @@ def _reconfigure_simple_requirements(ts_key: str):
     for var, url in requirements:
         existing = get_env_value(var)
         if existing:
-            _print_info(f"  {var}: configured ({existing[:8]}...)")
+            is_secret = bool((OPTIONAL_ENV_VARS.get(var) or {}).get("password"))
+            status = "configured" if is_secret else f"configured ({existing[:8]}...)"
+            _print_info(f"  {var}: {status}")
         if url:
             _print_info(f"  Get key at: {url}")
         value = _prompt(f"    {var} (Enter to keep current)", password=True)
@@ -4010,6 +4084,9 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
 
             # Show checklist
             new_enabled = _prompt_toolset_checklist(pinfo["label"], checklist_preselected, pkey)
+
+            dependency_failures = _preflight_toolset_enables(new_enabled)
+            new_enabled.difference_update(dependency_failures)
 
             # Only diff against toolsets the checklist actually offered. The
             # resolved ``current_enabled`` can include non-configurable toolsets
@@ -4125,6 +4202,11 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
                 all_current,
                 force_fresh=True,
             )
+            # The global selection is written to every platform. A toolset that
+            # was already enabled on one platform can therefore be newly enabled
+            # on another, so validate every selected lazy dependency here.
+            dependency_failures = _preflight_toolset_enables(new_enabled)
+            new_enabled.difference_update(dependency_failures)
             if new_enabled != all_current:
                 for pk in platform_keys:
                     prev = _get_platform_tools(config, pk, include_default_mcp_servers=False)
@@ -4177,6 +4259,9 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
             current_enabled,
             force_fresh=True,
         )
+
+        dependency_failures = _preflight_toolset_enables(new_enabled - current_enabled)
+        new_enabled.difference_update(dependency_failures)
 
         if new_enabled != current_enabled:
             # Scope the printed diff to the checklist's universe (see
@@ -4441,7 +4526,7 @@ def _print_tools_list(enabled_toolsets: set, mcp_servers: dict, platform: str = 
                 _print_info(f"{srv_name}  {color('all tools enabled', Colors.DIM)}")
 
 
-def tools_disable_enable_command(args):
+def tools_disable_enable_command(args) -> Dict[str, object]:
     """Enable, disable, or list tools for a platform.
 
     Built-in toolsets use plain names (e.g. ``web``, ``memory``).
@@ -4453,12 +4538,12 @@ def tools_disable_enable_command(args):
 
     if platform not in PLATFORMS:
         _print_error(f"Unknown platform '{platform}'. Valid: {', '.join(PLATFORMS)}")
-        return
+        return {"successful": set(), "failures": {platform: "unknown platform"}}
 
     if action == "list":
         _print_tools_list(_get_platform_tools(config, platform, include_default_mcp_servers=False),
                           config.get("mcp_servers") or {}, platform)
-        return
+        return {"successful": set(), "failures": {}}
 
     targets: List[str] = args.names
     toolset_targets = [t for t in targets if ":" not in t]
@@ -4485,6 +4570,11 @@ def tools_disable_enable_command(args):
             )
         toolset_targets = [t for t in toolset_targets if t not in restricted_targets]
 
+    dependency_failures: Dict[str, str] = {}
+    if action == "enable":
+        dependency_failures = _preflight_toolset_enables(toolset_targets, prompt=False)
+        toolset_targets = [t for t in toolset_targets if t not in dependency_failures]
+
     if toolset_targets:
         _apply_toolset_change(config, platform, toolset_targets, action)
 
@@ -4498,8 +4588,18 @@ def tools_disable_enable_command(args):
 
     successful = [
         t for t in targets
-        if t not in unknown_toolsets and (":" not in t or t.split(":")[0] not in failed_servers)
+        if t not in unknown_toolsets
+        and t not in restricted_targets
+        and t not in dependency_failures
+        and (":" not in t or t.split(":")[0] not in failed_servers)
     ]
     if successful:
         verb = "Disabled" if action == "disable" else "Enabled"
         _print_success(f"{verb}: {', '.join(successful)}")
+    failures: Dict[str, str] = {
+        name: "unknown toolset" for name in unknown_toolsets
+    }
+    failures.update({name: "not available on this platform" for name in restricted_targets})
+    failures.update(dependency_failures)
+    failures.update({f"{server}:*": "MCP server not found" for server in failed_servers})
+    return {"successful": set(successful), "failures": failures}

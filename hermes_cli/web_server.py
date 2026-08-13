@@ -13055,6 +13055,7 @@ async def get_toolsets(profile: Optional[str] = None):
     from hermes_cli.tools_config import (
         _get_effective_configurable_toolsets,
         _get_platform_tools,
+        _toolset_dependencies_available,
         _toolset_has_keys,
         gui_toolset_label,
     )
@@ -13067,22 +13068,22 @@ async def get_toolsets(profile: Optional[str] = None):
             "cli",
             include_default_mcp_servers=False,
         )
-    result = []
-    for name, label, desc in _get_effective_configurable_toolsets():
-        try:
-            tools = sorted(set(resolve_toolset(name)))
-        except Exception:
-            tools = []
-        is_enabled = name in enabled_toolsets
-        result.append({
-            "name": name,
-            "label": gui_toolset_label(label),
-            "description": desc,
-            "enabled": is_enabled,
-            "available": is_enabled,
-            "configured": _toolset_has_keys(name, config),
-            "tools": tools,
-        })
+        result = []
+        for name, label, desc in _get_effective_configurable_toolsets():
+            try:
+                tools = sorted(set(resolve_toolset(name)))
+            except Exception:
+                tools = []
+            is_enabled = name in enabled_toolsets
+            result.append({
+                "name": name,
+                "label": gui_toolset_label(label),
+                "description": desc,
+                "enabled": is_enabled,
+                "available": is_enabled and _toolset_dependencies_available(name),
+                "configured": _toolset_has_keys(name, config),
+                "tools": tools,
+            })
     return result
 
 
@@ -13102,24 +13103,32 @@ async def toggle_toolset(name: str, body: ToolsetToggle, profile: Optional[str] 
     """
     from hermes_cli.tools_config import (
         _get_effective_configurable_toolsets,
-        _get_platform_tools,
-        _save_platform_tools,
+        tools_disable_enable_command,
     )
+    from argparse import Namespace
 
     valid = {ts_key for ts_key, _, _ in _get_effective_configurable_toolsets()}
     if name not in valid:
         raise HTTPException(status_code=400, detail=f"Unknown toolset: {name}")
 
-    with _profile_scope(body.profile or profile):
-        config = load_config()
-        enabled = set(
-            _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    action = "enable" if body.enabled else "disable"
+    effective_profile = body.profile or profile
+
+    def _toggle_scoped():
+        # A first enable may lazy-install the Feishu SDK. Keep both that
+        # blocking work and its profile context off the FastAPI event loop.
+        with _profile_scope(effective_profile):
+            return tools_disable_enable_command(
+                Namespace(tools_action=action, names=[name], platform="cli")
+            )
+
+    outcome = await asyncio.to_thread(_toggle_scoped)
+    if name not in set(outcome.get("successful") or ()):
+        detail = (outcome.get("failures") or {}).get(name, "configuration failed")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot {action} toolset '{name}': {detail}",
         )
-        if body.enabled:
-            enabled.add(name)
-        else:
-            enabled.discard(name)
-        _save_platform_tools(config, "cli", enabled)
     return {"ok": True, "name": name, "enabled": body.enabled}
 
 

@@ -686,6 +686,7 @@ export interface Translations {
     noToolsetsDesc: string
     noDescription: string
     configured: string
+    dependenciesUnavailable: string
     needsKeys: string
     toolsetsEnabled: (enabled: number, total: number) => string
     configureToolset: (label: string) => string

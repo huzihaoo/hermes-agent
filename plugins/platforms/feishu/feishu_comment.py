@@ -1044,6 +1044,32 @@ def _save_session_history(key: str, messages: List[Dict[str, Any]]) -> None:
         logger.info("[Feishu-Comment] Session saved: %s (%d messages)", key, len(cleaned))
 
 
+def _comment_agent_toolsets(config: dict | None = None) -> List[str]:
+    """Return the comment-agent allowlist, with Aily only on explicit opt-in."""
+    enabled = ["feishu_doc", "feishu_drive"]
+    try:
+        if config is None:
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly()
+        raw = (config.get("platform_toolsets") or {}).get("feishu")
+        explicitly_enabled = isinstance(raw, list) and "feishu_aily" in raw
+        if explicitly_enabled:
+            from hermes_cli.tools_config import _get_platform_tools
+
+            resolved = _get_platform_tools(
+                config, "feishu", include_default_mcp_servers=False
+            )
+            if "feishu_aily" in resolved:
+                enabled.append("feishu_aily")
+    except Exception:
+        logger.warning(
+            "[Feishu-Comment] Could not resolve optional Aily toolset; keeping it disabled",
+            exc_info=True,
+        )
+    return enabled
+
+
 def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
     """Create an AIAgent with feishu tools and run the prompt.
 
@@ -1054,11 +1080,25 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
     """
     from run_agent import AIAgent
 
-    logger.info("[Feishu-Comment] _run_comment_agent: injecting lark client into tool thread-locals")
+    enabled_toolsets = _comment_agent_toolsets()
+    aily_enabled = "feishu_aily" in enabled_toolsets
+    logger.info(
+        "[Feishu-Comment] _run_comment_agent: injecting lark client (aily_enabled=%s)",
+        aily_enabled,
+    )
     from tools.feishu_doc_tool import set_client as set_doc_client
     from tools.feishu_drive_tool import set_client as set_drive_client
     set_doc_client(client)
     set_drive_client(client)
+    aily_token = None
+    reset_aily_client = None
+    if aily_enabled:
+        from tools.feishu_aily_knowledge_tool import (
+            reset_client as reset_aily_client,
+            set_client as set_aily_client,
+        )
+
+        aily_token = set_aily_client(client)
 
     try:
         model, runtime_kwargs = _resolve_model_and_runtime()
@@ -1082,7 +1122,7 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
             skip_context_files=True,
             skip_memory=True,
             max_iterations=15,
-            enabled_toolsets=["feishu_doc", "feishu_drive"],
+            enabled_toolsets=enabled_toolsets,
         )
         logger.info("[Feishu-Comment] _run_comment_agent: calling run_conversation (prompt=%d chars, history=%d)",
                     len(prompt), len(history))
@@ -1105,6 +1145,19 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
     finally:
         set_doc_client(None)
         set_drive_client(None)
+        if aily_token is not None and reset_aily_client is not None:
+            reset_aily_client(aily_token)
+
+
+async def _run_comment_agent_in_executor(
+    prompt: str, client: Any, session_key: str = ""
+) -> str:
+    """Run the synchronous comment agent without dropping profile ContextVars."""
+    from tools.thread_context import propagate_context_to_thread
+
+    loop = asyncio.get_running_loop()
+    run_comment = propagate_context_to_thread(_run_comment_agent)
+    return await loop.run_in_executor(None, run_comment, prompt, client, session_key)
 
 
 # ---------------------------------------------------------------------------
@@ -1349,10 +1402,7 @@ async def handle_drive_comment_event(
     # Step 4: Run agent in a thread (run_conversation is synchronous)
     # Session key groups all comment cards on the same document
     sess_key = _session_key(file_type, file_token)
-    loop = asyncio.get_running_loop()
-    response = await loop.run_in_executor(
-        None, _run_comment_agent, prompt, client, sess_key,
-    )
+    response = await _run_comment_agent_in_executor(prompt, client, sess_key)
 
     if not response or _NO_REPLY_SENTINEL in response:
         logger.info("[Feishu-Comment] Agent returned NO_REPLY, skipping delivery")

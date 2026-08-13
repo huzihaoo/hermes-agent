@@ -22,6 +22,25 @@ requires_env:
     url: "https://open.feishu.cn/"
     password: true
 optional_env:
+  - name: FEISHU_AILY_AUTH_APP_ID
+    description: "Optional dedicated Feishu app ID used to authenticate Aily knowledge API calls"
+    prompt: "Aily auth app ID"
+    url: "https://open.feishu.cn/"
+    password: false
+  - name: FEISHU_AILY_AUTH_APP_SECRET
+    description: "Optional dedicated Feishu app secret used to authenticate Aily knowledge API calls"
+    prompt: "Aily auth app secret"
+    url: "https://open.feishu.cn/"
+    password: true
+  - name: FEISHU_AILY_TARGET_APP_ID
+    description: "Aily app ID from aily.feishu.cn used as the knowledge API target (typically spring_...)"
+    prompt: "Aily target app ID"
+    url: "https://aily.feishu.cn/"
+    password: false
+  - name: FEISHU_AILY_DOMAIN
+    description: "Optional Aily API domain: 'feishu' (China) or 'lark' (International)"
+    prompt: "Aily domain (feishu/lark)"
+    password: false
   - name: FEISHU_DOMAIN
     description: "Domain: 'feishu' (China) or 'lark' (International)"
     prompt: "Domain (feishu/lark)"

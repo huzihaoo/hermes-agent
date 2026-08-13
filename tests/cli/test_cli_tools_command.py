@@ -9,6 +9,8 @@ def _make_cli(enabled_toolsets=None):
     """Build a minimal HermesCLI stub without running __init__."""
     cli_obj = HermesCLI.__new__(HermesCLI)
     cli_obj.enabled_toolsets = set(enabled_toolsets or ["web", "memory"])
+    cli_obj.agent = MagicMock()
+    cli_obj._active_agent_route_signature = ("test-route",)
     cli_obj._command_running = False
     cli_obj.console = MagicMock()
     return cli_obj
@@ -122,6 +124,25 @@ class TestToolsSlashEnableWithReset:
             cli_obj._handle_tools_command("/tools enable web")
         mock_reset.assert_called_once()
         assert "web" in cli_obj.enabled_toolsets
+        assert cli_obj.agent is None
+        assert cli_obj._active_agent_route_signature is None
+
+    def test_failed_enable_keeps_agent_and_does_not_claim_active(self):
+        cli_obj = _make_cli(["memory"])
+        original_agent = cli_obj.agent
+        with patch(
+            "hermes_cli.tools_config.tools_disable_enable_command",
+            return_value={"successful": set(), "failures": {"feishu_aily": "SDK unavailable"}},
+        ), patch.object(cli_obj, "new_session") as mock_reset, patch(
+            "cli._cprint"
+        ) as mock_print:
+            cli_obj._handle_tools_command("/tools enable feishu_aily")
+
+        output = "\n".join(str(call.args[0]) for call in mock_print.call_args_list)
+        mock_reset.assert_not_called()
+        assert cli_obj.agent is original_agent
+        assert "New tool configuration is active" not in output
+        assert "Tool configuration was not changed" in output
 
     def test_enable_missing_name_prints_usage(self, capsys):
         cli_obj = _make_cli()

@@ -761,7 +761,13 @@ function ToolsetDetail({
       {/* "Configured" as a resting state is noise — only the warn state earns a pill. */}
       <DetailHeader
         description={asText(toolset.description) || t.skills.noDescription}
-        pills={!toolset.configured && <PanelPill tone="warn">{t.skills.needsKeys}</PanelPill>}
+        pills={
+          toolset.enabled && !toolset.available ? (
+            <PanelPill tone="warn">{t.skills.dependenciesUnavailable}</PanelPill>
+          ) : (
+            !toolset.configured && <PanelPill tone="warn">{t.skills.needsKeys}</PanelPill>
+          )
+        }
         title={label}
       />
       {tools.length > 0 && (

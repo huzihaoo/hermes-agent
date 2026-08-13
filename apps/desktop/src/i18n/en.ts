@@ -791,6 +791,7 @@ export const en: Translations = {
     noToolsetsDesc: 'Try a broader search query.',
     noDescription: 'No description.',
     configured: 'Configured',
+    dependenciesUnavailable: 'Dependencies unavailable',
     needsKeys: 'Needs keys',
     toolsetsEnabled: (enabled, total) => `${enabled}/${total} toolsets enabled`,
     configureToolset: label => `Configure ${label}`,

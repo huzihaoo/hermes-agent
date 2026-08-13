@@ -974,6 +974,7 @@ export const zh: Translations = {
     noToolsetsDesc: '尝试更宽泛的搜索词。',
     noDescription: '暂无描述。',
     configured: '已配置',
+    dependenciesUnavailable: '依赖不可用',
     needsKeys: '需要密钥',
     toolsetsEnabled: (enabled, total) => `已启用 ${enabled}/${total} 个工具集`,
     configureToolset: label => `配置 ${label}`,

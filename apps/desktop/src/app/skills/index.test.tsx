@@ -109,4 +109,13 @@ describe('SkillsView toolset management', () => {
     await screen.findByRole('switch', { name: 'Toggle Web Search toolset' })
     await waitFor(() => expect(getToolsetConfig).toHaveBeenCalledWith('web'))
   })
+
+  it('shows enabled toolsets with missing dependencies as unavailable', async () => {
+    getToolsets.mockResolvedValue([toolset({ available: false, configured: true })])
+
+    await renderSkills()
+
+    expect(await screen.findByText('Dependencies unavailable')).toBeTruthy()
+    expect(screen.queryByText('Needs keys')).toBeNull()
+  })
 })

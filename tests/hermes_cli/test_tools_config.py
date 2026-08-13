@@ -12,6 +12,8 @@ from hermes_cli.tools_config import (
     _apply_toolset_change,
     _checklist_toolset_keys,
     _configure_provider,
+    _configure_toolset,
+    _ensure_toolset_dependencies,
     _reconfigure_provider,
     _get_platform_tools,
     _platform_toolset_summary,
@@ -19,6 +21,7 @@ from hermes_cli.tools_config import (
     _run_post_setup,
     _save_platform_tools,
     _toolset_has_keys,
+    _toolset_allowed_for_platform,
     _toolset_needs_configuration_prompt,
     CONFIGURABLE_TOOLSETS,
     TOOL_CATEGORIES,
@@ -1422,6 +1425,206 @@ def test_get_platform_tools_feishu_tools_not_on_other_platforms():
         enabled = _get_platform_tools({}, plat)
         assert "feishu_doc" not in enabled, f"feishu_doc leaked onto {plat}"
         assert "feishu_drive" not in enabled, f"feishu_drive leaked onto {plat}"
+
+
+def test_feishu_aily_dependency_mapping_uses_existing_feishu_feature(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda feature, **kwargs: calls.append((feature, kwargs)),
+    )
+    monkeypatch.setattr(
+        "tools.registry.invalidate_check_fn_cache",
+        lambda: calls.append(("invalidate", {})),
+    )
+
+    _ensure_toolset_dependencies("feishu_aily", prompt=False)
+
+    assert calls == [
+        ("platform.feishu", {"prompt": False}),
+        ("invalidate", {}),
+    ]
+
+
+def test_feishu_aily_dependency_availability_is_read_only(monkeypatch):
+    from hermes_cli.tools_config import _toolset_dependencies_available
+
+    calls = []
+    monkeypatch.setattr(
+        "tools.lazy_deps.is_available",
+        lambda feature: calls.append(feature) or False,
+    )
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("availability checks must not install dependencies")
+        ),
+    )
+
+    assert _toolset_dependencies_available("feishu_aily") is False
+    assert _toolset_dependencies_available("memory") is True
+    assert calls == ["platform.feishu"]
+
+
+def test_feishu_aily_is_explicitly_available_on_cli_and_feishu_only():
+    assert _toolset_allowed_for_platform("feishu_aily", "cli")
+    assert _toolset_allowed_for_platform("feishu_aily", "feishu")
+    for platform in ["telegram", "discord", "slack", "whatsapp"]:
+        assert not _toolset_allowed_for_platform("feishu_aily", platform)
+
+
+def test_get_platform_tools_does_not_install_feishu_sdk(monkeypatch):
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda *args, **kwargs: pytest.fail("toolset resolution must not install dependencies"),
+    )
+    config = {"platform_toolsets": {"cli": ["feishu_aily"]}}
+
+    assert "feishu_aily" in _get_platform_tools(config, "cli")
+
+
+def test_toolset_status_check_does_not_install_feishu_sdk(monkeypatch):
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda *args, **kwargs: pytest.fail("status checks must not install dependencies"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.tools_config.get_env_value",
+        lambda name: "configured",
+    )
+
+    assert _toolset_has_keys("feishu_aily") is True
+
+
+def test_feishu_aily_check_fn_does_not_install_sdk(monkeypatch):
+    from tools import feishu_aily_knowledge_tool as aily_tool
+
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda *args, **kwargs: pytest.fail("model check_fn must not install dependencies"),
+    )
+    monkeypatch.setattr(aily_tool.importlib.util, "find_spec", lambda name: None)
+
+    assert aily_tool._check_feishu() is False
+
+
+def test_configure_feishu_aily_ensures_sdk_before_credentials(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda feature, **kwargs: calls.append(("ensure", feature, kwargs)),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._configure_simple_requirements",
+        lambda ts_key: calls.append(("configure", ts_key)),
+    )
+
+    _configure_toolset("feishu_aily", {})
+
+    assert calls == [
+        ("ensure", "platform.feishu", {"prompt": True}),
+        ("configure", "feishu_aily"),
+    ]
+
+
+def test_configure_feishu_aily_stops_when_sdk_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("SDK unavailable")),
+    )
+    configured = []
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._configure_simple_requirements",
+        lambda ts_key: configured.append(ts_key),
+    )
+
+    with pytest.raises(RuntimeError, match="SDK unavailable"):
+        _configure_toolset("feishu_aily", {})
+
+    assert configured == []
+
+
+def test_first_install_feishu_aily_dependency_failure_is_not_persisted(
+    monkeypatch, capsys
+):
+    config = {"platform_toolsets": {"cli": []}}
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_enabled_platforms",
+        lambda: ["cli"],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._prompt_toolset_checklist",
+        lambda *args, **kwargs: {"feishu_aily"},
+    )
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("SDK unavailable")),
+    )
+    saved = []
+    monkeypatch.setattr(
+        "hermes_cli.tools_config.save_config",
+        lambda cfg: saved.append(cfg.copy()),
+    )
+
+    tools_command(first_install=True, config=config)
+
+    assert "feishu_aily" not in config["platform_toolsets"]["cli"]
+    assert saved
+    assert "Cannot enable toolset 'feishu_aily': SDK unavailable" in capsys.readouterr().out
+
+
+def test_reconfigure_feishu_aily_dependency_failure_does_not_save(
+    monkeypatch, capsys
+):
+    config = {"platform_toolsets": {"cli": ["feishu_aily"]}}
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_effective_configurable_toolsets",
+        lambda: [("feishu_aily", "Feishu Aily Knowledge", "knowledge Q&A")],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._toolset_has_keys",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr("hermes_cli.tools_config._prompt_choice", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("SDK unavailable")),
+    )
+    configured = []
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._reconfigure_simple_requirements",
+        lambda ts_key: configured.append(ts_key),
+    )
+    saved = []
+    monkeypatch.setattr("hermes_cli.tools_config.save_config", lambda cfg: saved.append(cfg))
+
+    _reconfigure_tool(config)
+
+    assert configured == []
+    assert saved == []
+    assert "Cannot configure toolset 'feishu_aily': SDK unavailable" in capsys.readouterr().out
+
+
+def test_reconfigure_feishu_aily_never_displays_secret_prefix(monkeypatch, capsys):
+    from hermes_cli.tools_config import _reconfigure_simple_requirements
+
+    secret = "opaque-secret-prefix-must-never-render"
+    values = {
+        "FEISHU_AILY_AUTH_APP_ID": "cli_visible_auth_id",
+        "FEISHU_AILY_AUTH_APP_SECRET": secret,
+        "FEISHU_AILY_TARGET_APP_ID": "spring_visible_target",
+    }
+    monkeypatch.setattr(
+        "hermes_cli.tools_config.get_env_value", lambda name: values.get(name)
+    )
+    monkeypatch.setattr("hermes_cli.tools_config._prompt", lambda *args, **kwargs: "")
+
+    _reconfigure_simple_requirements("feishu_aily")
+
+    output = capsys.readouterr().out
+    assert "FEISHU_AILY_AUTH_APP_SECRET: configured" in output
+    assert secret not in output
+    assert secret[:8] not in output
 
 
 def test_get_effective_configurable_toolsets_dedupes_bundled_plugins():

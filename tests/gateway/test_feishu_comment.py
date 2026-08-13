@@ -1,6 +1,7 @@
 """Tests for feishu_comment — event filtering, access control integration, wiki reverse lookup."""
 
 import asyncio
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -178,6 +179,113 @@ class TestSanitizeCommentText(unittest.TestCase):
         self.assertNotIn(">", result)
         self.assertIn("&lt;", result)
         self.assertIn("&gt;", result)
+
+
+class TestCommentAgentTools(unittest.TestCase):
+    def test_aily_is_default_off_and_requires_direct_feishu_opt_in(self):
+        from plugins.platforms.feishu.feishu_comment import _comment_agent_toolsets
+
+        self.assertEqual(_comment_agent_toolsets({}), ["feishu_doc", "feishu_drive"])
+        self.assertEqual(
+            _comment_agent_toolsets(
+                {"platform_toolsets": {"feishu": ["hermes-feishu"]}}
+            ),
+            ["feishu_doc", "feishu_drive"],
+        )
+        self.assertEqual(
+            _comment_agent_toolsets(
+                {"platform_toolsets": {"feishu": ["feishu_aily"]}}
+            ),
+            ["feishu_doc", "feishu_drive", "feishu_aily"],
+        )
+        self.assertEqual(
+            _comment_agent_toolsets(
+                {
+                    "platform_toolsets": {"feishu": ["feishu_aily"]},
+                    "agent": {"disabled_toolsets": ["feishu_aily"]},
+                }
+            ),
+            ["feishu_doc", "feishu_drive"],
+        )
+
+    def test_explicit_aily_client_is_injected_and_restored(self):
+        from plugins.platforms.feishu import feishu_comment
+        from tools.feishu_aily_knowledge_tool import (
+            get_client as get_aily_client,
+            reset_client as reset_aily_client,
+            set_client as set_aily_client,
+        )
+        from tools.feishu_doc_tool import get_client as get_doc_client
+        from tools.feishu_drive_tool import get_client as get_drive_client
+
+        client = Mock()
+        previous_client = Mock()
+        observed = {}
+        outer_token = set_aily_client(previous_client)
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                observed["toolsets"] = kwargs["enabled_toolsets"]
+                observed["clients"] = (
+                    get_doc_client(),
+                    get_drive_client(),
+                    get_aily_client(),
+                )
+
+            def run_conversation(self, prompt, conversation_history=None):
+                return {"final_response": "ok", "api_calls": 0, "messages": []}
+
+        fake_run_agent = SimpleNamespace(AIAgent=FakeAgent)
+        runtime = {
+            "provider": "test",
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "credential_pool": None,
+        }
+        try:
+            with patch.dict(sys.modules, {"run_agent": fake_run_agent}), patch.object(
+                feishu_comment,
+                "_resolve_model_and_runtime",
+                return_value=("test-model", runtime),
+            ), patch.object(
+                feishu_comment,
+                "_comment_agent_toolsets",
+                return_value=["feishu_doc", "feishu_drive", "feishu_aily"],
+            ):
+                result = feishu_comment._run_comment_agent("question", client)
+
+            self.assertEqual(result, "ok")
+            self.assertEqual(
+                observed["toolsets"], ["feishu_doc", "feishu_drive", "feishu_aily"]
+            )
+            self.assertEqual(observed["clients"], (client, client, client))
+            self.assertIsNone(get_doc_client())
+            self.assertIsNone(get_drive_client())
+            self.assertIs(get_aily_client(), previous_client)
+        finally:
+            reset_aily_client(outer_token)
+
+    def test_executor_propagates_profile_secret_scope(self):
+        from agent import secret_scope
+        from plugins.platforms.feishu import feishu_comment
+
+        previous_mode = secret_scope.is_multiplex_active()
+        secret_scope.set_multiplex_active(True)
+        token = secret_scope.set_secret_scope({"COMMENT_PROFILE_MARKER": "profile-a"})
+
+        def worker(_prompt, _client, _session_key):
+            return secret_scope.get_secret("COMMENT_PROFILE_MARKER")
+
+        try:
+            with patch.object(feishu_comment, "_run_comment_agent", worker):
+                result = asyncio.run(
+                    feishu_comment._run_comment_agent_in_executor("q", Mock(), "session")
+                )
+            self.assertEqual(result, "profile-a")
+        finally:
+            secret_scope.reset_secret_scope(token)
+            secret_scope.set_multiplex_active(previous_mode)
 
 
 class TestWikiReverseLookup(unittest.TestCase):

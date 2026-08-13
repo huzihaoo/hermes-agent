@@ -2225,6 +2225,10 @@ class FeishuAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.FEISHU)
 
+        # SDK callbacks may arrive on foreign threads after the gateway's
+        # adapter-construction scope has exited. Retain only the profile home;
+        # secrets are reloaded for each callback so rotations take effect.
+        self._profile_home = get_hermes_home()
         self._settings = self._load_settings(config.extra or {})
         self._apply_settings(self._settings)
         self._client: Optional[Any] = None
@@ -5380,16 +5384,32 @@ class FeishuAdapter(BasePlatformAdapter):
         logging, and reaction.  Scheduling follows the same
         ``run_coroutine_threadsafe`` pattern used by ``_on_message_event``.
         """
-        from plugins.platforms.feishu.feishu_comment import handle_drive_comment_event
-
         loop = self._loop
         if not self._loop_accepts_callbacks(loop):
             logger.warning("[Feishu] Dropping drive comment event before adapter loop is ready")
             return
         self._submit_on_loop(
             loop,
-            handle_drive_comment_event(self._client, data, self_open_id=self._bot_open_id),
+            self._handle_drive_comment_event_scoped(data),
         )
+
+    async def _handle_drive_comment_event_scoped(self, data: Any) -> None:
+        """Handle a comment callback inside the adapter's owning profile."""
+        from agent.secret_scope import is_multiplex_active
+        from plugins.platforms.feishu.feishu_comment import handle_drive_comment_event
+
+        if not is_multiplex_active():
+            await handle_drive_comment_event(
+                self._client, data, self_open_id=self._bot_open_id
+            )
+            return
+
+        from gateway.run import _profile_runtime_scope
+
+        with _profile_runtime_scope(self._profile_home):
+            await handle_drive_comment_event(
+                self._client, data, self_open_id=self._bot_open_id
+            )
 
     def _on_meeting_invited_event(self, data: Any) -> None:
         """Handle VC bot meeting invitation notification (vc.bot.meeting_invited_v1)."""

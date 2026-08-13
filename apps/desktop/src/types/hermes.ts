@@ -655,6 +655,7 @@ export interface SkillInfo {
 }
 
 export interface ToolsetInfo {
+  available: boolean
   configured: boolean
   description: string
   enabled: boolean

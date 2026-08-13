@@ -5,6 +5,21 @@ from unittest.mock import patch
 from hermes_cli.tools_config import tools_disable_enable_command
 
 
+def test_cmd_tools_returns_nonzero_when_enable_preflight_fails(monkeypatch):
+    from hermes_cli import main as main_mod
+
+    monkeypatch.setattr(
+        "hermes_cli.tools_config.tools_disable_enable_command",
+        lambda _args: {"successful": set(), "failures": {"feishu_aily": "SDK unavailable"}},
+    )
+    with patch.object(main_mod.sys, "exit", side_effect=SystemExit(1)) as exit_mock:
+        try:
+            main_mod.cmd_tools(Namespace(tools_action="enable", names=["feishu_aily"], platform="cli"))
+        except SystemExit as exc:
+            assert exc.code == 1
+    exit_mock.assert_called_once_with(1)
+
+
 # ── Built-in toolset disable ────────────────────────────────────────────────
 
 
@@ -58,6 +73,83 @@ class TestToolsEnableBuiltin:
             tools_disable_enable_command(Namespace(tools_action="enable", names=["web"], platform="cli"))
         saved = mock_save.call_args[0][0]
         assert saved["platform_toolsets"]["cli"].count("web") == 1
+
+    def test_enable_feishu_aily_ensures_optional_sdk_for_cli(self, capsys):
+        config = {"platform_toolsets": {"cli": []}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save, \
+             patch("tools.lazy_deps.ensure") as mock_ensure, \
+             patch("tools.registry.invalidate_check_fn_cache") as mock_invalidate:
+            tools_disable_enable_command(
+                Namespace(tools_action="enable", names=["feishu_aily"], platform="cli")
+            )
+
+        mock_ensure.assert_called_once_with("platform.feishu", prompt=False)
+        mock_invalidate.assert_called_once_with()
+        saved = mock_save.call_args[0][0]
+        assert "feishu_aily" in saved["platform_toolsets"]["cli"]
+        assert "Enabled: feishu_aily" in capsys.readouterr().out
+
+    def test_enable_feishu_aily_ensures_optional_sdk_for_feishu(self):
+        config = {"platform_toolsets": {"feishu": []}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save, \
+             patch("tools.lazy_deps.ensure") as mock_ensure:
+            tools_disable_enable_command(
+                Namespace(tools_action="enable", names=["feishu_aily"], platform="feishu")
+            )
+
+        mock_ensure.assert_called_once_with("platform.feishu", prompt=False)
+        saved = mock_save.call_args[0][0]
+        assert "feishu_aily" in saved["platform_toolsets"]["feishu"]
+
+    def test_enable_feishu_aily_dependency_failure_is_not_enabled(self, capsys):
+        config = {"platform_toolsets": {"cli": ["memory"]}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save, \
+             patch("tools.lazy_deps.ensure", side_effect=RuntimeError("SDK unavailable")):
+            successful = tools_disable_enable_command(
+                Namespace(tools_action="enable", names=["feishu_aily"], platform="cli")
+            )
+
+        saved = mock_save.call_args[0][0]
+        assert "feishu_aily" not in saved["platform_toolsets"]["cli"]
+        out = capsys.readouterr().out
+        assert "Cannot enable toolset 'feishu_aily': SDK unavailable" in out
+        assert "Enabled: feishu_aily" not in out
+        assert successful["successful"] == set()
+        assert successful["failures"] == {"feishu_aily": "SDK unavailable"}
+
+    def test_dependency_failure_does_not_block_other_enable_targets(self, capsys):
+        config = {"platform_toolsets": {"cli": []}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save, \
+             patch("tools.lazy_deps.ensure", side_effect=RuntimeError("SDK unavailable")):
+            tools_disable_enable_command(
+                Namespace(
+                    tools_action="enable",
+                    names=["feishu_aily", "web"],
+                    platform="cli",
+                )
+            )
+
+        saved = mock_save.call_args[0][0]
+        assert "feishu_aily" not in saved["platform_toolsets"]["cli"]
+        assert "web" in saved["platform_toolsets"]["cli"]
+        out = capsys.readouterr().out
+        assert "Enabled: web" in out
+        assert "Enabled: feishu_aily" not in out
+
+    def test_disable_feishu_aily_does_not_install_optional_sdk(self):
+        config = {"platform_toolsets": {"cli": ["feishu_aily"]}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config"), \
+             patch("tools.lazy_deps.ensure") as mock_ensure:
+            tools_disable_enable_command(
+                Namespace(tools_action="disable", names=["feishu_aily"], platform="cli")
+            )
+
+        mock_ensure.assert_not_called()
 
 
 # ── MCP tool disable ────────────────────────────────────────────────────────
@@ -174,6 +266,14 @@ class TestToolsList:
         out = capsys.readouterr().out
         assert "github" in out
         assert "create_issue" in out
+
+    def test_list_feishu_aily_status_does_not_install_optional_sdk(self):
+        config = {"platform_toolsets": {"cli": ["feishu_aily"]}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("tools.lazy_deps.ensure") as mock_ensure:
+            tools_disable_enable_command(Namespace(tools_action="list", platform="cli"))
+
+        mock_ensure.assert_not_called()
 
 
 # ── Validation ───────────────────────────────────────────────────────────────

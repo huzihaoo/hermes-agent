@@ -174,6 +174,56 @@ class TestFeishuMessageNormalization(unittest.TestCase):
 
 
 class TestFeishuAdapterMessaging(unittest.TestCase):
+    def test_comment_callback_preserves_single_profile_env_scope(self):
+        from agent import secret_scope
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu import feishu_comment
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        observed = {}
+
+        async def handler(_client, _data, *, self_open_id):
+            observed["secret"] = secret_scope.get_secret("COMMENT_PROFILE_MARKER")
+            observed["self_open_id"] = self_open_id
+
+        with patch.dict(os.environ, {"COMMENT_PROFILE_MARKER": "process-env"}), patch.object(
+            feishu_comment, "handle_drive_comment_event", handler
+        ):
+            asyncio.run(adapter._handle_drive_comment_event_scoped(object()))
+
+        self.assertEqual(observed["secret"], "process-env")
+
+    def test_comment_callback_binds_and_resets_multiplex_profile(self):
+        from agent import secret_scope
+        from gateway.config import PlatformConfig
+        from plugins.platforms.feishu import feishu_comment
+        from plugins.platforms.feishu.adapter import FeishuAdapter
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_home = Path(temp_dir)
+            (profile_home / ".env").write_text(
+                "COMMENT_PROFILE_MARKER=profile-a\n", encoding="utf-8"
+            )
+            adapter = FeishuAdapter(PlatformConfig())
+            adapter._profile_home = profile_home
+            observed = {}
+
+            async def handler(_client, _data, *, self_open_id):
+                observed["secret"] = secret_scope.get_secret("COMMENT_PROFILE_MARKER")
+                raise RuntimeError("test callback failure")
+
+            previous_mode = secret_scope.is_multiplex_active()
+            secret_scope.set_multiplex_active(True)
+            try:
+                with patch.object(feishu_comment, "handle_drive_comment_event", handler):
+                    with self.assertRaisesRegex(RuntimeError, "test callback failure"):
+                        asyncio.run(adapter._handle_drive_comment_event_scoped(object()))
+                self.assertEqual(observed["secret"], "profile-a")
+                self.assertIsNone(secret_scope.current_secret_scope())
+            finally:
+                secret_scope.set_multiplex_active(previous_mode)
+
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
         "FEISHU_APP_SECRET": "secret_app",

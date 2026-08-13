@@ -12679,7 +12679,11 @@ def cmd_tools(args):
     if action in {"list", "disable", "enable"}:
         from hermes_cli.tools_config import tools_disable_enable_command
 
-        tools_disable_enable_command(args)
+        outcome = tools_disable_enable_command(args)
+        if action != "list" and (
+            outcome.get("failures") or not outcome.get("successful")
+        ):
+            sys.exit(1)
     elif action == "post-setup":
         from hermes_cli.tools_config import run_post_setup_command
 

@@ -592,12 +592,20 @@ export default function SkillsPage() {
                                   {labelText}
                                 </span>
                                 <Badge
-                                  tone={ts.enabled ? "success" : "outline"}
+                                  tone={
+                                    ts.enabled && ts.available
+                                      ? "success"
+                                      : ts.enabled
+                                        ? "warning"
+                                        : "outline"
+                                  }
                                   className="text-xs"
                                 >
-                                  {ts.enabled
+                                  {ts.enabled && ts.available
                                     ? t.common.active
-                                    : t.common.inactive}
+                                    : ts.enabled
+                                      ? t.skills.setupNeeded
+                                      : t.common.inactive}
                                 </Badge>
                               </div>
                               <p className="text-xs text-text-secondary mb-2">

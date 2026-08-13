@@ -332,6 +332,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "feishu_aily": {
+        "description": "Feishu Aily knowledge Q&A — query Aily knowledge bases via SSE",
+        "tools": ["feishu_aily_knowledge_ask"],
+        "includes": []
+    },
+
     "spotify": {
         "description": "Native Spotify playback, search, playlist, album, and library tools",
         "tools": [

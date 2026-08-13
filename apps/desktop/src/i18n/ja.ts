@@ -870,6 +870,7 @@ export const ja = defineLocale({
     noToolsetsDesc: '検索キーワードを広げてください。',
     noDescription: '説明はありません。',
     configured: '設定済み',
+    dependenciesUnavailable: '依存関係を利用できません',
     needsKeys: 'キーが必要',
     toolsetsEnabled: (enabled, total) => `${enabled}/${total} ツールセットが有効`,
     configureToolset: label => `${label} を設定`,
