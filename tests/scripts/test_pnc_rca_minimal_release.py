@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -93,8 +94,10 @@ class FakeStore:
         self.current = {
             "epoch_id": kwargs["epoch_id"],
             **release._activation_expected({
-                "release_fingerprint": kwargs["release_fingerprint"],
-                "release_binding_sha256": kwargs["release_binding_sha256"],
+                "release_fingerprint_sha256": kwargs[
+                    "release_fingerprint_sha256"
+                ],
+                "release_note_sha256": kwargs["release_note_sha256"],
                 "config_sha256": kwargs["config_sha256"],
                 "db_logical_identity_sha256": release._sha(
                     release._canonical(kwargs["db_logical_identity"])
@@ -970,7 +973,50 @@ def test_activation_uses_control_store_directly_and_hides_legacy_columns(release
     ]
     assert len(store.activation_calls) == 1
     assert applied["current_epoch"]["epoch_id"] == binding["epoch_id"]
+    assert applied["current_epoch"]["partition_end_fence_sha256"] == binding[
+        "partition_start_fence_sha256"
+    ]
     assert "capsule" not in json.dumps(applied)
+
+    store.current["partition_end_fence_sha256"] = "f" * 64
+    with pytest.raises(
+        release.ReleaseError,
+        match="activation_direct_steady_binding_conflict",
+    ):
+        release._activation_plan(note, binding, _factory(store, []))
+
+
+def test_activation_plan_and_status_reject_hidden_v14_binding_tamper(release_files):
+    note = release_files["note"]
+    binding = release._bound_binding(release_files["note_raw"], note)
+    store = release.RcaControlStore(release_files["control_db"])
+    store.activate_direct_steady_epoch(
+        epoch_id=binding["epoch_id"],
+        release_fingerprint_sha256=binding["release_fingerprint_sha256"],
+        release_note_sha256=binding["release_note_sha256"],
+        config_sha256=binding["config_sha256"],
+        db_logical_identity=binding["db_logical_identity"],
+        partition_start_fence=binding["partition_start_fence"],
+        operator=note["activation"]["operator"],
+        reason=note["activation"]["reason"],
+    )
+    with sqlite3.connect(release_files["control_db"]) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs "
+            "SET preauthorization_fingerprint = ? WHERE is_current = 1",
+            ("f" * 64,),
+        )
+
+    with pytest.raises(
+        release.ReleaseError,
+        match="activation_predecessor_binding_invalid",
+    ):
+        release._activation_plan(note, binding, release._open_store)
+    with pytest.raises(
+        release.ReleaseError,
+        match="activation_predecessor_binding_invalid",
+    ):
+        release._activation_status(note, binding, release._open_store)
 
 
 def test_activation_rejects_inflight_steady_predecessor(release_files):
@@ -2311,6 +2357,23 @@ def test_verify_requires_completed_owner_receipt_and_current_apply_pids(
     receipt = release_files["apply_receipt"]
     receipt.unlink()
     with pytest.raises(release.ReleaseError, match="apply_receipt_unavailable"):
+        release.verify_release(
+            **_verify_args(release_files),
+            delivery_store_factory=_delivery_factory(store),
+        )
+
+
+def test_verify_rejects_undeployed_v1_apply_receipt(release_files, monkeypatch):
+    store = _configure_verify_fixture(release_files, monkeypatch)
+    receipt = json.loads(release_files["apply_receipt"].read_bytes())
+    receipt["schema_version"] = "pnc_rca_minimal_release_apply_receipt_v1"
+    _write_json(release_files["apply_receipt"], receipt)
+
+    assert release.RECEIPT_SCHEMA == "pnc_rca_minimal_release_apply_receipt_v2"
+    with pytest.raises(
+        release.ReleaseError,
+        match="apply_receipt_schema_unsupported",
+    ):
         release.verify_release(
             **_verify_args(release_files),
             delivery_store_factory=_delivery_factory(store),

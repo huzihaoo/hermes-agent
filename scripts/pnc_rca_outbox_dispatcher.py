@@ -3374,6 +3374,12 @@ class HealthReporter:
             }
         )
         store_health = self.store.health()
+        activation_health = store_health.get("activation")
+        activation_ready = (
+            isinstance(activation_health, Mapping)
+            and activation_health.get("configured") is True
+            and activation_health.get("production_active") is True
+        )
         workspace_runtime = self.workspace_runtime_status()
         capacity_admission = self.capacity_admission_status()
         healthy = (
@@ -3387,6 +3393,7 @@ class HealthReporter:
             }
             and not circuit.is_open
             and store_health.get("ok") is True
+            and (not self.config.activation_required or activation_ready)
             and (
                 workspace_runtime["required"] is not True
                 or workspace_runtime["ready"] is True

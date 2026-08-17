@@ -55,6 +55,16 @@ SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS = frozenset(
         CONTROL_STORE_SCHEMA_VERSION,
     }
 )
+_V14_COMPAT_RELEASE_BINDING_COLUMNS = frozenset({
+    "preauthorization_fingerprint",
+    "preauthorization_gate_receipt_sha256",
+    "preauthorization_capsule_sha256",
+    "preproduction_fingerprint",
+    "preproduction_gate_receipt_sha256",
+    "preproduction_capsule_sha256",
+    "production_fingerprint",
+    "production_gate_receipt_sha256",
+})
 CONTROL_DB_MIN_AVAILABLE_BYTES = 1024 * 1024 * 1024
 DEFAULT_OUTBOX_HIGH_WATERMARK = 100
 MANUAL_OUTBOX_SHARE_NUMERATOR = 4
@@ -1482,6 +1492,8 @@ class RcaControlStore:
             conn.execute("PRAGMA foreign_keys=OFF")
             self._migrate_source_neutral_parents(conn)
             conn.execute("PRAGMA foreign_keys=ON")
+            # The physical v14 epoch DDL stays inline and byte-stable because
+            # sqlite_master.sql is part of the audited compatibility surface.
             conn.executescript(
                 """
                 BEGIN IMMEDIATE;
@@ -4417,45 +4429,145 @@ class RcaControlStore:
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest(), normalized
 
     @staticmethod
-    def _current_activation_epoch_tx(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    def _current_activation_epoch_unchecked_tx(
+        conn: sqlite3.Connection,
+    ) -> sqlite3.Row | None:
         return conn.execute(
             "SELECT * FROM rca_activation_epochs WHERE is_current = 1"
         ).fetchone()
 
+    @classmethod
+    def _current_activation_epoch_tx(
+        cls, conn: sqlite3.Connection
+    ) -> sqlite3.Row | None:
+        """Return current v14 only after its latest audit binding validates."""
+
+        row = cls._current_activation_epoch_unchecked_tx(conn)
+        if row is not None:
+            cls._v14_compat_activation_transition_binding_tx(conn, epoch=row)
+        return row
+
     @staticmethod
-    def _public_activation_epoch(row: sqlite3.Row) -> dict[str, Any]:
+    def _v14_compat_release_epoch_projection(
+        row: sqlite3.Row,
+    ) -> dict[str, str]:
+        """Project the physical v14 columns into the neutral release API."""
+
         return {
-            "epoch_id": str(row["epoch_id"]),
-            "state": str(row["state"]),
-            "preauthorization_fingerprint": str(
-                row["preauthorization_fingerprint"]
-            ),
-            "preauthorization_gate_receipt_sha256": str(
-                row["preauthorization_gate_receipt_sha256"]
-            ),
-            "preauthorization_capsule_sha256": str(
-                row["preauthorization_capsule_sha256"]
-            ),
-            "preproduction_fingerprint": str(
-                row["preproduction_fingerprint"] or ""
-            ),
-            "preproduction_gate_receipt_sha256": str(
-                row["preproduction_gate_receipt_sha256"] or ""
-            ),
-            "preproduction_capsule_sha256": str(
-                row["preproduction_capsule_sha256"] or ""
-            ),
-            "config_sha256": str(row["config_sha256"]),
-            "db_logical_identity_sha256": str(row["db_logical_identity_sha256"]),
-            "partition_start_fence_sha256": str(
-                row["partition_start_fence_sha256"]
+            "release_fingerprint_sha256": str(row["production_fingerprint"] or ""),
+            "release_note_sha256": str(
+                row["production_gate_receipt_sha256"] or ""
             ),
             "partition_end_fence_sha256": str(
                 row["partition_end_fence_sha256"] or ""
             ),
-            "production_fingerprint": str(row["production_fingerprint"] or ""),
-            "production_gate_receipt_sha256": str(
-                row["production_gate_receipt_sha256"] or ""
+        }
+
+    @staticmethod
+    def _v14_compat_direct_steady_binding_matches(
+        row: sqlite3.Row,
+        *,
+        release_fingerprint_sha256: str,
+        release_note_sha256: str,
+        config_sha256: str,
+        db_logical_identity_json: str,
+        db_logical_identity_sha256: str,
+        partition_start_fence_json: str,
+        partition_start_fence_sha256: str,
+    ) -> bool:
+        expected = {
+            "state": "steady_active",
+            "preauthorization_fingerprint": release_fingerprint_sha256,
+            "preauthorization_gate_receipt_sha256": release_note_sha256,
+            "preauthorization_capsule_sha256": release_note_sha256,
+            "preproduction_fingerprint": release_fingerprint_sha256,
+            "preproduction_gate_receipt_sha256": release_note_sha256,
+            "preproduction_capsule_sha256": release_note_sha256,
+            "config_sha256": config_sha256,
+            "db_logical_identity_sha256": db_logical_identity_sha256,
+            "partition_start_fence_sha256": partition_start_fence_sha256,
+            "partition_end_fence_sha256": partition_start_fence_sha256,
+            "production_fingerprint": release_fingerprint_sha256,
+            "production_gate_receipt_sha256": release_note_sha256,
+        }
+        return (
+            all(str(row[field] or "") == str(value) for field, value in expected.items())
+            and str(row["db_logical_identity_json"]) == db_logical_identity_json
+            and str(row["partition_start_fence_json"])
+            == partition_start_fence_json
+            and str(row["partition_end_fence_json"] or "")
+            == partition_start_fence_json
+        )
+
+    @staticmethod
+    def _insert_v14_compat_direct_steady_epoch_tx(
+        conn: sqlite3.Connection,
+        *,
+        epoch_id: str,
+        release_fingerprint_sha256: str,
+        release_note_sha256: str,
+        config_sha256: str,
+        db_logical_identity_json: str,
+        db_logical_identity_sha256: str,
+        partition_start_fence_json: str,
+        partition_start_fence_sha256: str,
+        created_at: str,
+    ) -> None:
+        """Write one neutral direct release through the physical v14 columns."""
+
+        conn.execute(
+            """
+            INSERT INTO rca_activation_epochs(
+                epoch_id, state, is_current,
+                preauthorization_fingerprint,
+                preauthorization_gate_receipt_sha256,
+                preauthorization_capsule_sha256,
+                preproduction_fingerprint,
+                preproduction_gate_receipt_sha256,
+                preproduction_capsule_sha256,
+                config_sha256, db_logical_identity_json,
+                db_logical_identity_sha256, partition_start_fence_json,
+                partition_start_fence_sha256, partition_end_fence_json,
+                partition_end_fence_sha256, production_fingerprint,
+                production_gate_receipt_sha256, created_at, updated_at,
+                steady_activated_at
+            ) VALUES (?, 'steady_active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                epoch_id,
+                release_fingerprint_sha256,
+                release_note_sha256,
+                release_note_sha256,
+                release_fingerprint_sha256,
+                release_note_sha256,
+                release_note_sha256,
+                config_sha256,
+                db_logical_identity_json,
+                db_logical_identity_sha256,
+                partition_start_fence_json,
+                partition_start_fence_sha256,
+                partition_start_fence_json,
+                partition_start_fence_sha256,
+                release_fingerprint_sha256,
+                release_note_sha256,
+                created_at,
+                created_at,
+                created_at,
+            ),
+        )
+
+    @classmethod
+    def _public_activation_epoch(
+        cls, row: sqlite3.Row
+    ) -> dict[str, Any]:
+        return {
+            "epoch_id": str(row["epoch_id"]),
+            "state": str(row["state"]),
+            **cls._v14_compat_release_epoch_projection(row),
+            "config_sha256": str(row["config_sha256"]),
+            "db_logical_identity_sha256": str(row["db_logical_identity_sha256"]),
+            "partition_start_fence_sha256": str(
+                row["partition_start_fence_sha256"]
             ),
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),
@@ -4474,7 +4586,7 @@ class RcaControlStore:
         return actor, justification
 
     @staticmethod
-    def _activation_transition_binding_material_tx(
+    def _v14_compat_activation_transition_binding_material_tx(
         conn: sqlite3.Connection,
         *,
         epoch: sqlite3.Row,
@@ -4525,12 +4637,14 @@ class RcaControlStore:
         }
 
     @classmethod
-    def _activation_transition_binding_tx(
+    def _v14_compat_activation_transition_binding_tx(
         cls,
         conn: sqlite3.Connection,
         *,
         epoch: sqlite3.Row,
     ) -> dict[str, Any]:
+        """Validate the latest v14 transition audit against its physical row."""
+
         audit = conn.execute(
             """
             SELECT audit_id, from_state, to_state, binding_fingerprint,
@@ -4547,7 +4661,7 @@ class RcaControlStore:
             raise ActivationEpochError("activation_predecessor_binding_invalid")
         observed = str(audit["binding_fingerprint"] or "").lower()
         expected = _canonical_sha256(
-            cls._activation_transition_binding_material_tx(
+            cls._v14_compat_activation_transition_binding_material_tx(
                 conn,
                 epoch=epoch,
                 from_state=str(audit["from_state"] or ""),
@@ -4576,7 +4690,7 @@ class RcaControlStore:
         transitioned_at: str,
     ) -> int:
         binding_fingerprint = _canonical_sha256(
-            RcaControlStore._activation_transition_binding_material_tx(
+            RcaControlStore._v14_compat_activation_transition_binding_material_tx(
                 conn,
                 epoch=epoch,
                 from_state=from_state,
@@ -4670,7 +4784,9 @@ class RcaControlStore:
             if current is None:
                 conn.commit()
                 return None
-            binding = self._activation_transition_binding_tx(conn, epoch=current)
+            binding = self._v14_compat_activation_transition_binding_tx(
+                conn, epoch=current
+            )
             binding["inflight"] = self._direct_steady_current_inflight_tx(
                 conn,
                 epoch_id=str(current["epoch_id"]),
@@ -4688,8 +4804,8 @@ class RcaControlStore:
         self,
         *,
         epoch_id: str,
-        release_fingerprint: str,
-        release_binding_sha256: str,
+        release_fingerprint_sha256: str,
+        release_note_sha256: str,
         config_sha256: str,
         db_logical_identity: Mapping[str, Any],
         partition_start_fence: Mapping[str, Any],
@@ -4713,21 +4829,17 @@ class RcaControlStore:
         """
         identity = self._normalize_activation_epoch_id(epoch_id)
         release_hash = self._normalize_activation_sha256(
-            release_fingerprint, "release_fingerprint"
+            release_fingerprint_sha256, "release_fingerprint_sha256"
         )
         receipt_hash = self._normalize_activation_sha256(
-            release_binding_sha256,
-            "release_binding_sha256",
+            release_note_sha256,
+            "release_note_sha256",
         )
         config_hash = self._normalize_activation_sha256(config_sha256, "config_sha256")
         db_identity_json = self._normalize_activation_db_identity(db_logical_identity)
         db_identity_sha = hashlib.sha256(db_identity_json.encode("utf-8")).hexdigest()
         start_fence_json = self._normalize_partition_fence(partition_start_fence)
-        # There is no bounded window in direct mode.  Bind the end to the same
-        # observed start snapshot rather than inventing a second broker read.
-        end_fence_json = start_fence_json
-        end_fence_sha = hashlib.sha256(end_fence_json.encode("utf-8")).hexdigest()
-        start_fence_sha = end_fence_sha
+        start_fence_sha = hashlib.sha256(start_fence_json.encode("utf-8")).hexdigest()
         actor, justification = self._normalize_activation_audit_text(operator, reason)
         predecessor_values = (
             str(expected_predecessor_epoch_id or "").strip(),
@@ -4757,32 +4869,15 @@ class RcaControlStore:
             if existing is not None and str(existing["epoch_id"]) == identity:
                 # A completed direct release is create-once.  Retrying the
                 # exact binding is safe; changing any identity is a conflict.
-                expected = {
-                    "state": "steady_active",
-                    "preauthorization_fingerprint": release_hash,
-                    "preauthorization_gate_receipt_sha256": receipt_hash,
-                    "preauthorization_capsule_sha256": receipt_hash,
-                    "preproduction_fingerprint": release_hash,
-                    "preproduction_gate_receipt_sha256": receipt_hash,
-                    "preproduction_capsule_sha256": receipt_hash,
-                    "config_sha256": config_hash,
-                    "db_logical_identity_sha256": db_identity_sha,
-                    "partition_start_fence_sha256": start_fence_sha,
-                    "partition_end_fence_sha256": end_fence_sha,
-                    "production_fingerprint": release_hash,
-                    "production_gate_receipt_sha256": receipt_hash,
-                }
-                identical = (
-                    all(
-                        str(existing[field] or "") == str(value)
-                        for field, value in expected.items()
-                    )
-                    and str(existing["db_logical_identity_json"])
-                    == db_identity_json
-                    and str(existing["partition_start_fence_json"])
-                    == start_fence_json
-                    and str(existing["partition_end_fence_json"] or "")
-                    == end_fence_json
+                identical = self._v14_compat_direct_steady_binding_matches(
+                    existing,
+                    release_fingerprint_sha256=release_hash,
+                    release_note_sha256=receipt_hash,
+                    config_sha256=config_hash,
+                    db_logical_identity_json=db_identity_json,
+                    db_logical_identity_sha256=db_identity_sha,
+                    partition_start_fence_json=start_fence_json,
+                    partition_start_fence_sha256=start_fence_sha,
                 )
                 if identical:
                     conn.commit()
@@ -4800,9 +4895,11 @@ class RcaControlStore:
                     raise ActivationEpochError("activation_current_epoch_exists")
                 predecessor_binding: dict[str, Any] | None = None
                 if predecessor_epoch_id:
-                    predecessor_binding = self._activation_transition_binding_tx(
-                        conn,
-                        epoch=existing,
+                    predecessor_binding = (
+                        self._v14_compat_activation_transition_binding_tx(
+                            conn,
+                            epoch=existing,
+                        )
                     )
                     if (
                         predecessor_binding["epoch_id"] != predecessor_epoch_id
@@ -4862,47 +4959,21 @@ class RcaControlStore:
                 if updated.rowcount != 1:
                     raise ActivationEpochError("activation_epoch_state_changed")
 
-            conn.execute(
-                """
-                INSERT INTO rca_activation_epochs(
-                    epoch_id, state, is_current,
-                    preauthorization_fingerprint,
-                    preauthorization_gate_receipt_sha256,
-                    preauthorization_capsule_sha256,
-                    preproduction_fingerprint,
-                    preproduction_gate_receipt_sha256,
-                    preproduction_capsule_sha256,
-                    config_sha256, db_logical_identity_json,
-                    db_logical_identity_sha256, partition_start_fence_json,
-                    partition_start_fence_sha256, partition_end_fence_json,
-                    partition_end_fence_sha256, production_fingerprint,
-                    production_gate_receipt_sha256, created_at, updated_at,
-                    steady_activated_at
-                ) VALUES (?, 'steady_active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    identity,
-                    release_hash,
-                    receipt_hash,
-                    receipt_hash,
-                    release_hash,
-                    receipt_hash,
-                    receipt_hash,
-                    config_hash,
-                    db_identity_json,
-                    db_identity_sha,
-                    start_fence_json,
-                    start_fence_sha,
-                    end_fence_json,
-                    end_fence_sha,
-                    release_hash,
-                    receipt_hash,
-                    current,
-                    current,
-                    current,
-                ),
+            self._insert_v14_compat_direct_steady_epoch_tx(
+                conn,
+                epoch_id=identity,
+                release_fingerprint_sha256=release_hash,
+                release_note_sha256=receipt_hash,
+                config_sha256=config_hash,
+                db_logical_identity_json=db_identity_json,
+                db_logical_identity_sha256=db_identity_sha,
+                partition_start_fence_json=start_fence_json,
+                partition_start_fence_sha256=start_fence_sha,
+                created_at=current,
             )
-            row = self._current_activation_epoch_tx(conn)
+            # The matching audit is inserted immediately below in this same
+            # transaction, so this is the only post-insert unchecked read.
+            row = self._current_activation_epoch_unchecked_tx(conn)
             if row is None or str(row["epoch_id"]) != identity:
                 raise ActivationEpochError("activation_epoch_create_lost")
             self._insert_activation_transition_audit_tx(
@@ -4926,8 +4997,18 @@ class RcaControlStore:
     def activation_epoch(self) -> dict[str, Any] | None:
         conn = self._connect()
         try:
+            conn.execute("BEGIN")
             row = self._current_activation_epoch_tx(conn)
-            return self._public_activation_epoch(row) if row is not None else None
+            if row is None:
+                conn.commit()
+                return None
+            value = self._public_activation_epoch(row)
+            conn.commit()
+            return value
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -4990,6 +5071,19 @@ class RcaControlStore:
         conn = self._connect()
         try:
             conn.execute("BEGIN")
+            try:
+                current_epoch = self._current_activation_epoch_tx(conn)
+            except ActivationEpochError as exc:
+                raise RecordConflictError(
+                    "manual_external_write_activation_epoch_not_current"
+                ) from exc
+            if (
+                current_epoch is None
+                or str(current_epoch["state"] or "") != "steady_active"
+            ):
+                raise RecordConflictError(
+                    "manual_external_write_activation_epoch_not_current"
+                )
             source = conn.execute(
                 """
                 SELECT source.source_kind, source.platform, source.chat_id,
@@ -5301,6 +5395,21 @@ class RcaControlStore:
             raise RecordConflictError("external_write_fence_schema_invalid")
         conn = self._connect()
         try:
+            conn.execute("BEGIN")
+            try:
+                current_epoch = self._current_activation_epoch_tx(conn)
+            except ActivationEpochError as exc:
+                raise RecordConflictError(
+                    "external_write_fence_epoch_not_current"
+                ) from exc
+            if (
+                current_epoch is None
+                or str(current_epoch["epoch_id"]) != epoch_id
+                or str(current_epoch["state"] or "") != "steady_active"
+            ):
+                raise RecordConflictError(
+                    "external_write_fence_epoch_not_current"
+                )
             row = conn.execute(
                 """
                 SELECT epoch.epoch_id, epoch.state, epoch.is_current,
@@ -5329,6 +5438,11 @@ class RcaControlStore:
                 """,
                 (ledger_id, epoch_id, admission_key),
             ).fetchone()
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
         if row is None or int(row["is_current"]) != 1:
@@ -5978,8 +6092,9 @@ class RcaControlStore:
             ledger_id=ledger_id,
         )
 
-    @staticmethod
+    @classmethod
     def bind_activation_admission_tx(
+        cls,
         conn: sqlite3.Connection,
         decision: ActivationAdmissionDecision,
         *,
@@ -6019,12 +6134,10 @@ class RcaControlStore:
             or str(ledger["decision"]) != "admit"
         ):
             raise ActivationEpochError("activation_binding_ledger_conflict")
-        epoch = conn.execute(
-            "SELECT state, is_current FROM rca_activation_epochs WHERE epoch_id = ?",
-            (decision.epoch_id,),
-        ).fetchone()
+        epoch = cls._current_activation_epoch_tx(conn)
         if (
             epoch is None
+            or str(epoch["epoch_id"]) != decision.epoch_id
             or str(epoch["state"] or "") != "steady_active"
             or int(epoch["is_current"] or 0) != 1
         ):
@@ -8634,16 +8747,7 @@ class RcaControlStore:
             },
             "business_triggers": {"activation_epoch_id", "activation_ledger_id"},
             "rca_outbox": {"activation_epoch_id", "activation_ledger_id"},
-            "rca_activation_epochs": {
-                "preauthorization_fingerprint",
-                "preauthorization_gate_receipt_sha256",
-                "preauthorization_capsule_sha256",
-                "preproduction_fingerprint",
-                "preproduction_gate_receipt_sha256",
-                "preproduction_capsule_sha256",
-                "production_fingerprint",
-                "production_gate_receipt_sha256",
-            },
+            "rca_activation_epochs": _V14_COMPAT_RELEASE_BINDING_COLUMNS,
         }
         for table, required_columns in required_activation_columns.items():
             present_columns = {
@@ -9388,6 +9492,16 @@ class RcaControlStore:
             activation_ledger_id = core.execution_admission["activation_ledger_id"]
             establishing_snapshot = binding_action == "create" and snapshot_row is None
             if establishing_snapshot and activation_ledger_id is not None:
+                current_epoch = self._current_activation_epoch_tx(conn)
+                if (
+                    current_epoch is None
+                    or str(current_epoch["epoch_id"])
+                    != str(core.execution_admission["activation_epoch_id"])
+                    or str(current_epoch["state"] or "") != "steady_active"
+                ):
+                    raise RecordConflictError(
+                        "w3_snapshot_execution_authority_mismatch"
+                    )
                 activation_source_kind = (
                     "manual"
                     if envelope.source_kind == "feishu_group_manual"
@@ -13342,8 +13456,10 @@ class RcaControlStore:
             return {}
         conn = self._connect()
         try:
+            conn.execute("BEGIN")
             row = self._current_activation_epoch_tx(conn)
             if row is None or str(row["state"]) != "steady_active":
+                conn.commit()
                 return {}
             try:
                 start_fence = json.loads(str(row["partition_start_fence_json"]))
@@ -13368,7 +13484,12 @@ class RcaControlStore:
                         "activation_partition_start_fence_invalid"
                     )
                 result[partition] = raw_offset
+            conn.commit()
             return result
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -14108,6 +14229,7 @@ class RcaControlStore:
         current = _iso(now)
         conn = self._connect()
         try:
+            conn.execute("BEGIN")
             activation_predicate, activation_parameters = (
                 self._activation_claim_predicate_tx(conn)
             )
@@ -14132,7 +14254,13 @@ class RcaControlStore:
                 """,
                 (*activation_parameters, current, current, limit),
             ).fetchall()
-            return [dict(row) for row in rows]
+            value = [dict(row) for row in rows]
+            conn.commit()
+            return value
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -14536,10 +14664,26 @@ class RcaControlStore:
         try:
             conn.execute("BEGIN")
             snapshot_at = _now_iso()
-            current_epoch = self._current_activation_epoch_tx(conn)
-            activation_predicate, activation_parameters = (
-                self._activation_claim_predicate_tx(conn)
-            )
+            current_epoch = self._current_activation_epoch_unchecked_tx(conn)
+            activation_binding_valid = False
+            activation_current = None
+            if current_epoch is not None:
+                try:
+                    self._v14_compat_activation_transition_binding_tx(
+                        conn, epoch=current_epoch
+                    )
+                except ActivationEpochError:
+                    activation_predicate, activation_parameters = "0", ()
+                else:
+                    activation_binding_valid = True
+                    activation_current = self._public_activation_epoch(current_epoch)
+                    activation_predicate, activation_parameters = (
+                        self._activation_claim_predicate_tx(conn)
+                    )
+            else:
+                activation_predicate, activation_parameters = (
+                    self._activation_claim_predicate_tx(conn)
+                )
             inbox = {
                 row["decision"]: int(row["count"])
                 for row in conn.execute(
@@ -14620,10 +14764,8 @@ class RcaControlStore:
             }
             pending_inbox = 0
             unbound_admissions = 0
-            activation_current = None
             if current_epoch is not None:
                 epoch_id = str(current_epoch["epoch_id"])
-                activation_current = self._public_activation_epoch(current_epoch)
                 for row in conn.execute(
                     """
                     SELECT decision, COUNT(*) AS count
@@ -14711,8 +14853,11 @@ class RcaControlStore:
                 and isinstance(filesystem["available_bytes"], int)
                 and filesystem["available_bytes"] >= CONTROL_DB_MIN_AVAILABLE_BYTES
             )
+            activation_ok = (
+                current_epoch is None or activation_binding_valid
+            )
             return {
-                "ok": capacity_ok,
+                "ok": capacity_ok and activation_ok,
                 "schema_version": CONTROL_STORE_SCHEMA_VERSION,
                 "db_path": str(self.db_path),
                 "snapshot_at": snapshot_at,
@@ -14734,8 +14879,10 @@ class RcaControlStore:
                 "activation": {
                     "mode": "steady_only",
                     "configured": current_epoch is not None,
+                    "binding_valid": activation_binding_valid,
                     "production_active": bool(
                         current_epoch is not None
+                        and activation_binding_valid
                         and str(current_epoch["state"]) == "steady_active"
                     ),
                     "current_epoch": activation_current,

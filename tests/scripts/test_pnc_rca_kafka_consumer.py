@@ -98,8 +98,8 @@ def _message(offset=10, value=None):
 def _activate_direct_steady(store, *, start_offset=20):
     return store.activate_direct_steady_epoch(
         epoch_id="rca-consumer-steady-20260817",
-        release_fingerprint="1" * 64,
-        release_binding_sha256="2" * 64,
+        release_fingerprint_sha256="1" * 64,
+        release_note_sha256="2" * 64,
         config_sha256="3" * 64,
         db_logical_identity={"database": "consumer-test-control"},
         partition_start_fence={TOPIC: {"0": start_offset}},
@@ -1309,6 +1309,27 @@ def test_health_v3_binds_full_config_and_immutable_runtime_identity(tmp_path):
     )
     assert len(first["runtime_identity"]["loaded_runtime_sha256"]) == 64
     assert first["runtime_identity"] == second["runtime_identity"]
+
+
+def test_activation_required_health_is_red_without_current_epoch(tmp_path):
+    config = _config(
+        tmp_path,
+        HERMES_RCA_KAFKA_ACTIVATION_REQUIRED="true",
+    )
+    store = RcaControlStore(config.control_db_path)
+    reporter = consumer_module.HealthReporter(config, store)
+    reporter.set_assignment_reporter(
+        lambda: {"assigned_partitions": [0], "callback_errors": 0}
+    )
+
+    reporter.write(state="idle", stats=consumer_module.PollStats(), force=True)
+
+    body = json.loads(config.health_path.read_text(encoding="utf-8"))
+    assert body["store"]["ok"] is True
+    assert body["store"]["activation"]["configured"] is False
+    assert body["store"]["activation"]["production_active"] is False
+    assert body["ok"] is False
+    assert body["healthy"] is False
 
 
 def test_health_status_rejects_identity_without_loaded_runtime_digest(tmp_path):

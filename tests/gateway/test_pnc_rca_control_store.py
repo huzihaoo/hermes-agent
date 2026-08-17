@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -49,8 +50,8 @@ def _steady_control_store(path) -> RcaControlStore:
     if store.activation_epoch() is None:
         store.activate_direct_steady_epoch(
             epoch_id="rca-test-steady",
-            release_fingerprint="1" * 64,
-            release_binding_sha256="a" * 64,
+            release_fingerprint_sha256="1" * 64,
+            release_note_sha256="a" * 64,
             config_sha256="2" * 64,
             db_logical_identity={"database": "control-test"},
             partition_start_fence={TOPIC: {"2": 0}},
@@ -963,8 +964,8 @@ def _activate_direct_steady_epoch(
     predecessor = expected_predecessor or {}
     return store.activate_direct_steady_epoch(
         epoch_id=epoch_id,
-        release_fingerprint=release_fingerprint,
-        release_binding_sha256=receipt_sha256,
+        release_fingerprint_sha256=release_fingerprint,
+        release_note_sha256=receipt_sha256,
         config_sha256=config_sha256,
         db_logical_identity={
             "device": 7,
@@ -980,6 +981,15 @@ def _activate_direct_steady_epoch(
             predecessor.get("binding_fingerprint") or ""
         ),
     )
+
+
+def _tamper_hidden_v14_binding(store: RcaControlStore) -> None:
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs "
+            "SET preauthorization_fingerprint = ? WHERE is_current = 1",
+            ("f" * 64,),
+        )
 
 
 def test_kafka_runtime_transition_is_atomic_and_duplicate_preserves_first_identity(
@@ -1104,6 +1114,17 @@ def test_direct_steady_is_idempotent_and_rejects_binding_conflicts(tmp_path):
     first = _activate_direct_steady_epoch(store)
     second = _activate_direct_steady_epoch(store)
     assert second == first
+    assert first["release_fingerprint_sha256"] == "1" * 64
+    assert first["release_note_sha256"] == "a" * 64
+    assert first["partition_start_fence_sha256"] == first[
+        "partition_end_fence_sha256"
+    ]
+    assert not {
+        "preauthorization_fingerprint",
+        "preproduction_fingerprint",
+        "production_fingerprint",
+        "production_gate_receipt_sha256",
+    } & first.keys()
     assert len(store.list_rows("rca_activation_transition_audit")) == 1
 
     with pytest.raises(
@@ -1112,13 +1133,109 @@ def test_direct_steady_is_idempotent_and_rejects_binding_conflicts(tmp_path):
         _activate_direct_steady_epoch(store, config_sha256="9" * 64)
 
 
+def test_activation_epoch_rejects_hidden_v14_binding_tamper(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _activate_direct_steady_epoch(store)
+    _tamper_hidden_v14_binding(store)
+
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_predecessor_binding_invalid",
+    ):
+        store.activation_epoch()
+
+
+def test_control_health_rejects_hidden_v14_binding_tamper(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    _activate_direct_steady_epoch(store)
+    _tamper_hidden_v14_binding(store)
+
+    health = store.health()
+    assert health["ok"] is False
+    assert health["activation"]["configured"] is True
+    assert health["activation"]["binding_valid"] is False
+    assert health["activation"]["production_active"] is False
+    assert health["activation"]["current_epoch"] is None
+
+
+def test_admission_rejects_hidden_v14_binding_tamper(tmp_path):
+    store = _steady_control_store(tmp_path / "control.sqlite3")
+    _tamper_hidden_v14_binding(store)
+
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_predecessor_binding_invalid",
+    ):
+        store.ingest_record(
+            _record(),
+            policy=_policy(),
+            submit_enabled=True,
+            activation_required=True,
+        )
+    assert store.list_rows("kafka_inbox") == []
+    assert store.list_rows("rca_activation_admission_ledger") == []
+
+
+def test_claim_preview_and_fence_reject_hidden_v14_binding_tamper(tmp_path):
+    store = _steady_control_store(tmp_path / "control.sqlite3")
+    result = store.ingest_record(
+        _record(),
+        policy=_policy(),
+        submit_enabled=True,
+        activation_required=True,
+    )
+    assert result.decision == "accepted"
+    _tamper_hidden_v14_binding(store)
+
+    for operation in (
+        lambda: store.preview_dispatchable(now=datetime.now(timezone.utc)),
+        lambda: store.claim_outbox(
+            lease_owner="audit-tamper-test",
+            now=datetime.now(timezone.utc),
+        ),
+        lambda: store.activation_partition_start_fence(
+            topic=TOPIC,
+            partitions=[2],
+        ),
+    ):
+        with pytest.raises(
+            ActivationEpochError,
+            match="activation_predecessor_binding_invalid",
+        ):
+            operation()
+    [outbox] = store.list_rows("rca_outbox")
+    assert outbox["status"] == "pending"
+
+
+def test_fresh_v14_activation_sqlite_master_hashes_remain_stable(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    expected = {
+        "idx_rca_single_current_activation_epoch": (
+            "0a1f9aa726d2b8320cbd91abc8edb827d257967df6f685e38721548afdde26c7"
+        ),
+        "rca_activation_epochs": (
+            "a1ced1ccf76bce5c3f635151776a7dc51ffda0bc543d446808414461b64262ca"
+        ),
+    }
+    with sqlite3.connect(store.db_path) as conn:
+        rows = conn.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE name IN (?, ?) ORDER BY name",
+            tuple(sorted(expected)),
+        ).fetchall()
+
+    assert {
+        name: hashlib.sha256(sql.encode()).hexdigest() for name, sql in rows
+    } == expected
+
+
 def test_direct_steady_allows_empty_fence_only_for_kafka_disabled_release(tmp_path):
     store = RcaControlStore(tmp_path / "control.sqlite3")
 
     epoch = store.activate_direct_steady_epoch(
         epoch_id="rca-direct-kafka-disabled-20260712",
-        release_fingerprint="1" * 64,
-        release_binding_sha256="a" * 64,
+        release_fingerprint_sha256="1" * 64,
+        release_note_sha256="a" * 64,
         config_sha256="2" * 64,
         db_logical_identity={"database": "control-test"},
         partition_start_fence={},

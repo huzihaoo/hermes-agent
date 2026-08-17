@@ -206,8 +206,8 @@ def _control(
     control = RcaControlStore(db_path)
     control.activate_direct_steady_epoch(
         epoch_id="delivery-epoch-1",
-        release_fingerprint="a" * 64,
-        release_binding_sha256="b" * 64,
+        release_fingerprint_sha256="a" * 64,
+        release_note_sha256="b" * 64,
         config_sha256="c" * 64,
         db_logical_identity={"database": "delivery-test"},
         partition_start_fence={TOPIC: {"2": 0}},
@@ -248,8 +248,8 @@ def _activate_direct_steady(
 ):
     return control.activate_direct_steady_epoch(
         epoch_id=epoch_id,
-        release_fingerprint="a" * 64,
-        release_binding_sha256="b" * 64,
+        release_fingerprint_sha256="a" * 64,
+        release_note_sha256="b" * 64,
         config_sha256="c" * 64,
         db_logical_identity={"database": "delivery-test"},
         partition_start_fence={TOPIC: {"2": start_offset}},
@@ -300,8 +300,8 @@ def _switch_activation_epoch(control, *, old_epoch, new_epoch):
     assert updated.rowcount == 1
     return control.activate_direct_steady_epoch(
         epoch_id=new_epoch,
-        release_fingerprint="d" * 64,
-        release_binding_sha256="e" * 64,
+        release_fingerprint_sha256="d" * 64,
+        release_note_sha256="e" * 64,
         config_sha256="f" * 64,
         db_logical_identity={"database": "delivery-test"},
         partition_start_fence={TOPIC: {"2": 11}},
@@ -445,7 +445,7 @@ def _claimed_effect(tmp_path):
     return store, effect
 
 
-def _canonical_canary(tmp_path, *, owner_authorized=True):
+def _canonical_canary(tmp_path, *, owner_authorized=True, leave_claimed=False):
     batch_id = "canary-r15aw-7041712812-20260817"
     issue_id = "7041712812"
     epoch_id = "delivery-test-steady"
@@ -456,8 +456,8 @@ def _canonical_canary(tmp_path, *, owner_authorized=True):
         prior_epoch_id = "delivery-test-prior-steady"
         control.activate_direct_steady_epoch(
             epoch_id=prior_epoch_id,
-            release_fingerprint="a" * 64,
-            release_binding_sha256="b" * 64,
+            release_fingerprint_sha256="a" * 64,
+            release_note_sha256="b" * 64,
             config_sha256="c" * 64,
             db_logical_identity={"database": "canonical-canary-prior-test"},
             partition_start_fence={TOPIC: {"2": 0}},
@@ -512,8 +512,8 @@ def _canonical_canary(tmp_path, *, owner_authorized=True):
     else:
         control.activate_direct_steady_epoch(
             epoch_id=epoch_id,
-            release_fingerprint="a" * 64,
-            release_binding_sha256="b" * 64,
+            release_fingerprint_sha256="a" * 64,
+            release_note_sha256="b" * 64,
             config_sha256="c" * 64,
             db_logical_identity={"database": "canonical-canary-test"},
             partition_start_fence={TOPIC: {"2": 0}},
@@ -590,10 +590,33 @@ def _canonical_canary(tmp_path, *, owner_authorized=True):
         now=current,
         activation_required=True,
     )
+    if leave_claimed:
+        with sqlite3.connect(control.db_path) as conn:
+            updated = conn.execute(
+                "UPDATE rca_delivery_jobs SET issue_url = ? "
+                "WHERE submission_key = ?",
+                (
+                    "https://project.feishu.cn/g1q3/issue/detail/7041712812",
+                    admitted.submission_key,
+                ),
+            )
+        assert updated.rowcount == 1
     effect = store.claim_due_effect(
         lease_owner="dispatcher", now=current, activation_required=True
     )
     assert effect is not None
+    if leave_claimed:
+        store.mark_effect_write_started(
+            claim=effect,
+            now=current,
+            activation_required=True,
+        )
+        return {
+            "control": control,
+            "store": store,
+            "effect": effect,
+            "now": current,
+        }
     remote_id = "oc_canonical_canary_comment"
     content = str(effect.payload["comment_content"])
     observation = _delivery_observation(
@@ -657,8 +680,15 @@ def test_canonical_canary_readback_projects_settled_db_evidence(tmp_path):
     data = _canonical_canary(tmp_path)
 
     readback = _canonical_canary_readback(data)
+    with sqlite3.connect(data["db_path"]) as conn:
+        [job_issue_url] = conn.execute(
+            "SELECT issue_url FROM rca_delivery_jobs"
+        ).fetchone()
 
     assert data["generation"] == 2
+    assert job_issue_url == (
+        "https://project.feishu.cn/t03o4q/issue/detail/7041712812"
+    )
     assert readback["batch_id"] == data["batch_id"]
     assert readback["activation_epoch_id"] == data["epoch_id"]
     assert readback["transport"] == {
@@ -669,6 +699,98 @@ def test_canonical_canary_readback_projects_settled_db_evidence(tmp_path):
     }
     assert readback["execution_identity_readback"] == data["execution_identity"]
     assert readback["required_effects"][0]["write_phase"] == "settled"
+
+
+def test_terminal_rerun_provider_rejects_hidden_v14_tamper_before_call(
+    tmp_path,
+    monkeypatch,
+):
+    from gateway import pnc_rca_delivery_store as delivery_store_module
+    from gateway import pnc_rca_provider_fence as provider_fence
+    from gateway.pnc_rca_provider_fence import (
+        build_terminal_rerun_provider_claim,
+    )
+    from gateway.pnc_rca_write_fence import ExternalWriteFenceError
+    from scripts import pnc_rca_delivery_dispatcher as dispatcher_module
+
+    data = _canonical_canary(tmp_path, leave_claimed=True)
+    effect = data["effect"]
+    binding = data["store"].validate_terminal_rerun_external_write_binding(
+        effect_key=effect.effect_key,
+        delivery_id=effect.delivery_id,
+        lease_token=effect.lease_token,
+        lease_fence=effect.fence,
+        operation="feishu_issue_comment",
+        issue_url=effect.issue_url,
+        target_key=effect.target_key,
+        business_key=effect.business_key,
+        submission_key=effect.submission_key,
+        generation=effect.generation,
+        require_write_started=True,
+        now=data["now"],
+    )
+    claim = build_terminal_rerun_provider_claim(
+        authority_sha256=binding["authority_sha256"],
+        outbox_id=binding["outbox_id"],
+        epoch_id=binding["epoch_id"],
+        activation_ledger_id=binding["activation_ledger_id"],
+        effect_key=binding["effect_key"],
+        delivery_id=binding["delivery_id"],
+        lease_token=binding["lease_token"],
+        lease_fence=binding["lease_fence"],
+        issue_target=binding["issue_url"],
+        target_key=binding["target_key"],
+        business_key=binding["business_key"],
+        submission_key=binding["submission_key"],
+        generation=binding["generation"],
+        project_key=binding["project_key"],
+        project_simple_name=binding["project_simple_name"],
+        work_item_type_key=binding["work_item_type_key"],
+        work_item_id=binding["work_item_id"],
+    )
+    monkeypatch.setattr(
+        provider_fence,
+        "_canonical_store",
+        lambda: data["control"],
+    )
+    monkeypatch.setattr(
+        delivery_store_module,
+        "_utc_datetime",
+        lambda _value=None: data["now"],
+    )
+    live = provider_fence.revalidate_provider_write_claim(
+        claim,
+        operation="feishu_issue_comment",
+        issue_project_key=binding["project_key"],
+        issue_work_item_id=binding["work_item_id"],
+    )
+    assert live["authority_kind"] == "terminal_rerun"
+    provider_calls = []
+    adapter = dispatcher_module.MeegleIssueCommentAdapter(
+        lambda args: (
+            provider_calls.append(args)
+            or (0, json.dumps({"comment_id": "unexpected"}), "")
+        )
+    )
+    with sqlite3.connect(data["control"].db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs "
+            "SET preauthorization_fingerprint = ? WHERE is_current = 1",
+            ("f" * 64,),
+        )
+
+    with dispatcher_module._bound_provider_write_guard(claim):
+        with pytest.raises(
+            ExternalWriteFenceError,
+            match="external_write_fence_epoch_not_current",
+        ):
+            adapter.add_comment(
+                binding["project_key"],
+                binding["work_item_id"],
+                "must not send",
+            )
+
+    assert provider_calls == []
 
 
 def test_canonical_canary_readback_rejects_generation_one(tmp_path):
@@ -2341,6 +2463,7 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
         build_profile_terminal_provider_claim,
     )
     from gateway.pnc_rca_write_fence import ExternalWriteFenceError
+    from scripts import pnc_rca_delivery_dispatcher as dispatcher_module
     provider_now = datetime.now(timezone.utc)
     control = RcaControlStore(tmp_path / "control.sqlite3")
     epoch = _activate_direct_steady(
@@ -2428,6 +2551,44 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
     assert live["authority_kind"] == "profile_terminal"
     assert live["project_key"] == REAL_G1Q3_PROJECT_KEY
     assert live["project_simple_name"] == REAL_G1Q3_PROJECT_SIMPLE_NAME
+    provider_calls = []
+    adapter = dispatcher_module.MeegleIssueCommentAdapter(
+        lambda args: (
+            provider_calls.append(args)
+            or (0, json.dumps({"comment_id": "unexpected"}), "")
+        )
+    )
+    with sqlite3.connect(control.db_path) as conn:
+        original_hidden_fingerprint = str(
+            conn.execute(
+                "SELECT preauthorization_fingerprint "
+                "FROM rca_activation_epochs WHERE is_current = 1"
+            ).fetchone()[0]
+        )
+        conn.execute(
+            "UPDATE rca_activation_epochs "
+            "SET preauthorization_fingerprint = ? WHERE is_current = 1",
+            ("f" * 64,),
+        )
+    try:
+        with dispatcher_module._bound_provider_write_guard(claim):
+            with pytest.raises(
+                ExternalWriteFenceError,
+                match="external_write_fence_epoch_not_current",
+            ):
+                adapter.add_comment(
+                    REAL_G1Q3_PROJECT_KEY,
+                    "7041712812",
+                    "must not send",
+                )
+    finally:
+        with sqlite3.connect(control.db_path) as conn:
+            conn.execute(
+                "UPDATE rca_activation_epochs "
+                "SET preauthorization_fingerprint = ? WHERE is_current = 1",
+                (original_hidden_fingerprint,),
+            )
+    assert provider_calls == []
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
             "UPDATE rca_trigger_sources SET source_kind='feishu_group_manual' "
@@ -2878,8 +3039,9 @@ def test_delivery_health_observes_stalled_watch_without_blocking_readiness(tmp_p
     assert health["production_blockers"] == {
         "activation_schema_unavailable": 0,
         "activation_epoch_not_steady": 0,
-        "activation_fingerprint_invalid": 0,
-        "activation_gate_receipt_invalid": 0,
+        "activation_binding_invalid": 0,
+        "release_fingerprint_invalid": 0,
+        "release_note_invalid": 0,
         "uncertain_effects": 0,
         "pending_delivery_observations": 0,
     }
@@ -2951,13 +3113,6 @@ def test_activation_health_does_not_block_on_historical_uncertain_effect(tmp_pat
     )
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
-            "UPDATE rca_activation_epochs "
-            "SET state = 'steady_active', production_fingerprint = ?, "
-            "production_gate_receipt_sha256 = ? "
-            "WHERE epoch_id = 'delivery-epoch-2' AND is_current = 1",
-            ("4" * 64, "5" * 64),
-        )
-        conn.execute(
             "UPDATE rca_delivery_effects "
             "SET status = 'uncertain', write_phase = 'write_started'"
         )
@@ -2976,7 +3131,7 @@ def test_activation_health_does_not_block_on_historical_uncertain_effect(tmp_pat
     assert health["business_ready"] is True
 
 
-def test_activation_health_requires_steady_epoch_and_production_fingerprint(
+def test_activation_health_requires_steady_epoch_and_release_binding(
     tmp_path,
 ):
     control, result = _control(tmp_path)
@@ -2985,11 +3140,14 @@ def test_activation_health_requires_steady_epoch_and_production_fingerprint(
 
     bounded = store.health(now=NOW, activation_required=True)
 
-    assert bounded["activation"]["production_fingerprint"] == ""
+    assert bounded["activation"]["release_fingerprint_sha256"] == ""
+    assert bounded["activation"]["release_note_sha256"] == ""
+    assert bounded["activation"]["binding_valid"] is False
     assert bounded["activation"]["production_ready"] is False
     assert bounded["production_blockers"]["activation_epoch_not_steady"] == 1
-    assert bounded["production_blockers"]["activation_fingerprint_invalid"] == 1
-    assert bounded["production_blockers"]["activation_gate_receipt_invalid"] == 1
+    assert bounded["production_blockers"]["activation_binding_invalid"] == 1
+    assert bounded["production_blockers"]["release_fingerprint_invalid"] == 1
+    assert bounded["production_blockers"]["release_note_invalid"] == 1
     assert bounded["business_ready"] is False
 
     with sqlite3.connect(control.db_path) as conn:
@@ -3003,41 +3161,64 @@ def test_activation_health_requires_steady_epoch_and_production_fingerprint(
     zero_fingerprint = store.health(now=NOW, activation_required=True)
 
     assert zero_fingerprint["activation"]["production_ready"] is False
+    assert zero_fingerprint["activation"]["binding_valid"] is False
     assert zero_fingerprint["production_blockers"]["activation_epoch_not_steady"] == 0
+    assert zero_fingerprint["production_blockers"]["activation_binding_invalid"] == 1
     assert (
-        zero_fingerprint["production_blockers"]["activation_fingerprint_invalid"]
+        zero_fingerprint["production_blockers"]["release_fingerprint_invalid"]
         == 1
     )
-    assert (
-        zero_fingerprint["production_blockers"]["activation_gate_receipt_invalid"]
-        == 1
-    )
+    assert zero_fingerprint["production_blockers"]["release_note_invalid"] == 1
     assert zero_fingerprint["business_ready"] is False
 
+    ready_control, _ = _control(tmp_path / "ready")
+    ready_store = RcaDeliveryStore(ready_control.db_path)
+    ready = ready_store.health(now=NOW, activation_required=True)
+
+    assert ready["activation"]["release_fingerprint_sha256"] == "a" * 64
+    assert ready["activation"]["release_note_sha256"] == "b" * 64
+    assert ready["activation"]["binding_valid"] is True
+    assert ready["activation"]["production_ready"] is True
+    assert ready["production_blockers"]["activation_epoch_not_steady"] == 0
+    assert ready["production_blockers"]["activation_binding_invalid"] == 0
+    assert ready["production_blockers"]["release_fingerprint_invalid"] == 0
+    assert ready["production_blockers"]["release_note_invalid"] == 0
+    assert ready["business_ready"] is True
+
+    epoch = ready_store.activation_epoch()
+    assert epoch is not None
+    assert epoch["state"] == "steady_active"
+    assert epoch["release_fingerprint_sha256"] == "a" * 64
+    assert epoch["release_note_sha256"] == "b" * 64
+    assert "production_fingerprint" not in epoch
+    assert "production_gate_receipt_sha256" not in epoch
+    assert isinstance(epoch["config_sha256"], str)
+
+
+def test_resident_activation_store_and_health_reject_hidden_v14_tamper(tmp_path):
+    control, _ = _control(tmp_path)
+    store = RcaDeliveryStore(control.db_path)
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
             "UPDATE rca_activation_epochs "
-            "SET production_fingerprint = ?, production_gate_receipt_sha256 = ? "
-            "WHERE is_current = 1",
-            ("2" * 64, "3" * 64),
+            "SET preauthorization_fingerprint = ? WHERE is_current = 1",
+            ("f" * 64,),
         )
 
-    ready = store.health(now=NOW, activation_required=True)
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_predecessor_binding_invalid",
+    ):
+        store.activation_epoch()
 
-    assert ready["activation"]["production_fingerprint"] == "2" * 64
-    assert ready["activation"]["production_gate_receipt_sha256"] == "3" * 64
-    assert ready["activation"]["production_ready"] is True
-    assert ready["production_blockers"]["activation_epoch_not_steady"] == 0
-    assert ready["production_blockers"]["activation_fingerprint_invalid"] == 0
-    assert ready["production_blockers"]["activation_gate_receipt_invalid"] == 0
-    assert ready["business_ready"] is True
-
-    epoch = store.activation_epoch()
-    assert epoch is not None
-    assert epoch["state"] == "steady_active"
-    assert epoch["production_fingerprint"] == "2" * 64
-    assert epoch["production_gate_receipt_sha256"] == "3" * 64
-    assert isinstance(epoch["config_sha256"], str)
+    health = store.health(now=NOW, activation_required=True)
+    assert health["ok"] is False
+    assert health["business_ready"] is False
+    assert health["activation"]["binding_valid"] is False
+    assert health["activation"]["release_fingerprint_sha256"] == ""
+    assert health["activation"]["release_note_sha256"] == ""
+    assert health["activation"]["processing_enabled"] is False
+    assert health["production_blockers"]["activation_binding_invalid"] == 1
 
 
 def test_concurrent_backfill_creates_exactly_one_watch(tmp_path):
@@ -3903,8 +4084,8 @@ def test_fully_settled_issue_only_delivery_allows_activation_replacement(tmp_pat
     assert predecessor["inflight"]["total"] == 0
     replacement = control.activate_direct_steady_epoch(
         epoch_id="delivery-epoch-issue-only-successor",
-        release_fingerprint="7" * 64,
-        release_binding_sha256="8" * 64,
+        release_fingerprint_sha256="7" * 64,
+        release_note_sha256="8" * 64,
         config_sha256="a" * 64,
         db_logical_identity={"database": "delivery-test"},
         partition_start_fence={TOPIC: {"2": 11}},

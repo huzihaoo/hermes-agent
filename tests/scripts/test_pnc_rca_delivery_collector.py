@@ -29,6 +29,7 @@ from tests.gateway.test_pnc_rca_delivery_store import (
     _control,
     _delivery,
     _insert_subscription,
+    _switch_activation_epoch,
 )
 from tests.gateway.test_pnc_rca_w3_snapshot import _runtime_authority
 from tests.gateway.test_pnc_rca_write_fence import _release_note
@@ -50,19 +51,49 @@ def _config_env(tmp_path) -> dict[str, str]:
 def _bind_minimal_release(control, fixture, *, epoch_id="delivery-epoch-1"):
     fixture.epoch["epoch_id"] = epoch_id
     with sqlite3.connect(control.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        release_note_sha256 = fixture.epoch["release_note_sha256"]
         updated = conn.execute(
             "UPDATE rca_activation_epochs "
-            "SET state = 'steady_active', config_sha256 = ?, "
+            "SET state = 'steady_active', preauthorization_fingerprint = ?, "
+            "preauthorization_gate_receipt_sha256 = ?, "
+            "preauthorization_capsule_sha256 = ?, "
+            "preproduction_fingerprint = ?, "
+            "preproduction_gate_receipt_sha256 = ?, "
+            "preproduction_capsule_sha256 = ?, config_sha256 = ?, "
             "production_fingerprint = ?, production_gate_receipt_sha256 = ? "
             "WHERE epoch_id = ? AND is_current = 1",
             (
+                fixture.fingerprint,
+                release_note_sha256,
+                release_note_sha256,
+                fixture.fingerprint,
+                release_note_sha256,
+                release_note_sha256,
                 fixture.env_sha256,
                 fixture.fingerprint,
-                fixture.epoch["production_gate_receipt_sha256"],
+                release_note_sha256,
                 epoch_id,
             ),
         )
-    assert updated.rowcount == 1
+        assert updated.rowcount == 1
+        epoch = conn.execute(
+            "SELECT * FROM rca_activation_epochs "
+            "WHERE epoch_id = ? AND is_current = 1",
+            (epoch_id,),
+        ).fetchone()
+        assert epoch is not None
+        RcaControlStore._insert_activation_transition_audit_tx(
+            conn,
+            epoch=epoch,
+            from_state="direct_release",
+            to_state="steady_active",
+            operator="test:fixture",
+            reason="bind test minimal release",
+            transitioned_at="2026-08-17T12:00:00+00:00",
+        )
+        conn.commit()
 
 
 def _set_live_release_environment(monkeypatch, fixture):
@@ -1389,7 +1420,7 @@ def test_enabled_startup_locks_minimal_release_before_writable_collector(
     assert locked.release_fingerprint_sha256 == fixture.fingerprint
     assert (
         locked.release_note_sha256
-        == fixture.epoch["production_gate_receipt_sha256"]
+        == fixture.epoch["release_note_sha256"]
     )
 
 
@@ -1432,11 +1463,11 @@ def test_collector_epoch_switch_rejects_batch_before_backfill_or_claim(
         status_reader=lambda *_args: provider_calls.append("status"),
     )
     assert instance._validate_runtime_release()["epoch_id"] == "delivery-epoch-1"
-    with sqlite3.connect(control.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_activation_epochs SET epoch_id = 'delivery-epoch-2' "
-            "WHERE is_current = 1"
-        )
+    _switch_activation_epoch(
+        control,
+        old_epoch="delivery-epoch-1",
+        new_epoch="delivery-epoch-2",
+    )
     monkeypatch.setattr(
         store,
         "backfill_completed_submissions",
@@ -1451,7 +1482,7 @@ def test_collector_epoch_switch_rejects_batch_before_backfill_or_claim(
     with pytest.raises(collector.ExternalWriteFenceError) as exc:
         instance.collect_batch()
 
-    assert exc.value.code == "resident_release_binding_changed"
+    assert exc.value.code == "resident_release_fingerprint_mismatch"
     assert provider_calls == []
 
 

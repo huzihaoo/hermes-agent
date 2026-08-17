@@ -68,6 +68,7 @@ from tests.gateway.test_pnc_rca_delivery_store import (
     _activate_direct_steady,
     _bind_activation_execution,
     _control,
+    _current_epoch_valid_w3_quarantined_control,
     _insert_subscription,
     _switch_activation_epoch,
 )
@@ -87,19 +88,49 @@ _TEST_PROVIDER_WRITE_CLAIM = build_write_fence_provider_claim({"state": "issued"
 def _bind_minimal_release(control, fixture, *, epoch_id="delivery-epoch-1"):
     fixture.epoch["epoch_id"] = epoch_id
     with sqlite3.connect(control.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        release_note_sha256 = fixture.epoch["release_note_sha256"]
         updated = conn.execute(
             "UPDATE rca_activation_epochs "
-            "SET state = 'steady_active', config_sha256 = ?, "
+            "SET state = 'steady_active', preauthorization_fingerprint = ?, "
+            "preauthorization_gate_receipt_sha256 = ?, "
+            "preauthorization_capsule_sha256 = ?, "
+            "preproduction_fingerprint = ?, "
+            "preproduction_gate_receipt_sha256 = ?, "
+            "preproduction_capsule_sha256 = ?, config_sha256 = ?, "
             "production_fingerprint = ?, production_gate_receipt_sha256 = ? "
             "WHERE epoch_id = ? AND is_current = 1",
             (
+                fixture.fingerprint,
+                release_note_sha256,
+                release_note_sha256,
+                fixture.fingerprint,
+                release_note_sha256,
+                release_note_sha256,
                 fixture.env_sha256,
                 fixture.fingerprint,
-                fixture.epoch["production_gate_receipt_sha256"],
+                release_note_sha256,
                 epoch_id,
             ),
         )
-    assert updated.rowcount == 1
+        assert updated.rowcount == 1
+        epoch = conn.execute(
+            "SELECT * FROM rca_activation_epochs "
+            "WHERE epoch_id = ? AND is_current = 1",
+            (epoch_id,),
+        ).fetchone()
+        assert epoch is not None
+        RcaControlStore._insert_activation_transition_audit_tx(
+            conn,
+            epoch=epoch,
+            from_state="direct_release",
+            to_state="steady_active",
+            operator="test:fixture",
+            reason="bind test minimal release",
+            transitioned_at="2026-08-17T12:00:00+00:00",
+        )
+        conn.commit()
 
 
 def _set_live_release_environment(monkeypatch, fixture):
@@ -347,7 +378,7 @@ def test_enabled_startup_locks_minimal_release_before_writable_store_and_provide
     assert locked.release_fingerprint_sha256 == fixture.fingerprint
     assert (
         locked.release_note_sha256
-        == fixture.epoch["production_gate_receipt_sha256"]
+        == fixture.epoch["release_note_sha256"]
     )
 
 
@@ -400,11 +431,11 @@ def test_dispatcher_epoch_switch_rejects_claim_and_provider_boundaries(
         now=lambda: NOW,
     )
     assert dispatcher._validate_runtime_release()["epoch_id"] == "delivery-epoch-1"
-    with sqlite3.connect(control.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_activation_epochs SET epoch_id = 'delivery-epoch-2' "
-            "WHERE is_current = 1"
-        )
+    _switch_activation_epoch(
+        control,
+        old_epoch="delivery-epoch-1",
+        new_epoch="delivery-epoch-2",
+    )
     if boundary == "claim":
         monkeypatch.setattr(
             store,
@@ -423,7 +454,61 @@ def test_dispatcher_epoch_switch_rejects_claim_and_provider_boundaries(
             )
             provider()
 
-    assert exc.value.code == "resident_release_binding_changed"
+    assert exc.value.code == "resident_release_fingerprint_mismatch"
+    assert provider_calls == []
+
+
+def test_w3_provider_rejects_hidden_v14_tamper_before_adapter_call(tmp_path):
+    control, current, snapshot = _current_epoch_valid_w3_quarantined_control(
+        tmp_path
+    )
+    store = RcaDeliveryStore(control.db_path)
+    assert store.backfill_completed_submissions(
+        now=current + timedelta(seconds=3),
+        activation_required=True,
+    ) == 1
+    effect = store.claim_due_effect(
+        lease_owner="w3-provider-audit-test",
+        now=current + timedelta(seconds=4),
+        activation_required=True,
+    )
+    assert effect is not None
+    fence = snapshot["write_fence"]
+    provider_claim = build_write_fence_provider_claim(fence)
+    provider_calls = []
+    adapter = MeegleIssueCommentAdapter(
+        lambda args: (
+            provider_calls.append(args)
+            or (0, json.dumps({"comment_id": "unexpected"}), "")
+        )
+    )
+    dispatcher = object.__new__(DeliveryDispatcher)
+    dispatcher.store = store
+    dispatcher._validate_runtime_release = lambda: {}
+    dispatcher.now = lambda: current + timedelta(seconds=4)
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs "
+            "SET preauthorization_fingerprint = ? WHERE is_current = 1",
+            ("f" * 64,),
+        )
+
+    with pytest.raises(
+        dispatcher_module.ExternalWriteFenceError,
+        match="external_write_fence_epoch_not_current",
+    ):
+        dispatcher._validate_external_write(
+            effect,
+            operation="feishu_issue_comment",
+            target=effect.issue_url,
+        )
+        with dispatcher_module._bound_provider_write_guard(provider_claim):
+            adapter.add_comment(
+                effect.project_key,
+                effect.work_item_id,
+                "must not send",
+            )
+
     assert provider_calls == []
 
 
@@ -2924,8 +3009,9 @@ def test_terminal_manual_delivery_skips_report_http_and_sends_both_effects(tmp_p
     assert before["production_blockers"] == {
         "activation_schema_unavailable": 0,
         "activation_epoch_not_steady": 0,
-        "activation_fingerprint_invalid": 0,
-        "activation_gate_receipt_invalid": 0,
+        "activation_binding_invalid": 0,
+        "release_fingerprint_invalid": 0,
+        "release_note_invalid": 0,
         "uncertain_effects": 0,
         "pending_delivery_observations": 0,
     }

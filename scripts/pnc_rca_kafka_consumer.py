@@ -550,6 +550,12 @@ class HealthReporter:
             return
         self._last_write_monotonic = now_monotonic
         store_health = self.store.health()
+        activation_health = store_health.get("activation")
+        activation_ready = (
+            isinstance(activation_health, Mapping)
+            and activation_health.get("configured") is True
+            and activation_health.get("production_active") is True
+        )
         assignment = (
             dict(self.assignment_reporter())
             if self.assignment_reporter is not None
@@ -576,6 +582,7 @@ class HealthReporter:
             }
             and stats.blocked_partitions == 0
             and store_health.get("ok") is True
+            and (not self.config.activation_required or activation_ready)
             and assignment_ok
         )
         heartbeat_at = _utc_now()

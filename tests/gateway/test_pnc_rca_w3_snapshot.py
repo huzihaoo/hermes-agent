@@ -77,8 +77,8 @@ def _activate_steady(store: RcaControlStore) -> RcaControlStore:
     if store.activation_epoch() is None:
         store.activate_direct_steady_epoch(
             epoch_id=STEADY_EPOCH_ID,
-            release_fingerprint="1" * 64,
-            release_binding_sha256="2" * 64,
+            release_fingerprint_sha256="1" * 64,
+            release_note_sha256="2" * 64,
             config_sha256="3" * 64,
             db_logical_identity={"database": "w3-control-test"},
             partition_start_fence={"topic": {"0": 0}},

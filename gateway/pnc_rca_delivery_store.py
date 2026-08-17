@@ -41,7 +41,9 @@ from gateway.pnc_rca_delivery_contract import (
 from gateway.pnc_rca_delivery_observability import validate_delivery_observation
 from gateway.pnc_rca_control_store import (
     OUTBOX_CIRCUIT_RESET_SCHEMA_VERSION,
+    ActivationEpochError,
     RcaControlStore,
+    _V14_COMPAT_RELEASE_BINDING_COLUMNS,
     _validate_dispatcher_circuit_reset_audit,
 )
 from gateway.pnc_rca_conclusion_adjudication import (
@@ -270,6 +272,7 @@ ACTIVATION_DELIVERY_STATES = frozenset({"steady_active"})
 _ACTIVATION_REQUIRED_TABLES = frozenset({
     "rca_activation_epochs",
     "rca_activation_admission_ledger",
+    "rca_activation_transition_audit",
     "business_triggers",
     "rca_outbox",
 })
@@ -954,6 +957,24 @@ class RcaDeliveryStore:
                 raise
         return conn
 
+    @staticmethod
+    def _validate_current_v14_activation_binding_tx(
+        conn: sqlite3.Connection,
+    ) -> sqlite3.Row:
+        """Fail provider writes closed on current v14 epoch/audit drift."""
+
+        epoch = RcaControlStore._current_activation_epoch_unchecked_tx(conn)
+        if epoch is None:
+            raise RuntimeError("external_write_fence_epoch_not_current")
+        try:
+            RcaControlStore._v14_compat_activation_transition_binding_tx(
+                conn,
+                epoch=epoch,
+            )
+        except ActivationEpochError as exc:
+            raise RuntimeError("external_write_fence_epoch_not_current") from exc
+        return epoch
+
     def validate_external_write_fence_binding(
         self,
         fence: Mapping[str, Any],
@@ -966,6 +987,8 @@ class RcaDeliveryStore:
             raise RuntimeError("external_write_fence_schema_invalid")
         conn = self._connect_read_only()
         try:
+            conn.execute("BEGIN")
+            self._validate_current_v14_activation_binding_tx(conn)
             row = conn.execute(
                 """
                 SELECT epoch.epoch_id, epoch.state, epoch.is_current,
@@ -993,6 +1016,11 @@ class RcaDeliveryStore:
                 """,
                 (ledger_id, epoch_id, admission_key),
             ).fetchone()
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
         if row is None or int(row["is_current"]) != 1:
@@ -1070,6 +1098,7 @@ class RcaDeliveryStore:
         conn = self._connect()
         try:
             conn.execute("BEGIN")
+            self._validate_current_v14_activation_binding_tx(conn)
             row = conn.execute(
                 """
                 SELECT outbox.*,
@@ -1293,6 +1322,7 @@ class RcaDeliveryStore:
         conn = self._connect()
         try:
             conn.execute("BEGIN")
+            self._validate_current_v14_activation_binding_tx(conn)
             authority = self._owner_authorized_rerun_authority_tx(
                 conn,
                 business_key=business_key,
@@ -1446,32 +1476,37 @@ class RcaDeliveryStore:
 
         conn = self._connect_read_only()
         try:
+            conn.execute("BEGIN")
             if not self._table_exists(conn, "rca_activation_epochs"):
+                conn.commit()
                 return None
-            columns = self._table_columns_tx(conn, "rca_activation_epochs")
-            release_columns = (
-                "config_sha256",
-                "production_fingerprint",
-                "production_gate_receipt_sha256",
-            )
-            selected = ["epoch_id", "state"]
-            selected.extend(name for name in release_columns if name in columns)
             row = conn.execute(
-                f"SELECT {', '.join(selected)} FROM rca_activation_epochs "
-                "WHERE is_current = 1"
+                "SELECT * FROM rca_activation_epochs WHERE is_current = 1"
             ).fetchone()
+            if row is None:
+                conn.commit()
+                return None
+            RcaControlStore._v14_compat_activation_transition_binding_tx(
+                conn, epoch=row
+            )
+            binding = RcaControlStore._v14_compat_release_epoch_projection(row)
+            value = {
+                "epoch_id": str(row["epoch_id"]),
+                "state": str(row["state"]),
+                "config_sha256": str(row["config_sha256"] or ""),
+                "release_fingerprint_sha256": binding[
+                    "release_fingerprint_sha256"
+                ],
+                "release_note_sha256": binding["release_note_sha256"],
+            }
+            conn.commit()
+            return value
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
-        if row is None:
-            return None
-        return {
-            "epoch_id": str(row["epoch_id"]),
-            "state": str(row["state"]),
-            **{
-                name: str(row[name] or "") if name in selected else ""
-                for name in release_columns
-            },
-        }
 
     def validate_learning_lane_external_operation(
         self, *, business_key: str, generation: int, operation: str
@@ -1551,8 +1586,7 @@ class RcaDeliveryStore:
                 "epoch_id",
                 "state",
                 "is_current",
-                "production_fingerprint",
-                "production_gate_receipt_sha256",
+                *_V14_COMPAT_RELEASE_BINDING_COLUMNS,
             },
             "rca_activation_admission_ledger": {
                 "ledger_id",
@@ -1562,6 +1596,14 @@ class RcaDeliveryStore:
                 "business_key",
                 "submission_key",
                 "generation",
+            },
+            "rca_activation_transition_audit": {
+                "audit_id",
+                "epoch_id",
+                "from_state",
+                "to_state",
+                "binding_fingerprint",
+                "transitioned_at",
             },
             "business_triggers": {"activation_epoch_id", "activation_ledger_id"},
             "rca_outbox": {"activation_epoch_id", "activation_ledger_id"},
@@ -10218,8 +10260,9 @@ class RcaDeliveryStore:
                 "schema_ready": False,
                 "current_epoch_id": "",
                 "current_epoch_state": "unconfigured",
-                "production_fingerprint": "",
-                "production_gate_receipt_sha256": "",
+                "binding_valid": False,
+                "release_fingerprint_sha256": "",
+                "release_note_sha256": "",
                 "production_ready": False,
                 "processing_enabled": not activation_enforced,
                 "eligible_counts": dict(empty),
@@ -10227,31 +10270,43 @@ class RcaDeliveryStore:
                 "blocked_historical_counts": dict(empty),
             }
         epoch = conn.execute(
-            "SELECT epoch_id, state, production_fingerprint, "
-            "production_gate_receipt_sha256 "
-            "FROM rca_activation_epochs WHERE is_current = 1"
+            "SELECT * FROM rca_activation_epochs WHERE is_current = 1"
         ).fetchone()
         state = str(epoch["state"]) if epoch is not None else "unconfigured"
-        production_fingerprint = (
-            str(epoch["production_fingerprint"] or "") if epoch is not None else ""
+        binding_valid = False
+        release_binding = {
+            "release_fingerprint_sha256": "",
+            "release_note_sha256": "",
+        }
+        if epoch is not None:
+            try:
+                RcaControlStore._v14_compat_activation_transition_binding_tx(
+                    conn, epoch=epoch
+                )
+            except ActivationEpochError:
+                pass
+            else:
+                binding_valid = True
+                release_binding = (
+                    RcaControlStore._v14_compat_release_epoch_projection(epoch)
+                )
+        release_fingerprint_sha256 = release_binding[
+            "release_fingerprint_sha256"
+        ]
+        release_fingerprint_valid = (
+            re.fullmatch(r"[0-9a-f]{64}", release_fingerprint_sha256) is not None
+            and release_fingerprint_sha256 != "0" * 64
         )
-        production_fingerprint_valid = (
-            re.fullmatch(r"[0-9a-f]{64}", production_fingerprint) is not None
-            and production_fingerprint != "0" * 64
-        )
-        production_gate_receipt_sha256 = (
-            str(epoch["production_gate_receipt_sha256"] or "")
-            if epoch is not None
-            else ""
-        )
-        production_gate_receipt_valid = (
-            re.fullmatch(r"[0-9a-f]{64}", production_gate_receipt_sha256) is not None
-            and production_gate_receipt_sha256 != "0" * 64
+        release_note_sha256 = release_binding["release_note_sha256"]
+        release_note_valid = (
+            re.fullmatch(r"[0-9a-f]{64}", release_note_sha256) is not None
+            and release_note_sha256 != "0" * 64
         )
         production_ready = (
-            state == "steady_active"
-            and production_fingerprint_valid
-            and production_gate_receipt_valid
+            binding_valid
+            and state == "steady_active"
+            and release_fingerprint_valid
+            and release_note_valid
         )
         if not activation_enforced:
             return {
@@ -10259,8 +10314,9 @@ class RcaDeliveryStore:
                 "schema_ready": True,
                 "current_epoch_id": "",
                 "current_epoch_state": state,
-                "production_fingerprint": production_fingerprint,
-                "production_gate_receipt_sha256": production_gate_receipt_sha256,
+                "binding_valid": binding_valid,
+                "release_fingerprint_sha256": release_fingerprint_sha256,
+                "release_note_sha256": release_note_sha256,
                 "production_ready": production_ready,
                 "processing_enabled": True,
                 "eligible_counts": dict(empty),
@@ -10342,10 +10398,13 @@ class RcaDeliveryStore:
             "schema_ready": True,
             "current_epoch_id": str(epoch["epoch_id"]) if epoch is not None else "",
             "current_epoch_state": state,
-            "production_fingerprint": production_fingerprint,
-            "production_gate_receipt_sha256": production_gate_receipt_sha256,
+            "binding_valid": binding_valid,
+            "release_fingerprint_sha256": release_fingerprint_sha256,
+            "release_note_sha256": release_note_sha256,
             "production_ready": production_ready,
-            "processing_enabled": state in ACTIVATION_DELIVERY_STATES,
+            "processing_enabled": (
+                binding_valid and state in ACTIVATION_DELIVERY_STATES
+            ),
             "eligible_counts": {
                 name: values["eligible"] for name, values in sorted(rows.items())
             },
@@ -10998,24 +11057,29 @@ class RcaDeliveryStore:
                     activation["required"]
                     and activation["current_epoch_state"] != "steady_active"
                 ),
-                "activation_fingerprint_invalid": int(
+                "activation_binding_invalid": int(
+                    activation["required"]
+                    and bool(activation["current_epoch_id"])
+                    and not activation["binding_valid"]
+                ),
+                "release_fingerprint_invalid": int(
                     activation["required"]
                     and not (
                         re.fullmatch(
                             r"[0-9a-f]{64}",
-                            str(activation["production_fingerprint"]),
+                            str(activation["release_fingerprint_sha256"]),
                         )
-                        and activation["production_fingerprint"] != "0" * 64
+                        and activation["release_fingerprint_sha256"] != "0" * 64
                     )
                 ),
-                "activation_gate_receipt_invalid": int(
+                "release_note_invalid": int(
                     activation["required"]
                     and not (
                         re.fullmatch(
                             r"[0-9a-f]{64}",
-                            str(activation["production_gate_receipt_sha256"]),
+                            str(activation["release_note_sha256"]),
                         )
-                        and activation["production_gate_receipt_sha256"] != "0" * 64
+                        and activation["release_note_sha256"] != "0" * 64
                     )
                 ),
                 "uncertain_effects": business_blockers["uncertain_effects"],

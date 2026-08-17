@@ -348,8 +348,10 @@ def validate_resident_release_note(
     note_sha256 = hashlib.sha256(raw).hexdigest()
     fingerprint = str(note.get("release_fingerprint_sha256") or "").strip()
     # This is a one-way v1 contract: legacy activation receipts are not release notes.
-    epoch_fingerprint = str(epoch.get("production_fingerprint") or "").strip()
-    epoch_receipt = str(epoch.get("production_gate_receipt_sha256") or "").strip()
+    epoch_fingerprint = str(
+        epoch.get("release_fingerprint_sha256") or ""
+    ).strip()
+    epoch_receipt = str(epoch.get("release_note_sha256") or "").strip()
     identity = validated_identity["release_identity"]
     if (
         _SHA256_RE.fullmatch(fingerprint) is None

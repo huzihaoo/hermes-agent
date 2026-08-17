@@ -42,7 +42,7 @@ from gateway.pnc_rca_write_fence import (
 
 SCHEMA = "pnc_rca_minimal_release_driver_v1"
 NOTE_SCHEMA = MINIMAL_RELEASE_NOTE_SCHEMA_VERSION
-RECEIPT_SCHEMA = "pnc_rca_minimal_release_apply_receipt_v1"
+RECEIPT_SCHEMA = "pnc_rca_minimal_release_apply_receipt_v2"
 TERMINAL_FAILURE_SCHEMA = "pnc_rca_minimal_release_terminal_failure_v1"
 EXECUTION_READBACK_SCHEMA = "pnc_rca_execution_identity_readback_v1"
 PRODUCTION_DEFINITION = MINIMAL_RELEASE_PRODUCTION_DEFINITION
@@ -731,8 +731,8 @@ def _bound_binding(note_raw: bytes, note: Mapping[str, Any]) -> dict:
         raise ReleaseError("release_note_activation_binding_invalid")
     return {
         "epoch_id": activation["epoch_id"],
-        "release_fingerprint": note["release_fingerprint_sha256"],
-        "release_binding_sha256": _sha(note_raw),
+        "release_fingerprint_sha256": note["release_fingerprint_sha256"],
+        "release_note_sha256": _sha(note_raw),
         "config_sha256": note["runtime_projection"]["env_sha256"],
         "db_logical_identity": dict(db_identity),
         "db_logical_identity_sha256": activation["db_logical_identity_sha256"],
@@ -804,25 +804,14 @@ def _open_delivery_store(path: Path) -> RcaDeliveryStore:
 
 
 def _activation_expected(binding: Mapping[str, Any]) -> dict[str, str]:
-    # The two capsule-named keys are historical ControlStore schema columns.
-    # They are checked for compatibility but never exposed as release concepts.
-    fingerprint = binding["release_fingerprint"]
-    note_sha = binding["release_binding_sha256"]
-    fence_sha = binding["partition_start_fence_sha256"]
     return {
         "state": "steady_active",
-        "preauthorization_fingerprint": fingerprint,
-        "preauthorization_gate_receipt_sha256": note_sha,
-        "preauthorization_capsule_sha256": note_sha,
-        "preproduction_fingerprint": fingerprint,
-        "preproduction_gate_receipt_sha256": note_sha,
-        "preproduction_capsule_sha256": note_sha,
+        "release_fingerprint_sha256": binding["release_fingerprint_sha256"],
+        "release_note_sha256": binding["release_note_sha256"],
         "config_sha256": binding["config_sha256"],
         "db_logical_identity_sha256": binding["db_logical_identity_sha256"],
-        "partition_start_fence_sha256": fence_sha,
-        "partition_end_fence_sha256": fence_sha,
-        "production_fingerprint": fingerprint,
-        "production_gate_receipt_sha256": note_sha,
+        "partition_start_fence_sha256": binding["partition_start_fence_sha256"],
+        "partition_end_fence_sha256": binding["partition_start_fence_sha256"],
     }
 
 
@@ -834,8 +823,8 @@ def _public_epoch(epoch: Mapping[str, Any]) -> dict:
         "db_logical_identity_sha256",
         "partition_start_fence_sha256",
         "partition_end_fence_sha256",
-        "production_fingerprint",
-        "production_gate_receipt_sha256",
+        "release_fingerprint_sha256",
+        "release_note_sha256",
         "updated_at",
     )
     return {key: epoch.get(key) for key in keys}
@@ -913,8 +902,8 @@ def _activation_plan(
         "epoch_id": binding["epoch_id"],
         "would_change": change,
         "predecessor_inflight": inflight,
-        "release_fingerprint": binding["release_fingerprint"],
-        "release_note_sha256": binding["release_binding_sha256"],
+        "release_fingerprint_sha256": binding["release_fingerprint_sha256"],
+        "release_note_sha256": binding["release_note_sha256"],
         "config_sha256": binding["config_sha256"],
     }
 
@@ -931,8 +920,8 @@ def _activation_apply(
             Path(activation["control_db_path"]), False
         ).activate_direct_steady_epoch(
             epoch_id=binding["epoch_id"],
-            release_fingerprint=binding["release_fingerprint"],
-            release_binding_sha256=binding["release_binding_sha256"],
+            release_fingerprint_sha256=binding["release_fingerprint_sha256"],
+            release_note_sha256=binding["release_note_sha256"],
             config_sha256=binding["config_sha256"],
             db_logical_identity=binding["db_logical_identity"],
             partition_start_fence=binding["partition_start_fence"],
@@ -2935,9 +2924,10 @@ def _validate_completed_apply_receipt(
         "state_path": note["canary"]["state_path"],
         "submitted_by_driver": False,
     }
+    if receipt.get("schema_version") != RECEIPT_SCHEMA:
+        raise ReleaseError("apply_receipt_schema_unsupported")
     if (
         set(receipt) != expected_keys
-        or receipt.get("schema_version") != RECEIPT_SCHEMA
         or receipt.get("transaction_state") != "completed"
         or receipt.get("ok") is not True
         or receipt.get("mode") != "apply"

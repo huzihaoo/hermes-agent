@@ -135,8 +135,8 @@ def _release_note(tmp_path):
         "config_sha256": env_sha256,
         "epoch_id": "epoch-1",
         "state": "steady_active",
-        "production_fingerprint": fingerprint,
-        "production_gate_receipt_sha256": note_sha256,
+        "release_fingerprint_sha256": fingerprint,
+        "release_note_sha256": note_sha256,
     }
     return SimpleNamespace(
         env_path=env_path,
@@ -170,7 +170,7 @@ def test_resident_release_note_binds_epoch_runtime_and_manifest(tmp_path):
         "release_id": "rca-r15av-test",
         "release_fingerprint_sha256": fixture.fingerprint,
         "release_note_path": str(fixture.path),
-        "release_note_sha256": fixture.epoch["production_gate_receipt_sha256"],
+        "release_note_sha256": fixture.epoch["release_note_sha256"],
         "runtime_root": str(fixture.runtime_root),
         "runtime_commit": fixture.runtime_commit,
         "runtime_tree": fixture.runtime_tree,
@@ -194,9 +194,9 @@ def test_resident_release_note_binds_epoch_runtime_and_manifest(tmp_path):
 def test_resident_release_note_rejects_identity_drift(tmp_path, mutation, code):
     fixture = _release_note(tmp_path)
     if mutation == "fingerprint":
-        fixture.epoch["production_fingerprint"] = "d" * 64
+        fixture.epoch["release_fingerprint_sha256"] = "d" * 64
     elif mutation == "receipt":
-        fixture.epoch["production_gate_receipt_sha256"] = "d" * 64
+        fixture.epoch["release_note_sha256"] = "d" * 64
     elif mutation == "root":
         fixture.runtime_root = tmp_path / "other-host-release"
     elif mutation == "commit":
@@ -249,8 +249,8 @@ def test_resident_release_note_requires_gitlab_only_identity_and_definition(
     else:
         fixture.note["release_id"] = "INVALID RELEASE"
     fingerprint, receipt = _seal_release_note(fixture.path, fixture.note)
-    fixture.epoch["production_fingerprint"] = fingerprint
-    fixture.epoch["production_gate_receipt_sha256"] = receipt
+    fixture.epoch["release_fingerprint_sha256"] = fingerprint
+    fixture.epoch["release_note_sha256"] = receipt
 
     with pytest.raises(ExternalWriteFenceError) as exc:
         validate_resident_release_note(
@@ -281,8 +281,8 @@ def test_resident_release_note_rejects_incomplete_release_identity(
     fixture = _release_note(tmp_path)
     fixture.note["release_identity"][role].pop("remote_tag_object")
     fingerprint, receipt = _seal_release_note(fixture.path, fixture.note)
-    fixture.epoch["production_fingerprint"] = fingerprint
-    fixture.epoch["production_gate_receipt_sha256"] = receipt
+    fixture.epoch["release_fingerprint_sha256"] = fingerprint
+    fixture.epoch["release_note_sha256"] = receipt
 
     with pytest.raises(ExternalWriteFenceError) as exc:
         validate_resident_release_note(
@@ -318,7 +318,7 @@ def test_bound_resident_release_rejects_startup_binding_drift(tmp_path, drift):
         "live_env_path": fixture.env_path,
         "expected_epoch_id": fixture.epoch["epoch_id"],
         "expected_fingerprint": fixture.fingerprint,
-        "expected_note_sha256": fixture.epoch["production_gate_receipt_sha256"],
+        "expected_note_sha256": fixture.epoch["release_note_sha256"],
     }
     assert validate_bound_resident_release(Store(), **kwargs)["epoch_id"] == "epoch-1"
     if drift == "epoch":
@@ -399,8 +399,8 @@ def test_resident_release_note_rejects_note_and_store_bound_to_same_clone_db(tmp
     clone = tmp_path / "clone.sqlite3"
     fixture.note["activation"]["control_db_path"] = str(clone)
     fingerprint, receipt = _seal_release_note(fixture.path, fixture.note)
-    fixture.epoch["production_fingerprint"] = fingerprint
-    fixture.epoch["production_gate_receipt_sha256"] = receipt
+    fixture.epoch["release_fingerprint_sha256"] = fingerprint
+    fixture.epoch["release_note_sha256"] = receipt
 
     with pytest.raises(ExternalWriteFenceError) as exc:
         validate_resident_release_note(

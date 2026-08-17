@@ -733,6 +733,38 @@ def test_steady_health_requires_hmac_and_has_no_expiring_authorization(tmp_path)
     })
 
 
+def test_activation_required_health_is_red_without_current_epoch(tmp_path):
+    env = _config_env(tmp_path, enabled=True)
+    env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"
+    config = dispatcher.DispatcherConfig.from_env(env, hermes_home=tmp_path)
+    store = RcaControlStore(config.control_db_path)
+    workspace_runtime = dispatcher.WorkspaceRuntimeIdentity(
+        root=tmp_path / "workspace-runtime",
+        manifest_path=tmp_path / "workspace-runtime" / "manifest.json",
+        creator_path=tmp_path / "workspace-runtime" / "bin" / "create_task_v2.py",
+        manifest_sha256="a" * 64,
+        closure_sha256="b" * 64,
+        source_commit="c" * 40,
+        file_sha256={path: "d" * 64 for path in dispatcher.WORKSPACE_RUNTIME_FILES},
+    )
+    reporter = dispatcher.HealthReporter(
+        config,
+        store,
+        workspace_runtime_observer=lambda: workspace_runtime,
+        admission_key_fingerprint_observer=lambda: "e" * 64,
+    )
+
+    reporter.write(state="idle", stats=dispatcher.DispatchStats())
+
+    payload = json.loads(config.health_path.read_text(encoding="utf-8"))
+    assert payload["store"]["ok"] is True
+    assert payload["store"]["activation"]["configured"] is False
+    assert payload["store"]["activation"]["production_active"] is False
+    assert payload["ok"] is False
+    assert payload["healthy"] is False
+    assert payload["readiness"]["ready_for_dispatch"] is False
+
+
 def test_capacity_guard_fails_before_claim_when_admission_key_is_invalid(tmp_path):
     config = dispatcher.DispatcherConfig.from_env(
         _config_env(tmp_path, enabled=True), hermes_home=tmp_path

@@ -25,8 +25,8 @@ def test_kafka_terminal_rerun_contract_crosses_control_outbox_and_collector(
     store = RcaControlStore(tmp_path / "control.sqlite3")
     epoch = store.activate_direct_steady_epoch(
         epoch_id="rca-kafka-retrigger-contract-steady",
-        release_fingerprint="1" * 64,
-        release_binding_sha256="2" * 64,
+        release_fingerprint_sha256="1" * 64,
+        release_note_sha256="2" * 64,
         config_sha256="3" * 64,
         db_logical_identity={"database": "kafka-retrigger-contract"},
         partition_start_fence={TOPIC: {"2": 0}},
