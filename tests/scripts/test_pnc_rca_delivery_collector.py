@@ -31,6 +31,7 @@ from tests.gateway.test_pnc_rca_delivery_store import (
     _insert_subscription,
 )
 from tests.gateway.test_pnc_rca_w3_snapshot import _runtime_authority
+from tests.gateway.test_pnc_rca_write_fence import _release_note
 
 
 def _config_env(tmp_path) -> dict[str, str]:
@@ -45,6 +46,31 @@ def _config_env(tmp_path) -> dict[str, str]:
         "HERMES_RCA_DELIVERY_COLLECTOR_LEASE_SECONDS": "60",
         "HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED": "true",
     }
+
+
+def _bind_minimal_release(control, fixture, *, epoch_id="delivery-epoch-1"):
+    fixture.epoch["epoch_id"] = epoch_id
+    with sqlite3.connect(control.db_path) as conn:
+        updated = conn.execute(
+            "UPDATE rca_activation_epochs "
+            "SET state = 'steady_active', config_sha256 = ?, "
+            "production_fingerprint = ?, production_gate_receipt_sha256 = ? "
+            "WHERE epoch_id = ? AND is_current = 1",
+            (
+                fixture.env_sha256,
+                fixture.fingerprint,
+                fixture.epoch["production_gate_receipt_sha256"],
+                epoch_id,
+            ),
+        )
+    assert updated.rowcount == 1
+
+
+def _set_live_release_environment(monkeypatch, fixture):
+    monkeypatch.setenv("PNC_LIVE_RUNTIME_ROOT", str(fixture.runtime_root))
+    monkeypatch.setenv("PNC_LIVE_RUNTIME_COMMIT", fixture.runtime_commit)
+    monkeypatch.setenv("PNC_LIVE_RUNTIME_TREE", fixture.runtime_tree)
+    monkeypatch.setenv("PNC_LIVE_MANIFEST_SHA256", fixture.manifest_sha256)
 
 
 def _json_bytes(value) -> bytes:
@@ -756,6 +782,147 @@ def test_enabled_resident_without_epoch_exits_before_collector_creation(
     assert constructed is False
     assert delivery.list_rows("rca_delivery_effects") == []
     assert "resident_activation_epoch_missing" in capsys.readouterr().out
+
+
+def test_enabled_startup_locks_minimal_release_before_writable_collector(
+    tmp_path,
+    monkeypatch,
+):
+    control, result = _control(tmp_path)
+    _bind_activation_execution(control, result, state="steady_active")
+    RcaDeliveryStore(control.db_path)
+    fixture = _release_note(tmp_path)
+    _bind_minimal_release(control, fixture)
+    _set_live_release_environment(monkeypatch, fixture)
+    config = replace(
+        collector.CollectorConfig.from_env(
+            _config_env(tmp_path),
+            hermes_home=tmp_path,
+        ),
+        release_note_path=fixture.path,
+    )
+    events = []
+    captured = {}
+    real_store = collector.RcaDeliveryStore
+    real_validate = collector.validate_bound_resident_release
+
+    def tracked_store(*args, **kwargs):
+        events.append(
+            (
+                "store",
+                kwargs.get("read_only", False),
+                kwargs.get("ensure_current_rows", True),
+            )
+        )
+        return real_store(*args, **kwargs)
+
+    def tracked_validate(*args, **kwargs):
+        events.append(("validate",))
+        return real_validate(*args, **kwargs)
+
+    def constructed_collector(*, store, config):
+        events.append(("collector",))
+        captured["config"] = config
+        return SimpleNamespace(store=store, config=config)
+
+    monkeypatch.setattr(
+        RcaControlStore,
+        "_create_read_only_snapshot",
+        lambda _self: pytest.fail("normal startup must not copy the control DB"),
+    )
+    monkeypatch.setattr(collector, "RcaDeliveryStore", tracked_store)
+    monkeypatch.setattr(
+        collector, "validate_bound_resident_release", tracked_validate
+    )
+    monkeypatch.setattr(
+        collector, "load_collector_environment", lambda: fixture.env_path
+    )
+    monkeypatch.setattr(
+        collector.CollectorConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(collector, "DeliveryCollector", constructed_collector)
+    monkeypatch.setattr(collector, "run_collector_loop", lambda *_args, **_kwargs: 0)
+
+    assert collector.main(["--once"]) == 0
+    assert events == [
+        ("store", True, False),
+        ("validate",),
+        ("store", False, True),
+        ("collector",),
+    ]
+    locked = captured["config"]
+    assert locked.resident_release_enforced is True
+    assert locked.release_id == fixture.note["release_id"]
+    assert locked.release_epoch_id == fixture.epoch["epoch_id"]
+    assert locked.release_fingerprint_sha256 == fixture.fingerprint
+    assert (
+        locked.release_note_sha256
+        == fixture.epoch["production_gate_receipt_sha256"]
+    )
+
+
+def test_collector_epoch_switch_rejects_batch_before_backfill_or_claim(
+    tmp_path,
+    monkeypatch,
+):
+    control, result = _control(tmp_path)
+    _bind_activation_execution(control, result, state="steady_active")
+    store = RcaDeliveryStore(control.db_path)
+    fixture = _release_note(tmp_path)
+    _bind_minimal_release(control, fixture)
+    _set_live_release_environment(monkeypatch, fixture)
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "false"
+    base = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
+    binding = collector.validate_bound_resident_release(
+        store,
+        release_note_path=fixture.path,
+        runtime_root=fixture.runtime_root,
+        runtime_commit=fixture.runtime_commit,
+        runtime_tree=fixture.runtime_tree,
+        live_manifest_sha256=fixture.manifest_sha256,
+        live_env_path=fixture.env_path,
+    )
+    config = replace(
+        base,
+        release_note_path=fixture.path,
+        release_env_path=fixture.env_path,
+        resident_release_enforced=True,
+        release_id=binding["release_id"],
+        release_epoch_id=binding["epoch_id"],
+        release_fingerprint_sha256=binding["release_fingerprint_sha256"],
+        release_note_sha256=binding["release_note_sha256"],
+    )
+    provider_calls = []
+    instance = collector.DeliveryCollector(
+        store=store,
+        config=config,
+        status_reader=lambda *_args: provider_calls.append("status"),
+    )
+    assert instance._validate_runtime_release()["epoch_id"] == "delivery-epoch-1"
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET epoch_id = 'delivery-epoch-2' "
+            "WHERE is_current = 1"
+        )
+    monkeypatch.setattr(
+        store,
+        "backfill_completed_submissions",
+        lambda **_kwargs: pytest.fail("backfill ran after release epoch drift"),
+    )
+    monkeypatch.setattr(
+        store,
+        "claim_due_watch",
+        lambda **_kwargs: pytest.fail("claim ran after release epoch drift"),
+    )
+
+    with pytest.raises(collector.ExternalWriteFenceError) as exc:
+        instance.collect_batch()
+
+    assert exc.value.code == "resident_release_binding_changed"
+    assert provider_calls == []
 
 
 @pytest.mark.parametrize("value", ["1", "0", "yes", "on", "off", ""])

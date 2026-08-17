@@ -36,10 +36,6 @@ from gateway.pnc_rca_delivery_contract import (
     validate_card_patch_effect_payload,
     validate_delivery_subscription_target,
 )
-from gateway.pnc_rca_delivery_quarantine_baseline import (
-    BASELINE_NAME as DELIVERY_QUARANTINE_BASELINE_NAME,
-    quarantine_baseline_status_tx,
-)
 from gateway.pnc_rca_delivery_observability import validate_delivery_observation
 from gateway.pnc_rca_control_store import (
     OUTBOX_CIRCUIT_RESET_SCHEMA_VERSION,
@@ -1466,6 +1462,29 @@ class RcaDeliveryStore:
                 raise
         return conn
 
+    def _connect_read_only(self) -> sqlite3.Connection:
+        """Open a lightweight live read without mutating SQLite journal state."""
+
+        if self.require_current:
+            self._validate_runtime_fences()
+        conn = sqlite3.connect(
+            f"{self.db_path.resolve().as_uri()}?mode=ro",
+            uri=True,
+            timeout=self.busy_timeout_ms / 1000,
+            isolation_level=None,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA query_only=ON")
+        if self.require_current:
+            try:
+                self._validate_runtime_fences()
+            except RuntimeError:
+                conn.close()
+                raise
+        return conn
+
     def validate_external_write_fence_binding(
         self,
         fence: Mapping[str, Any],
@@ -1476,7 +1495,7 @@ class RcaDeliveryStore:
         admission_key = str(fence.get("admission_key") or "").strip()
         if not epoch_id or isinstance(ledger_id, bool) or not isinstance(ledger_id, int) or not admission_key:
             raise RuntimeError("external_write_fence_schema_invalid")
-        conn = self._connect()
+        conn = self._connect_read_only()
         try:
             row = conn.execute(
                 """
@@ -1954,21 +1973,36 @@ class RcaDeliveryStore:
         return observed.astimezone(timezone.utc) < boundary.astimezone(timezone.utc)
 
     def activation_epoch(self) -> dict[str, Any] | None:
-        """Return the current epoch identity for resident safe-off checks."""
+        """Return the current epoch and its minimal production release binding."""
 
-        conn = self._connect()
+        conn = self._connect_read_only()
         try:
             if not self._table_exists(conn, "rca_activation_epochs"):
                 return None
+            columns = self._table_columns_tx(conn, "rca_activation_epochs")
+            release_columns = (
+                "config_sha256",
+                "production_fingerprint",
+                "production_gate_receipt_sha256",
+            )
+            selected = ["epoch_id", "state"]
+            selected.extend(name for name in release_columns if name in columns)
             row = conn.execute(
-                "SELECT epoch_id, state FROM rca_activation_epochs "
+                f"SELECT {', '.join(selected)} FROM rca_activation_epochs "
                 "WHERE is_current = 1"
             ).fetchone()
         finally:
             conn.close()
         if row is None:
             return None
-        return {"epoch_id": str(row["epoch_id"]), "state": str(row["state"])}
+        return {
+            "epoch_id": str(row["epoch_id"]),
+            "state": str(row["state"]),
+            **{
+                name: str(row[name] or "") if name in selected else ""
+                for name in release_columns
+            },
+        }
 
     def validate_learning_lane_external_operation(
         self, *, business_key: str, generation: int, operation: str
@@ -2044,7 +2078,13 @@ class RcaDeliveryStore:
         if not _ACTIVATION_REQUIRED_TABLES.issubset(present):
             return False
         required_columns = {
-            "rca_activation_epochs": {"epoch_id", "state", "is_current"},
+            "rca_activation_epochs": {
+                "epoch_id",
+                "state",
+                "is_current",
+                "production_fingerprint",
+                "production_gate_receipt_sha256",
+            },
             "rca_activation_budget_slots": {
                 "epoch_id",
                 "slot_kind",
@@ -11346,21 +11386,50 @@ class RcaDeliveryStore:
                 "schema_ready": False,
                 "current_epoch_id": "",
                 "current_epoch_state": "unconfigured",
+                "production_fingerprint": "",
+                "production_gate_receipt_sha256": "",
+                "production_ready": False,
                 "processing_enabled": not activation_enforced,
                 "eligible_counts": dict(empty),
                 "held_current_counts": dict(empty),
                 "blocked_historical_counts": dict(empty),
             }
         epoch = conn.execute(
-            "SELECT epoch_id, state FROM rca_activation_epochs WHERE is_current = 1"
+            "SELECT epoch_id, state, production_fingerprint, "
+            "production_gate_receipt_sha256 "
+            "FROM rca_activation_epochs WHERE is_current = 1"
         ).fetchone()
         state = str(epoch["state"]) if epoch is not None else "unconfigured"
+        production_fingerprint = (
+            str(epoch["production_fingerprint"] or "") if epoch is not None else ""
+        )
+        production_fingerprint_valid = (
+            re.fullmatch(r"[0-9a-f]{64}", production_fingerprint) is not None
+            and production_fingerprint != "0" * 64
+        )
+        production_gate_receipt_sha256 = (
+            str(epoch["production_gate_receipt_sha256"] or "")
+            if epoch is not None
+            else ""
+        )
+        production_gate_receipt_valid = (
+            re.fullmatch(r"[0-9a-f]{64}", production_gate_receipt_sha256) is not None
+            and production_gate_receipt_sha256 != "0" * 64
+        )
+        production_ready = (
+            state == "steady_active"
+            and production_fingerprint_valid
+            and production_gate_receipt_valid
+        )
         if not activation_enforced:
             return {
                 "required": False,
                 "schema_ready": True,
                 "current_epoch_id": "",
                 "current_epoch_state": state,
+                "production_fingerprint": production_fingerprint,
+                "production_gate_receipt_sha256": production_gate_receipt_sha256,
+                "production_ready": production_ready,
                 "processing_enabled": True,
                 "eligible_counts": dict(empty),
                 "held_current_counts": dict(empty),
@@ -11441,6 +11510,9 @@ class RcaDeliveryStore:
             "schema_ready": True,
             "current_epoch_id": str(epoch["epoch_id"]) if epoch is not None else "",
             "current_epoch_state": state,
+            "production_fingerprint": production_fingerprint,
+            "production_gate_receipt_sha256": production_gate_receipt_sha256,
+            "production_ready": production_ready,
             "processing_enabled": state in ACTIVATION_DELIVERY_STATES,
             "eligible_counts": {
                 name: values["eligible"] for name, values in sorted(rows.items())
@@ -11663,12 +11735,6 @@ class RcaDeliveryStore:
         *,
         now: datetime | None = None,
         activation_required: bool = False,
-        quarantine_baseline_path: str | Path | None = None,
-        expected_quarantine_baseline_sha256: str = "",
-        quarantine_release_id: str = "",
-        quarantine_bootstrap_epoch_id: str = "",
-        quarantine_active_release_binding_path: str | Path = "",
-        quarantine_live_env_path: str | Path = "",
     ) -> dict[str, Any]:
         self._validate_activation_required(activation_required)
         current_dt = _utc_datetime(now)
@@ -11676,7 +11742,7 @@ class RcaDeliveryStore:
         stalled_cutoff = _iso(
             current_dt - timedelta(seconds=DELIVERY_WATCH_SLA_SECONDS)
         )
-        conn = self._connect()
+        conn = self._connect_read_only()
         try:
             conn.execute("BEGIN")
             activation = self._activation_health_tx(
@@ -11852,21 +11918,6 @@ class RcaDeliveryStore:
                     (stalled_cutoff,),
                 ).fetchone()[0]
             )
-            quarantine_baseline = quarantine_baseline_status_tx(
-                conn,
-                db_path=self.db_path,
-                baseline_path=(
-                    quarantine_baseline_path
-                    if quarantine_baseline_path is not None
-                    else self.db_path.parent / DELIVERY_QUARANTINE_BASELINE_NAME
-                ),
-                expected_sha256=expected_quarantine_baseline_sha256,
-                expected_release_id=quarantine_release_id,
-                bootstrap_epoch_id=quarantine_bootstrap_epoch_id,
-                active_release_binding_path=quarantine_active_release_binding_path,
-                live_env_path=quarantine_live_env_path,
-            )
-            unacknowledged_quarantine = quarantine_baseline["unacknowledged"]
             business_blockers = {
                 "activation_schema_unavailable": int(
                     activation["required"] and not activation["schema_ready"]
@@ -11874,13 +11925,10 @@ class RcaDeliveryStore:
                 "stalled_watches": stalled_watch_count,
                 "terminal_failed_watches": int(watch.get("terminal_failed", 0)),
                 "quarantined_watches": int(watch.get("quarantined", 0)),
-                "quarantined_jobs": int(unacknowledged_quarantine["jobs"]),
+                "quarantined_jobs": int(jobs.get("quarantined", 0)),
                 "uncertain_effects": uncertain_effect_blockers,
-                "quarantined_effects": int(unacknowledged_quarantine["effects"]),
-                "quarantined_subscriptions": int(
-                    unacknowledged_quarantine["subscriptions"]
-                ),
-                "quarantine_baseline_invalid": int(not quarantine_baseline["ready"]),
+                "quarantined_effects": int(effects.get("quarantined", 0)),
+                "quarantined_subscriptions": int(subscriptions.get("quarantined", 0)),
                 "pending_required_subscriptions": pending_required_subscriptions,
                 "unresolved_required_effects": unresolved_required_effects,
                 "outcome_slo_breached": int(not outcome_slo["healthy"]),
@@ -11889,22 +11937,36 @@ class RcaDeliveryStore:
                 ),
             }
             # Keep ordinary backlog and historical outcome counts visible without
-            # turning them into admission gates.  The release-scoped quarantine
-            # baseline is different: missing authority or rows outside its exact
-            # acknowledged snapshot make a new external write unsafe.
+            # turning them into admission gates.
             production_blockers = {
                 "activation_schema_unavailable": business_blockers[
                     "activation_schema_unavailable"
                 ],
+                "activation_epoch_not_steady": int(
+                    activation["required"]
+                    and activation["current_epoch_state"] != "steady_active"
+                ),
+                "activation_fingerprint_invalid": int(
+                    activation["required"]
+                    and not (
+                        re.fullmatch(
+                            r"[0-9a-f]{64}",
+                            str(activation["production_fingerprint"]),
+                        )
+                        and activation["production_fingerprint"] != "0" * 64
+                    )
+                ),
+                "activation_gate_receipt_invalid": int(
+                    activation["required"]
+                    and not (
+                        re.fullmatch(
+                            r"[0-9a-f]{64}",
+                            str(activation["production_gate_receipt_sha256"]),
+                        )
+                        and activation["production_gate_receipt_sha256"] != "0" * 64
+                    )
+                ),
                 "uncertain_effects": business_blockers["uncertain_effects"],
-                "quarantined_jobs": business_blockers["quarantined_jobs"],
-                "quarantined_effects": business_blockers["quarantined_effects"],
-                "quarantined_subscriptions": business_blockers[
-                    "quarantined_subscriptions"
-                ],
-                "quarantine_baseline_invalid": business_blockers[
-                    "quarantine_baseline_invalid"
-                ],
                 "pending_delivery_observations": business_blockers[
                     "pending_delivery_observations"
                 ],
@@ -11938,7 +12000,6 @@ class RcaDeliveryStore:
                 "delivery_subscriptions": subscriptions,
                 "delivery_subscription_reasons": subscription_reasons,
                 "delivery_subscription_events": subscription_events,
-                "delivery_quarantine": quarantine_baseline,
                 "delivery_dispatcher_circuit": circuit,
                 "delivery_dispatcher_circuits": circuits,
                 "activation": activation,

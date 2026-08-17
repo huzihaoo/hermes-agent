@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -66,11 +66,6 @@ from gateway.pnc_rca_abstention_projection import (
     build_gate_a_public_result,
     project_gate_a_report,
 )
-from gateway.pnc_rca_delivery_quarantine_baseline import (
-    disabled_quarantine_baseline_status,
-    quarantine_baseline_settings,
-    read_quarantine_baseline_status,
-)
 from gateway.pnc_rca_delivery_store import (
     DeliveryRecordConflictError,
     ExecutionWatchClaim,
@@ -98,7 +93,7 @@ from gateway.pnc_rca_snapshot import (
 from gateway.pnc_rca_write_fence import (
     ExternalWriteFenceError,
     canonical_write_fence_sha256,
-    require_resident_activation_epoch,
+    validate_bound_resident_release,
     validate_write_fence,
     validate_write_fence_source_binding,
     write_fence_binding,
@@ -441,15 +436,16 @@ class CollectorConfig:
     ssh_mini_agent: str
     artifact_read_timeout_seconds: int
     terminal_artifact_grace_seconds: int
-    quarantine_baseline_path: Path
-    quarantine_baseline_sha256: str
-    quarantine_release_id: str
-    quarantine_bootstrap_epoch_id: str
-    quarantine_active_release_binding_path: Path
-    quarantine_live_env_path: Path
     failure_route_outlet_root: Path
     failure_route_outlet_lease_seconds: int
     failure_route_outlet_max_attempts: int
+    release_note_path: Path = Path()
+    release_env_path: Path = Path()
+    resident_release_enforced: bool = False
+    release_id: str = ""
+    release_epoch_id: str = ""
+    release_fingerprint_sha256: str = ""
+    release_note_sha256: str = ""
     capacity_sample_enabled: bool = False
     capacity_sample_batch_size: int = 20
     capacity_sample_lock_timeout_seconds: int = 5
@@ -539,11 +535,6 @@ class CollectorConfig:
                 control_db_path.parent / "failure-route-outlet",
             )
         ).expanduser()
-        quarantine = quarantine_baseline_settings(
-            source,
-            hermes_home=home,
-            control_db_path=control_db_path,
-        )
         w3_snapshot_read_mode, w3_snapshot_authority = (
             w3_snapshot_read_config_from_env(source)
         )
@@ -581,14 +572,6 @@ class CollectorConfig:
             terminal_artifact_grace_seconds=_integer(
                 source, f"{ENV_PREFIX}TERMINAL_ARTIFACT_GRACE_SECONDS", 900
             ),
-            quarantine_baseline_path=quarantine.baseline_path,
-            quarantine_baseline_sha256=quarantine.baseline_sha256,
-            quarantine_release_id=quarantine.release_id,
-            quarantine_bootstrap_epoch_id=quarantine.bootstrap_epoch_id,
-            quarantine_active_release_binding_path=(
-                quarantine.active_release_binding_path
-            ),
-            quarantine_live_env_path=quarantine.live_env_path,
             failure_route_outlet_root=failure_route_outlet_root,
             failure_route_outlet_lease_seconds=_integer(
                 source,
@@ -602,6 +585,12 @@ class CollectorConfig:
                 5,
                 minimum=1,
             ),
+            release_note_path=Path(
+                str(source.get("HERMES_RCA_RELEASE_NOTE_PATH", "") or "")
+            ).expanduser(),
+            release_env_path=Path(
+                str(source.get(f"{ENV_PREFIX}ENV_FILE", home / ".env") or "")
+            ).expanduser(),
             capacity_sample_enabled=capacity_sample_enabled,
             capacity_sample_batch_size=capacity_batch,
             capacity_sample_lock_timeout_seconds=_integer(
@@ -631,14 +620,13 @@ class CollectorConfig:
             "ssh_mini_agent": self.ssh_mini_agent,
             "artifact_read_timeout_seconds": self.artifact_read_timeout_seconds,
             "terminal_artifact_grace_seconds": self.terminal_artifact_grace_seconds,
-            "quarantine_baseline_path": str(self.quarantine_baseline_path),
-            "quarantine_baseline_sha256": self.quarantine_baseline_sha256,
-            "quarantine_release_id": self.quarantine_release_id,
-            "quarantine_bootstrap_epoch_id": self.quarantine_bootstrap_epoch_id,
-            "quarantine_active_release_binding_path": str(
-                self.quarantine_active_release_binding_path
-            ),
-            "quarantine_live_env_path": str(self.quarantine_live_env_path),
+            "release_note_path": str(self.release_note_path),
+            "release_env_path": str(self.release_env_path),
+            "resident_release_enforced": self.resident_release_enforced,
+            "release_id": self.release_id,
+            "release_epoch_id": self.release_epoch_id,
+            "release_fingerprint_sha256": self.release_fingerprint_sha256,
+            "release_note_sha256": self.release_note_sha256,
             "failure_route_outlet_root": str(self.failure_route_outlet_root),
             "failure_route_outlet": {
                 "root": str(self.failure_route_outlet_root),
@@ -2343,6 +2331,24 @@ class DeliveryCollector:
         )
         self.capacity_last_error = ""
         self.capacity_last_outcome = "disabled"
+        self.release_binding: dict[str, Any] = {}
+
+    def _validate_runtime_release(self) -> dict[str, Any]:
+        if not getattr(self.config, "resident_release_enforced", False):
+            return {}
+        self.release_binding = validate_bound_resident_release(
+            self.store,
+            release_note_path=self.config.release_note_path,
+            runtime_root=os.environ.get("PNC_LIVE_RUNTIME_ROOT", ""),
+            runtime_commit=os.environ.get("PNC_LIVE_RUNTIME_COMMIT", ""),
+            runtime_tree=os.environ.get("PNC_LIVE_RUNTIME_TREE", ""),
+            live_manifest_sha256=os.environ.get("PNC_LIVE_MANIFEST_SHA256", ""),
+            live_env_path=self.config.release_env_path,
+            expected_epoch_id=self.config.release_epoch_id,
+            expected_fingerprint=self.config.release_fingerprint_sha256,
+            expected_note_sha256=self.config.release_note_sha256,
+        )
+        return dict(self.release_binding)
 
     def _internal_failure_route_outlet(self) -> FailureRouteOutlet:
         if self._failure_route_outlet is None:
@@ -3095,6 +3101,7 @@ class DeliveryCollector:
         )
 
     def collect_batch(self) -> list[CollectOutcome]:
+        self._validate_runtime_release()
         self.backfill()
         outcomes: list[CollectOutcome] = []
         for _ in range(self.config.batch_size):
@@ -3515,17 +3522,27 @@ class HealthReporter:
             self._refresh_dependencies()
         store_health = self.store.health(
             activation_required=self.config.activation_required,
-            quarantine_baseline_path=self.config.quarantine_baseline_path,
-            expected_quarantine_baseline_sha256=(
-                self.config.quarantine_baseline_sha256
-            ),
-            quarantine_release_id=self.config.quarantine_release_id,
-            quarantine_bootstrap_epoch_id=(self.config.quarantine_bootstrap_epoch_id),
-            quarantine_active_release_binding_path=(
-                self.config.quarantine_active_release_binding_path
-            ),
-            quarantine_live_env_path=self.config.quarantine_live_env_path,
         )
+        release_binding: dict[str, Any] = {}
+        release_error = ""
+        if self.config.resident_release_enforced:
+            try:
+                release_binding = validate_bound_resident_release(
+                    self.store,
+                    release_note_path=self.config.release_note_path,
+                    runtime_root=os.environ.get("PNC_LIVE_RUNTIME_ROOT", ""),
+                    runtime_commit=os.environ.get("PNC_LIVE_RUNTIME_COMMIT", ""),
+                    runtime_tree=os.environ.get("PNC_LIVE_RUNTIME_TREE", ""),
+                    live_manifest_sha256=os.environ.get(
+                        "PNC_LIVE_MANIFEST_SHA256", ""
+                    ),
+                    live_env_path=self.config.release_env_path,
+                    expected_epoch_id=self.config.release_epoch_id,
+                    expected_fingerprint=self.config.release_fingerprint_sha256,
+                    expected_note_sha256=self.config.release_note_sha256,
+                )
+            except ExternalWriteFenceError as exc:
+                release_error = exc.code
         dependency_error = self.dependency_error
         payload = {
             "schema_version": HEALTH_SCHEMA_VERSION,
@@ -3535,6 +3552,7 @@ class HealthReporter:
                 and not error
                 and not dependency_error
                 and self.dependencies_ready
+                and not release_error
                 and (not self.config.enabled or store_health.get("ok") is True)
             ),
             "enabled": self.config.enabled,
@@ -3550,6 +3568,8 @@ class HealthReporter:
                 ),
             },
             "dependency_error": dependency_error,
+            "release": release_binding,
+            "release_error": release_error,
             "stats": asdict(stats),
             "capacity_samples": {
                 "enabled": self.config.capacity_sample_enabled,
@@ -3733,7 +3753,7 @@ def load_collector_environment(env_file: str | Path | None = None) -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_collector_environment()
+    loaded_env_path = load_collector_environment()
     args = _parser().parse_args(argv)
     try:
         config = CollectorConfig.from_env()
@@ -3741,24 +3761,42 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         return 2
     if args.check_config:
-        quarantine_baseline = (
-            read_quarantine_baseline_status(
-                config.control_db_path,
-                baseline_path=config.quarantine_baseline_path,
-                expected_sha256=config.quarantine_baseline_sha256,
-                expected_release_id=config.quarantine_release_id,
-                bootstrap_epoch_id=config.quarantine_bootstrap_epoch_id,
-                active_release_binding_path=(
-                    config.quarantine_active_release_binding_path
-                ),
-                live_env_path=config.quarantine_live_env_path,
-            )
-            if config.enabled
-            else disabled_quarantine_baseline_status(
-                baseline_path=config.quarantine_baseline_path,
-                expected_sha256=config.quarantine_baseline_sha256,
-            )
-        )
+        release_binding: dict[str, Any] = {}
+        store_health: dict[str, Any] = {"ok": True, "activation": {}}
+        if config.enabled:
+            try:
+                check_store = RcaDeliveryStore(
+                    config.control_db_path,
+                    require_current=True,
+                    read_only=True,
+                    ensure_current_rows=False,
+                )
+                release_binding = validate_bound_resident_release(
+                    check_store,
+                    release_note_path=config.release_note_path,
+                    runtime_root=os.environ.get("PNC_LIVE_RUNTIME_ROOT", ""),
+                    runtime_commit=os.environ.get("PNC_LIVE_RUNTIME_COMMIT", ""),
+                    runtime_tree=os.environ.get("PNC_LIVE_RUNTIME_TREE", ""),
+                    live_manifest_sha256=os.environ.get(
+                        "PNC_LIVE_MANIFEST_SHA256", ""
+                    ),
+                    live_env_path=loaded_env_path,
+                )
+                store_health = check_store.health(
+                    activation_required=config.activation_required
+                )
+            except (ExternalWriteFenceError, OSError, RuntimeError, sqlite3.Error) as exc:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": getattr(exc, "code", type(exc).__name__),
+                            "detail": str(exc),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 2
         try:
             remote_css_parser = probe_remote_css_parser(
                 config.ssh_mini_agent,
@@ -3779,7 +3817,11 @@ def main(argv: list[str] | None = None) -> int:
             enabled=config.enabled,
         )
         dependencies_ready = failure_route_outlet.get("ready") is True
-        ready = quarantine_baseline["ready"] and dependencies_ready
+        release_ready = (
+            not config.enabled
+            or store_health.get("activation", {}).get("production_ready") is True
+        )
+        ready = release_ready and dependencies_ready
         print(
             json.dumps(
                 {
@@ -3789,7 +3831,8 @@ def main(argv: list[str] | None = None) -> int:
                         "remote_css_parser": remote_css_parser,
                         "failure_route_outlet": failure_route_outlet,
                     },
-                    "quarantine_baseline": quarantine_baseline,
+                    "activation": store_health.get("activation", {}),
+                    "release": release_binding,
                 },
                 ensure_ascii=False,
             )
@@ -3804,8 +3847,53 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(payload, ensure_ascii=False))
         return 0 if healthy else 2
+    if config.enabled and not args.dry_run:
+        try:
+            gate_store = RcaDeliveryStore(
+                config.control_db_path,
+                require_current=True,
+                read_only=True,
+                ensure_current_rows=False,
+            )
+            release_binding = validate_bound_resident_release(
+                gate_store,
+                release_note_path=config.release_note_path,
+                runtime_root=os.environ.get("PNC_LIVE_RUNTIME_ROOT", ""),
+                runtime_commit=os.environ.get("PNC_LIVE_RUNTIME_COMMIT", ""),
+                runtime_tree=os.environ.get("PNC_LIVE_RUNTIME_TREE", ""),
+                live_manifest_sha256=os.environ.get("PNC_LIVE_MANIFEST_SHA256", ""),
+                live_env_path=loaded_env_path,
+            )
+        except (ExternalWriteFenceError, OSError, RuntimeError, sqlite3.Error) as exc:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": getattr(exc, "code", type(exc).__name__),
+                        "detail": str(exc),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+        config = replace(
+            config,
+            release_env_path=loaded_env_path,
+            resident_release_enforced=True,
+            release_id=release_binding["release_id"],
+            release_epoch_id=release_binding["epoch_id"],
+            release_fingerprint_sha256=release_binding[
+                "release_fingerprint_sha256"
+            ],
+            release_note_sha256=release_binding["release_note_sha256"],
+        )
     try:
-        store = RcaDeliveryStore(config.control_db_path, require_current=True)
+        store = RcaDeliveryStore(
+            config.control_db_path,
+            require_current=True,
+            read_only=args.dry_run,
+            ensure_current_rows=not args.dry_run,
+        )
     except (OSError, RuntimeError, sqlite3.Error) as exc:
         print(
             json.dumps(
@@ -3814,19 +3902,6 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 2
-    if config.enabled and not args.dry_run:
-        try:
-            require_resident_activation_epoch(
-                RcaControlStore(config.control_db_path, require_current=True)
-            )
-        except ExternalWriteFenceError as exc:
-            print(
-                json.dumps(
-                    {"ok": False, "error": exc.code, "detail": exc.detail},
-                    ensure_ascii=False,
-                )
-            )
-            return 2
     collector = DeliveryCollector(store=store, config=config)
     if args.dry_run:
         print(json.dumps(collector.dry_run_once(), ensure_ascii=False))

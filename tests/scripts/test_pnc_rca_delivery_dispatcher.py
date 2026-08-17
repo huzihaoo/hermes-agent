@@ -35,6 +35,7 @@ from gateway.pnc_rca_delivery_contract import (
 from gateway.pnc_rca_control_store import RcaControlStore
 from gateway.pnc_rca_provider_fence import build_write_fence_provider_claim
 from gateway.pnc_rca_delivery_store import (
+    DeliveryDispatcherCircuit,
     DeliveryObservationIntent,
     RcaDeliveryStore,
     StaleDeliveryEffectLeaseError,
@@ -76,10 +77,36 @@ from tests.gateway.test_pnc_rca_delivery_contract import (
     _consumer_capability,
     _focus_payload,
 )
+from tests.gateway.test_pnc_rca_write_fence import _release_note
 from gateway.pnc_rca_issue_focus import ANALYSIS_INSUFFICIENT_STATEMENT
 
 
 _TEST_PROVIDER_WRITE_CLAIM = build_write_fence_provider_claim({"state": "issued"})
+
+
+def _bind_minimal_release(control, fixture, *, epoch_id="delivery-epoch-1"):
+    fixture.epoch["epoch_id"] = epoch_id
+    with sqlite3.connect(control.db_path) as conn:
+        updated = conn.execute(
+            "UPDATE rca_activation_epochs "
+            "SET state = 'steady_active', config_sha256 = ?, "
+            "production_fingerprint = ?, production_gate_receipt_sha256 = ? "
+            "WHERE epoch_id = ? AND is_current = 1",
+            (
+                fixture.env_sha256,
+                fixture.fingerprint,
+                fixture.epoch["production_gate_receipt_sha256"],
+                epoch_id,
+            ),
+        )
+    assert updated.rowcount == 1
+
+
+def _set_live_release_environment(monkeypatch, fixture):
+    monkeypatch.setenv("PNC_LIVE_RUNTIME_ROOT", str(fixture.runtime_root))
+    monkeypatch.setenv("PNC_LIVE_RUNTIME_COMMIT", fixture.runtime_commit)
+    monkeypatch.setenv("PNC_LIVE_RUNTIME_TREE", fixture.runtime_tree)
+    monkeypatch.setenv("PNC_LIVE_MANIFEST_SHA256", fixture.manifest_sha256)
 REAL_G1Q3_PROJECT_KEY = "68ef617fb371dc80a10641f7"
 REAL_G1Q3_PROJECT_SIMPLE_NAME = "t03o4q"
 
@@ -214,6 +241,264 @@ def test_enabled_resident_without_epoch_exits_before_provider_creation(
     assert provider_created is False
     assert delivery.list_rows("rca_delivery_effects") == []
     assert "resident_activation_epoch_missing" in capsys.readouterr().out
+
+
+def test_enabled_startup_locks_minimal_release_before_writable_store_and_provider(
+    tmp_path,
+    monkeypatch,
+):
+    control, result = _control(tmp_path)
+    _bind_activation_execution(control, result, state="steady_active")
+    RcaDeliveryStore(control.db_path)
+    fixture = _release_note(tmp_path)
+    _bind_minimal_release(control, fixture)
+    _set_live_release_environment(monkeypatch, fixture)
+    config = replace(_config(tmp_path), release_note_path=fixture.path)
+    events = []
+    captured = {}
+    real_store = dispatcher_module.RcaDeliveryStore
+    real_validate = dispatcher_module.validate_bound_resident_release
+
+    def tracked_store(*args, **kwargs):
+        events.append(
+            (
+                "store",
+                kwargs.get("read_only", False),
+                kwargs.get("ensure_current_rows", True),
+            )
+        )
+        return real_store(*args, **kwargs)
+
+    def tracked_validate(*args, **kwargs):
+        events.append(("validate",))
+        return real_validate(*args, **kwargs)
+
+    def meegle_provider():
+        events.append(("provider", "meegle"))
+        return SimpleNamespace(
+            list_comments=lambda *_args, **_kwargs: {},
+            add_comment=lambda *_args, **_kwargs: {},
+            get_fields=lambda *_args, **_kwargs: {},
+            update_fields=lambda *_args, **_kwargs: {},
+        )
+
+    def thread_provider():
+        events.append(("provider", "thread"))
+        return SimpleNamespace(
+            list_replies=lambda *_args, **_kwargs: {},
+            add_reply=lambda *_args, **_kwargs: {},
+        )
+
+    def constructed_dispatcher(**kwargs):
+        events.append(("dispatcher",))
+        captured["config"] = kwargs["config"]
+        return SimpleNamespace(store=kwargs["store"], config=kwargs["config"])
+
+    monkeypatch.setattr(
+        RcaControlStore,
+        "_create_read_only_snapshot",
+        lambda _self: pytest.fail("normal startup must not copy the control DB"),
+    )
+    monkeypatch.setattr(dispatcher_module, "RcaDeliveryStore", tracked_store)
+    monkeypatch.setattr(
+        dispatcher_module, "validate_bound_resident_release", tracked_validate
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "load_delivery_dispatcher_environment",
+        lambda: fixture.env_path,
+    )
+    monkeypatch.setattr(
+        dispatcher_module.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(
+        dispatcher_module, "MeegleIssueCommentAdapter", meegle_provider
+    )
+    monkeypatch.setattr(
+        dispatcher_module, "FeishuThreadReplyAdapter", thread_provider
+    )
+    monkeypatch.setattr(
+        dispatcher_module, "DeliveryDispatcher", constructed_dispatcher
+    )
+    monkeypatch.setattr(
+        dispatcher_module, "run_dispatch_loop", lambda *_args, **_kwargs: 0
+    )
+
+    assert dispatcher_module.main(["--once"]) == 0
+    assert events == [
+        ("store", True, False),
+        ("validate",),
+        ("store", False, True),
+        ("provider", "meegle"),
+        ("provider", "thread"),
+        ("dispatcher",),
+    ]
+    locked = captured["config"]
+    assert locked.resident_release_enforced is True
+    assert locked.release_id == fixture.note["release_id"]
+    assert locked.observation_release_id == fixture.note["release_id"]
+    assert locked.release_epoch_id == fixture.epoch["epoch_id"]
+    assert locked.release_fingerprint_sha256 == fixture.fingerprint
+    assert (
+        locked.release_note_sha256
+        == fixture.epoch["production_gate_receipt_sha256"]
+    )
+
+
+@pytest.mark.parametrize("boundary", ["claim", "provider"])
+def test_dispatcher_epoch_switch_rejects_claim_and_provider_boundaries(
+    tmp_path,
+    monkeypatch,
+    boundary,
+):
+    control, result = _control(tmp_path)
+    _bind_activation_execution(control, result, state="steady_active")
+    store = RcaDeliveryStore(control.db_path)
+    fixture = _release_note(tmp_path)
+    _bind_minimal_release(control, fixture)
+    _set_live_release_environment(monkeypatch, fixture)
+    binding = dispatcher_module.validate_bound_resident_release(
+        store,
+        release_note_path=fixture.path,
+        runtime_root=fixture.runtime_root,
+        runtime_commit=fixture.runtime_commit,
+        runtime_tree=fixture.runtime_tree,
+        live_manifest_sha256=fixture.manifest_sha256,
+        live_env_path=fixture.env_path,
+    )
+    config = replace(
+        _config(tmp_path),
+        release_note_path=fixture.path,
+        release_env_path=fixture.env_path,
+        resident_release_enforced=True,
+        release_id=binding["release_id"],
+        release_epoch_id=binding["epoch_id"],
+        release_fingerprint_sha256=binding["release_fingerprint_sha256"],
+        release_note_sha256=binding["release_note_sha256"],
+    )
+    provider_calls = []
+
+    def provider(*_args, **_kwargs):
+        provider_calls.append("provider")
+        return {"success": True}
+
+    dispatcher = DeliveryDispatcher(
+        store=store,
+        config=config,
+        list_comments=provider,
+        add_comment=provider,
+        get_fields=provider,
+        update_fields=provider,
+        report_verifier=provider,
+        now=lambda: NOW,
+    )
+    assert dispatcher._validate_runtime_release()["epoch_id"] == "delivery-epoch-1"
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET epoch_id = 'delivery-epoch-2' "
+            "WHERE is_current = 1"
+        )
+    if boundary == "claim":
+        monkeypatch.setattr(
+            store,
+            "claim_due_effect",
+            lambda **_kwargs: pytest.fail("claim ran after release epoch drift"),
+        )
+
+    with pytest.raises(dispatcher_module.ExternalWriteFenceError) as exc:
+        if boundary == "claim":
+            dispatcher.dispatch_one()
+        else:
+            dispatcher._validate_external_write(
+                SimpleNamespace(),
+                operation="feishu_issue_comment",
+                target="https://project.feishu.cn/g1q3/issue/detail/1",
+            )
+            provider()
+
+    assert exc.value.code == "resident_release_binding_changed"
+    assert provider_calls == []
+
+
+def test_collector_and_dispatcher_dry_run_use_live_read_only_store_without_ensure(
+    tmp_path,
+    monkeypatch,
+):
+    from scripts import pnc_rca_delivery_collector as collector_module
+
+    db_path = tmp_path / "control.sqlite3"
+    RcaControlStore(db_path)
+    RcaDeliveryStore(db_path)
+    with sqlite3.connect(db_path) as conn:
+        before = conn.execute(
+            "SELECT COUNT(*) FROM rca_delivery_dispatcher_circuit"
+        ).fetchone()[0]
+    collector_config = CollectorConfig.from_env(
+        {
+            "HERMES_RCA_DELIVERY_COLLECTOR_ENABLED": "true",
+            "HERMES_RCA_DELIVERY_COLLECTOR_CONTROL_DB_PATH": str(db_path),
+        },
+        hermes_home=tmp_path,
+    )
+    dispatcher_config = _config(tmp_path)
+    real_store = RcaDeliveryStore
+    collector_calls = []
+    dispatcher_calls = []
+
+    def collector_store(*args, **kwargs):
+        collector_calls.append(
+            (kwargs.get("read_only"), kwargs.get("ensure_current_rows"))
+        )
+        return real_store(*args, **kwargs)
+
+    def dispatcher_store(*args, **kwargs):
+        dispatcher_calls.append(
+            (kwargs.get("read_only"), kwargs.get("ensure_current_rows"))
+        )
+        return real_store(*args, **kwargs)
+
+    monkeypatch.setattr(
+        RcaControlStore,
+        "_create_read_only_snapshot",
+        lambda _self: pytest.fail("dry-run must not copy the control DB"),
+    )
+    monkeypatch.setattr(
+        RcaDeliveryStore,
+        "_ensure_card_patch_circuit_row",
+        lambda _self: pytest.fail("dry-run must not ensure mutable rows"),
+    )
+    monkeypatch.setattr(collector_module, "RcaDeliveryStore", collector_store)
+    monkeypatch.setattr(
+        collector_module, "load_collector_environment", lambda: tmp_path / ".env"
+    )
+    monkeypatch.setattr(
+        collector_module.CollectorConfig,
+        "from_env",
+        classmethod(lambda _cls: collector_config),
+    )
+    monkeypatch.setattr(dispatcher_module, "RcaDeliveryStore", dispatcher_store)
+    monkeypatch.setattr(
+        dispatcher_module,
+        "load_delivery_dispatcher_environment",
+        lambda: tmp_path / ".env",
+    )
+    monkeypatch.setattr(
+        dispatcher_module.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: dispatcher_config),
+    )
+
+    assert collector_module.main(["--dry-run"]) == 0
+    assert dispatcher_module.main(["--dry-run"]) == 0
+    assert collector_calls == [(True, False)]
+    assert dispatcher_calls == [(True, False)]
+    with sqlite3.connect(db_path) as conn:
+        after = conn.execute(
+            "SELECT COUNT(*) FROM rca_delivery_dispatcher_circuit"
+        ).fetchone()[0]
+    assert after == before
 
 
 def test_delivery_dispatcher_environment_loader_preserves_literal_expansion_syntax(
@@ -1670,7 +1955,9 @@ def _dispatcher(
     )
 
 
-def test_enabled_config_requires_bound_observability_identity(tmp_path):
+def test_enabled_config_requires_inventory_pin_and_derives_release_id_at_startup(
+    tmp_path,
+):
     values = {
         "HERMES_RCA_DELIVERY_DISPATCHER_ENABLED": "true",
         "HERMES_RCA_DELIVERY_DISPATCHER_OBSERVABILITY_ENABLED": "true",
@@ -1682,8 +1969,9 @@ def test_enabled_config_requires_bound_observability_identity(tmp_path):
 
     values["HERMES_RCA_DELIVERY_DISPATCHER_INVENTORY_PIN"] = "a" * 64
     values.pop("HERMES_RCA_DELIVERY_DISPATCHER_OBSERVATION_RELEASE_ID")
-    with pytest.raises(ValueError, match="OBSERVATION_RELEASE_ID"):
-        DispatcherConfig.from_env(values, hermes_home=tmp_path)
+    config = DispatcherConfig.from_env(values, hermes_home=tmp_path)
+
+    assert config.observation_release_id == ""
 
 
 def _observation_intent(index: int) -> DeliveryObservationIntent:
@@ -2979,11 +3267,10 @@ def test_terminal_manual_delivery_skips_report_http_and_sends_both_effects(tmp_p
     assert before["business_blockers"]["unresolved_required_effects"] == 2
     assert before["production_blockers"] == {
         "activation_schema_unavailable": 0,
+        "activation_epoch_not_steady": 0,
+        "activation_fingerprint_invalid": 0,
+        "activation_gate_receipt_invalid": 0,
         "uncertain_effects": 0,
-        "quarantined_jobs": 0,
-        "quarantined_effects": 0,
-        "quarantined_subscriptions": 0,
-        "quarantine_baseline_invalid": 0,
         "pending_delivery_observations": 0,
     }
     thread_remote = ThreadRemote()

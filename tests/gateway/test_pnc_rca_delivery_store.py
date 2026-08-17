@@ -269,9 +269,17 @@ def _bind_activation_execution(
     current = NOW.isoformat()
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
-            "UPDATE rca_activation_epochs SET state = ?, updated_at = ? "
+            "UPDATE rca_activation_epochs "
+            "SET state = ?, updated_at = ?, production_fingerprint = ?, "
+            "production_gate_receipt_sha256 = ? "
             "WHERE epoch_id = ? AND is_current = 1",
-            (state, current, epoch_id),
+            (
+                state,
+                current,
+                "2" * 64 if state == "steady_active" else None,
+                "3" * 64 if state == "steady_active" else None,
+                epoch_id,
+            ),
         )
         cursor = conn.execute(
             """
@@ -2949,16 +2957,39 @@ def test_delivery_health_observes_stalled_watch_without_blocking_readiness(tmp_p
     assert health["business_ready"] is True
     assert health["ok"] is True
     assert health["business_blockers"]["stalled_watches"] == 1
+    assert "delivery_quarantine" not in health
     assert health["production_blockers"] == {
         "activation_schema_unavailable": 0,
+        "activation_epoch_not_steady": 0,
+        "activation_fingerprint_invalid": 0,
+        "activation_gate_receipt_invalid": 0,
         "uncertain_effects": 0,
-        "quarantined_jobs": 0,
-        "quarantined_effects": 0,
-        "quarantined_subscriptions": 0,
-        "quarantine_baseline_invalid": 0,
         "pending_delivery_observations": 0,
     }
     assert watch["state"] == "pending"
+
+
+def test_delivery_health_keeps_historical_quarantine_diagnostic_only(tmp_path):
+    store, effect = _claimed_effect(tmp_path)
+    store.quarantine_effect(
+        claim=effect,
+        error_code="feishu_work_item_not_found",
+        error_detail="historical delivery quarantine",
+        now=NOW,
+    )
+
+    health = store.health(now=NOW)
+
+    assert health["business_blockers"]["quarantined_jobs"] == 1
+    assert health["business_blockers"]["quarantined_effects"] == 1
+    assert health["business_blockers"]["quarantined_subscriptions"] == 0
+    assert not {
+        "quarantined_jobs",
+        "quarantined_effects",
+        "quarantined_subscriptions",
+        "quarantine_baseline_invalid",
+    } & health["production_blockers"].keys()
+    assert health["business_ready"] is True
 
 
 def test_activation_health_does_not_block_on_historical_uncertain_effect(tmp_path):
@@ -3004,8 +3035,11 @@ def test_activation_health_does_not_block_on_historical_uncertain_effect(tmp_pat
     )
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
-            "UPDATE rca_activation_epochs SET state = 'steady_active' "
-            "WHERE epoch_id = 'delivery-epoch-2' AND is_current = 1"
+            "UPDATE rca_activation_epochs "
+            "SET state = 'steady_active', production_fingerprint = ?, "
+            "production_gate_receipt_sha256 = ? "
+            "WHERE epoch_id = 'delivery-epoch-2' AND is_current = 1",
+            ("4" * 64, "5" * 64),
         )
         conn.execute(
             "UPDATE rca_delivery_effects "
@@ -3024,6 +3058,70 @@ def test_activation_health_does_not_block_on_historical_uncertain_effect(tmp_pat
     assert health["business_blockers"]["uncertain_effects"] == 0
     assert health["production_blockers"]["uncertain_effects"] == 0
     assert health["business_ready"] is True
+
+
+def test_activation_health_requires_steady_epoch_and_production_fingerprint(
+    tmp_path,
+):
+    control, result = _control(tmp_path)
+    _bind_activation_execution(control, result, state="bounded_active")
+    store = RcaDeliveryStore(control.db_path)
+
+    bounded = store.health(now=NOW, activation_required=True)
+
+    assert bounded["activation"]["production_fingerprint"] == ""
+    assert bounded["activation"]["production_ready"] is False
+    assert bounded["production_blockers"]["activation_epoch_not_steady"] == 1
+    assert bounded["production_blockers"]["activation_fingerprint_invalid"] == 1
+    assert bounded["production_blockers"]["activation_gate_receipt_invalid"] == 1
+    assert bounded["business_ready"] is False
+
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs "
+            "SET state = 'steady_active', production_fingerprint = ? "
+            "WHERE is_current = 1",
+            ("0" * 64,),
+        )
+
+    zero_fingerprint = store.health(now=NOW, activation_required=True)
+
+    assert zero_fingerprint["activation"]["production_ready"] is False
+    assert zero_fingerprint["production_blockers"]["activation_epoch_not_steady"] == 0
+    assert (
+        zero_fingerprint["production_blockers"]["activation_fingerprint_invalid"]
+        == 1
+    )
+    assert (
+        zero_fingerprint["production_blockers"]["activation_gate_receipt_invalid"]
+        == 1
+    )
+    assert zero_fingerprint["business_ready"] is False
+
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs "
+            "SET production_fingerprint = ?, production_gate_receipt_sha256 = ? "
+            "WHERE is_current = 1",
+            ("2" * 64, "3" * 64),
+        )
+
+    ready = store.health(now=NOW, activation_required=True)
+
+    assert ready["activation"]["production_fingerprint"] == "2" * 64
+    assert ready["activation"]["production_gate_receipt_sha256"] == "3" * 64
+    assert ready["activation"]["production_ready"] is True
+    assert ready["production_blockers"]["activation_epoch_not_steady"] == 0
+    assert ready["production_blockers"]["activation_fingerprint_invalid"] == 0
+    assert ready["production_blockers"]["activation_gate_receipt_invalid"] == 0
+    assert ready["business_ready"] is True
+
+    epoch = store.activation_epoch()
+    assert epoch is not None
+    assert epoch["state"] == "steady_active"
+    assert epoch["production_fingerprint"] == "2" * 64
+    assert epoch["production_gate_receipt_sha256"] == "3" * 64
+    assert isinstance(epoch["config_sha256"], str)
 
 
 def test_concurrent_backfill_creates_exactly_one_watch(tmp_path):

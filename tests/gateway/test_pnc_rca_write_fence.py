@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -11,12 +13,225 @@ from gateway.pnc_rca_write_fence import (
     canonical_write_fence_sha256,
     require_resident_activation_epoch,
     snapshot_core_sha256,
+    validate_bound_resident_release,
     validate_write_fence,
     validate_write_fence_source_binding,
+    validate_resident_release_note,
 )
 
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
+
+
+def _seal_release_note(path, note):
+    fingerprint = canonical_write_fence_sha256(note["release_identity"])
+    note["release_fingerprint_sha256"] = fingerprint
+    raw = (
+        json.dumps(note, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode()
+    path.write_bytes(raw)
+    os.chmod(path, 0o600)
+    return fingerprint, hashlib.sha256(raw).hexdigest()
+
+
+def _release_note(tmp_path):
+    manifest_sha256 = "5" * 64
+    runtime_commit = "6" * 40
+    runtime_tree = "7" * 40
+    runtime_root = tmp_path / "host-release"
+    pipeline_commit = "8" * 40
+    pipeline_tree = "9" * 40
+    env_path = tmp_path / ".env"
+    env_raw = b"HERMES_OUTBOUND_MODE=record-only\n"
+    env_path.write_bytes(env_raw)
+    os.chmod(env_path, 0o600)
+    env_sha256 = hashlib.sha256(env_raw).hexdigest()
+    identity = {
+        "host": {
+            "commit": runtime_commit,
+            "tree": runtime_tree,
+            "runtime_root": str(runtime_root),
+            "remote_tag": "rca-host-r15av-test",
+            "remote_tag_object": "d" * 40,
+        },
+        "worker": {
+            "commit": "a" * 40,
+            "tree": "b" * 40,
+            "runtime_root": "/home/mini/.hermes/worker/releases/r15av-test",
+            "remote_tag": "rca-worker-r15av-test",
+            "remote_tag_object": "e" * 40,
+        },
+        "pipeline": {
+            "commit": pipeline_commit,
+            "tree": pipeline_tree,
+            "runtime_root": "/home/mini/.hermes/rca-prod-runtime/releases/r15av-test",
+        },
+        "report_service": {
+            "manifest_sha256": "c" * 64,
+            "pipeline_commit": pipeline_commit,
+            "pipeline_tree": pipeline_tree,
+        },
+    }
+    note = {
+        "schema_version": "pnc_rca_minimal_release_note_v1",
+        "release_id": "rca-r15av-test",
+        "release_identity": identity,
+        "runtime_projection": {
+            "env_sha256": env_sha256,
+            "live_manifest_sha256": manifest_sha256,
+        },
+    }
+    path = tmp_path / "release-note.json"
+    fingerprint, note_sha256 = _seal_release_note(path, note)
+    epoch = {
+        "config_sha256": env_sha256,
+        "epoch_id": "epoch-1",
+        "state": "steady_active",
+        "production_fingerprint": fingerprint,
+        "production_gate_receipt_sha256": note_sha256,
+    }
+    return SimpleNamespace(
+        env_path=env_path,
+        env_sha256=env_sha256,
+        epoch=epoch,
+        fingerprint=fingerprint,
+        manifest_sha256=manifest_sha256,
+        note=note,
+        path=path,
+        runtime_commit=runtime_commit,
+        runtime_root=runtime_root,
+        runtime_tree=runtime_tree,
+    )
+
+
+def test_resident_release_note_binds_epoch_runtime_and_manifest(tmp_path):
+    fixture = _release_note(tmp_path)
+
+    assert validate_resident_release_note(
+        fixture.epoch,
+        release_note_path=fixture.path,
+        runtime_root=fixture.runtime_root,
+        runtime_commit=fixture.runtime_commit,
+        runtime_tree=fixture.runtime_tree,
+        live_manifest_sha256=fixture.manifest_sha256,
+        live_env_path=fixture.env_path,
+    ) == {
+        "epoch_id": "epoch-1",
+        "release_id": "rca-r15av-test",
+        "release_fingerprint_sha256": fixture.fingerprint,
+        "release_note_path": str(fixture.path),
+        "release_note_sha256": fixture.epoch["production_gate_receipt_sha256"],
+        "runtime_root": str(fixture.runtime_root),
+        "runtime_commit": fixture.runtime_commit,
+        "runtime_tree": fixture.runtime_tree,
+        "live_manifest_sha256": fixture.manifest_sha256,
+        "live_env_sha256": fixture.env_sha256,
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("fingerprint", "resident_release_fingerprint_mismatch"),
+        ("receipt", "resident_release_note_sha256_mismatch"),
+        ("root", "resident_release_runtime_commit_mismatch"),
+        ("commit", "resident_release_runtime_commit_mismatch"),
+        ("tree", "resident_release_runtime_commit_mismatch"),
+        ("manifest", "resident_release_manifest_mismatch"),
+        ("env", "resident_release_env_mismatch"),
+    ],
+)
+def test_resident_release_note_rejects_identity_drift(tmp_path, mutation, code):
+    fixture = _release_note(tmp_path)
+    if mutation == "fingerprint":
+        fixture.epoch["production_fingerprint"] = "d" * 64
+    elif mutation == "receipt":
+        fixture.epoch["production_gate_receipt_sha256"] = "d" * 64
+    elif mutation == "root":
+        fixture.runtime_root = tmp_path / "other-host-release"
+    elif mutation == "commit":
+        fixture.runtime_commit = "d" * 40
+    elif mutation == "tree":
+        fixture.runtime_tree = "d" * 40
+    elif mutation == "manifest":
+        fixture.manifest_sha256 = "d" * 64
+    else:
+        fixture.env_path.write_bytes(b"HERMES_OUTBOUND_MODE=live\n")
+
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        validate_resident_release_note(
+            fixture.epoch,
+            release_note_path=fixture.path,
+            runtime_root=fixture.runtime_root,
+            runtime_commit=fixture.runtime_commit,
+            runtime_tree=fixture.runtime_tree,
+            live_manifest_sha256=fixture.manifest_sha256,
+            live_env_path=fixture.env_path,
+        )
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize(
+    ("role", "code"),
+    [
+        ("host", "resident_release_runtime_commit_mismatch"),
+        ("worker", "resident_release_identity_invalid"),
+    ],
+)
+def test_resident_release_note_rejects_incomplete_release_identity(
+    tmp_path, role, code
+):
+    fixture = _release_note(tmp_path)
+    fixture.note["release_identity"][role].pop("remote_tag_object")
+    fingerprint, receipt = _seal_release_note(fixture.path, fixture.note)
+    fixture.epoch["production_fingerprint"] = fingerprint
+    fixture.epoch["production_gate_receipt_sha256"] = receipt
+
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        validate_resident_release_note(
+            fixture.epoch,
+            release_note_path=fixture.path,
+            runtime_root=fixture.runtime_root,
+            runtime_commit=fixture.runtime_commit,
+            runtime_tree=fixture.runtime_tree,
+            live_manifest_sha256=fixture.manifest_sha256,
+            live_env_path=fixture.env_path,
+        )
+
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize("drift", ["epoch", "fingerprint", "receipt"])
+def test_bound_resident_release_rejects_startup_binding_drift(tmp_path, drift):
+    fixture = _release_note(tmp_path)
+
+    class Store:
+        def activation_epoch(self):
+            return fixture.epoch
+
+    kwargs = {
+        "release_note_path": fixture.path,
+        "runtime_root": fixture.runtime_root,
+        "runtime_commit": fixture.runtime_commit,
+        "runtime_tree": fixture.runtime_tree,
+        "live_manifest_sha256": fixture.manifest_sha256,
+        "live_env_path": fixture.env_path,
+        "expected_epoch_id": fixture.epoch["epoch_id"],
+        "expected_fingerprint": fixture.fingerprint,
+        "expected_note_sha256": fixture.epoch["production_gate_receipt_sha256"],
+    }
+    assert validate_bound_resident_release(Store(), **kwargs)["epoch_id"] == "epoch-1"
+    if drift == "epoch":
+        kwargs["expected_epoch_id"] = "epoch-2"
+    elif drift == "fingerprint":
+        kwargs["expected_fingerprint"] = "d" * 64
+    else:
+        kwargs["expected_note_sha256"] = "d" * 64
+
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        validate_bound_resident_release(Store(), **kwargs)
+
+    assert exc.value.code == "resident_release_binding_changed"
 
 
 def _snapshot():
@@ -328,6 +543,7 @@ def test_w13_shaped_claim_cannot_change_authoritative_issue_target():
         issue_url="https://project.feishu.cn/g1q3/issue/detail/123",
     )
     dispatcher = DeliveryDispatcher.__new__(DeliveryDispatcher)
+    dispatcher._validate_runtime_release = lambda: {}
     dispatcher.store = Store()
     dispatcher.now = lambda: NOW
     dispatcher._validate_external_write(
@@ -492,6 +708,7 @@ def test_dispatcher_missing_fence_blocks_historical_and_new_effects():
         (False, "external_write_fence_missing"),
     ):
         dispatcher = DeliveryDispatcher.__new__(DeliveryDispatcher)
+        dispatcher._validate_runtime_release = lambda: {}
         dispatcher.store = Store(historical)
         dispatcher.now = lambda: NOW
         with pytest.raises(ExternalWriteFenceError) as exc:

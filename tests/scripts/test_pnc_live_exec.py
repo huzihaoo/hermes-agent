@@ -46,9 +46,13 @@ print(json.dumps({
     'args': sys.argv[1:],
     'cwd': os.getcwd(),
     'manifest_sha256': os.environ.get('PNC_LIVE_MANIFEST_SHA256'),
+    'runtime_root': os.environ.get('PNC_LIVE_RUNTIME_ROOT'),
     'runtime_commit': os.environ.get('PNC_LIVE_RUNTIME_COMMIT'),
+    'runtime_tree': os.environ.get('PNC_LIVE_RUNTIME_TREE'),
     'service_label': os.environ.get('PNC_LIVE_SERVICE_LABEL'),
     'pythonpath': os.environ.get('PYTHONPATH'),
+    'inherited_outbound_mode': os.environ.get('HERMES_OUTBOUND_MODE'),
+    'inherited_rca_enabled': os.environ.get('HERMES_RCA_DELIVERY_DISPATCHER_ENABLED'),
 }))
 """,
         encoding="utf-8",
@@ -156,6 +160,7 @@ def test_check_and_exec_use_the_manifest_bound_release(tmp_path: Path):
     assert evidence["ok"] is True
     assert evidence["runtime_root"] == str(root)
     assert evidence["runtime_commit"] == commit
+    assert evidence["runtime_tree"] == tree
     assert evidence["script"] == str(root / "scripts" / "pnc_vm_task_sync.py")
 
     executed = _run(
@@ -163,7 +168,11 @@ def test_check_and_exec_use_the_manifest_bound_release(tmp_path: Path):
         SERVICE_LABEL,
         "--probe",
         "value",
-        extra_env={"PYTHONPATH": "/stale/import/root"},
+        extra_env={
+            "PYTHONPATH": "/stale/import/root",
+            "HERMES_OUTBOUND_MODE": "live",
+            "HERMES_RCA_DELIVERY_DISPATCHER_ENABLED": "true",
+        },
     )
     assert executed.returncode == 0, executed.stderr
     result = json.loads(executed.stdout)
@@ -171,10 +180,65 @@ def test_check_and_exec_use_the_manifest_bound_release(tmp_path: Path):
         "args": ["--probe", "value"],
         "cwd": str(root),
         "manifest_sha256": evidence["manifest_sha256"],
+        "inherited_outbound_mode": "live",
+        "inherited_rca_enabled": "true",
         "pythonpath": str(root),
+        "runtime_root": str(root),
         "runtime_commit": commit,
+        "runtime_tree": tree,
         "service_label": SERVICE_LABEL,
     }
+
+
+@pytest.mark.parametrize("service_label", sorted(live_exec.SIGNED_RCA_ENV_LABELS))
+def test_signed_rca_residents_drop_business_config_overrides(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, service_label: str
+):
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "live")
+    monkeypatch.setenv("HERMES_RCA_DELIVERY_DISPATCHER_ENABLED", "true")
+    monkeypatch.setenv("HERMES_RCA_RELEASE_NOTE_PATH", "/stale/release-note.json")
+    monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", "https://stale.invalid")
+    resolved = {
+        "manifest_sha256": "1" * 64,
+        "runtime_commit": "2" * 40,
+        "runtime_root": str(tmp_path / "runtime"),
+        "runtime_tree": "3" * 40,
+        "runtime_venv": str(tmp_path / "venv"),
+        "service_label": service_label,
+    }
+
+    environment = live_exec._exec_environment(resolved, tmp_path / "hermes")
+
+    assert "HERMES_OUTBOUND_MODE" not in environment
+    assert "HERMES_RCA_DELIVERY_DISPATCHER_ENABLED" not in environment
+    assert "HERMES_RCA_RELEASE_NOTE_PATH" not in environment
+    assert "PNC_FOXGLOVE_RENDER_HOST" not in environment
+
+
+@pytest.mark.parametrize(
+    "service_label",
+    ["local.pnc.completion-notice-relay", "local.pnc.vm-task-sync"],
+)
+def test_other_services_preserve_service_specific_business_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, service_label: str
+):
+    monkeypatch.setenv("HERMES_OUTBOUND_MODE", "record-only")
+    monkeypatch.setenv("HERMES_RCA_DELIVERY_DISPATCHER_ENABLED", "false")
+    monkeypatch.setenv("PNC_FOXGLOVE_RENDER_HOST", "http://192.168.26.174:18081")
+    resolved = {
+        "manifest_sha256": "1" * 64,
+        "runtime_commit": "2" * 40,
+        "runtime_root": str(tmp_path / "runtime"),
+        "runtime_tree": "3" * 40,
+        "runtime_venv": str(tmp_path / "venv"),
+        "service_label": service_label,
+    }
+
+    environment = live_exec._exec_environment(resolved, tmp_path / "hermes")
+
+    assert environment["HERMES_OUTBOUND_MODE"] == "record-only"
+    assert environment["HERMES_RCA_DELIVERY_DISPATCHER_ENABLED"] == "false"
+    assert environment["PNC_FOXGLOVE_RENDER_HOST"] == "http://192.168.26.174:18081"
 
 
 def test_stale_runtime_commit_fails_closed_with_nonzero_exit(tmp_path: Path):

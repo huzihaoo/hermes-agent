@@ -128,6 +128,11 @@ PNC_RESIDENT_LABELS = (
     "local.pnc.task-dashboard.viewer",
 )
 
+SIGNED_RCA_ENV_LABELS = frozenset({
+    "local.pnc.rca-delivery-collector",
+    "local.pnc.rca-delivery-dispatcher",
+})
+
 
 class LiveExecError(RuntimeError):
     def __init__(self, code: str):
@@ -456,11 +461,20 @@ def _exec_environment(resolved: dict[str, str], hermes_home: Path) -> dict[str, 
         "PYTHONPATH",
     ):
         environment.pop(key, None)
+    if resolved["service_label"] in SIGNED_RCA_ENV_LABELS:
+        for key in tuple(environment):
+            if (
+                key in {"HERMES_OUTBOUND_MODE", "PNC_FOXGLOVE_RENDER_HOST"}
+                or key.startswith("HERMES_RCA_")
+            ):
+                environment.pop(key, None)
     environment.update({
         "HERMES_HOME": str(hermes_home),
         "PATH": ":".join(str(path) for path in stable_paths),
         "PNC_LIVE_MANIFEST_SHA256": resolved["manifest_sha256"],
+        "PNC_LIVE_RUNTIME_ROOT": resolved["runtime_root"],
         "PNC_LIVE_RUNTIME_COMMIT": resolved["runtime_commit"],
+        "PNC_LIVE_RUNTIME_TREE": resolved["runtime_tree"],
         "PNC_LIVE_SERVICE_LABEL": resolved["service_label"],
         "PYTHONPATH": resolved["runtime_root"],
         "PYTHONDONTWRITEBYTECODE": "1",

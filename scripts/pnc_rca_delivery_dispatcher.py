@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -82,11 +82,6 @@ from gateway.pnc_rca_quality_oracle import (
     evaluate_structural_tier,
     require_publishable,
 )
-from gateway.pnc_rca_delivery_quarantine_baseline import (
-    disabled_quarantine_baseline_status,
-    quarantine_baseline_settings,
-    read_quarantine_baseline_status,
-)
 from gateway.pnc_rca_control_store import (
     RecordConflictError,
     RcaControlStore,
@@ -134,6 +129,7 @@ from gateway.pnc_rca_write_fence import (
     ExternalWriteFenceError,
     RESIDENT_EXTERNAL_WRITE_STATES,
     require_resident_activation_epoch,
+    validate_bound_resident_release,
     validate_write_fence,
 )
 from gateway.pnc_rca_conclusion_adjudication import (
@@ -1191,8 +1187,6 @@ class DispatcherConfig:
     reconciliation_visibility_grace_seconds: int
     reconciliation_min_missing_reads: int
     recovery_write_interval_seconds: int
-    quarantine_baseline_path: Path
-    quarantine_baseline_sha256: str
     quarantine_release_id: str
     quarantine_bootstrap_epoch_id: str
     quarantine_active_release_binding_path: Path
@@ -1201,6 +1195,13 @@ class DispatcherConfig:
     observability_path: Path = field(default_factory=default_observation_path)
     inventory_pin: str = ""
     observation_release_id: str = ""
+    release_note_path: Path = Path()
+    release_env_path: Path = Path()
+    resident_release_enforced: bool = False
+    release_id: str = ""
+    release_epoch_id: str = ""
+    release_fingerprint_sha256: str = ""
+    release_note_sha256: str = ""
 
     def __post_init__(self) -> None:
         minimum_lease = (
@@ -1225,10 +1226,6 @@ class DispatcherConfig:
             if _SHA256_RE.fullmatch(self.inventory_pin) is None:
                 raise ValueError(
                     f"{ENV_PREFIX}INVENTORY_PIN must be a lowercase SHA-256"
-                )
-            if not self.observation_release_id:
-                raise ValueError(
-                    f"{ENV_PREFIX}OBSERVATION_RELEASE_ID is required when enabled"
                 )
 
     @classmethod
@@ -1255,11 +1252,6 @@ class DispatcherConfig:
                 / "control.sqlite3",
             )
         ).expanduser()
-        quarantine = quarantine_baseline_settings(
-            source,
-            hermes_home=home,
-            control_db_path=control_db_path,
-        )
         return cls(
             enabled=_boolean(source, f"{ENV_PREFIX}ENABLED", False),
             activation_required=_strict_boolean(
@@ -1310,14 +1302,23 @@ class DispatcherConfig:
                 300,
                 minimum=60,
             ),
-            quarantine_baseline_path=quarantine.baseline_path,
-            quarantine_baseline_sha256=quarantine.baseline_sha256,
-            quarantine_release_id=quarantine.release_id,
-            quarantine_bootstrap_epoch_id=quarantine.bootstrap_epoch_id,
-            quarantine_active_release_binding_path=(
-                quarantine.active_release_binding_path
-            ),
-            quarantine_live_env_path=quarantine.live_env_path,
+            quarantine_release_id=str(
+                source.get("HERMES_RCA_PROD_RELEASE_ID", "") or ""
+            ).strip(),
+            quarantine_bootstrap_epoch_id=str(
+                source.get("HERMES_RCA_PROD_BOOTSTRAP_EPOCH_ID", "") or ""
+            ).strip(),
+            quarantine_active_release_binding_path=Path(
+                source.get(
+                    "HERMES_RCA_ACTIVE_RELEASE_BINDING_PATH",
+                    home
+                    / "runtime"
+                    / "pnc_agent"
+                    / "feishu_issue_kafka_rca"
+                    / "active-release-binding.json",
+                )
+            ).expanduser(),
+            quarantine_live_env_path=home / ".env",
             observability_enabled=_boolean(
                 source, f"{ENV_PREFIX}OBSERVABILITY_ENABLED", True
             ),
@@ -1333,6 +1334,12 @@ class DispatcherConfig:
             observation_release_id=str(
                 source.get(f"{ENV_PREFIX}OBSERVATION_RELEASE_ID", "") or ""
             ).strip(),
+            release_note_path=Path(
+                str(source.get("HERMES_RCA_RELEASE_NOTE_PATH", "") or "")
+            ).expanduser(),
+            release_env_path=Path(
+                str(source.get(f"{ENV_PREFIX}ENV_FILE", home / ".env") or "")
+            ).expanduser(),
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -1353,14 +1360,13 @@ class DispatcherConfig:
             ),
             "reconciliation_min_missing_reads": (self.reconciliation_min_missing_reads),
             "recovery_write_interval_seconds": (self.recovery_write_interval_seconds),
-            "quarantine_baseline_path": str(self.quarantine_baseline_path),
-            "quarantine_baseline_sha256": self.quarantine_baseline_sha256,
-            "quarantine_release_id": self.quarantine_release_id,
-            "quarantine_bootstrap_epoch_id": self.quarantine_bootstrap_epoch_id,
-            "quarantine_active_release_binding_path": str(
-                self.quarantine_active_release_binding_path
-            ),
-            "quarantine_live_env_path": str(self.quarantine_live_env_path),
+            "release_note_path": str(self.release_note_path),
+            "release_env_path": str(self.release_env_path),
+            "resident_release_enforced": self.resident_release_enforced,
+            "release_id": self.release_id,
+            "release_epoch_id": self.release_epoch_id,
+            "release_fingerprint_sha256": self.release_fingerprint_sha256,
+            "release_note_sha256": self.release_note_sha256,
             "observability_enabled": self.observability_enabled,
             "observability_path": str(self.observability_path),
             "inventory_pin_configured": bool(self.inventory_pin),
@@ -4041,6 +4047,7 @@ class DeliveryDispatcher:
         )
         self.stats = DispatchStats()
         self.runtime_identity: Mapping[str, Any] | None = None
+        self.release_binding: dict[str, Any] = {}
         self._effect_lease_renew_interval_seconds = float(
             EFFECT_LEASE_RENEW_INTERVAL_SECONDS
             if _effect_lease_renew_interval_seconds is None
@@ -4057,6 +4064,23 @@ class DeliveryDispatcher:
             )
         self._active_effect_lease_keeper: _EffectLeaseKeeper | None = None
         self._active_effect_lease_identity: tuple[str, str, int] | None = None
+
+    def _validate_runtime_release(self) -> dict[str, Any]:
+        if not getattr(self.config, "resident_release_enforced", False):
+            return {}
+        self.release_binding = validate_bound_resident_release(
+            self.store,
+            release_note_path=self.config.release_note_path,
+            runtime_root=os.environ.get("PNC_LIVE_RUNTIME_ROOT", ""),
+            runtime_commit=os.environ.get("PNC_LIVE_RUNTIME_COMMIT", ""),
+            runtime_tree=os.environ.get("PNC_LIVE_RUNTIME_TREE", ""),
+            live_manifest_sha256=os.environ.get("PNC_LIVE_MANIFEST_SHA256", ""),
+            live_env_path=self.config.release_env_path,
+            expected_epoch_id=self.config.release_epoch_id,
+            expected_fingerprint=self.config.release_fingerprint_sha256,
+            expected_note_sha256=self.config.release_note_sha256,
+        )
+        return dict(self.release_binding)
 
     @staticmethod
     def _claim_lease_identity(claim: DeliveryEffectClaim) -> tuple[str, str, int]:
@@ -4307,8 +4331,8 @@ class DeliveryDispatcher:
         ):
             raise DeliveryObservationError("observation_inventory_pin_mismatch")
         configured_release_id = str(
-            getattr(self.config, "observation_release_id", "")
-            or getattr(self.config, "quarantine_release_id", "")
+            self.release_binding.get("release_id")
+            or getattr(self.config, "observation_release_id", "")
             or ""
         ).strip()
         contract_release_id = str(contract.get("release_id") or "").strip()
@@ -4613,6 +4637,7 @@ class DeliveryDispatcher:
         target: str,
     ) -> dict[str, Any]:
         """Revalidate the immutable W5 fence immediately before a provider call."""
+        self._validate_runtime_release()
         try:
             self.store.validate_learning_lane_external_operation(
                 business_key=claim.business_key,
@@ -5125,6 +5150,7 @@ class DeliveryDispatcher:
         self.stats.loops += 1
         if not self.config.enabled:
             return DispatchOutcome(status="disabled")
+        self._validate_runtime_release()
         self._flush_pending_delivery_observations()
         claim = self.store.claim_due_effect(
             lease_owner=self.lease_owner,
@@ -6375,17 +6401,27 @@ class HealthReporter:
         circuit = circuits[DELIVERY_EFFECT_KIND]
         store_health = self.store.health(
             activation_required=self.config.activation_required,
-            quarantine_baseline_path=self.config.quarantine_baseline_path,
-            expected_quarantine_baseline_sha256=(
-                self.config.quarantine_baseline_sha256
-            ),
-            quarantine_release_id=self.config.quarantine_release_id,
-            quarantine_bootstrap_epoch_id=(self.config.quarantine_bootstrap_epoch_id),
-            quarantine_active_release_binding_path=(
-                self.config.quarantine_active_release_binding_path
-            ),
-            quarantine_live_env_path=self.config.quarantine_live_env_path,
         )
+        release_binding: dict[str, Any] = {}
+        release_error = ""
+        if self.config.resident_release_enforced:
+            try:
+                release_binding = validate_bound_resident_release(
+                    self.store,
+                    release_note_path=self.config.release_note_path,
+                    runtime_root=os.environ.get("PNC_LIVE_RUNTIME_ROOT", ""),
+                    runtime_commit=os.environ.get("PNC_LIVE_RUNTIME_COMMIT", ""),
+                    runtime_tree=os.environ.get("PNC_LIVE_RUNTIME_TREE", ""),
+                    live_manifest_sha256=os.environ.get(
+                        "PNC_LIVE_MANIFEST_SHA256", ""
+                    ),
+                    live_env_path=self.config.release_env_path,
+                    expected_epoch_id=self.config.release_epoch_id,
+                    expected_fingerprint=self.config.release_fingerprint_sha256,
+                    expected_note_sha256=self.config.release_note_sha256,
+                )
+            except ExternalWriteFenceError as exc:
+                release_error = exc.code
         body = {
             "schema_version": HEALTH_SCHEMA_VERSION,
             "healthy": (
@@ -6399,6 +6435,7 @@ class HealthReporter:
                 }
                 and not any(value.is_open for value in circuits.values())
                 and (not self.config.enabled or store_health.get("ok") is True)
+                and not release_error
                 and not (
                     self.config.observability_enabled
                     and bool(stats.observability_current_error)
@@ -6425,6 +6462,8 @@ class HealthReporter:
                 effect_kind: asdict(value) for effect_kind, value in circuits.items()
             },
             "store": store_health,
+            "release": release_binding,
+            "release_error": release_error,
         }
         path = self.config.health_path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -7253,7 +7292,7 @@ def load_delivery_dispatcher_environment(
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_delivery_dispatcher_environment()
+    loaded_env_path = load_delivery_dispatcher_environment()
     args = _parser().parse_args(argv)
     try:
         _validate_circuit_reset_arguments(args)
@@ -7262,35 +7301,65 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         return 2
     if args.check_config:
-        quarantine_baseline = (
-            read_quarantine_baseline_status(
-                config.control_db_path,
-                baseline_path=config.quarantine_baseline_path,
-                expected_sha256=config.quarantine_baseline_sha256,
-                expected_release_id=config.quarantine_release_id,
-                bootstrap_epoch_id=config.quarantine_bootstrap_epoch_id,
-                active_release_binding_path=(
-                    config.quarantine_active_release_binding_path
-                ),
-                live_env_path=config.quarantine_live_env_path,
-            )
-            if config.enabled
-            else disabled_quarantine_baseline_status(
-                baseline_path=config.quarantine_baseline_path,
-                expected_sha256=config.quarantine_baseline_sha256,
-            )
-        )
+        release_binding: dict[str, Any] = {}
+        store_health: dict[str, Any] = {"ok": True, "activation": {}}
+        if config.enabled:
+            try:
+                check_store = RcaDeliveryStore(
+                    config.control_db_path,
+                    require_current=True,
+                    read_only=True,
+                    ensure_current_rows=False,
+                )
+                release_binding = validate_bound_resident_release(
+                    check_store,
+                    release_note_path=config.release_note_path,
+                    runtime_root=os.environ.get("PNC_LIVE_RUNTIME_ROOT", ""),
+                    runtime_commit=os.environ.get("PNC_LIVE_RUNTIME_COMMIT", ""),
+                    runtime_tree=os.environ.get("PNC_LIVE_RUNTIME_TREE", ""),
+                    live_manifest_sha256=os.environ.get(
+                        "PNC_LIVE_MANIFEST_SHA256", ""
+                    ),
+                    live_env_path=loaded_env_path,
+                )
+                store_health = check_store.health(
+                    activation_required=config.activation_required
+                )
+            except (ExternalWriteFenceError, OSError, RuntimeError, sqlite3.Error) as exc:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": getattr(exc, "code", type(exc).__name__),
+                            "detail": str(exc),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 2
         print(
             json.dumps(
                 {
-                    "ok": quarantine_baseline["ready"],
+                    "ok": (
+                        not config.enabled
+                        or store_health.get("activation", {}).get("production_ready")
+                        is True
+                    ),
                     "config": config.public_dict(),
-                    "quarantine_baseline": quarantine_baseline,
+                    "activation": store_health.get("activation", {}),
+                    "release": release_binding,
                 },
                 ensure_ascii=False,
             )
         )
-        return 0 if quarantine_baseline["ready"] else 2
+        return (
+            0
+            if (
+                not config.enabled
+                or store_health.get("activation", {}).get("production_ready") is True
+            )
+            else 2
+        )
     if args.health:
         healthy, payload = read_health(
             config.health_path,
@@ -7300,18 +7369,59 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(payload, ensure_ascii=False))
         return 0 if healthy else 2
+    reset_mode = bool(
+        args.clear_circuit
+        or args.materialize_reset
+        or args.pre_w3_effect_keys
+        or args.materialize_pre_w3_disposition
+    )
+    if config.enabled and not args.dry_run and not reset_mode:
+        try:
+            gate_store = RcaDeliveryStore(
+                config.control_db_path,
+                require_current=True,
+                read_only=True,
+                ensure_current_rows=False,
+            )
+            release_binding = validate_bound_resident_release(
+                gate_store,
+                release_note_path=config.release_note_path,
+                runtime_root=os.environ.get("PNC_LIVE_RUNTIME_ROOT", ""),
+                runtime_commit=os.environ.get("PNC_LIVE_RUNTIME_COMMIT", ""),
+                runtime_tree=os.environ.get("PNC_LIVE_RUNTIME_TREE", ""),
+                live_manifest_sha256=os.environ.get("PNC_LIVE_MANIFEST_SHA256", ""),
+                live_env_path=loaded_env_path,
+            )
+            config = replace(
+                config,
+                observation_release_id=release_binding["release_id"],
+                release_env_path=loaded_env_path,
+                resident_release_enforced=True,
+                release_id=release_binding["release_id"],
+                release_epoch_id=release_binding["epoch_id"],
+                release_fingerprint_sha256=release_binding[
+                    "release_fingerprint_sha256"
+                ],
+                release_note_sha256=release_binding["release_note_sha256"],
+            )
+        except (ExternalWriteFenceError, OSError, RuntimeError, sqlite3.Error) as exc:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": getattr(exc, "code", type(exc).__name__),
+                        "detail": str(exc),
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 2
     try:
-        reset_mode = bool(
-            args.clear_circuit
-            or args.materialize_reset
-            or args.pre_w3_effect_keys
-            or args.materialize_pre_w3_disposition
-        )
         store = RcaDeliveryStore(
             config.control_db_path,
             require_current=True,
-            read_only=reset_mode and not args.apply,
-            ensure_current_rows=not reset_mode,
+            read_only=(reset_mode and not args.apply) or args.dry_run,
+            ensure_current_rows=not reset_mode and not args.dry_run,
         )
     except (OSError, RuntimeError, sqlite3.Error) as exc:
         print(
@@ -7412,20 +7522,6 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
-
-    if config.enabled:
-        try:
-            require_resident_activation_epoch(
-                RcaControlStore(config.control_db_path, require_current=True)
-            )
-        except ExternalWriteFenceError as exc:
-            print(
-                json.dumps(
-                    {"ok": False, "error": exc.code, "detail": exc.detail},
-                    ensure_ascii=False,
-                )
-            )
-            return 2
 
     adapter = MeegleIssueCommentAdapter()
     thread_adapter = FeishuThreadReplyAdapter()

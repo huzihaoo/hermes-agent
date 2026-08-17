@@ -11,7 +11,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
+from pathlib import Path
 import re
+import stat
 from typing import Any, Mapping
 
 
@@ -38,6 +41,8 @@ RESIDENT_INGRESS_OPEN_STATES = frozenset(
     {"confirmed", "bounded_active", "steady_active"}
 )
 RESIDENT_EXTERNAL_WRITE_STATES = RESIDENT_ACTIVATION_EPOCH_STATES
+MINIMAL_RELEASE_NOTE_SCHEMA_VERSION = "pnc_rca_minimal_release_note_v1"
+MAX_MINIMAL_RELEASE_NOTE_BYTES = 1024 * 1024
 WRITE_FENCE_FIELDS = frozenset(
     {
         "schema_version",
@@ -96,6 +101,249 @@ def require_resident_activation_epoch(
             "resident_activation_epoch_state_invalid", state or "unconfigured"
         )
     return dict(epoch)
+
+
+def validate_resident_release_note(
+    epoch: Mapping[str, Any],
+    *,
+    release_note_path: str | Path,
+    runtime_root: str | Path,
+    runtime_commit: str,
+    runtime_tree: str,
+    live_manifest_sha256: str,
+    live_env_path: str | Path,
+) -> dict[str, Any]:
+    """Bind one resident process to the current epoch's minimal release note."""
+
+    path = Path(release_note_path).expanduser()
+    if not path.is_absolute() or path != path.absolute():
+        raise ExternalWriteFenceError("resident_release_note_path_invalid")
+    try:
+        lexical = path.lstat()
+    except OSError as exc:
+        raise ExternalWriteFenceError(
+            "resident_release_note_unavailable", type(exc).__name__
+        ) from exc
+    if (
+        stat.S_ISLNK(lexical.st_mode)
+        or not stat.S_ISREG(lexical.st_mode)
+        or lexical.st_uid != os.getuid()
+        or lexical.st_nlink != 1
+        or stat.S_IMODE(lexical.st_mode) & 0o077
+        or lexical.st_size <= 0
+        or lexical.st_size > MAX_MINIMAL_RELEASE_NOTE_BYTES
+    ):
+        raise ExternalWriteFenceError("resident_release_note_file_invalid")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ExternalWriteFenceError(
+            "resident_release_note_unavailable", type(exc).__name__
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        raw = b""
+        while len(raw) <= MAX_MINIMAL_RELEASE_NOTE_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, MAX_MINIMAL_RELEASE_NOTE_BYTES + 1 - len(raw)),
+            )
+            if not chunk:
+                break
+            raw += chunk
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        len(raw) > MAX_MINIMAL_RELEASE_NOTE_BYTES
+        or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or before.st_dev != lexical.st_dev
+        or before.st_ino != lexical.st_ino
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.getuid()
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) & 0o077
+    ):
+        raise ExternalWriteFenceError("resident_release_note_changed")
+    try:
+        note = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ExternalWriteFenceError("resident_release_note_schema_invalid") from exc
+    if not isinstance(note, Mapping):
+        raise ExternalWriteFenceError("resident_release_note_schema_invalid")
+    note = dict(note)
+    if note.get("schema_version") != MINIMAL_RELEASE_NOTE_SCHEMA_VERSION:
+        raise ExternalWriteFenceError("resident_release_note_schema_invalid")
+    note_sha256 = hashlib.sha256(raw).hexdigest()
+    fingerprint = str(note.get("release_fingerprint_sha256") or "").strip()
+    # This is a one-way v1 contract: legacy activation receipts are not release notes.
+    epoch_fingerprint = str(epoch.get("production_fingerprint") or "").strip()
+    epoch_receipt = str(epoch.get("production_gate_receipt_sha256") or "").strip()
+    identity = note.get("release_identity")
+    if (
+        not isinstance(identity, Mapping)
+        or
+        _SHA256_RE.fullmatch(fingerprint) is None
+        or fingerprint == "0" * 64
+        or hashlib.sha256(_canonical(identity)).hexdigest() != fingerprint
+        or fingerprint != epoch_fingerprint
+    ):
+        raise ExternalWriteFenceError("resident_release_fingerprint_mismatch")
+    if _SHA256_RE.fullmatch(epoch_receipt) is None or note_sha256 != epoch_receipt:
+        raise ExternalWriteFenceError("resident_release_note_sha256_mismatch")
+    host = identity.get("host")
+    worker = identity.get("worker")
+    pipeline = identity.get("pipeline")
+    report = identity.get("report_service")
+    projection = note.get("runtime_projection")
+    runtime_path = Path(runtime_root).expanduser()
+    if not runtime_path.is_absolute():
+        raise ExternalWriteFenceError("resident_release_runtime_commit_mismatch")
+    expected_root = str(runtime_path)
+    expected_commit = str(runtime_commit or "").strip()
+    expected_tree = str(runtime_tree or "").strip()
+    expected_manifest = str(live_manifest_sha256 or "").strip()
+    if (
+        not isinstance(host, Mapping)
+        or str(host.get("runtime_root") or "").strip() != expected_root
+        or str(host.get("commit") or "").strip() != expected_commit
+        or re.fullmatch(r"[0-9a-f]{40}", expected_commit) is None
+        or str(host.get("tree") or "").strip() != expected_tree
+        or re.fullmatch(r"[0-9a-f]{40}", expected_tree) is None
+        or not str(host.get("remote_tag") or "").strip()
+        or re.fullmatch(r"[0-9a-f]{40}", str(host.get("remote_tag_object") or ""))
+        is None
+    ):
+        raise ExternalWriteFenceError("resident_release_runtime_commit_mismatch")
+    if (
+        not isinstance(worker, Mapping)
+        or re.fullmatch(r"[0-9a-f]{40}", str(worker.get("commit") or "")) is None
+        or re.fullmatch(r"[0-9a-f]{40}", str(worker.get("tree") or "")) is None
+        or not Path(str(worker.get("runtime_root") or "")).is_absolute()
+        or not str(worker.get("remote_tag") or "").strip()
+        or re.fullmatch(
+            r"[0-9a-f]{40}", str(worker.get("remote_tag_object") or "")
+        )
+        is None
+        or not isinstance(pipeline, Mapping)
+        or re.fullmatch(r"[0-9a-f]{40}", str(pipeline.get("commit") or "")) is None
+        or re.fullmatch(r"[0-9a-f]{40}", str(pipeline.get("tree") or "")) is None
+        or not Path(str(pipeline.get("runtime_root") or "")).is_absolute()
+        or not isinstance(report, Mapping)
+        or _SHA256_RE.fullmatch(str(report.get("manifest_sha256") or "")) is None
+        or str(report.get("pipeline_commit") or "") != str(pipeline.get("commit"))
+        or str(report.get("pipeline_tree") or "") != str(pipeline.get("tree"))
+    ):
+        raise ExternalWriteFenceError("resident_release_identity_invalid")
+    if (
+        not isinstance(projection, Mapping)
+        or str(projection.get("live_manifest_sha256") or "").strip()
+        != expected_manifest
+        or _SHA256_RE.fullmatch(expected_manifest) is None
+    ):
+        raise ExternalWriteFenceError("resident_release_manifest_mismatch")
+    expected_env = str(projection.get("env_sha256") or "").strip()
+    env_path = Path(live_env_path).expanduser()
+    try:
+        env_lexical = env_path.lstat()
+        env_descriptor = os.open(env_path, flags)
+    except OSError as exc:
+        raise ExternalWriteFenceError(
+            "resident_release_env_unavailable", type(exc).__name__
+        ) from exc
+    try:
+        env_before = os.fstat(env_descriptor)
+        env_raw = b""
+        while len(env_raw) <= MAX_MINIMAL_RELEASE_NOTE_BYTES:
+            chunk = os.read(
+                env_descriptor,
+                min(1024 * 1024, MAX_MINIMAL_RELEASE_NOTE_BYTES + 1 - len(env_raw)),
+            )
+            if not chunk:
+                break
+            env_raw += chunk
+        env_after = os.fstat(env_descriptor)
+    finally:
+        os.close(env_descriptor)
+    if (
+        not env_path.is_absolute()
+        or stat.S_ISLNK(env_lexical.st_mode)
+        or not stat.S_ISREG(env_lexical.st_mode)
+        or env_lexical.st_uid != os.getuid()
+        or env_lexical.st_nlink != 1
+        or stat.S_IMODE(env_lexical.st_mode) & 0o077
+        or len(env_raw) > MAX_MINIMAL_RELEASE_NOTE_BYTES
+        or (
+            env_lexical.st_dev,
+            env_lexical.st_ino,
+            env_lexical.st_size,
+            env_lexical.st_mtime_ns,
+        )
+        != (env_before.st_dev, env_before.st_ino, env_before.st_size, env_before.st_mtime_ns)
+        or (env_before.st_dev, env_before.st_ino, env_before.st_size, env_before.st_mtime_ns)
+        != (env_after.st_dev, env_after.st_ino, env_after.st_size, env_after.st_mtime_ns)
+        or not stat.S_ISREG(env_before.st_mode)
+        or env_before.st_uid != os.getuid()
+        or env_before.st_nlink != 1
+        or stat.S_IMODE(env_before.st_mode) & 0o077
+        or _SHA256_RE.fullmatch(expected_env) is None
+        or hashlib.sha256(env_raw).hexdigest() != expected_env
+    ):
+        raise ExternalWriteFenceError("resident_release_env_mismatch")
+    release_id = str(note.get("release_id") or "").strip()
+    if not release_id:
+        raise ExternalWriteFenceError("resident_release_note_schema_invalid")
+    return {
+        "epoch_id": str(epoch.get("epoch_id") or ""),
+        "release_id": release_id,
+        "release_fingerprint_sha256": fingerprint,
+        "release_note_path": str(path),
+        "release_note_sha256": note_sha256,
+        "runtime_root": expected_root,
+        "runtime_commit": expected_commit,
+        "runtime_tree": expected_tree,
+        "live_manifest_sha256": expected_manifest,
+        "live_env_sha256": expected_env,
+    }
+
+
+def validate_bound_resident_release(
+    store: Any,
+    *,
+    release_note_path: str | Path,
+    runtime_root: str | Path,
+    runtime_commit: str,
+    runtime_tree: str,
+    live_manifest_sha256: str,
+    live_env_path: str | Path,
+    expected_epoch_id: str = "",
+    expected_fingerprint: str = "",
+    expected_note_sha256: str = "",
+) -> dict[str, Any]:
+    """Revalidate the current steady epoch against one immutable release note."""
+
+    epoch = require_resident_activation_epoch(store, allowed_states={"steady_active"})
+    binding = validate_resident_release_note(
+        epoch,
+        release_note_path=release_note_path,
+        runtime_root=runtime_root,
+        runtime_commit=runtime_commit,
+        runtime_tree=runtime_tree,
+        live_manifest_sha256=live_manifest_sha256,
+        live_env_path=live_env_path,
+    )
+    if expected_epoch_id and binding["epoch_id"] != expected_epoch_id:
+        raise ExternalWriteFenceError("resident_release_binding_changed")
+    if (
+        expected_fingerprint
+        and binding["release_fingerprint_sha256"] != expected_fingerprint
+    ):
+        raise ExternalWriteFenceError("resident_release_binding_changed")
+    if expected_note_sha256 and binding["release_note_sha256"] != expected_note_sha256:
+        raise ExternalWriteFenceError("resident_release_binding_changed")
+    return binding
 
 
 def _canonical(value: Any) -> bytes:
@@ -698,6 +946,8 @@ __all__ = [
     "target_set_sha256",
     "validate_write_fence",
     "validate_write_fence_source_binding",
+    "validate_bound_resident_release",
+    "validate_resident_release_note",
     "write_target_set_from_source_envelope",
     "write_fence_binding",
 ]

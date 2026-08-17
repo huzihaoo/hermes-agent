@@ -33,6 +33,7 @@ from gateway.pnc_rca_delivery_quarantine_baseline import (
     build_successor_preactivation_quarantine_core,
     canonical_quarantine_baseline_bytes,
     issue_quarantine_baseline,
+    read_quarantine_baseline_status,
 )
 from gateway.pnc_rca_delivery_quarantine_migration import (
     QuarantineMigrationError,
@@ -2915,60 +2916,100 @@ def _build_bundle(
     }
 
 
-def _health(bundle: dict, *, path: Path | None = None, sha256: str | None = None):
-    return bundle["store"].health(
-        now=NOW + timedelta(seconds=5),
-        quarantine_baseline_path=path or bundle["baseline_path"],
-        expected_quarantine_baseline_sha256=(
+def _baseline_status(
+    bundle: dict, *, path: Path | None = None, sha256: str | None = None
+):
+    return read_quarantine_baseline_status(
+        bundle["store"].db_path,
+        baseline_path=path or bundle["baseline_path"],
+        expected_sha256=(
             bundle["baseline_sha256"] if sha256 is None else sha256
         ),
-        quarantine_release_id=bundle["core"]["release_id"],
-        quarantine_bootstrap_epoch_id=bundle["bootstrap_epoch_id"],
-        quarantine_active_release_binding_path=bundle["active_release_binding_path"],
-        quarantine_live_env_path=bundle["live_env_path"],
+        expected_release_id=bundle["core"]["release_id"],
+        bootstrap_epoch_id=bundle["bootstrap_epoch_id"],
+        active_release_binding_path=bundle["active_release_binding_path"],
+        live_env_path=bundle["live_env_path"],
     )
 
 
-def test_exact_approved_baseline_acknowledges_lifetime_without_db_writes(tmp_path):
+def _set_current_activation_production_ready(store: RcaDeliveryStore) -> None:
+    control = RcaControlStore(store.db_path)
+    epoch_id = "rca-baseline-health-ready"
+    created = control.create_activation_epoch(
+        epoch_id=epoch_id,
+        preauthorization_fingerprint="a" * 64,
+        preauthorization_gate_receipt_sha256="b" * 64,
+        preauthorization_capsule_sha256="c" * 64,
+        config_sha256="d" * 64,
+        db_logical_identity={"database": "baseline-health-test"},
+        partition_start_fence={"rca-baseline-health-test": {"0": 0}},
+        operator="delivery-test",
+        reason="prove quarantine is diagnostic rather than a production gate",
+        now=NOW,
+    )
+    control.preauthorize_activation_epoch(
+        epoch_id=epoch_id,
+        preproduction_fingerprint="e" * 64,
+        preproduction_gate_receipt_sha256="f" * 64,
+        preproduction_capsule_sha256="1" * 64,
+        expected_preauthorization_fingerprint="a" * 64,
+        expected_preauthorization_gate_receipt_sha256="b" * 64,
+        expected_preauthorization_capsule_sha256="c" * 64,
+        expected_config_sha256=created["config_sha256"],
+        expected_db_logical_identity_sha256=created["db_logical_identity_sha256"],
+        expected_partition_start_fence_sha256=created[
+            "partition_start_fence_sha256"
+        ],
+        operator="delivery-test",
+        reason="bind exact preproduction identity for health test",
+        now=NOW,
+    )
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs "
+            "SET state = 'steady_active', production_fingerprint = ?, "
+            "production_gate_receipt_sha256 = ?, updated_at = ? "
+            "WHERE epoch_id = ? AND is_current = 1",
+            ("2" * 64, "3" * 64, NOW.isoformat(), epoch_id),
+        )
+
+
+def test_quarantine_baseline_remains_offline_evidence_not_health_gate(tmp_path):
     bundle = _build_bundle(tmp_path)
     store = bundle["store"]
     assert bundle["core"]["schema_version"] == CORE_SCHEMA_VERSION
-    missing = store.health(now=NOW + timedelta(seconds=5))
-    assert missing["business_ready"] is False
-    assert missing["business_blockers"]["quarantined_jobs"] == 1
-    assert missing["production_blockers"] == {
-        "activation_schema_unavailable": 0,
-        "uncertain_effects": 0,
-        "quarantined_jobs": 1,
-        "quarantined_effects": 1,
-            "quarantined_subscriptions": 1,
-            "quarantine_baseline_invalid": 1,
-            "pending_delivery_observations": 0,
-        }
+    baseline = _baseline_status(bundle)
+    assert baseline["ready"] is True
+    assert baseline["lifetime"] == {"jobs": 1, "effects": 1, "subscriptions": 1}
+    assert baseline["acknowledged"] == baseline["lifetime"]
+    assert baseline["baseline_identity"]["release_id"] == "release-baseline-001"
+
+    _set_current_activation_production_ready(store)
     before_backpressure = store.backpressure_snapshot(
         now=NOW + timedelta(seconds=5)
     ).public_dict()
+    health = store.health(
+        now=NOW + timedelta(seconds=5), activation_required=True
+    )
 
-    health = _health(bundle)
-
+    assert health["activation"]["production_ready"] is True
     assert health["business_ready"] is True
     assert not any(health["production_blockers"].values())
+    assert health["production_blockers"] == {
+        "activation_schema_unavailable": 0,
+        "activation_epoch_not_steady": 0,
+        "activation_fingerprint_invalid": 0,
+        "activation_gate_receipt_invalid": 0,
+        "uncertain_effects": 0,
+        "pending_delivery_observations": 0,
+    }
     assert health["delivery_jobs"]["quarantined"] == 1
     assert health["delivery_effects"]["quarantined"] == 1
     assert health["delivery_subscriptions"]["quarantined"] == 1
-    baseline = health["delivery_quarantine"]
-    assert baseline["lifetime"] == {"jobs": 1, "effects": 1, "subscriptions": 1}
-    assert baseline["acknowledged"] == baseline["lifetime"]
-    assert baseline["unacknowledged"] == {
-        "jobs": 0,
-        "effects": 0,
-        "subscriptions": 0,
-    }
-    assert baseline["baseline_identity"]["release_id"] == "release-baseline-001"
-    assert (
-        baseline["baseline_identity"]["quarantine_core_sha256"]
-        == bundle["core"]["core_sha256"]
-    )
+    assert health["business_blockers"]["quarantined_jobs"] == 1
+    assert health["business_blockers"]["quarantined_effects"] == 1
+    assert health["business_blockers"]["quarantined_subscriptions"] == 1
+    assert "delivery_quarantine" not in health
     assert bundle["core"]["issuance_policy"]["bom_binding"] == (
         "quarantine_core_sha256"
     )
@@ -2992,8 +3033,8 @@ def test_static_migration_cache_does_not_hide_live_quarantine_drift(
 
     monkeypatch.setattr(baseline_module, "validate_migration_receipt", counted)
 
-    assert _health(bundle)["business_ready"] is True
-    assert _health(bundle)["business_ready"] is True
+    assert _baseline_status(bundle)["ready"] is True
+    assert _baseline_status(bundle)["ready"] is True
     assert len(calls) == 1
     with sqlite3.connect(bundle["store"].db_path) as conn:
         conn.execute(
@@ -3001,12 +3042,11 @@ def test_static_migration_cache_does_not_hide_live_quarantine_drift(
             ((NOW + timedelta(seconds=9)).isoformat(),),
         )
 
-    drifted = _health(bundle)
+    drifted = _baseline_status(bundle)
 
     assert len(calls) == 1
-    assert drifted["business_ready"] is False
-    assert drifted["business_blockers"]["quarantine_baseline_invalid"] == 1
-    assert drifted["delivery_quarantine"]["error_code"] == (
+    assert drifted["ready"] is False
+    assert drifted["error_code"] == (
         "delivery_quarantine_baseline_snapshot_mismatch"
     )
 
@@ -3035,9 +3075,9 @@ def test_activation_deferred_issue_comment_is_explicitly_adjudicated(tmp_path):
         "analyzed_at": (NOW + timedelta(seconds=2)).isoformat(),
         "reason": "exact historical terminal rows and settlement evidence",
     }
-    health = _health(bundle)
-    assert health["business_ready"] is True
-    assert health["delivery_quarantine"]["acknowledged"]["subscriptions"] == 2
+    status = _baseline_status(bundle)
+    assert status["ready"] is True
+    assert status["acknowledged"]["subscriptions"] == 2
 
 
 def test_unrecognized_quarantined_issue_comment_still_fails_closed(tmp_path):
@@ -3188,7 +3228,7 @@ def test_baseline_can_be_reissued_after_monotonic_quarantine_audit_events(tmp_pa
             ((NOW + timedelta(seconds=7)).isoformat(),),
         )
 
-    assert _health(bundle)["business_ready"] is False
+    assert _baseline_status(bundle)["ready"] is False
     core = build_quarantine_core(
         bundle["store"].db_path,
         **_migration_kwargs(bundle["migration"]),
@@ -3240,14 +3280,16 @@ def test_baseline_can_be_reissued_after_monotonic_quarantine_audit_events(tmp_pa
 
     reissued_path = tmp_path / "delivery-quarantine-baseline-002.json"
     reissued_sha256 = _write(reissued_path, baseline)
-    health = _health(bundle, path=reissued_path, sha256=reissued_sha256)
+    status = _baseline_status(
+        bundle, path=reissued_path, sha256=reissued_sha256
+    )
 
     assert baseline["quarantine_core"]["quarantine_event_projection"] == (
         core["quarantine_event_projection"]
     )
-    assert health["business_ready"] is True, health
+    assert status["ready"] is True, status
     assert core["quarantine_event_projection"]["event_count"] == 5
-    identity = health["delivery_quarantine"]["baseline_identity"]
+    identity = status["baseline_identity"]
     assert identity["quarantine_core_sha256"] == core["core_sha256"]
     assert identity["approval_evidence_sha256"] == approval_sha256
     assert identity["active_release_binding_sha256"] == hashlib.sha256(
@@ -3569,7 +3611,7 @@ def test_require_current_rejects_v6_without_mutating_it(tmp_path):
     assert version == "pnc_rca_delivery_store_v6"
 
 
-def test_historical_enter_delete_requires_baseline_without_current_rows(tmp_path):
+def test_historical_quarantine_audit_is_offline_evidence_not_health_gate(tmp_path):
     _control(tmp_path)
     store = RcaDeliveryStore(tmp_path / "control.sqlite3")
     with sqlite3.connect(store.db_path) as conn:
@@ -3583,18 +3625,30 @@ def test_historical_enter_delete_requires_baseline_without_current_rows(tmp_path
             ),
         )
 
-    health = store.health(now=NOW + timedelta(seconds=1))
-
-    baseline = health["delivery_quarantine"]
-    assert baseline["required"] is True
-    assert baseline["state"] == "unavailable"
-    assert baseline["error_code"] == "delivery_quarantine_baseline_not_configured"
-    assert baseline["lifetime"] == {
+    offline_status = read_quarantine_baseline_status(
+        store.db_path,
+        baseline_path=tmp_path / "not-configured.json",
+        expected_sha256="",
+    )
+    assert offline_status["required"] is True
+    assert offline_status["state"] == "unavailable"
+    assert offline_status["error_code"] == (
+        "delivery_quarantine_baseline_not_configured"
+    )
+    assert offline_status["lifetime"] == {
         "jobs": 1,
         "effects": 0,
         "subscriptions": 0,
     }
-    assert health["business_blockers"]["quarantined_jobs"] == 1
+
+    _set_current_activation_production_ready(store)
+    health = store.health(
+        now=NOW + timedelta(seconds=1), activation_required=True
+    )
+    assert health["business_ready"] is True
+    assert not any(health["production_blockers"].values())
+    assert health["business_blockers"]["quarantined_jobs"] == 0
+    assert "delivery_quarantine" not in health
 
 
 @pytest.mark.parametrize(
@@ -3615,7 +3669,7 @@ def test_historical_enter_delete_requires_baseline_without_current_rows(tmp_path
         "live_env_tamper",
     ],
 )
-def test_baseline_or_snapshot_drift_fails_closed(tmp_path, case):
+def test_offline_baseline_or_snapshot_drift_fails_closed(tmp_path, case):
     bundle = _build_bundle(tmp_path)
     path = bundle["baseline_path"]
     sha256 = bundle["baseline_sha256"]
@@ -3664,18 +3718,16 @@ def test_baseline_or_snapshot_drift_fails_closed(tmp_path, case):
         bundle["live_env_path"].write_text("tampered=true\n")
         bundle["live_env_path"].chmod(0o600)
 
-    health = _health(bundle, path=path, sha256=sha256)
+    status = _baseline_status(bundle, path=path, sha256=sha256)
 
-    assert health["business_ready"] is False
-    assert health["business_blockers"]["quarantine_baseline_invalid"] == 1
-    assert health["delivery_quarantine"]["ready"] is False
-    assert health["delivery_quarantine"]["unacknowledged"]["jobs"] == 1
+    assert status["ready"] is False
+    assert status["unacknowledged"]["jobs"] == 1
 
 
 @pytest.mark.parametrize("mutation", ["status_roundtrip", "insert_delete"])
 def test_monotonic_quarantine_events_prevent_old_baseline_revival(tmp_path, mutation):
     bundle = _build_bundle(tmp_path)
-    assert _health(bundle)["business_ready"] is True
+    assert _baseline_status(bundle)["ready"] is True
     with sqlite3.connect(bundle["store"].db_path) as conn:
         if mutation == "status_roundtrip":
             conn.execute(
@@ -3711,10 +3763,10 @@ def test_monotonic_quarantine_events_prevent_old_baseline_revival(tmp_path, muta
                 "WHERE subscription_key = 'transient-quarantine-subscription'"
             )
 
-    health = _health(bundle)
+    status = _baseline_status(bundle)
 
-    assert health["business_ready"] is False
-    assert health["delivery_quarantine"]["error_code"] == (
+    assert status["ready"] is False
+    assert status["error_code"] == (
         "delivery_quarantine_event_projection_mismatch"
     )
 
@@ -3863,10 +3915,10 @@ def test_strict_baseline_json_rejects_duplicate_keys_and_nan(tmp_path, payload):
     path.chmod(0o600)
     sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
 
-    health = _health(bundle, sha256=sha256)
+    status = _baseline_status(bundle, sha256=sha256)
 
-    assert health["business_ready"] is False
-    assert health["delivery_quarantine"]["error_code"].endswith(
+    assert status["ready"] is False
+    assert status["error_code"].endswith(
         "duplicate_key" if payload == "duplicate" else "number_invalid"
     )
 
@@ -3875,18 +3927,18 @@ def test_database_path_identity_mismatch_fails_closed(tmp_path):
     first = _build_bundle(tmp_path / "first")
     second = _build_bundle(tmp_path / "second")
 
-    health = second["store"].health(
-        now=NOW + timedelta(seconds=5),
-        quarantine_baseline_path=first["baseline_path"],
-        expected_quarantine_baseline_sha256=first["baseline_sha256"],
-        quarantine_release_id=first["core"]["release_id"],
-        quarantine_bootstrap_epoch_id=first["bootstrap_epoch_id"],
-        quarantine_active_release_binding_path=first["active_release_binding_path"],
-        quarantine_live_env_path=first["live_env_path"],
+    status = read_quarantine_baseline_status(
+        second["store"].db_path,
+        baseline_path=first["baseline_path"],
+        expected_sha256=first["baseline_sha256"],
+        expected_release_id=first["core"]["release_id"],
+        bootstrap_epoch_id=first["bootstrap_epoch_id"],
+        active_release_binding_path=first["active_release_binding_path"],
+        live_env_path=first["live_env_path"],
     )
 
-    assert health["business_ready"] is False
-    assert health["delivery_quarantine"]["error_code"] == (
+    assert status["ready"] is False
+    assert status["error_code"] == (
         "delivery_quarantine_migration_receipt_scope_invalid"
     )
 
