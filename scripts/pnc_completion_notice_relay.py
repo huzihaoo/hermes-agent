@@ -64,6 +64,7 @@ from gateway.pnc_rca_delivery_contract import (  # noqa: E402
 from gateway.pnc_rca_artifacts import local_candidates_for_vm_path  # noqa: E402
 from gateway.pnc_rca_write_fence import (  # noqa: E402
     ExternalWriteFenceError,
+    MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
     snapshot_core_sha256,
     validate_write_fence,
     validate_write_fence_source_binding,
@@ -4935,71 +4936,77 @@ def _automatic_g1q3_write_fence_ready(task_id: str) -> bool:
     return True
 
 
-def _relay_live_fence_binding(fence: Mapping[str, Any]) -> dict[str, Any]:
-    path = _relay_control_db_path()
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
+def _relay_live_fence_binding(
+    fence: Mapping[str, Any],
+    *,
+    store_factory: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Revalidate one relay write through the schema-aware delivery store."""
+
+    if store_factory is None:
+        from gateway.pnc_rca_delivery_store import RcaDeliveryStore
+
+        store_factory = RcaDeliveryStore
     try:
-        row = conn.execute(
-            """
-            SELECT epoch.epoch_id, epoch.state, epoch.is_current,
-                   ledger.ledger_id, ledger.admission_key,
-                   ledger.business_key, ledger.submission_key,
-                   ledger.generation, ledger.decision, ledger.bound_at,
-                   snapshot.admission_snapshot_json,
-                   envelope.source_envelope_json
-              FROM rca_activation_epochs AS epoch
-              JOIN rca_activation_admission_ledger AS ledger
-                ON ledger.epoch_id = epoch.epoch_id
-               AND ledger.ledger_id = ?
-              JOIN rca_admission_snapshots AS snapshot
-                ON snapshot.business_key = ledger.business_key
-               AND snapshot.submission_key = ledger.submission_key
-               AND snapshot.generation = ledger.generation
-               AND snapshot.activation_epoch_id = ledger.epoch_id
-               AND snapshot.activation_ledger_id = ledger.ledger_id
-              JOIN rca_snapshot_source_envelopes AS envelope
-                ON envelope.snapshot_sha256 = snapshot.snapshot_sha256
-               AND envelope.source_envelope_sha256 =
-                   snapshot.creator_source_envelope_sha256
-               AND envelope.source_id = snapshot.creator_source_id
-             WHERE epoch.epoch_id = ? AND ledger.admission_key = ?
-            """,
-            (
-                fence.get("activation_ledger_id"),
-                fence.get("activation_epoch_id"),
-                fence.get("admission_key"),
-            ),
-        ).fetchone()
-    finally:
-        conn.close()
-    if row is None or int(row["is_current"]) != 1:
-        raise ExternalWriteFenceError("external_write_fence_epoch_not_current")
-    if str(row["state"]) != "steady_active":
-        raise ExternalWriteFenceError("external_write_fence_epoch_not_current")
-    if str(row["decision"]) != "admit" or not row["bound_at"]:
-        raise ExternalWriteFenceError("external_write_fence_operation_denied")
-    try:
-        targets = validate_write_fence_source_binding(
-            fence,
-            snapshot=json.loads(str(row["admission_snapshot_json"])),
-            source_envelope=json.loads(str(row["source_envelope_json"])),
+        store = store_factory(
+            _relay_control_db_path(),
+            require_current=True,
+            ensure_current_rows=False,
+            allow_successor_read_only=True,
         )
+        capability = store.schema_runtime_capability()
+        _require_relay_current_write_capability(capability)
+        return dict(store.validate_external_write_fence_binding(fence))
     except ExternalWriteFenceError:
         raise
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ExternalWriteFenceError(
-            "external_write_fence_schema_invalid"
-        ) from exc
-    return {
-        "epoch_id": str(row["epoch_id"]),
-        "state": str(row["state"]),
-        "ledger_id": int(row["ledger_id"]),
-        "business_key": str(row["business_key"]),
-        "submission_key": str(row["submission_key"]),
-        "generation": int(row["generation"]),
-        **targets,
-    }
+    except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as exc:
+        code = str(exc)
+        if code not in {
+            "external_write_fence_schema_invalid",
+            "external_write_fence_epoch_not_current",
+            "external_write_fence_operation_denied",
+            "external_write_fence_identity_mismatch",
+            "external_write_fence_target_mismatch",
+        }:
+            code = "external_write_fence_epoch_not_current"
+        raise ExternalWriteFenceError(code) from exc
+
+
+_RELAY_SCHEMA_RUNTIME_CAPABILITY_FIELDS = frozenset({
+    "observed_control_schema_version",
+    "binary_write_schema_version",
+    "mode",
+    "read_supported",
+    "write_enabled",
+    "work_admission_enabled",
+    "lease_acquisition_enabled",
+    "external_effect_enabled",
+})
+
+
+def _require_relay_current_write_capability(value: object) -> None:
+    """Reject any partial or non-current capability before fence/provider calls."""
+
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != _RELAY_SCHEMA_RUNTIME_CAPABILITY_FIELDS
+        or value.get("observed_control_schema_version")
+        != MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
+        or value.get("binary_write_schema_version")
+        != MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
+        or value.get("mode") != "current_write"
+        or any(
+            value.get(field) is not True
+            for field in (
+                "read_supported",
+                "write_enabled",
+                "work_admission_enabled",
+                "lease_acquisition_enabled",
+                "external_effect_enabled",
+            )
+        )
+    ):
+        raise ExternalWriteFenceError("external_write_fence_schema_read_only")
 
 
 def _fenced_task_senders(

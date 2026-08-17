@@ -32,10 +32,13 @@ from gateway.pnc_rca_control_store import ActivationEpochError, RcaControlStore
 from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from gateway.pnc_rca_runtime_identity import runtime_identity_is_valid
 from gateway.pnc_rca_write_fence import (
+    MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
     MINIMAL_RELEASE_HOST_REMOTE,
     MINIMAL_RELEASE_NOTE_SCHEMA_VERSION,
     MINIMAL_RELEASE_PRODUCTION_DEFINITION,
     MinimalReleaseNoteIdentityError,
+    minimal_release_epoch_contract_sha256,
+    validate_minimal_release_activation_contract,
     validate_minimal_release_note_identity,
 )
 
@@ -67,6 +70,16 @@ CONTROL_DB_ENV_KEYS = (
     "HERMES_RCA_DELIVERY_DISPATCHER_CONTROL_DB_PATH",
     "HERMES_RCA_CONTROL_DB_PATH",
 )
+SCHEMA_RUNTIME_CAPABILITY_FIELDS = frozenset({
+    "observed_control_schema_version",
+    "binary_write_schema_version",
+    "mode",
+    "read_supported",
+    "write_enabled",
+    "work_admission_enabled",
+    "lease_acquisition_enabled",
+    "external_effect_enabled",
+})
 
 # label, release-relative script, HERMES_HOME-relative health, freshness field,
 # health schema. Gateway status has no schema and updated_at is a transition,
@@ -369,6 +382,8 @@ def _load_note(path: Path, home: Path) -> tuple[bytes, dict]:
         "control_db_path",
         "operator",
         "reason",
+        "expected_control_schema_version",
+        "target_control_schema_version",
         "expected_predecessor_epoch_id",
         "expected_predecessor_state",
         "expected_predecessor_binding_fingerprint",
@@ -376,6 +391,7 @@ def _load_note(path: Path, home: Path) -> tuple[bytes, dict]:
         "db_logical_identity_sha256",
         "partition_start_fence",
         "partition_start_fence_sha256",
+        "epoch_contract_sha256",
     }
     if (
         not isinstance(activation, Mapping)
@@ -729,8 +745,19 @@ def _bound_binding(note_raw: bytes, note: Mapping[str, Any]) -> dict:
         or activation["partition_start_fence_sha256"] != _sha(_canonical(fence))
     ):
         raise ReleaseError("release_note_activation_binding_invalid")
+    try:
+        validate_minimal_release_activation_contract(activation)
+    except MinimalReleaseNoteIdentityError as exc:
+        raise ReleaseError("release_note_epoch_contract_invalid") from exc
     return {
         "epoch_id": activation["epoch_id"],
+        "expected_control_schema_version": activation[
+            "expected_control_schema_version"
+        ],
+        "target_control_schema_version": activation[
+            "target_control_schema_version"
+        ],
+        "epoch_contract_sha256": activation["epoch_contract_sha256"],
         "release_fingerprint_sha256": note["release_fingerprint_sha256"],
         "release_note_sha256": _sha(note_raw),
         "config_sha256": note["runtime_projection"]["env_sha256"],
@@ -803,6 +830,59 @@ def _open_delivery_store(path: Path) -> RcaDeliveryStore:
     )
 
 
+def _schema_runtime_capability(store: Any, *, writable: bool) -> dict[str, Any]:
+    try:
+        capability = store.schema_runtime_capability()
+    except Exception as exc:
+        raise ReleaseError("control_schema_capability_unavailable") from exc
+    if (
+        not isinstance(capability, Mapping)
+        or set(capability) != SCHEMA_RUNTIME_CAPABILITY_FIELDS
+        or not isinstance(capability.get("mode"), str)
+        or not all(
+            isinstance(capability.get(field), bool)
+            for field in (
+                "read_supported",
+                "write_enabled",
+                "work_admission_enabled",
+                "lease_acquisition_enabled",
+                "external_effect_enabled",
+            )
+        )
+    ):
+        raise ReleaseError("control_schema_capability_invalid")
+    if (
+        capability.get("observed_control_schema_version")
+        != MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
+        or capability.get("binary_write_schema_version")
+        != MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
+    ):
+        raise ReleaseError("control_schema_v14_required")
+    write_flags = tuple(
+        capability[field]
+        for field in (
+            "write_enabled",
+            "work_admission_enabled",
+            "lease_acquisition_enabled",
+            "external_effect_enabled",
+        )
+    )
+    if writable:
+        if (
+            capability.get("mode") != "current_write"
+            or capability.get("read_supported") is not True
+            or write_flags != (True, True, True, True)
+        ):
+            raise ReleaseError("control_schema_v14_write_unavailable")
+    elif (
+        capability.get("mode") != "explicit_read_only"
+        or capability.get("read_supported") is not True
+        or write_flags != (False, False, False, False)
+    ):
+        raise ReleaseError("control_schema_v14_read_unavailable")
+    return dict(capability)
+
+
 def _activation_expected(binding: Mapping[str, Any]) -> dict[str, str]:
     return {
         "state": "steady_active",
@@ -851,6 +931,7 @@ def _activation_plan(
     }
     try:
         store = store_factory(Path(activation["control_db_path"]), True)
+        capability = _schema_runtime_capability(store, writable=False)
         current = store.activation_epoch()
         predecessor_id = str(activation.get("expected_predecessor_epoch_id") or "")
         inflight = zero
@@ -905,6 +986,7 @@ def _activation_plan(
         "release_fingerprint_sha256": binding["release_fingerprint_sha256"],
         "release_note_sha256": binding["release_note_sha256"],
         "config_sha256": binding["config_sha256"],
+        "control_schema": capability,
     }
 
 
@@ -916,9 +998,9 @@ def _activation_apply(
 ) -> dict:
     activation = note["activation"]
     try:
-        current = store_factory(
-            Path(activation["control_db_path"]), False
-        ).activate_direct_steady_epoch(
+        store = store_factory(Path(activation["control_db_path"]), False)
+        _schema_runtime_capability(store, writable=True)
+        current = store.activate_direct_steady_epoch(
             epoch_id=binding["epoch_id"],
             release_fingerprint_sha256=binding["release_fingerprint_sha256"],
             release_note_sha256=binding["release_note_sha256"],
@@ -949,9 +1031,9 @@ def _activation_status(
     note: Mapping[str, Any], binding: Mapping[str, Any], store_factory: StoreFactory
 ) -> dict:
     try:
-        current = store_factory(
-            Path(note["activation"]["control_db_path"]), True
-        ).activation_epoch()
+        store = store_factory(Path(note["activation"]["control_db_path"]), True)
+        _schema_runtime_capability(store, writable=False)
+        current = store.activation_epoch()
     except (ActivationEpochError, RuntimeError, ValueError) as exc:
         raise _store_error(exc) from exc
     if (
@@ -2235,6 +2317,7 @@ def _prepare_control_binding(
     topics = _normalize_partition_topics(partition_topics)
     try:
         store = store_factory(control_db, True)
+        _schema_runtime_capability(store, writable=False)
         source = store.control_db_source_snapshot_identity()
         predecessor = store.direct_steady_predecessor()
         fence: dict[str, dict[str, int]] = {}
@@ -2284,6 +2367,8 @@ def _prepare_control_binding(
             ],
         }
     return {
+        "expected_control_schema_version": MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+        "target_control_schema_version": MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
         "db_logical_identity": dict(logical),
         "partition_start_fence": fence,
         **predecessor_fields,
@@ -2556,6 +2641,34 @@ def prepare_release(
         release_fingerprint=release_fingerprint,
     )
     activation = _prepare_control_binding(control_db, partition_topics, store_factory)
+    activation_note = {
+        "epoch_id": epoch_id,
+        "control_db_path": str(control_db),
+        "operator": operator,
+        "reason": reason,
+        "expected_control_schema_version": activation[
+            "expected_control_schema_version"
+        ],
+        "target_control_schema_version": activation["target_control_schema_version"],
+        "db_logical_identity": activation["db_logical_identity"],
+        "db_logical_identity_sha256": _sha(
+            _canonical(activation["db_logical_identity"])
+        ),
+        "partition_start_fence": activation["partition_start_fence"],
+        "partition_start_fence_sha256": _sha(
+            _canonical(activation["partition_start_fence"])
+        ),
+        "expected_predecessor_epoch_id": activation[
+            "expected_predecessor_epoch_id"
+        ],
+        "expected_predecessor_state": activation["expected_predecessor_state"],
+        "expected_predecessor_binding_fingerprint": activation[
+            "expected_predecessor_binding_fingerprint"
+        ],
+    }
+    activation_note["epoch_contract_sha256"] = (
+        minimal_release_epoch_contract_sha256(activation_note)
+    )
     note = {
         "schema_version": NOTE_SCHEMA,
         "production_definition": PRODUCTION_DEFINITION,
@@ -2566,27 +2679,7 @@ def prepare_release(
             "env_sha256": _sha(env_raw),
             "live_manifest_sha256": _sha(manifest_raw),
         },
-        "activation": {
-            "epoch_id": epoch_id,
-            "control_db_path": str(control_db),
-            "operator": operator,
-            "reason": reason,
-            "db_logical_identity": activation["db_logical_identity"],
-            "db_logical_identity_sha256": _sha(
-                _canonical(activation["db_logical_identity"])
-            ),
-            "partition_start_fence": activation["partition_start_fence"],
-            "partition_start_fence_sha256": _sha(
-                _canonical(activation["partition_start_fence"])
-            ),
-            "expected_predecessor_epoch_id": activation[
-                "expected_predecessor_epoch_id"
-            ],
-            "expected_predecessor_state": activation["expected_predecessor_state"],
-            "expected_predecessor_binding_fingerprint": activation[
-                "expected_predecessor_binding_fingerprint"
-            ],
-        },
+        "activation": activation_note,
         "resident_profile": {
             "name": "operator_issue_only_v1",
             "required": [row[0] for row in REQUIRED_RESIDENTS],

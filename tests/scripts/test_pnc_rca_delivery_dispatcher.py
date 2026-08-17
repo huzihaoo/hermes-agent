@@ -70,6 +70,8 @@ from tests.gateway.test_pnc_rca_delivery_store import (
     _control,
     _current_epoch_valid_w3_quarantined_control,
     _insert_subscription,
+    _physical_v15_delivery_fixture,
+    _sqlite_storage_identity,
     _switch_activation_epoch,
 )
 from tests.gateway.test_pnc_rca_delivery_contract import (
@@ -274,6 +276,256 @@ def test_enabled_resident_without_epoch_exits_before_provider_creation(
     assert "resident_activation_epoch_missing" in capsys.readouterr().out
 
 
+def _successor_read_only_capability() -> dict[str, object]:
+    return {
+        "observed_control_schema_version": "pnc_rca_control_store_v15",
+        "binary_write_schema_version": "pnc_rca_control_store_v14",
+        "mode": "successor_read_only",
+        "read_supported": True,
+        "write_enabled": False,
+        "work_admission_enabled": False,
+        "lease_acquisition_enabled": False,
+        "external_effect_enabled": False,
+    }
+
+
+def test_successor_read_only_dispatcher_writes_health_without_provider_or_claim(
+    tmp_path,
+    monkeypatch,
+):
+    config = _config(tmp_path, enabled=True)
+    calls = []
+
+    class SuccessorStore:
+        def schema_runtime_capability(self):
+            return _successor_read_only_capability()
+
+        def health(self, **kwargs):
+            calls.append(("health", kwargs))
+            return {
+                "ok": False,
+                "process_healthy": True,
+                "schema_runtime_capability": _successor_read_only_capability(),
+            }
+
+        def delivery_dispatcher_circuits(self):
+            pytest.fail("circuit state must not be read in quiescent mode")
+
+        def claim_due_effect(self, **_kwargs):
+            pytest.fail("effect claim must not run")
+
+    def store_factory(*_args, **kwargs):
+        calls.append(("store", kwargs))
+        return SuccessorStore()
+
+    monkeypatch.setattr(
+        dispatcher_module, "load_delivery_dispatcher_environment", lambda: None
+    )
+    monkeypatch.setattr(
+        dispatcher_module.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(dispatcher_module, "RcaDeliveryStore", store_factory)
+    monkeypatch.setattr(
+        dispatcher_module,
+        "validate_bound_resident_release",
+        lambda *_args, **_kwargs: pytest.fail("release writer gate must not run"),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "MeegleIssueCommentAdapter",
+        lambda *_args, **_kwargs: pytest.fail("Meegle provider must not be created"),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "FeishuThreadReplyAdapter",
+        lambda *_args, **_kwargs: pytest.fail("Feishu provider must not be created"),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "DeliveryDispatcher",
+        lambda *_args, **_kwargs: pytest.fail("dispatcher must not be created"),
+    )
+
+    assert dispatcher_module.main(["--once"]) == 0
+
+    assert calls[0][0] == "store"
+    assert calls[0][1].get("read_only", False) is False
+    assert calls[0][1]["ensure_current_rows"] is False
+    assert calls[0][1]["allow_successor_read_only"] is True
+    assert calls[1] == (
+        "health",
+        {"activation_required": config.activation_required},
+    )
+    payload = json.loads(config.health_path.read_text(encoding="utf-8"))
+    assert payload["mode"] == "successor_read_only"
+    assert payload["ok"] is False
+    assert payload["healthy"] is True
+    assert payload["process_healthy"] is True
+    assert payload["business_ready"] is False
+    assert payload["ready"] is False
+    assert payload["processing"] is False
+    assert payload["schema_runtime_capability"] == (
+        _successor_read_only_capability()
+    )
+    healthy, observed = dispatcher_module.read_health(
+        config.health_path,
+        max_age_seconds=config.health_max_age_seconds,
+    )
+    assert healthy is False
+    assert observed["liveness_ok"] is True
+
+
+def test_real_v15_dispatcher_preserves_db_wal_shm_without_provider_or_claim(
+    tmp_path,
+    monkeypatch,
+):
+    path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    wal_writer = sqlite3.connect(path)
+    assert wal_writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    wal_writer.execute("PRAGMA wal_autocheckpoint=0")
+    wal_writer.execute(
+        "INSERT INTO rca_delivery_meta(key, value) VALUES(?, ?)",
+        ("dispatcher_resident_live_wal_fixture", "present"),
+    )
+    wal_writer.commit()
+    assert Path(f"{path}-wal").is_file()
+    assert Path(f"{path}-shm").is_file()
+    before = _sqlite_storage_identity(path)
+    config = replace(_config(tmp_path, enabled=True), control_db_path=path)
+
+    monkeypatch.setattr(
+        dispatcher_module, "load_delivery_dispatcher_environment", lambda: None
+    )
+    monkeypatch.setattr(
+        dispatcher_module.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "validate_bound_resident_release",
+        lambda *_args, **_kwargs: pytest.fail("release writer gate must not run"),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "MeegleIssueCommentAdapter",
+        lambda *_args, **_kwargs: pytest.fail("Meegle provider must not be created"),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "FeishuThreadReplyAdapter",
+        lambda *_args, **_kwargs: pytest.fail("Feishu provider must not be created"),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "DeliveryDispatcher",
+        lambda *_args, **_kwargs: pytest.fail("dispatcher must not be created"),
+    )
+
+    try:
+        assert dispatcher_module.main(["--once"]) == 0
+        after = _sqlite_storage_identity(path)
+        assert after["db"] == before["db"]
+        assert after["-wal"] == before["-wal"]
+        assert (after["-shm"] is None) is (before["-shm"] is None)
+    finally:
+        wal_writer.close()
+
+    payload = json.loads(config.health_path.read_text(encoding="utf-8"))
+    assert payload["mode"] == "successor_read_only"
+    assert payload["ok"] is False
+    assert payload["process_healthy"] is True
+    assert payload["ready"] is False
+    assert payload["processing"] is False
+
+
+@pytest.mark.parametrize("mode", ["check_config", "dry_run"])
+def test_successor_read_only_dispatcher_diagnostics_do_not_create_provider(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    mode,
+):
+    config = _config(tmp_path, enabled=True)
+    config.control_db_path.write_bytes(b"fixture")
+    calls = []
+
+    class SuccessorStore:
+        def schema_runtime_capability(self):
+            return _successor_read_only_capability()
+
+        def preview_dispatchable_effects(self, **_kwargs):
+            calls.append("preview")
+            return []
+
+    def store_factory(*_args, **kwargs):
+        calls.append(("store", kwargs))
+        return SuccessorStore()
+
+    monkeypatch.setattr(
+        dispatcher_module, "load_delivery_dispatcher_environment", lambda: None
+    )
+    monkeypatch.setattr(
+        dispatcher_module.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(dispatcher_module, "RcaDeliveryStore", store_factory)
+    monkeypatch.setattr(
+        dispatcher_module,
+        "validate_bound_resident_release",
+        lambda *_args, **_kwargs: pytest.fail("release writer gate must not run"),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "MeegleIssueCommentAdapter",
+        lambda *_args, **_kwargs: pytest.fail("provider must not be created"),
+    )
+
+    flag = "--check-config" if mode == "check_config" else "--dry-run"
+    assert dispatcher_module.main([flag]) == 2
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["mode"] == "successor_read_only"
+    assert payload["ready"] is False
+    assert payload["processing"] is False
+    assert payload["operation"] == mode
+    assert "preview" not in calls
+    [store_call] = calls
+    assert store_call[0] == "store"
+    assert store_call[1]["read_only"] is True
+    assert store_call[1]["ensure_current_rows"] is False
+    assert store_call[1]["allow_successor_read_only"] is True
+
+
+def test_disabled_dispatcher_check_config_does_not_probe_existing_control_db(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    config = _config(tmp_path, enabled=False)
+    config.control_db_path.write_bytes(b"not-a-database")
+    monkeypatch.setattr(
+        dispatcher_module, "load_delivery_dispatcher_environment", lambda: None
+    )
+    monkeypatch.setattr(
+        dispatcher_module.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "RcaDeliveryStore",
+        lambda *_args, **_kwargs: pytest.fail("disabled check-config probed DB"),
+    )
+
+    assert dispatcher_module.main(["--check-config"]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
 def test_enabled_startup_locks_minimal_release_before_writable_store_and_provider(
     tmp_path,
     monkeypatch,
@@ -284,6 +536,14 @@ def test_enabled_startup_locks_minimal_release_before_writable_store_and_provide
     RcaDeliveryStore(control.db_path)
     _bind_minimal_release(control, fixture)
     _set_live_release_environment(monkeypatch, fixture)
+    wal_writer = sqlite3.connect(control.db_path)
+    assert wal_writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    wal_writer.execute("PRAGMA wal_autocheckpoint=0")
+    wal_writer.execute(
+        "INSERT INTO rca_delivery_meta(key, value) VALUES(?, ?)",
+        ("dispatcher_startup_active_wal", "present"),
+    )
+    wal_writer.commit()
     config = replace(
         _config(tmp_path),
         control_db_path=control.db_path,
@@ -331,8 +591,12 @@ def test_enabled_startup_locks_minimal_release_before_writable_store_and_provide
 
     monkeypatch.setattr(
         RcaControlStore,
-        "_create_read_only_snapshot",
-        lambda _self: pytest.fail("normal startup must not copy the control DB"),
+        "create_schema_probe_snapshot",
+        classmethod(
+            lambda _cls, *_args, **_kwargs: pytest.fail(
+                "normal startup must not copy the control DB"
+            )
+        ),
     )
     monkeypatch.setattr(dispatcher_module, "RcaDeliveryStore", tracked_store)
     monkeypatch.setattr(
@@ -361,9 +625,12 @@ def test_enabled_startup_locks_minimal_release_before_writable_store_and_provide
         dispatcher_module, "run_dispatch_loop", lambda *_args, **_kwargs: 0
     )
 
-    assert dispatcher_module.main(["--once"]) == 0
+    try:
+        assert dispatcher_module.main(["--once"]) == 0
+    finally:
+        wal_writer.close()
     assert events == [
-        ("store", True, False),
+        ("store", False, False),
         ("validate",),
         ("store", False, True),
         ("provider", "meegle"),
@@ -3007,6 +3274,7 @@ def test_terminal_manual_delivery_skips_report_http_and_sends_both_effects(tmp_p
     assert before["business_ready"] is True
     assert before["business_blockers"]["unresolved_required_effects"] == 2
     assert before["production_blockers"] == {
+        "schema_successor_read_only": 0,
         "activation_schema_unavailable": 0,
         "activation_epoch_not_steady": 0,
         "activation_binding_invalid": 0,

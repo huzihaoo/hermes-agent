@@ -62,6 +62,8 @@ class FakeStore:
         predecessor=None,
         source_snapshot=None,
         partition_progress=None,
+        observed_control_schema_version=release.MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+        binary_write_schema_version=release.MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
     ):
         self.current = current
         self.predecessor = predecessor
@@ -69,6 +71,22 @@ class FakeStore:
         self.progress = partition_progress or {}
         self.activation_calls = []
         self.partition_calls = []
+        self.read_only = True
+        self.observed_control_schema_version = observed_control_schema_version
+        self.binary_write_schema_version = binary_write_schema_version
+
+    def schema_runtime_capability(self):
+        writable = not self.read_only
+        return {
+            "observed_control_schema_version": self.observed_control_schema_version,
+            "binary_write_schema_version": self.binary_write_schema_version,
+            "mode": "current_write" if writable else "explicit_read_only",
+            "read_supported": True,
+            "write_enabled": writable,
+            "work_admission_enabled": writable,
+            "lease_acquisition_enabled": writable,
+            "external_effect_enabled": writable,
+        }
 
     def activation_epoch(self):
         return self.current
@@ -309,6 +327,28 @@ def release_files(tmp_path):
     manifest_raw = _write_json(manifest_source, manifest)
     db_identity = {"schema_version": "test_db_v1", "path": str(control_db)}
     fence = {"feishu-project-workflow-event": {"0": 1984}}
+    activation = {
+        "epoch_id": "rca-activation-r15aw-20260817",
+        "control_db_path": str(control_db),
+        "operator": "owner:test",
+        "reason": "test minimal release",
+        "expected_control_schema_version": (
+            release.MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
+        ),
+        "target_control_schema_version": (
+            release.MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
+        ),
+        "expected_predecessor_epoch_id": "",
+        "expected_predecessor_state": "",
+        "expected_predecessor_binding_fingerprint": "",
+        "db_logical_identity": db_identity,
+        "db_logical_identity_sha256": release._sha(release._canonical(db_identity)),
+        "partition_start_fence": fence,
+        "partition_start_fence_sha256": release._sha(release._canonical(fence)),
+    }
+    activation["epoch_contract_sha256"] = (
+        release.minimal_release_epoch_contract_sha256(activation)
+    )
     note = {
         "schema_version": release.NOTE_SCHEMA,
         "production_definition": release.PRODUCTION_DEFINITION,
@@ -319,19 +359,7 @@ def release_files(tmp_path):
             "env_sha256": release._sha(env_raw),
             "live_manifest_sha256": release._sha(manifest_raw),
         },
-        "activation": {
-            "epoch_id": "rca-activation-r15aw-20260817",
-            "control_db_path": str(control_db),
-            "operator": "owner:test",
-            "reason": "test minimal release",
-            "expected_predecessor_epoch_id": "",
-            "expected_predecessor_state": "",
-            "expected_predecessor_binding_fingerprint": "",
-            "db_logical_identity": db_identity,
-            "db_logical_identity_sha256": release._sha(release._canonical(db_identity)),
-            "partition_start_fence": fence,
-            "partition_start_fence_sha256": release._sha(release._canonical(fence)),
-        },
+        "activation": activation,
         "resident_profile": {
             "name": "operator_issue_only_v1",
             "required": [row[0] for row in release.REQUIRED_RESIDENTS],
@@ -363,6 +391,7 @@ def release_files(tmp_path):
 def _factory(store, calls):
     def factory(path, read_only):
         calls.append((path, read_only))
+        store.read_only = read_only
         return store
 
     return factory
@@ -492,6 +521,15 @@ def test_prepare_derives_and_writes_deterministic_owner_only_outputs(release_fil
     assert note["activation"]["partition_start_fence"] == {
         "feishu-project-workflow-event": {"0": 1984}
     }
+    assert note["activation"]["expected_control_schema_version"] == (
+        release.MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
+    )
+    assert note["activation"]["target_control_schema_version"] == (
+        release.MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
+    )
+    assert note["activation"]["epoch_contract_sha256"] == (
+        release.minimal_release_epoch_contract_sha256(note["activation"])
+    )
     env = release._parse_env(prepared["env_output"].read_bytes())
     assert {key: env[key] for key in release.CONTROL_DB_ENV_KEYS} == {
         key: str(release_files["control_db"]) for key in release.CONTROL_DB_ENV_KEYS
@@ -508,6 +546,24 @@ def test_prepare_derives_and_writes_deterministic_owner_only_outputs(release_fil
         path.unlink()
     release.prepare_release(**prepared["args"], runner=FakeRunner(release_files))
     assert {path: path.read_bytes() for path in first} == first
+
+
+def test_prepare_rejects_v15_control_store_without_outputs(release_files):
+    store = FakeStore(
+        observed_control_schema_version="pnc_rca_control_store_v15",
+        binary_write_schema_version=release.MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+    )
+    prepared = _prepare_fixture(release_files, store=store)
+
+    with pytest.raises(release.ReleaseError, match="control_schema_v14_required"):
+        release.prepare_release(
+            **prepared["args"], runner=FakeRunner(release_files)
+        )
+
+    assert not prepared["note_path"].exists()
+    assert not prepared["env_output"].exists()
+    assert not prepared["manifest_output"].exists()
+    assert not store.activation_calls
 
 
 def test_prepare_rejects_existing_output_and_cleans_new_reservations(release_files):
@@ -955,6 +1011,126 @@ def test_release_note_embeds_exact_activation_binding(release_files, change):
     with pytest.raises(release.ReleaseError) as caught:
         release._load_note(release_files["note_path"], release_files["home"])
     assert caught.value.code == expected
+
+
+@pytest.mark.parametrize("change", ["schema", "predecessor", "db", "fence"])
+def test_release_note_epoch_contract_hash_binds_activation_inputs(
+    release_files, change
+):
+    note = json.loads(release_files["note_path"].read_text())
+    activation = note["activation"]
+    if change == "schema":
+        activation["target_control_schema_version"] = "pnc_rca_control_store_v15"
+    elif change == "predecessor":
+        activation.update({
+            "expected_predecessor_epoch_id": "rca-activation-r15av-20260817",
+            "expected_predecessor_state": "steady_active",
+            "expected_predecessor_binding_fingerprint": "d" * 64,
+        })
+    elif change == "db":
+        activation["db_logical_identity"] = {"database": "changed"}
+        activation["db_logical_identity_sha256"] = release._sha(
+            release._canonical(activation["db_logical_identity"])
+        )
+    else:
+        activation["partition_start_fence"] = {
+            "feishu-project-workflow-event": {"0": 1985}
+        }
+        activation["partition_start_fence_sha256"] = release._sha(
+            release._canonical(activation["partition_start_fence"])
+        )
+    _write_json(release_files["note_path"], note)
+
+    with pytest.raises(release.ReleaseError, match="release_note_epoch_contract_invalid"):
+        release._load_note(release_files["note_path"], release_files["home"])
+
+
+@pytest.mark.parametrize("operation", ["plan", "apply", "status"])
+def test_activation_paths_reject_v15_store_before_activation_writer(
+    release_files, operation
+):
+    note = release_files["note"]
+    binding = release._bound_binding(release_files["note_raw"], note)
+    store = FakeStore(
+        observed_control_schema_version="pnc_rca_control_store_v15",
+        binary_write_schema_version=release.MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+    )
+    factory = _factory(store, [])
+
+    with pytest.raises(release.ReleaseError, match="control_schema_v14_required"):
+        if operation == "plan":
+            release._activation_plan(note, binding, factory)
+        elif operation == "apply":
+            release._activation_apply(
+                note, binding, {"would_change": True}, factory
+            )
+        else:
+            release._activation_status(note, binding, factory)
+
+    assert not store.activation_calls
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("mode", "current_write"),
+        ("read_supported", False),
+        ("write_enabled", True),
+        ("external_effect_enabled", True),
+    ],
+)
+def test_activation_plan_rejects_forged_v14_read_capability(
+    release_files, field, value
+):
+    note = release_files["note"]
+    binding = release._bound_binding(release_files["note_raw"], note)
+    store = FakeStore()
+    capability = store.schema_runtime_capability()
+    capability[field] = value
+    store.schema_runtime_capability = lambda: dict(capability)
+
+    with pytest.raises(
+        release.ReleaseError, match="control_schema_v14_read_unavailable"
+    ):
+        release._activation_plan(note, binding, _factory(store, []))
+
+    assert not store.activation_calls
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("mode", "explicit_read_only"),
+        ("read_supported", False),
+        ("write_enabled", False),
+        ("external_effect_enabled", False),
+    ],
+)
+def test_activation_apply_rejects_forged_v14_write_capability_before_writer(
+    release_files, field, value
+):
+    note = release_files["note"]
+    binding = release._bound_binding(release_files["note_raw"], note)
+    store = FakeStore()
+    capability = {
+        **store.schema_runtime_capability(),
+        "mode": "current_write",
+        "write_enabled": True,
+        "work_admission_enabled": True,
+        "lease_acquisition_enabled": True,
+        "external_effect_enabled": True,
+    }
+    capability[field] = value
+    store.schema_runtime_capability = lambda: dict(capability)
+
+    with pytest.raises(
+        release.ReleaseError, match="control_schema_v14_write_unavailable"
+    ):
+        release._activation_apply(
+            note, binding, {"would_change": True}, _factory(store, [])
+        )
+
+    assert not store.activation_calls
 
 
 def test_activation_uses_control_store_directly_and_hides_legacy_columns(release_files):

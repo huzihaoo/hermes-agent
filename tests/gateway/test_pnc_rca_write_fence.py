@@ -8,12 +8,15 @@ import pytest
 
 from gateway.pnc_rca_write_fence import (
     ExternalWriteFenceError,
+    MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
     MINIMAL_RELEASE_HOST_REMOTE,
+    MINIMAL_RELEASE_NOTE_SCHEMA_VERSION,
     MINIMAL_RELEASE_PRODUCTION_DEFINITION,
     MinimalReleaseNoteIdentityError,
     RESIDENT_INGRESS_OPEN_STATES,
     build_issued_write_fence,
     canonical_write_fence_sha256,
+    minimal_release_epoch_contract_sha256,
     require_resident_activation_epoch,
     snapshot_core_sha256,
     validate_bound_resident_release,
@@ -25,6 +28,22 @@ from gateway.pnc_rca_write_fence import (
 
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
+
+
+def _schema_runtime_capability(
+    observed=MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+    binary_write=MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+):
+    return {
+        "observed_control_schema_version": observed,
+        "binary_write_schema_version": binary_write,
+        "mode": "current_write",
+        "read_supported": True,
+        "write_enabled": True,
+        "work_admission_enabled": True,
+        "lease_acquisition_enabled": True,
+        "external_effect_enabled": True,
+    }
 
 
 def _seal_release_note(path, note):
@@ -88,8 +107,27 @@ def _release_note(tmp_path):
             "pipeline_tree": pipeline_tree,
         },
     }
+    db_identity = {"schema_version": "test_db_v1"}
+    activation = {
+        "epoch_id": "rca-activation-r15av-test",
+        "control_db_path": str(control_db_path),
+        "operator": "owner:test",
+        "reason": "resident release binding test",
+        "expected_control_schema_version": MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+        "target_control_schema_version": MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+        "expected_predecessor_epoch_id": "",
+        "expected_predecessor_state": "",
+        "expected_predecessor_binding_fingerprint": "",
+        "db_logical_identity": db_identity,
+        "db_logical_identity_sha256": canonical_write_fence_sha256(db_identity),
+        "partition_start_fence": {},
+        "partition_start_fence_sha256": canonical_write_fence_sha256({}),
+    }
+    activation["epoch_contract_sha256"] = minimal_release_epoch_contract_sha256(
+        activation
+    )
     note = {
-        "schema_version": "pnc_rca_minimal_release_note_v1",
+        "schema_version": MINIMAL_RELEASE_NOTE_SCHEMA_VERSION,
         "production_definition": MINIMAL_RELEASE_PRODUCTION_DEFINITION,
         "release_id": "rca-r15av-test",
         "release_identity": identity,
@@ -97,19 +135,7 @@ def _release_note(tmp_path):
             "env_sha256": env_sha256,
             "live_manifest_sha256": manifest_sha256,
         },
-        "activation": {
-            "epoch_id": "rca-activation-r15av-test",
-            "control_db_path": str(control_db_path),
-            "operator": "owner:test",
-            "reason": "resident release binding test",
-            "expected_predecessor_epoch_id": "",
-            "expected_predecessor_state": "",
-            "expected_predecessor_binding_fingerprint": "",
-            "db_logical_identity": {"schema_version": "test_db_v1"},
-            "db_logical_identity_sha256": "a" * 64,
-            "partition_start_fence": {},
-            "partition_start_fence_sha256": "b" * 64,
-        },
+        "activation": activation,
         "resident_profile": {
             "name": "operator_issue_only_v1",
             "required": [
@@ -177,6 +203,40 @@ def test_resident_release_note_binds_epoch_runtime_and_manifest(tmp_path):
         "live_manifest_sha256": fixture.manifest_sha256,
         "live_env_sha256": fixture.env_sha256,
     }
+
+
+@pytest.mark.parametrize("change", ["missing_field", "contract_hash", "v15_target"])
+def test_resident_release_note_rejects_invalid_v2_activation_contract(
+    tmp_path, change
+):
+    fixture = _release_note(tmp_path)
+    activation = fixture.note["activation"]
+    if change == "missing_field":
+        activation.pop("epoch_contract_sha256")
+    elif change == "contract_hash":
+        activation["epoch_contract_sha256"] = "d" * 64
+    else:
+        activation["target_control_schema_version"] = "pnc_rca_control_store_v15"
+        activation["epoch_contract_sha256"] = minimal_release_epoch_contract_sha256(
+            activation
+        )
+    fingerprint, receipt = _seal_release_note(fixture.path, fixture.note)
+    fixture.epoch["release_fingerprint_sha256"] = fingerprint
+    fixture.epoch["release_note_sha256"] = receipt
+
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        validate_resident_release_note(
+            fixture.epoch,
+            release_note_path=fixture.path,
+            runtime_root=fixture.runtime_root,
+            runtime_commit=fixture.runtime_commit,
+            runtime_tree=fixture.runtime_tree,
+            live_manifest_sha256=fixture.manifest_sha256,
+            live_env_path=fixture.env_path,
+            control_db_path=fixture.control_db_path,
+        )
+
+    assert exc.value.code == "resident_release_note_schema_invalid"
 
 
 @pytest.mark.parametrize(
@@ -306,6 +366,9 @@ def test_bound_resident_release_rejects_startup_binding_drift(tmp_path, drift):
     class Store:
         db_path = fixture.control_db_path
 
+        def schema_runtime_capability(self):
+            return _schema_runtime_capability()
+
         def activation_epoch(self):
             return fixture.epoch
 
@@ -332,6 +395,86 @@ def test_bound_resident_release_rejects_startup_binding_drift(tmp_path, drift):
         validate_bound_resident_release(Store(), **kwargs)
 
     assert exc.value.code == "resident_release_binding_changed"
+
+
+def test_bound_resident_release_rejects_v15_store_before_epoch_read(tmp_path):
+    fixture = _release_note(tmp_path)
+
+    class Store:
+        db_path = fixture.control_db_path
+
+        def __init__(self):
+            self.activation_reads = 0
+
+        def schema_runtime_capability(self):
+            return _schema_runtime_capability(
+                observed="pnc_rca_control_store_v15",
+                binary_write=MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+            )
+
+        def activation_epoch(self):
+            self.activation_reads += 1
+            return fixture.epoch
+
+    store = Store()
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        validate_bound_resident_release(
+            store,
+            release_note_path=fixture.path,
+            runtime_root=fixture.runtime_root,
+            runtime_commit=fixture.runtime_commit,
+            runtime_tree=fixture.runtime_tree,
+            live_manifest_sha256=fixture.manifest_sha256,
+            live_env_path=fixture.env_path,
+        )
+
+    assert exc.value.code == "resident_control_schema_not_v14"
+    assert store.activation_reads == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("mode", "successor_read_only"),
+        ("read_supported", False),
+        ("write_enabled", False),
+        ("external_effect_enabled", False),
+    ],
+)
+def test_bound_resident_release_rejects_forged_v14_capability_before_epoch_read(
+    tmp_path, field, value
+):
+    fixture = _release_note(tmp_path)
+    capability = _schema_runtime_capability()
+    capability[field] = value
+
+    class Store:
+        db_path = fixture.control_db_path
+
+        def __init__(self):
+            self.activation_reads = 0
+
+        def schema_runtime_capability(self):
+            return dict(capability)
+
+        def activation_epoch(self):
+            self.activation_reads += 1
+            return fixture.epoch
+
+    store = Store()
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        validate_bound_resident_release(
+            store,
+            release_note_path=fixture.path,
+            runtime_root=fixture.runtime_root,
+            runtime_commit=fixture.runtime_commit,
+            runtime_tree=fixture.runtime_tree,
+            live_manifest_sha256=fixture.manifest_sha256,
+            live_env_path=fixture.env_path,
+        )
+
+    assert exc.value.code == "resident_control_schema_capability_invalid"
+    assert store.activation_reads == 0
 
 
 @pytest.mark.parametrize(
@@ -431,6 +574,9 @@ def test_bound_resident_release_rejects_missing_or_noncanonical_store_path(
     fixture = _release_note(tmp_path)
 
     class Store:
+        def schema_runtime_capability(self):
+            return _schema_runtime_capability()
+
         def activation_epoch(self):
             return fixture.epoch
 

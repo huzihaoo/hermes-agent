@@ -515,7 +515,6 @@ def _profile_terminal_effect_binding(
         delivery_store = RcaDeliveryStore(
             store.db_path,
             require_current=True,
-            read_only=True,
             ensure_current_rows=False,
         )
         live = delivery_store.validate_profile_terminal_external_write_binding(
@@ -583,7 +582,6 @@ def _terminal_rerun_effect_binding(
         delivery_store = RcaDeliveryStore(
             store.db_path,
             require_current=True,
-            read_only=True,
             ensure_current_rows=False,
         )
         live = delivery_store.validate_terminal_rerun_external_write_binding(

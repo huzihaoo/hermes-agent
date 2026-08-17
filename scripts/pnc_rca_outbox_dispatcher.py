@@ -148,6 +148,17 @@ DEFAULT_INPUT_WAIT_MAX_AGE_SECONDS = 900
 MIN_INPUT_WAIT_MAX_AGE_SECONDS = 60
 MAX_INPUT_WAIT_MAX_AGE_SECONDS = 3_600
 HEALTH_HEARTBEAT_INTERVAL_SECONDS = 10.0
+SUCCESSOR_READ_ONLY_MODE = "successor_read_only"
+SCHEMA_RUNTIME_CAPABILITY_KEYS = frozenset({
+    "observed_control_schema_version",
+    "binary_write_schema_version",
+    "mode",
+    "read_supported",
+    "write_enabled",
+    "work_admission_enabled",
+    "lease_acquisition_enabled",
+    "external_effect_enabled",
+})
 _FORBIDDEN_MDI_COMMAND_PATTERN = re.compile(
     r"\bmdi\s+(?:download|refresh2?|clip|event)\b", re.IGNORECASE
 )
@@ -3514,6 +3525,158 @@ class HealthReporter:
         self._last_body = serialized
 
 
+def _schema_runtime_capability(store: RcaControlStore) -> dict[str, Any]:
+    capability = dict(store.schema_runtime_capability())
+    if set(capability) != SCHEMA_RUNTIME_CAPABILITY_KEYS:
+        raise RuntimeError("rca_schema_runtime_capability_invalid")
+    if capability.get("mode") == SUCCESSOR_READ_ONLY_MODE and (
+        capability.get("read_supported") is not True
+        or any(
+            capability.get(name) is not False
+            for name in (
+                "write_enabled",
+                "work_admission_enabled",
+                "lease_acquisition_enabled",
+                "external_effect_enabled",
+            )
+        )
+    ):
+        raise RuntimeError("rca_successor_read_only_capability_invalid")
+    return capability
+
+
+def _successor_read_only_diagnostic(
+    config: DispatcherConfig,
+    capability: Mapping[str, Any],
+    *,
+    operation: str,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": "rca_resident_successor_read_only",
+        "operation": operation,
+        "mode": SUCCESSOR_READ_ONLY_MODE,
+        "ready": False,
+        "processing": False,
+        "config": config.public_dict(),
+        "schema_runtime_capability": dict(capability),
+    }
+
+
+class SuccessorReadOnlyHealthReporter:
+    """Publish process liveness without entering any work-producing boundary."""
+
+    def __init__(
+        self,
+        config: DispatcherConfig,
+        store: RcaControlStore,
+        capability: Mapping[str, Any],
+    ) -> None:
+        self.config = config
+        self.store = store
+        self.capability = dict(capability)
+        self.started_at = _utc_iso()
+        self.runtime_identity = build_runtime_identity(
+            service_label=SERVICE_LABEL,
+            script_path=Path(__file__),
+            public_config=config.runtime_public_dict(),
+            loaded_dependencies=RCA_OUTBOX_DISPATCHER_LOADED_DEPENDENCIES,
+        )
+
+    def write(self, *, state: str = SUCCESSOR_READ_ONLY_MODE) -> None:
+        observed_at = _utc_iso()
+        body = {
+            "schema_version": DISPATCHER_HEALTH_SCHEMA_VERSION,
+            "ok": False,
+            "healthy": True,
+            "process_healthy": True,
+            "business_ready": False,
+            "enabled": self.config.dispatch_enabled,
+            "state": state,
+            "mode": SUCCESSOR_READ_ONLY_MODE,
+            "ready": False,
+            "processing": False,
+            "started_at": self.started_at,
+            "heartbeat_at": observed_at,
+            "readiness_observed_at": observed_at,
+            "readiness": {
+                "state": SUCCESSOR_READ_ONLY_MODE,
+                "healthy": False,
+                "ready_for_dispatch": False,
+                "observed_at": observed_at,
+            },
+            "liveness": {
+                "state": "reporting",
+                "heartbeat_at": observed_at,
+                "readiness_observed_at": observed_at,
+            },
+            "runtime_identity": self.runtime_identity.to_dict(),
+            "config": self.config.runtime_public_dict(),
+            "schema_runtime_capability": dict(self.capability),
+            "workspace_runtime": {
+                "required": False,
+                "bound": False,
+                "ready": False,
+                "state": "not_evaluated_successor_read_only",
+                "error_code": "",
+                "identity": None,
+            },
+            "capacity_admission": {
+                "required": False,
+                "ready": False,
+                "state": "not_evaluated_successor_read_only",
+                "error_code": "",
+                "capacity_mode": "steady",
+                "admission_key_fingerprint": None,
+                "authorization": None,
+            },
+            "stats": asdict(DispatchStats()),
+            "last_outcome": None,
+            "delivery_backpressure": {
+                "enabled": False,
+                "active": False,
+                "high_watermark": self.config.delivery_high_watermark,
+                "resume_watermark": self.config.delivery_resume_watermark,
+                "last_snapshot": None,
+                "last_error": None,
+            },
+            "store": self.store.health(),
+        }
+        path = self.config.health_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+
+
+def run_successor_read_only_loop(
+    config: DispatcherConfig,
+    store: RcaControlStore,
+    capability: Mapping[str, Any],
+    *,
+    once: bool = False,
+    stop_requested: Callable[[], bool] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    stop = stop_requested or (lambda: False)
+    reporter = SuccessorReadOnlyHealthReporter(config, store, capability)
+    interval = min(
+        float(config.poll_interval_seconds),
+        HEALTH_HEARTBEAT_INTERVAL_SECONDS,
+    )
+    while not stop():
+        reporter.write()
+        if once:
+            return 0
+        sleep(interval)
+    reporter.write(state="stopped")
+    return 0
+
+
 def _health_runtime_identity_ok(payload: Mapping[str, Any]) -> bool:
     config = payload.get("config")
     return isinstance(config, Mapping) and runtime_identity_is_valid(
@@ -3635,27 +3798,58 @@ def read_health_status(
     )
     store = payload.get("store")
     downstream = payload.get("delivery_backpressure")
+    successor_read_only = (
+        payload.get("mode") == SUCCESSOR_READ_ONLY_MODE
+        and payload.get("state") == SUCCESSOR_READ_ONLY_MODE
+        and payload.get("ready") is False
+        and payload.get("processing") is False
+        and isinstance(payload.get("schema_runtime_capability"), Mapping)
+        and set(payload["schema_runtime_capability"])
+        == SCHEMA_RUNTIME_CAPABILITY_KEYS
+        and payload["schema_runtime_capability"].get("mode")
+        == SUCCESSOR_READ_ONLY_MODE
+        and payload["schema_runtime_capability"].get("read_supported") is True
+        and all(
+            payload["schema_runtime_capability"].get(name) is False
+            for name in (
+                "write_enabled",
+                "work_admission_enabled",
+                "lease_acquisition_enabled",
+                "external_effect_enabled",
+            )
+        )
+    )
     producer_ok = (
         payload.get("schema_version") == DISPATCHER_HEALTH_SCHEMA_VERSION
         and payload.get("ok") is True
         and payload.get("healthy") is True
-        and mode_ok
         and isinstance(store, Mapping)
-        and store.get("ok") is True
         and isinstance(downstream, Mapping)
         and _health_runtime_identity_ok(payload)
+        and mode_ok
+        and store.get("ok") is True
         and _health_workspace_runtime_ok(payload)
         and _health_capacity_admission_ok(payload)
     )
     result = dict(payload)
     result["ok"] = bool(fresh and producer_ok)
+    result["liveness_ok"] = bool(
+        fresh
+        and successor_read_only
+        and payload.get("process_healthy") is True
+        and payload.get("business_ready") is False
+        and payload.get("healthy") is True
+        and _health_runtime_identity_ok(payload)
+    )
     result["health_check"] = {
         "fresh": fresh,
         "heartbeat_age_seconds": age,
         "max_age_seconds": max_age_seconds,
         "checked_at": _utc_iso(now),
     }
-    if not producer_ok:
+    if successor_read_only:
+        result["health_check"]["reason"] = "successor_read_only_not_ready"
+    elif not producer_ok:
         result["health_check"]["reason"] = "dispatcher_reported_unhealthy"
     elif age < -MAX_HEALTH_FUTURE_SKEW_SECONDS:
         result["health_check"]["reason"] = "heartbeat_from_future"
@@ -3818,6 +4012,28 @@ def main(argv: list[str] | None = None) -> int:
         load_dispatcher_environment(args.env_file)
         config = DispatcherConfig.from_env()
         if args.check_config:
+            if config.dispatch_enabled and config.control_db_path.is_file():
+                check_store = RcaControlStore(
+                    config.control_db_path,
+                    require_current=True,
+                    read_only=True,
+                    allow_successor_read_only=True,
+                )
+                capability = _schema_runtime_capability(check_store)
+                if capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
+                    print(
+                        json.dumps(
+                            _successor_read_only_diagnostic(
+                                config,
+                                capability,
+                                operation="check_config",
+                            ),
+                            ensure_ascii=False,
+                            indent=2,
+                            sort_keys=True,
+                        )
+                    )
+                    return 2
             print(json.dumps({"ok": True, "config": config.public_dict()}, indent=2))
             return 0
         if args.health:
@@ -3827,12 +4043,58 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
             return 0 if result.get("ok") is True else 2
 
-        read_only_operator = bool(args.materialize_reset)
+        read_only_operator = bool(
+            args.materialize_reset
+            or args.dry_run
+            or (args.clear_circuit and not args.apply)
+        )
         store = RcaControlStore(
             config.control_db_path,
             require_current=True,
             read_only=read_only_operator,
+            allow_successor_read_only=True,
         )
+        capability = _schema_runtime_capability(store)
+        if capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
+            if args.dry_run or args.clear_circuit or args.materialize_reset:
+                operation = (
+                    "dry_run"
+                    if args.dry_run
+                    else (
+                        "materialize_reset"
+                        if args.materialize_reset
+                        else "clear_circuit"
+                    )
+                )
+                print(
+                    json.dumps(
+                        _successor_read_only_diagnostic(
+                            config,
+                            capability,
+                            operation=operation,
+                        ),
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                return 2
+
+            stopping = False
+
+            def request_successor_stop(_signum: int, _frame: Any) -> None:
+                nonlocal stopping
+                stopping = True
+
+            signal.signal(signal.SIGTERM, request_successor_stop)
+            signal.signal(signal.SIGINT, request_successor_stop)
+            return run_successor_read_only_loop(
+                config,
+                store,
+                capability,
+                once=args.once,
+                stop_requested=lambda: stopping,
+            )
         if args.materialize_reset:
             receipt_path = _absolute_new_receipt_path(args.receipt)
             audit = store.dispatcher_circuit_reset_audit(args.materialize_reset)

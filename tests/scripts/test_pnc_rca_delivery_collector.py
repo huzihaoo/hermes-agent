@@ -4,7 +4,7 @@ from dataclasses import replace
 import hashlib
 import json
 from datetime import timedelta
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import sqlite3
 import subprocess
 import sys
@@ -29,6 +29,8 @@ from tests.gateway.test_pnc_rca_delivery_store import (
     _control,
     _delivery,
     _insert_subscription,
+    _physical_v15_delivery_fixture,
+    _sqlite_storage_identity,
     _switch_activation_epoch,
 )
 from tests.gateway.test_pnc_rca_w3_snapshot import _runtime_authority
@@ -1344,6 +1346,263 @@ def test_enabled_resident_without_epoch_exits_before_collector_creation(
     assert "resident_activation_epoch_missing" in capsys.readouterr().out
 
 
+def _successor_read_only_capability() -> dict[str, object]:
+    return {
+        "observed_control_schema_version": "pnc_rca_control_store_v15",
+        "binary_write_schema_version": "pnc_rca_control_store_v14",
+        "mode": "successor_read_only",
+        "read_supported": True,
+        "write_enabled": False,
+        "work_admission_enabled": False,
+        "lease_acquisition_enabled": False,
+        "external_effect_enabled": False,
+    }
+
+
+def test_successor_read_only_collector_writes_health_without_work_or_probes(
+    tmp_path,
+    monkeypatch,
+):
+    config = collector.CollectorConfig.from_env(
+        _config_env(tmp_path),
+        hermes_home=tmp_path,
+    )
+    calls = []
+
+    class SuccessorStore:
+        def schema_runtime_capability(self):
+            return _successor_read_only_capability()
+
+        def health(self, **kwargs):
+            calls.append(("health", kwargs))
+            return {
+                "ok": False,
+                "process_healthy": True,
+                "schema_runtime_capability": _successor_read_only_capability(),
+            }
+
+        def backfill_completed_submissions(self, **_kwargs):
+            pytest.fail("backfill must not run")
+
+        def claim_due_watch(self, **_kwargs):
+            pytest.fail("watch claim must not run")
+
+    def store_factory(*_args, **kwargs):
+        calls.append(("store", kwargs))
+        return SuccessorStore()
+
+    monkeypatch.setattr(collector, "load_collector_environment", lambda: None)
+    monkeypatch.setattr(
+        collector.CollectorConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(collector, "RcaDeliveryStore", store_factory)
+    monkeypatch.setattr(
+        collector,
+        "validate_bound_resident_release",
+        lambda *_args, **_kwargs: pytest.fail("release writer gate must not run"),
+    )
+    monkeypatch.setattr(
+        collector,
+        "probe_remote_css_parser",
+        lambda *_args, **_kwargs: pytest.fail("VM dependency probe must not run"),
+    )
+    monkeypatch.setattr(
+        collector,
+        "DeliveryCollector",
+        lambda *_args, **_kwargs: pytest.fail("collector must not be created"),
+    )
+
+    assert collector.main(["--once"]) == 0
+
+    assert calls[0][0] == "store"
+    assert calls[0][1].get("read_only", False) is False
+    assert calls[0][1]["ensure_current_rows"] is False
+    assert calls[0][1]["allow_successor_read_only"] is True
+    assert calls[1] == (
+        "health",
+        {"activation_required": config.activation_required},
+    )
+    payload = json.loads(config.health_path.read_text(encoding="utf-8"))
+    assert payload["mode"] == "successor_read_only"
+    assert payload["ready"] is False
+    assert payload["processing"] is False
+    assert payload["healthy"] is True
+    assert payload["process_healthy"] is True
+    assert payload["business_ready"] is False
+    assert payload["ok"] is False
+    assert payload["schema_runtime_capability"] == (
+        _successor_read_only_capability()
+    )
+    assert payload["dependencies"]["remote_css_parser"]["status"] == (
+        "not_evaluated_successor_read_only"
+    )
+    healthy, observed = collector.read_health(
+        config.health_path,
+        max_age_seconds=config.health_max_age_seconds,
+    )
+    assert healthy is False
+    assert observed["mode"] == "successor_read_only"
+    assert observed["liveness_ok"] is True
+
+
+def test_real_v15_collector_preserves_db_wal_shm_without_work_or_vm_probe(
+    tmp_path,
+    monkeypatch,
+):
+    path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    wal_writer = sqlite3.connect(path)
+    assert wal_writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    wal_writer.execute("PRAGMA wal_autocheckpoint=0")
+    wal_writer.execute(
+        "INSERT INTO rca_delivery_meta(key, value) VALUES(?, ?)",
+        ("collector_resident_live_wal_fixture", "present"),
+    )
+    wal_writer.commit()
+    assert Path(f"{path}-wal").is_file()
+    assert Path(f"{path}-shm").is_file()
+    before = _sqlite_storage_identity(path)
+    config = collector.CollectorConfig.from_env(
+        _config_env(tmp_path),
+        hermes_home=tmp_path,
+    )
+
+    monkeypatch.setattr(collector, "load_collector_environment", lambda: None)
+    monkeypatch.setattr(
+        collector.CollectorConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(
+        collector,
+        "validate_bound_resident_release",
+        lambda *_args, **_kwargs: pytest.fail("release writer gate must not run"),
+    )
+    monkeypatch.setattr(
+        collector,
+        "probe_remote_css_parser",
+        lambda *_args, **_kwargs: pytest.fail("VM dependency probe must not run"),
+    )
+    monkeypatch.setattr(
+        collector,
+        "DeliveryCollector",
+        lambda *_args, **_kwargs: pytest.fail("collector must not be created"),
+    )
+
+    try:
+        assert collector.main(["--once"]) == 0
+        after = _sqlite_storage_identity(path)
+        assert after["db"] == before["db"]
+        assert after["-wal"] == before["-wal"]
+        assert (after["-shm"] is None) is (before["-shm"] is None)
+    finally:
+        wal_writer.close()
+
+    payload = json.loads(config.health_path.read_text(encoding="utf-8"))
+    assert payload["mode"] == "successor_read_only"
+    assert payload["ok"] is False
+    assert payload["process_healthy"] is True
+    assert payload["ready"] is False
+    assert payload["processing"] is False
+
+
+@pytest.mark.parametrize("mode", ["check_config", "dry_run"])
+def test_successor_read_only_collector_diagnostics_do_not_probe_or_preview(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    mode,
+):
+    config = collector.CollectorConfig.from_env(
+        _config_env(tmp_path),
+        hermes_home=tmp_path,
+    )
+    config.control_db_path.write_bytes(b"fixture")
+    calls = []
+
+    class SuccessorStore:
+        def schema_runtime_capability(self):
+            return _successor_read_only_capability()
+
+        def preview_unwatched_completed(self, **_kwargs):
+            calls.append("preview")
+            return []
+
+    def store_factory(*_args, **kwargs):
+        calls.append(("store", kwargs))
+        return SuccessorStore()
+
+    monkeypatch.setattr(collector, "load_collector_environment", lambda: None)
+    monkeypatch.setattr(
+        collector.CollectorConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(collector, "RcaDeliveryStore", store_factory)
+    monkeypatch.setattr(
+        collector,
+        "validate_bound_resident_release",
+        lambda *_args, **_kwargs: pytest.fail("release writer gate must not run"),
+    )
+    monkeypatch.setattr(
+        collector,
+        "probe_remote_css_parser",
+        lambda *_args, **_kwargs: pytest.fail("VM dependency probe must not run"),
+    )
+
+    flag = "--check-config" if mode == "check_config" else "--dry-run"
+    assert collector.main([flag]) == 2
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["mode"] == "successor_read_only"
+    assert payload["ready"] is False
+    assert payload["processing"] is False
+    assert payload["operation"] == mode
+    assert "preview" not in calls
+    [store_call] = calls
+    assert store_call[0] == "store"
+    assert store_call[1]["read_only"] is True
+    assert store_call[1]["ensure_current_rows"] is False
+    assert store_call[1]["allow_successor_read_only"] is True
+
+
+def test_disabled_collector_check_config_does_not_probe_existing_control_db(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_DELIVERY_COLLECTOR_ENABLED"] = "false"
+    config = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
+    config.control_db_path.write_bytes(b"not-a-database")
+    monkeypatch.setattr(collector, "load_collector_environment", lambda: None)
+    monkeypatch.setattr(
+        collector.CollectorConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(
+        collector,
+        "RcaDeliveryStore",
+        lambda *_args, **_kwargs: pytest.fail("disabled check-config probed DB"),
+    )
+    monkeypatch.setattr(
+        collector,
+        "probe_remote_css_parser",
+        lambda *_args, **_kwargs: collector.expected_remote_css_runtime_dependency(),
+    )
+    monkeypatch.setattr(
+        collector.FailureRouteOutlet,
+        "inspect",
+        lambda *_args, **_kwargs: {"ready": True, "status": "uninitialized"},
+    )
+
+    assert collector.main(["--check-config"]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
 def test_enabled_startup_locks_minimal_release_before_writable_collector(
     tmp_path,
     monkeypatch,
@@ -1354,6 +1613,14 @@ def test_enabled_startup_locks_minimal_release_before_writable_collector(
     RcaDeliveryStore(control.db_path)
     _bind_minimal_release(control, fixture)
     _set_live_release_environment(monkeypatch, fixture)
+    wal_writer = sqlite3.connect(control.db_path)
+    assert wal_writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    wal_writer.execute("PRAGMA wal_autocheckpoint=0")
+    wal_writer.execute(
+        "INSERT INTO rca_delivery_meta(key, value) VALUES(?, ?)",
+        ("collector_startup_active_wal", "present"),
+    )
+    wal_writer.commit()
     config = replace(
         collector.CollectorConfig.from_env(
             _config_env(tmp_path),
@@ -1388,8 +1655,12 @@ def test_enabled_startup_locks_minimal_release_before_writable_collector(
 
     monkeypatch.setattr(
         RcaControlStore,
-        "_create_read_only_snapshot",
-        lambda _self: pytest.fail("normal startup must not copy the control DB"),
+        "create_schema_probe_snapshot",
+        classmethod(
+            lambda _cls, *_args, **_kwargs: pytest.fail(
+                "normal startup must not copy the control DB"
+            )
+        ),
     )
     monkeypatch.setattr(collector, "RcaDeliveryStore", tracked_store)
     monkeypatch.setattr(
@@ -1406,9 +1677,12 @@ def test_enabled_startup_locks_minimal_release_before_writable_collector(
     monkeypatch.setattr(collector, "DeliveryCollector", constructed_collector)
     monkeypatch.setattr(collector, "run_collector_loop", lambda *_args, **_kwargs: 0)
 
-    assert collector.main(["--once"]) == 0
+    try:
+        assert collector.main(["--once"]) == 0
+    finally:
+        wal_writer.close()
     assert events == [
-        ("store", True, False),
+        ("store", False, False),
         ("validate",),
         ("store", False, True),
         ("collector",),

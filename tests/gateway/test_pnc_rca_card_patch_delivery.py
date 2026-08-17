@@ -34,6 +34,7 @@ from scripts.pnc_completion_notice_relay import FeishuHotSender, sync_task_card
 from scripts.pnc_rca_delivery_dispatcher import DeliveryDispatcher
 from scripts.vm_task_state_bridge import _atomic_write_json
 from tests.gateway.test_pnc_rca_conclusion_adjudication import (
+    ISSUE_ID,
     NOW,
     _record_retraction,
     _seed_published_conclusion,
@@ -46,7 +47,20 @@ def _card_patch(
     *,
     settle_correction: bool,
 ) -> tuple[RcaDeliveryStore, object, dict[str, object]]:
-    store = _seed_published_conclusion(tmp_path)
+    control, result = _control(tmp_path, issue_id=int(ISSUE_ID))
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE business_triggers SET created_at = ? "
+            "WHERE business_key = ? AND generation = ?",
+            (NOW.isoformat(), result.business_key, result.generation),
+        )
+    store = _seed_published_conclusion(
+        tmp_path,
+        store=RcaDeliveryStore(control.db_path),
+        submission_key=result.submission_key,
+        business_key=result.business_key,
+        generation=result.generation,
+    )
     adjudication = _record_retraction(store)
     if settle_correction:
         with sqlite3.connect(store.db_path) as conn:

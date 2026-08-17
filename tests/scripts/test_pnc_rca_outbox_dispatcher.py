@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,10 @@ from tests.gateway.test_pnc_rca_control_store import (
     _profile_snapshot_record,
     _record,
     _steady_control_store,
+)
+from tests.gateway.test_pnc_rca_delivery_store import (
+    _physical_v15_delivery_fixture,
+    _sqlite_storage_identity,
 )
 
 
@@ -371,6 +376,293 @@ def test_enabled_resident_without_epoch_exits_before_dispatcher_creation(
     assert store.list_rows("kafka_inbox") == []
     assert store.list_rows("rca_outbox") == []
     assert "resident_activation_epoch_missing" in capsys.readouterr().err
+
+
+def test_enabled_startup_uses_live_current_store_with_active_wal(
+    tmp_path,
+    monkeypatch,
+):
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path, enabled=True),
+        hermes_home=tmp_path,
+    )
+    _steady_control_store(config.control_db_path)
+    store_calls = []
+    real_store = dispatcher.RcaControlStore
+
+    def tracked_store(*args, **kwargs):
+        store_calls.append(dict(kwargs))
+        return real_store(*args, **kwargs)
+
+    fake_dispatcher = SimpleNamespace(
+        stats=dispatcher.DispatchStats(),
+        delivery_backpressure_health=lambda: {},
+        dispatch_batch=lambda: [dispatcher.DispatchOutcome(status="idle")],
+    )
+    fake_health = SimpleNamespace(
+        runtime_identity=SimpleNamespace(to_dict=lambda: {}),
+        dispatch_guard_outcome=lambda: None,
+        write=lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(dispatcher, "load_dispatcher_environment", lambda _path: None)
+    monkeypatch.setattr(
+        dispatcher.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(dispatcher, "RcaControlStore", tracked_store)
+    monkeypatch.setattr(dispatcher, "OutboxDispatcher", lambda **_kwargs: fake_dispatcher)
+    monkeypatch.setattr(dispatcher, "HealthReporter", lambda *_args, **_kwargs: fake_health)
+    monkeypatch.setattr(
+        RcaControlStore,
+        "create_schema_probe_snapshot",
+        classmethod(
+            lambda _cls, *_args, **_kwargs: pytest.fail(
+                "normal startup must not copy the control DB"
+            )
+        ),
+    )
+
+    wal_writer = sqlite3.connect(config.control_db_path)
+    try:
+        assert wal_writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        wal_writer.execute("PRAGMA wal_autocheckpoint=0")
+        wal_writer.execute(
+            "INSERT INTO control_meta(key, value) VALUES(?, ?)",
+            ("outbox_startup_active_wal", "present"),
+        )
+        wal_writer.commit()
+        before = _sqlite_storage_identity(config.control_db_path)
+
+        assert dispatcher.main(["--once"]) == 0
+
+        after = _sqlite_storage_identity(config.control_db_path)
+        assert after["db"] == before["db"]
+        assert after["-wal"] == before["-wal"]
+        assert (after["-shm"] is None) is (before["-shm"] is None)
+    finally:
+        wal_writer.close()
+
+    assert store_calls == [
+        {
+            "require_current": True,
+            "read_only": False,
+            "allow_successor_read_only": True,
+        }
+    ]
+
+
+def _successor_read_only_capability() -> dict[str, object]:
+    return {
+        "observed_control_schema_version": "pnc_rca_control_store_v15",
+        "binary_write_schema_version": "pnc_rca_control_store_v14",
+        "mode": "successor_read_only",
+        "read_supported": True,
+        "write_enabled": False,
+        "work_admission_enabled": False,
+        "lease_acquisition_enabled": False,
+        "external_effect_enabled": False,
+    }
+
+
+def test_successor_read_only_resident_writes_fresh_quiescent_health_only(
+    tmp_path,
+    monkeypatch,
+):
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path, enabled=True),
+        hermes_home=tmp_path,
+    )
+    calls = []
+
+    class SuccessorStore:
+        def schema_runtime_capability(self):
+            return _successor_read_only_capability()
+
+        def health(self):
+            calls.append("health")
+            return {
+                "ok": False,
+                "process_healthy": True,
+                "schema_version": "pnc_rca_control_store_v15",
+            }
+
+    def store_factory(*_args, **kwargs):
+        calls.append(("store", kwargs))
+        return SuccessorStore()
+
+    monkeypatch.setattr(dispatcher, "load_dispatcher_environment", lambda _path: None)
+    monkeypatch.setattr(
+        dispatcher.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(dispatcher, "RcaControlStore", store_factory)
+    monkeypatch.setattr(
+        dispatcher,
+        "require_resident_activation_epoch",
+        lambda *_args, **_kwargs: pytest.fail("activation writer gate must not run"),
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "OutboxDispatcher",
+        lambda *_args, **_kwargs: pytest.fail("dispatcher must not be created"),
+    )
+    monkeypatch.setattr(dispatcher.signal, "signal", lambda *_args: None)
+
+    assert dispatcher.main(["--once"]) == 0
+
+    [store_call, health_call] = calls
+    assert store_call[0] == "store"
+    assert store_call[1]["allow_successor_read_only"] is True
+    assert health_call == "health"
+    payload = json.loads(config.health_path.read_text(encoding="utf-8"))
+    assert payload["mode"] == "successor_read_only"
+    assert payload["ready"] is False
+    assert payload["processing"] is False
+    assert payload["healthy"] is True
+    assert payload["process_healthy"] is True
+    assert payload["business_ready"] is False
+    assert payload["ok"] is False
+    assert payload["schema_runtime_capability"] == (
+        _successor_read_only_capability()
+    )
+    assert payload["stats"] == dispatcher.asdict(dispatcher.DispatchStats())
+    observed = dispatcher.read_health_status(config)
+    assert observed["ok"] is False
+    assert observed["liveness_ok"] is True
+
+
+def test_real_v15_outbox_resident_preserves_db_wal_shm_and_does_no_work(
+    tmp_path,
+    monkeypatch,
+):
+    path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    wal_writer = sqlite3.connect(path)
+    assert wal_writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    wal_writer.execute("PRAGMA wal_autocheckpoint=0")
+    wal_writer.execute(
+        "INSERT INTO rca_delivery_meta(key, value) VALUES(?, ?)",
+        ("outbox_resident_live_wal_fixture", "present"),
+    )
+    wal_writer.commit()
+    assert Path(f"{path}-wal").is_file()
+    assert Path(f"{path}-shm").is_file()
+    before = _sqlite_storage_identity(path)
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path, enabled=True),
+        hermes_home=tmp_path,
+    )
+
+    monkeypatch.setattr(dispatcher, "load_dispatcher_environment", lambda _path: None)
+    monkeypatch.setattr(
+        dispatcher.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "require_resident_activation_epoch",
+        lambda *_args, **_kwargs: pytest.fail("activation writer gate must not run"),
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "OutboxDispatcher",
+        lambda *_args, **_kwargs: pytest.fail("dispatcher must not be created"),
+    )
+    monkeypatch.setattr(dispatcher.signal, "signal", lambda *_args: None)
+
+    try:
+        assert dispatcher.main(["--once"]) == 0
+        after = _sqlite_storage_identity(path)
+        assert after["db"] == before["db"]
+        assert after["-wal"] == before["-wal"]
+        assert (after["-shm"] is None) is (before["-shm"] is None)
+    finally:
+        wal_writer.close()
+
+    payload = json.loads(config.health_path.read_text(encoding="utf-8"))
+    assert payload["mode"] == "successor_read_only"
+    assert payload["ok"] is False
+    assert payload["process_healthy"] is True
+    assert payload["ready"] is False
+    assert payload["processing"] is False
+
+
+@pytest.mark.parametrize("mode", ["check_config", "dry_run"])
+def test_successor_read_only_operator_modes_are_structured_red_without_work(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    mode,
+):
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path, enabled=True),
+        hermes_home=tmp_path,
+    )
+    config.control_db_path.write_bytes(b"fixture")
+    calls = []
+
+    class SuccessorStore:
+        def schema_runtime_capability(self):
+            return _successor_read_only_capability()
+
+        def preview_dispatchable(self, **_kwargs):
+            calls.append("preview")
+            return []
+
+    def store_factory(*_args, **kwargs):
+        calls.append(("store", kwargs))
+        return SuccessorStore()
+
+    monkeypatch.setattr(dispatcher, "load_dispatcher_environment", lambda _path: None)
+    monkeypatch.setattr(
+        dispatcher.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(dispatcher, "RcaControlStore", store_factory)
+
+    flag = "--check-config" if mode == "check_config" else "--dry-run"
+    assert dispatcher.main([flag]) == 2
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["mode"] == "successor_read_only"
+    assert payload["ready"] is False
+    assert payload["processing"] is False
+    assert payload["operation"] == mode
+    assert "preview" not in calls
+    [store_call] = calls
+    assert store_call[0] == "store"
+    assert store_call[1]["read_only"] is True
+    assert store_call[1]["allow_successor_read_only"] is True
+
+
+def test_disabled_check_config_does_not_probe_existing_control_db(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path, enabled=False),
+        hermes_home=tmp_path,
+    )
+    config.control_db_path.write_bytes(b"not-a-database")
+    monkeypatch.setattr(dispatcher, "load_dispatcher_environment", lambda _path: None)
+    monkeypatch.setattr(
+        dispatcher.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "RcaControlStore",
+        lambda *_args, **_kwargs: pytest.fail("disabled check-config probed DB"),
+    )
+
+    assert dispatcher.main(["--check-config"]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
 
 
 def _patch_reset_cli(monkeypatch, config):

@@ -7,10 +7,16 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
+import threading
+import time
 
 import pytest
 
 from gateway.pnc_rca_control_store import (
+    ACTIVATION_TRANSITION_BINDING_SCHEMA_V14,
+    ACTIVATION_TRANSITION_BINDING_SCHEMA_V15,
+    CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+    CONTROL_STORE_SCHEMA_VERSION,
     MANUAL_TRIGGER_SCHEMA_VERSION,
     ActivationEpochError,
     KafkaRecord,
@@ -52,6 +58,57 @@ NOW = datetime(2026, 7, 10, 8, 0, tzinfo=timezone.utc)
 TOPIC = "feishu-project-workflow-event"
 REAL_G1Q3_PROJECT_KEY = "68ef617fb371dc80a10641f7"
 REAL_G1Q3_PROJECT_SIMPLE_NAME = "t03o4q"
+
+
+def _sqlite_storage_identity(path: Path) -> dict[str, dict[str, int | str] | None]:
+    identity: dict[str, dict[str, int | str] | None] = {}
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(f"{path}{suffix}")
+        try:
+            observed = candidate.stat()
+        except FileNotFoundError:
+            identity[suffix or "db"] = None
+            continue
+        identity[suffix or "db"] = {
+            "device": int(observed.st_dev),
+            "inode": int(observed.st_ino),
+            "size": int(observed.st_size),
+            "mtime_ns": int(observed.st_mtime_ns),
+            "sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(),
+        }
+    return identity
+
+
+def _assert_source_probe_identity(
+    before: dict[str, dict[str, int | str] | None],
+    after: dict[str, dict[str, int | str] | None],
+) -> None:
+    assert after["db"] == before["db"]
+    assert after["-wal"] == before["-wal"]
+    if before["-shm"] is None:
+        assert after["-shm"] is None
+    else:
+        assert after["-shm"] is not None
+        assert after["-shm"]["device"] == before["-shm"]["device"]
+        assert after["-shm"]["inode"] == before["-shm"]["inode"]
+
+
+def _activation_audit_payload_bytes(path: Path, epoch_id: str) -> bytes:
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT audit_id, epoch_id, from_state, to_state, operator, "
+            "reason, binding_fingerprint, transitioned_at "
+            "FROM rca_activation_transition_audit WHERE epoch_id = ? "
+            "ORDER BY audit_id DESC LIMIT 1",
+            (epoch_id,),
+        ).fetchone()
+    assert row is not None
+    return json.dumps(
+        {key: row[key] for key in row.keys()},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
 
 
 def test_terminal_rerun_payload_identity_accepts_current_issue_effect() -> None:
@@ -1901,6 +1958,72 @@ def test_read_existing_backpressure_snapshot_never_creates_missing_database(
     assert path.exists() is False
 
 
+def test_read_existing_backpressure_snapshot_stays_live_during_concurrent_wal_writes(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "control.sqlite3"
+    control = RcaControlStore(path)
+    _activate_direct_steady(control)
+    RcaDeliveryStore(path)
+
+    snapshot_calls = []
+
+    def reject_raw_snapshot(cls, *_args, **_kwargs):
+        del cls
+        snapshot_calls.append(True)
+        raise AssertionError("backpressure hot reads must not create a raw snapshot")
+
+    monkeypatch.setattr(
+        RcaControlStore,
+        "create_schema_probe_snapshot",
+        classmethod(reject_raw_snapshot),
+    )
+
+    writer_started = threading.Event()
+    stop_writer = threading.Event()
+
+    def write_loop():
+        conn = sqlite3.connect(path, timeout=5, isolation_level=None)
+        writes = 0
+        try:
+            assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+            conn.execute("PRAGMA wal_autocheckpoint=0")
+            while not stop_writer.is_set():
+                conn.execute(
+                    "INSERT INTO rca_delivery_meta(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    ("active_wal_backpressure_test", str(writes)),
+                )
+                writes += 1
+                writer_started.set()
+                time.sleep(0.001)
+        finally:
+            conn.close()
+        return writes
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        writer = pool.submit(write_loop)
+        assert writer_started.wait(timeout=5)
+        try:
+            snapshots = [
+                RcaDeliveryStore.read_existing_backpressure_snapshot(
+                    path,
+                    now=NOW,
+                    activation_required=True,
+                )
+                for _ in range(30)
+            ]
+        finally:
+            stop_writer.set()
+        writes = writer.result(timeout=5)
+
+    assert writes >= 2
+    assert snapshot_calls == []
+    assert all(snapshot.unresolved_work == 0 for snapshot in snapshots)
+    assert all(not snapshot.circuit.is_open for snapshot in snapshots)
+
+
 def test_current_store_has_long_lived_health_query_indexes(tmp_path):
     store = RcaDeliveryStore(tmp_path / "delivery.sqlite3")
     conn = store._connect()
@@ -1918,6 +2041,602 @@ def test_current_store_has_long_lived_health_query_indexes(tmp_path):
         "idx_delivery_jobs_updated_at",
         "idx_delivery_attempts_outcome_started",
     }.issubset(indexes)
+
+
+def _physical_v15_delivery_fixture(
+    tmp_path,
+) -> tuple[Path, dict[str, str]]:
+    from tests.gateway.test_pnc_rca_control_store import (
+        _migrate_v14_fixture_to_v15,
+    )
+
+    path = tmp_path / "control.sqlite3"
+    control = RcaControlStore(path)
+    _activate_direct_steady(control)
+    RcaDeliveryStore(path)
+    migration = _migrate_v14_fixture_to_v15(
+        path,
+        successor_epoch_id="delivery-epoch-v15",
+    )
+    return path, migration
+
+
+def test_nminus1_v15_weakened_activation_audit_ddl_is_rejected(tmp_path):
+    path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        strong_sql = str(
+            conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'rca_activation_transition_audit'"
+            ).fetchone()[0]
+        )
+        constraint = (
+            "CHECK(binding_schema_version IN ("
+            f"'{ACTIVATION_TRANSITION_BINDING_SCHEMA_V14}', "
+            f"'{ACTIVATION_TRANSITION_BINDING_SCHEMA_V15}'))"
+        )
+        weak_sql = strong_sql.replace(
+            constraint,
+            f"CHECK ('{ACTIVATION_TRANSITION_BINDING_SCHEMA_V15}' <> '')",
+        )
+        assert weak_sql != strong_sql
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "ALTER TABLE rca_activation_transition_audit "
+            "RENAME TO rca_activation_transition_audit_strong"
+        )
+        conn.execute(weak_sql)
+        conn.execute(
+            "INSERT INTO rca_activation_transition_audit "
+            "SELECT * FROM rca_activation_transition_audit_strong"
+        )
+        conn.execute("DROP TABLE rca_activation_transition_audit_strong")
+        conn.execute(
+            "CREATE INDEX idx_rca_activation_transition_epoch "
+            "ON rca_activation_transition_audit(epoch_id, audit_id)"
+        )
+        conn.commit()
+    before = _sqlite_storage_identity(path)
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:v15_activation_sql",
+    ):
+        RcaDeliveryStore(
+            path,
+            require_current=True,
+            ensure_current_rows=False,
+            allow_successor_read_only=True,
+        )
+
+    _assert_source_probe_identity(before, _sqlite_storage_identity(path))
+
+
+def test_nminus1_v15_control_schema_opens_delivery_store_read_only(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "control.sqlite3"
+    control = RcaControlStore(path)
+    _activate_direct_steady(control)
+    RcaDeliveryStore(path)
+
+    v14_before = _sqlite_storage_identity(path)
+    v14_store = RcaDeliveryStore(
+        path,
+        require_current=True,
+        ensure_current_rows=False,
+        allow_successor_read_only=True,
+    )
+    assert v14_store.schema_runtime_capability() == {
+        "observed_control_schema_version": CONTROL_STORE_SCHEMA_VERSION,
+        "binary_write_schema_version": CONTROL_STORE_SCHEMA_VERSION,
+        "mode": "current_write",
+        "read_supported": True,
+        "write_enabled": True,
+        "work_admission_enabled": True,
+        "lease_acquisition_enabled": True,
+        "external_effect_enabled": True,
+    }
+    _assert_source_probe_identity(v14_before, _sqlite_storage_identity(path))
+
+    from tests.gateway.test_pnc_rca_control_store import (
+        _migrate_v14_fixture_to_v15,
+    )
+
+    predecessor_audit_bytes = _activation_audit_payload_bytes(
+        path,
+        "delivery-epoch-1",
+    )
+    migration = _migrate_v14_fixture_to_v15(
+        path,
+        successor_epoch_id="delivery-epoch-v15",
+    )
+    assert migration["predecessor_epoch_id"] == "delivery-epoch-1"
+    assert migration["successor_epoch_id"] == "delivery-epoch-v15"
+    assert (
+        _activation_audit_payload_bytes(path, "delivery-epoch-1")
+        == predecessor_audit_bytes
+    )
+    with sqlite3.connect(path) as conn:
+        predecessor_audit = conn.execute(
+            "SELECT binding_fingerprint, binding_schema_version "
+            "FROM rca_activation_transition_audit WHERE epoch_id = ? "
+            "ORDER BY audit_id DESC LIMIT 1",
+            (migration["predecessor_epoch_id"],),
+        ).fetchone()
+        successor_audit = conn.execute(
+            "SELECT binding_fingerprint, binding_schema_version "
+            "FROM rca_activation_transition_audit WHERE epoch_id = ? "
+            "ORDER BY audit_id DESC LIMIT 1",
+            (migration["successor_epoch_id"],),
+        ).fetchone()
+    assert predecessor_audit == (
+        migration["predecessor_binding_fingerprint"],
+        ACTIVATION_TRANSITION_BINDING_SCHEMA_V14,
+    )
+    assert successor_audit == (
+        migration["successor_binding_fingerprint"],
+        ACTIVATION_TRANSITION_BINDING_SCHEMA_V15,
+    )
+    wal_writer = sqlite3.connect(path)
+    assert wal_writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    wal_writer.execute("PRAGMA wal_autocheckpoint=0")
+    wal_writer.execute(
+        "INSERT INTO rca_delivery_meta(key, value) VALUES(?, ?)",
+        ("nminus1_live_wal_fixture", "present"),
+    )
+    wal_writer.commit()
+    logical_rows_before = {
+        "control_schema": wal_writer.execute(
+            "SELECT value FROM control_meta WHERE key = 'schema_version'"
+        ).fetchone(),
+        "delivery_meta": wal_writer.execute(
+            "SELECT key, value FROM rca_delivery_meta ORDER BY key"
+        ).fetchall(),
+        "delivery_jobs": wal_writer.execute(
+            "SELECT COUNT(*) FROM rca_delivery_jobs"
+        ).fetchone(),
+        "delivery_effects": wal_writer.execute(
+            "SELECT COUNT(*) FROM rca_delivery_effects"
+        ).fetchone(),
+    }
+    assert Path(f"{path}-wal").is_file()
+    assert Path(f"{path}-shm").is_file()
+    before = _sqlite_storage_identity(path)
+    stale_store_error = "incompatible_control_store_schema:write_marker"
+    with pytest.raises(RuntimeError, match=stale_store_error):
+        v14_store._connect()
+    with pytest.raises(RuntimeError, match=stale_store_error):
+        v14_store.backfill_completed_submissions(
+            now=NOW,
+            activation_required=True,
+        )
+    with pytest.raises(RuntimeError, match=stale_store_error):
+        v14_store.validate_external_write_fence_binding({
+            "activation_epoch_id": migration["successor_epoch_id"],
+            "activation_ledger_id": 1,
+            "admission_key": "stale-v14-provider-fence",
+        })
+    after_stale_store_checks = _sqlite_storage_identity(path)
+    _assert_source_probe_identity(before, after_stale_store_checks)
+    before = after_stale_store_checks
+
+    from gateway import pnc_rca_delivery_store as delivery_store_module
+
+    connect_calls = []
+    real_connect = sqlite3.connect
+
+    def capture_connect(database, *args, **kwargs):
+        connect_calls.append((str(database), dict(kwargs)))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(delivery_store_module.sqlite3, "connect", capture_connect)
+
+    with pytest.raises(
+        RuntimeError,
+        match="rca_delivery_store_control_schema_not_current",
+    ):
+        RcaDeliveryStore(path, require_current=True)
+    after_default_rejection = _sqlite_storage_identity(path)
+    _assert_source_probe_identity(before, after_default_rejection)
+    before = after_default_rejection
+
+    store = RcaDeliveryStore(
+        path,
+        require_current=True,
+        ensure_current_rows=False,
+        allow_successor_read_only=True,
+    )
+    assert store.schema_runtime_capability() == {
+        "observed_control_schema_version": CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        "binary_write_schema_version": CONTROL_STORE_SCHEMA_VERSION,
+        "mode": "successor_read_only",
+        "read_supported": True,
+        "write_enabled": False,
+        "work_admission_enabled": False,
+        "lease_acquisition_enabled": False,
+        "external_effect_enabled": False,
+    }
+    assert connect_calls
+    assert all(
+        "?mode=ro" in database and options.get("uri") is True
+        for database, options in connect_calls
+    )
+    assert any(
+        database.startswith(path.resolve().as_uri())
+        for database, _options in connect_calls
+    )
+    assert any(
+        not database.startswith(path.resolve().as_uri())
+        for database, _options in connect_calls
+    )
+    after_successor_open = _sqlite_storage_identity(path)
+    _assert_source_probe_identity(before, after_successor_open)
+    before = after_successor_open
+
+    conn = store._connect_read_only()
+    try:
+        assert int(conn.execute("PRAGMA query_only").fetchone()[0]) == 1
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            conn.execute(
+                "UPDATE rca_delivery_meta SET value = value "
+                "WHERE key = 'schema_version'"
+            )
+    finally:
+        conn.close()
+    _assert_source_probe_identity(before, _sqlite_storage_identity(path))
+    assert {
+        "control_schema": wal_writer.execute(
+            "SELECT value FROM control_meta WHERE key = 'schema_version'"
+        ).fetchone(),
+        "delivery_meta": wal_writer.execute(
+            "SELECT key, value FROM rca_delivery_meta ORDER BY key"
+        ).fetchall(),
+        "delivery_jobs": wal_writer.execute(
+            "SELECT COUNT(*) FROM rca_delivery_jobs"
+        ).fetchone(),
+        "delivery_effects": wal_writer.execute(
+            "SELECT COUNT(*) FROM rca_delivery_effects"
+        ).fetchone(),
+    } == logical_rows_before
+    wal_writer.close()
+
+
+def test_nminus1_v15_activation_health_is_binding_valid_but_processing_disabled(
+    tmp_path,
+):
+    path, migration = _physical_v15_delivery_fixture(tmp_path)
+    store = RcaDeliveryStore(
+        path,
+        require_current=True,
+        allow_successor_read_only=True,
+    )
+
+    epoch = store.activation_epoch()
+    assert epoch == {
+        "epoch_id": migration["successor_epoch_id"],
+        "state": "steady_active",
+        "config_sha256": migration["successor_config_sha256"],
+        "release_fingerprint_sha256": migration[
+            "successor_release_fingerprint_sha256"
+        ],
+        "release_note_sha256": migration["successor_release_note_sha256"],
+    }
+    health = store.health(now=NOW, activation_required=True)
+    assert health["process_healthy"] is True
+    assert health["ok"] is False
+    assert health["business_ready"] is False
+    assert health["schema_runtime_capability"]["mode"] == "successor_read_only"
+    assert health["business_blockers"]["schema_successor_read_only"] == 1
+    assert health["production_blockers"]["schema_successor_read_only"] == 1
+    assert health["activation"]["schema_version"] == (
+        CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+    )
+    assert health["activation"]["binding_valid"] is True
+    assert health["activation"]["production_ready"] is False
+    assert health["activation"]["processing_enabled"] is False
+
+
+def test_nminus1_v15_delivery_writers_and_external_fences_are_denied_without_mutation(
+    tmp_path,
+):
+    path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    source_before = _sqlite_storage_identity(path)
+    assert source_before["-wal"] is None
+    assert source_before["-shm"] is None
+    with pytest.raises(
+        RuntimeError,
+        match="rca_delivery_store_control_schema_not_current",
+    ):
+        RcaDeliveryStore(path, require_current=True)
+    assert _sqlite_storage_identity(path) == source_before
+
+    store = RcaDeliveryStore(
+        path,
+        require_current=True,
+        allow_successor_read_only=True,
+    )
+    assert _sqlite_storage_identity(path) == source_before
+    before = source_before
+
+    denied = "rca_delivery_store_successor_read_only"
+    with pytest.raises(RuntimeError, match=denied):
+        store._connect()
+    with pytest.raises(RuntimeError, match=denied):
+        store.backfill_completed_submissions(now=NOW, activation_required=True)
+    with pytest.raises(RuntimeError, match=denied):
+        store.claim_due_watch(
+            lease_owner="successor-collector",
+            now=NOW,
+            activation_required=True,
+        )
+    with pytest.raises(RuntimeError, match=denied):
+        store.claim_due_effect(
+            lease_owner="successor-dispatcher",
+            now=NOW,
+            activation_required=True,
+        )
+    with pytest.raises(RuntimeError, match=denied):
+        store.validate_external_write_fence_binding({})
+    with pytest.raises(RuntimeError, match=denied):
+        store.validate_profile_terminal_external_write_binding(
+            effect_key="profile-effect",
+            delivery_id="profile-delivery",
+            lease_token="profile-lease",
+            lease_fence=1,
+            operation="feishu_issue_comment",
+            issue_url="https://project.feishu.cn/test/1",
+            target_key="feishu_project:test:issue:1",
+            business_key="profile-business",
+            submission_key="profile-submission",
+            generation=1,
+            require_write_started=False,
+            now=NOW,
+        )
+    with pytest.raises(RuntimeError, match=denied):
+        store.validate_terminal_rerun_external_write_binding(
+            effect_key="rerun-effect",
+            delivery_id="rerun-delivery",
+            lease_token="rerun-lease",
+            lease_fence=1,
+            operation="feishu_issue_comment",
+            issue_url="https://project.feishu.cn/test/1",
+            target_key="feishu_project:test:issue:1",
+            business_key="rerun-business",
+            submission_key="rerun-submission",
+            generation=2,
+            require_write_started=False,
+            now=NOW,
+        )
+    with pytest.raises(RuntimeError, match=denied):
+        store.validate_learning_lane_external_operation(
+            business_key="learning-business",
+            generation=1,
+            operation="feishu_issue_comment",
+        )
+    with pytest.raises(
+        RuntimeError,
+        match="delivery_backpressure_contract_invalid:control_schema_version",
+    ):
+        RcaDeliveryStore.read_existing_backpressure_snapshot(path, now=NOW)
+
+    assert _sqlite_storage_identity(path) == before
+
+
+def test_nminus1_v15_tampered_binding_is_health_red(tmp_path):
+    path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    with sqlite3.connect(path) as conn:
+        changed = conn.execute(
+            "UPDATE rca_activation_epochs "
+            "SET release_fingerprint_sha256 = ? WHERE is_current = 1",
+            ("f" * 64,),
+        )
+    assert changed.rowcount == 1
+
+    store = RcaDeliveryStore(
+        path,
+        require_current=True,
+        allow_successor_read_only=True,
+    )
+    health = store.health(now=NOW, activation_required=True)
+    assert health["process_healthy"] is True
+    assert health["ok"] is False
+    assert health["business_ready"] is False
+    assert health["activation"]["binding_valid"] is False
+    assert health["activation"]["production_ready"] is False
+    assert health["activation"]["processing_enabled"] is False
+    with pytest.raises(ActivationEpochError):
+        store.activation_epoch()
+
+
+def test_current_constructor_rejects_control_marker_drift_before_circuit_insert(
+    tmp_path,
+    monkeypatch,
+):
+    from gateway import pnc_rca_delivery_store as delivery_store_module
+
+    path = tmp_path / "control.sqlite3"
+    control = RcaControlStore(path)
+    _activate_direct_steady(control)
+    RcaDeliveryStore(path)
+
+    delivery_tables = (
+        "rca_delivery_meta",
+        "rca_delivery_dispatcher_circuit",
+        "rca_delivery_jobs",
+        "rca_delivery_effects",
+    )
+
+    def delivery_rows(conn):
+        return {
+            table: conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+            for table in delivery_tables
+        }
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "DELETE FROM rca_delivery_dispatcher_circuit WHERE circuit_name = ?",
+            (delivery_store_module.DELIVERY_CARD_PATCH_EFFECT_KIND,),
+        )
+        assert int(conn.execute("SELECT changes()").fetchone()[0]) == 1
+        business_rows_before = delivery_rows(conn)
+
+    original_ensure = RcaDeliveryStore._ensure_card_patch_circuit_row_at_path
+    keepers: list[sqlite3.Connection] = []
+    drift_identity: dict[str, dict[str, int | str] | None] = {}
+
+    def drift_control_marker_then_ensure(
+        cls,
+        db_path,
+        *,
+        busy_timeout_ms,
+    ):
+        del cls
+        writer = sqlite3.connect(db_path, isolation_level=None)
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("BEGIN IMMEDIATE")
+        changed = writer.execute(
+            "UPDATE control_meta SET value = ? "
+            "WHERE key = 'schema_version' AND value = ?",
+            (
+                CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+                CONTROL_STORE_SCHEMA_VERSION,
+            ),
+        )
+        assert changed.rowcount == 1
+        writer.commit()
+        keepers.append(writer)
+        drift_identity.update(_sqlite_storage_identity(Path(db_path)))
+        return original_ensure(db_path, busy_timeout_ms=busy_timeout_ms)
+
+    monkeypatch.setattr(
+        RcaDeliveryStore,
+        "_ensure_card_patch_circuit_row_at_path",
+        classmethod(drift_control_marker_then_ensure),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:write_marker",
+    ):
+        RcaDeliveryStore(path, require_current=True)
+
+    assert len(keepers) == 1
+    writer = keepers[0]
+    try:
+        assert writer.execute(
+            "SELECT value FROM control_meta WHERE key = 'schema_version'"
+        ).fetchone() == (CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,)
+        assert delivery_rows(writer) == business_rows_before
+        assert writer.execute(
+            "SELECT 1 FROM rca_delivery_dispatcher_circuit "
+            "WHERE circuit_name = ?",
+            (delivery_store_module.DELIVERY_CARD_PATCH_EFFECT_KIND,),
+        ).fetchone() is None
+        _assert_source_probe_identity(
+            drift_identity,
+            _sqlite_storage_identity(path),
+        )
+    finally:
+        writer.close()
+
+
+def test_external_binding_validators_remain_available_during_active_wal_write(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "control.sqlite3"
+    control = RcaControlStore(path)
+    _activate_direct_steady(control)
+    RcaDeliveryStore(path)
+    store = RcaDeliveryStore(
+        path,
+        require_current=True,
+        ensure_current_rows=False,
+        allow_successor_read_only=True,
+    )
+
+    snapshot_calls = []
+
+    def reject_raw_snapshot(cls, *_args, **_kwargs):
+        del cls
+        snapshot_calls.append(True)
+        raise AssertionError("external binding validation must not create a snapshot")
+
+    monkeypatch.setattr(
+        RcaControlStore,
+        "create_schema_probe_snapshot",
+        classmethod(reject_raw_snapshot),
+    )
+
+    writer = sqlite3.connect(path, isolation_level=None)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute(
+            "INSERT INTO rca_delivery_meta(key, value) VALUES(?, ?)",
+            ("active_wal_external_binding_test", "committed"),
+        )
+        writer.execute("BEGIN IMMEDIATE")
+        writer.execute(
+            "UPDATE rca_delivery_meta SET value = ? WHERE key = ?",
+            ("uncommitted", "active_wal_external_binding_test"),
+        )
+        assert writer.in_transaction
+        before = _sqlite_storage_identity(path)
+
+        with pytest.raises(
+            RuntimeError,
+            match="external_write_fence_operation_denied",
+        ):
+            store.validate_profile_terminal_external_write_binding(
+                effect_key="profile-effect",
+                delivery_id="profile-delivery",
+                lease_token="profile-lease",
+                lease_fence=1,
+                operation="feishu_issue_comment",
+                issue_url="https://project.feishu.cn/test/1",
+                target_key="feishu_project:test:issue:1",
+                business_key="profile-business",
+                submission_key="profile-submission",
+                generation=1,
+                require_write_started=False,
+                now=NOW,
+            )
+        with pytest.raises(
+            RuntimeError,
+            match="external_write_fence_identity_mismatch",
+        ):
+            store.validate_terminal_rerun_external_write_binding(
+                effect_key="rerun-effect",
+                delivery_id="rerun-delivery",
+                lease_token="rerun-lease",
+                lease_fence=1,
+                operation="feishu_issue_comment",
+                issue_url="https://project.feishu.cn/test/1",
+                target_key="feishu_project:test:issue:1",
+                business_key="rerun-business",
+                submission_key="rerun-submission",
+                generation=2,
+                require_write_started=False,
+                now=NOW,
+            )
+
+        assert snapshot_calls == []
+        _assert_source_probe_identity(before, _sqlite_storage_identity(path))
+    finally:
+        if writer.in_transaction:
+            writer.rollback()
+        writer.close()
+
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT value FROM rca_delivery_meta WHERE key = ?",
+            ("active_wal_external_binding_test",),
+        ).fetchone() == ("committed",)
 
 
 def test_future_delivery_schema_is_rejected_before_tables_are_changed(tmp_path):
@@ -3037,6 +3756,7 @@ def test_delivery_health_observes_stalled_watch_without_blocking_readiness(tmp_p
     assert health["business_blockers"]["stalled_watches"] == 1
     assert "delivery_quarantine" not in health
     assert health["production_blockers"] == {
+        "schema_successor_read_only": 0,
         "activation_schema_unavailable": 0,
         "activation_epoch_not_steady": 0,
         "activation_binding_invalid": 0,
@@ -3748,6 +4468,110 @@ def test_stale_effect_cannot_open_dispatcher_circuit(tmp_path):
         )
 
     assert store.delivery_dispatcher_circuit().is_open is False
+
+
+def test_delivery_writer_is_fenced_when_v15_commits_after_connect(
+    tmp_path,
+    monkeypatch,
+):
+    from tests.gateway.test_pnc_rca_control_store import (
+        _migrate_v14_fixture_to_v15,
+    )
+
+    path = tmp_path / "control.sqlite3"
+    control = RcaControlStore(path)
+    control.activate_direct_steady_epoch(
+        epoch_id="delivery-midflight-v14",
+        release_fingerprint_sha256="a" * 64,
+        release_note_sha256="b" * 64,
+        config_sha256="c" * 64,
+        db_logical_identity={"database": "delivery-midflight-test"},
+        partition_start_fence={},
+        operator="delivery-test",
+        reason="activate delivery midflight test runtime",
+        now=NOW,
+    )
+    RcaDeliveryStore(path)
+    store = RcaDeliveryStore(path, require_current=True)
+    store.open_delivery_dispatcher_circuit(
+        reason_code="test_midflight_public_writer",
+        now=NOW,
+    )
+    original_connect = store._connect
+    migrated = False
+
+    def connect_then_migrate():
+        nonlocal migrated
+        conn = original_connect()
+        if not migrated:
+            _migrate_v14_fixture_to_v15(path)
+            migrated = True
+        return conn
+
+    monkeypatch.setattr(store, "_connect", connect_then_migrate)
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="incompatible_control_store_schema:write_marker",
+    ):
+        store.close_delivery_dispatcher_circuit(now=NOW + timedelta(seconds=1))
+
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT state FROM rca_delivery_dispatcher_circuit "
+            "WHERE circuit_name = ?",
+            (DELIVERY_EFFECT_KIND,),
+        ).fetchone()[0] == "open"
+
+
+def test_delivery_require_current_connection_guard_rejects_schema_cookie_drift(
+    tmp_path,
+):
+    path = tmp_path / "control.sqlite3"
+    control = RcaControlStore(path)
+    control.activate_direct_steady_epoch(
+        epoch_id="delivery-schema-cookie-v14",
+        release_fingerprint_sha256="a" * 64,
+        release_note_sha256="b" * 64,
+        config_sha256="c" * 64,
+        db_logical_identity={"database": "delivery-schema-cookie-test"},
+        partition_start_fence={},
+        operator="delivery-test",
+        reason="activate delivery schema cookie test runtime",
+        now=NOW,
+    )
+    RcaDeliveryStore(path)
+    store = RcaDeliveryStore(path, require_current=True)
+    store.open_delivery_dispatcher_circuit(
+        reason_code="test_schema_cookie_drift",
+        now=NOW,
+    )
+    guarded = store._connect()
+    try:
+        with sqlite3.connect(path) as external:
+            external.execute("CREATE TABLE unrelated_delivery_schema_drift(id INTEGER)")
+
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="incompatible_control_store_schema:write_marker",
+        ):
+            guarded.execute(
+                "UPDATE rca_delivery_dispatcher_circuit SET state = 'closed' "
+                "WHERE circuit_name = ?",
+                (DELIVERY_EFFECT_KIND,),
+            )
+    finally:
+        guarded.close()
+
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT value FROM control_meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == CONTROL_STORE_SCHEMA_VERSION
+        assert conn.execute(
+            "SELECT state FROM rca_delivery_dispatcher_circuit "
+            "WHERE circuit_name = ?",
+            (DELIVERY_EFFECT_KIND,),
+        ).fetchone()[0] == "open"
 
 
 def test_effect_lease_extension_is_fenced_by_token_fence_owner_and_expiry(

@@ -35,7 +35,11 @@ WRITE_FENCE_ALLOWED_KINDS = frozenset({
 RESIDENT_ACTIVATION_EPOCH_STATES = frozenset({"steady_active"})
 RESIDENT_INGRESS_OPEN_STATES = RESIDENT_ACTIVATION_EPOCH_STATES
 RESIDENT_EXTERNAL_WRITE_STATES = RESIDENT_ACTIVATION_EPOCH_STATES
-MINIMAL_RELEASE_NOTE_SCHEMA_VERSION = "pnc_rca_minimal_release_note_v1"
+MINIMAL_RELEASE_NOTE_SCHEMA_VERSION = "pnc_rca_minimal_release_note_v2"
+MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION = "pnc_rca_control_store_v14"
+MINIMAL_RELEASE_EPOCH_CONTRACT_SCHEMA_VERSION = (
+    "pnc_rca_minimal_release_epoch_contract_v1"
+)
 MINIMAL_RELEASE_PRODUCTION_DEFINITION = (
     "gitlab_ref+release_note+exact_commit_tree_tag+immutable_runtime+"
     "restart_readback+single_canary"
@@ -102,6 +106,32 @@ _MINIMAL_RELEASE_REPORT_FACE_FIELDS = frozenset({
     "pipeline_commit",
     "pipeline_tree",
 })
+_MINIMAL_RELEASE_ACTIVATION_FIELDS = frozenset({
+    "epoch_id",
+    "control_db_path",
+    "operator",
+    "reason",
+    "expected_control_schema_version",
+    "target_control_schema_version",
+    "expected_predecessor_epoch_id",
+    "expected_predecessor_state",
+    "expected_predecessor_binding_fingerprint",
+    "db_logical_identity",
+    "db_logical_identity_sha256",
+    "partition_start_fence",
+    "partition_start_fence_sha256",
+    "epoch_contract_sha256",
+})
+_SCHEMA_RUNTIME_CAPABILITY_FIELDS = frozenset({
+    "observed_control_schema_version",
+    "binary_write_schema_version",
+    "mode",
+    "read_supported",
+    "write_enabled",
+    "work_admission_enabled",
+    "lease_acquisition_enabled",
+    "external_effect_enabled",
+})
 
 
 class MinimalReleaseNoteIdentityError(ValueError):
@@ -119,6 +149,170 @@ class ExternalWriteFenceError(ValueError):
         self.code = str(code or "external_write_fence_invalid")[:120]
         self.detail = str(detail or self.code)[:1000]
         super().__init__(self.detail)
+
+
+def minimal_release_epoch_contract_sha256(activation: Mapping[str, Any]) -> str:
+    """Hash the schema, predecessor, database identity, and start fence contract."""
+
+    if not isinstance(activation, Mapping):
+        raise MinimalReleaseNoteIdentityError("minimal_release_note_contract_invalid")
+    material = {
+        "schema_version": MINIMAL_RELEASE_EPOCH_CONTRACT_SCHEMA_VERSION,
+        "expected_control_schema_version": activation.get(
+            "expected_control_schema_version"
+        ),
+        "target_control_schema_version": activation.get(
+            "target_control_schema_version"
+        ),
+        "expected_predecessor_epoch_id": activation.get(
+            "expected_predecessor_epoch_id"
+        ),
+        "expected_predecessor_state": activation.get("expected_predecessor_state"),
+        "expected_predecessor_binding_fingerprint": activation.get(
+            "expected_predecessor_binding_fingerprint"
+        ),
+        "db_logical_identity": activation.get("db_logical_identity"),
+        "db_logical_identity_sha256": activation.get(
+            "db_logical_identity_sha256"
+        ),
+        "partition_start_fence": activation.get("partition_start_fence"),
+        "partition_start_fence_sha256": activation.get(
+            "partition_start_fence_sha256"
+        ),
+    }
+    try:
+        raw = json.dumps(
+            material,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise MinimalReleaseNoteIdentityError(
+            "minimal_release_note_contract_invalid"
+        ) from exc
+    return hashlib.sha256(raw).hexdigest()
+
+
+def validate_minimal_release_activation_contract(value: object) -> dict[str, Any]:
+    """Validate the exact v2 activation contract shared by release and residents."""
+
+    if not isinstance(value, Mapping) or set(value) != _MINIMAL_RELEASE_ACTIVATION_FIELDS:
+        raise MinimalReleaseNoteIdentityError("minimal_release_note_contract_invalid")
+    activation = dict(value)
+    predecessor = str(activation.get("expected_predecessor_epoch_id") or "")
+    predecessor_state = str(activation.get("expected_predecessor_state") or "")
+    predecessor_fingerprint = str(
+        activation.get("expected_predecessor_binding_fingerprint") or ""
+    )
+    db_identity = activation.get("db_logical_identity")
+    fence = activation.get("partition_start_fence")
+    db_identity_sha256 = str(activation.get("db_logical_identity_sha256") or "")
+    fence_sha256 = str(activation.get("partition_start_fence_sha256") or "")
+    contract_sha256 = str(activation.get("epoch_contract_sha256") or "")
+    try:
+        db_identity_raw = json.dumps(
+            db_identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        fence_raw = json.dumps(
+            fence,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise MinimalReleaseNoteIdentityError(
+            "minimal_release_note_contract_invalid"
+        ) from exc
+    if (
+        activation.get("expected_control_schema_version")
+        != MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
+        or activation.get("target_control_schema_version")
+        != MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
+        or not isinstance(db_identity, Mapping)
+        or not db_identity
+        or len(db_identity_raw) > 4096
+        or not isinstance(fence, Mapping)
+        or bool(predecessor) != bool(predecessor_state)
+        or bool(predecessor) != bool(predecessor_fingerprint)
+        or (
+            predecessor
+            and (
+                _MINIMAL_RELEASE_ID_RE.fullmatch(predecessor) is None
+                or predecessor_state not in {"aborted", "steady_active"}
+                or _SHA256_RE.fullmatch(predecessor_fingerprint) is None
+            )
+        )
+        or _SHA256_RE.fullmatch(db_identity_sha256) is None
+        or hashlib.sha256(db_identity_raw).hexdigest() != db_identity_sha256
+        or _SHA256_RE.fullmatch(fence_sha256) is None
+        or hashlib.sha256(fence_raw).hexdigest() != fence_sha256
+        or _SHA256_RE.fullmatch(contract_sha256) is None
+        or minimal_release_epoch_contract_sha256(activation) != contract_sha256
+    ):
+        raise MinimalReleaseNoteIdentityError("minimal_release_note_contract_invalid")
+    return activation
+
+
+def _require_resident_control_schema(store: Any) -> dict[str, Any]:
+    try:
+        capability = store.schema_runtime_capability()
+    except Exception as exc:
+        raise ExternalWriteFenceError(
+            "resident_control_schema_capability_unavailable", type(exc).__name__
+        ) from exc
+    if (
+        not isinstance(capability, Mapping)
+        or set(capability) != _SCHEMA_RUNTIME_CAPABILITY_FIELDS
+        or not isinstance(capability.get("mode"), str)
+        or not all(
+            isinstance(capability.get(field), bool)
+            for field in (
+                "read_supported",
+                "write_enabled",
+                "work_admission_enabled",
+                "lease_acquisition_enabled",
+                "external_effect_enabled",
+            )
+        )
+    ):
+        raise ExternalWriteFenceError("resident_control_schema_capability_invalid")
+    if (
+        capability.get("observed_control_schema_version")
+        != MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
+        or capability.get("binary_write_schema_version")
+        != MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
+    ):
+        raise ExternalWriteFenceError("resident_control_schema_not_v14")
+    write_flags = tuple(
+        capability[field]
+        for field in (
+            "write_enabled",
+            "work_admission_enabled",
+            "lease_acquisition_enabled",
+            "external_effect_enabled",
+        )
+    )
+    if (
+        capability.get("read_supported") is not True
+        or (
+            capability.get("mode") == "explicit_read_only"
+            and write_flags != (False, False, False, False)
+        )
+        or (
+            capability.get("mode") == "current_write"
+            and write_flags != (True, True, True, True)
+        )
+        or capability.get("mode") not in {"explicit_read_only", "current_write"}
+    ):
+        raise ExternalWriteFenceError("resident_control_schema_capability_invalid")
+    return dict(capability)
 
 
 def _minimal_release_gitlab_remote_valid(value: object) -> bool:
@@ -332,8 +526,10 @@ def validate_resident_release_note(
     if expected_control_db != canonical_control_db:
         raise ExternalWriteFenceError("resident_release_control_db_mismatch")
     activation = note.get("activation")
-    if not isinstance(activation, Mapping):
-        raise ExternalWriteFenceError("resident_release_note_schema_invalid")
+    try:
+        activation = validate_minimal_release_activation_contract(activation)
+    except MinimalReleaseNoteIdentityError as exc:
+        raise ExternalWriteFenceError("resident_release_note_schema_invalid") from exc
     note_control_db_raw = activation.get("control_db_path")
     try:
         note_control_db = _resident_control_db_path(note_control_db_raw)
@@ -347,7 +543,7 @@ def validate_resident_release_note(
         raise ExternalWriteFenceError("resident_release_control_db_mismatch")
     note_sha256 = hashlib.sha256(raw).hexdigest()
     fingerprint = str(note.get("release_fingerprint_sha256") or "").strip()
-    # This is a one-way v1 contract: legacy activation receipts are not release notes.
+    # This is a one-way v2 contract: legacy activation receipts are not release notes.
     epoch_fingerprint = str(
         epoch.get("release_fingerprint_sha256") or ""
     ).strip()
@@ -498,6 +694,7 @@ def validate_bound_resident_release(
             "resident_release_control_db_path_unavailable"
         ) from exc
     control_db_path = _resident_control_db_path(control_db_path)
+    _require_resident_control_schema(store)
     epoch = require_resident_activation_epoch(store, allowed_states={"steady_active"})
     binding = validate_resident_release_note(
         epoch,
@@ -1169,6 +1366,8 @@ def issue_snapshot_write_fence(
 
 __all__ = [
     "ExternalWriteFenceError",
+    "MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION",
+    "MINIMAL_RELEASE_EPOCH_CONTRACT_SCHEMA_VERSION",
     "MINIMAL_RELEASE_HOST_REMOTE",
     "MINIMAL_RELEASE_NOTE_SCHEMA_VERSION",
     "MINIMAL_RELEASE_PRODUCTION_DEFINITION",
@@ -1185,6 +1384,7 @@ __all__ = [
     "canonical_utc",
     "canonical_write_fence_sha256",
     "issue_snapshot_write_fence",
+    "minimal_release_epoch_contract_sha256",
     "require_resident_activation_epoch",
     "snapshot_core_payload",
     "snapshot_core_sha256",
@@ -1193,6 +1393,7 @@ __all__ = [
     "validate_write_fence_source_binding",
     "validate_bound_resident_release",
     "validate_minimal_release_note_identity",
+    "validate_minimal_release_activation_contract",
     "validate_resident_release_note",
     "write_target_set_from_source_envelope",
     "write_fence_binding",

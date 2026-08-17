@@ -180,6 +180,17 @@ LEASE_BOUNDARY_MARGIN_SECONDS = 15
 EFFECT_LEASE_RENEW_INTERVAL_SECONDS = 10
 MAX_EFFECT_LEASE_RENEW_INTERVAL_SECONDS = 15
 MAX_HEALTH_HEARTBEAT_INTERVAL_SECONDS = 15.0
+SUCCESSOR_READ_ONLY_MODE = "successor_read_only"
+SCHEMA_RUNTIME_CAPABILITY_KEYS = frozenset({
+    "observed_control_schema_version",
+    "binary_write_schema_version",
+    "mode",
+    "read_supported",
+    "write_enabled",
+    "work_admission_enabled",
+    "lease_acquisition_enabled",
+    "external_effect_enabled",
+})
 HTTP_VERIFY_READ_CHUNK_BYTES = 64 * 1024
 RETRY_DELAYS_SECONDS = (2, 5, 10, 20, 40, 120, 300, 900, 3600)
 UNCERTAIN_RECONCILIATION_POLL_SECONDS = 30
@@ -6043,6 +6054,152 @@ class HealthReporter:
         os.replace(temporary, path)
 
 
+def _schema_runtime_capability(store: RcaDeliveryStore) -> dict[str, Any]:
+    capability = dict(store.schema_runtime_capability())
+    if set(capability) != SCHEMA_RUNTIME_CAPABILITY_KEYS:
+        raise RuntimeError("rca_schema_runtime_capability_invalid")
+    if capability.get("mode") == SUCCESSOR_READ_ONLY_MODE and (
+        capability.get("read_supported") is not True
+        or any(
+            capability.get(name) is not False
+            for name in (
+                "write_enabled",
+                "work_admission_enabled",
+                "lease_acquisition_enabled",
+                "external_effect_enabled",
+            )
+        )
+    ):
+        raise RuntimeError("rca_successor_read_only_capability_invalid")
+    return capability
+
+
+def _successor_read_only_diagnostic(
+    config: DispatcherConfig,
+    capability: Mapping[str, Any],
+    *,
+    operation: str,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": "rca_resident_successor_read_only",
+        "operation": operation,
+        "mode": SUCCESSOR_READ_ONLY_MODE,
+        "ready": False,
+        "processing": False,
+        "config": config.public_dict(),
+        "schema_runtime_capability": dict(capability),
+    }
+
+
+class SuccessorReadOnlyHealthReporter:
+    """Publish dispatcher liveness without opening provider or claim boundaries."""
+
+    def __init__(
+        self,
+        config: DispatcherConfig,
+        store: RcaDeliveryStore,
+        capability: Mapping[str, Any],
+    ) -> None:
+        self.config = config
+        self.store = store
+        self.capability = dict(capability)
+        self.started_at = _utc_iso()
+        self.runtime_identity = build_runtime_identity(
+            service_label=SERVICE_LABEL,
+            script_path=Path(__file__),
+            public_config=config.public_dict(),
+            loaded_dependencies={
+                distribution: module
+                for distribution, module in (
+                    RCA_DELIVERY_DISPATCHER_LOADED_DEPENDENCIES.items()
+                )
+                if distribution != "lark-oapi"
+            },
+        )
+
+    def write(self, *, state: str = SUCCESSOR_READ_ONLY_MODE) -> None:
+        body = {
+            "schema_version": HEALTH_SCHEMA_VERSION,
+            "ok": False,
+            "healthy": True,
+            "process_healthy": True,
+            "business_ready": False,
+            "ready": False,
+            "processing": False,
+            "state": state,
+            "mode": SUCCESSOR_READ_ONLY_MODE,
+            "started_at": self.started_at,
+            "updated_at": _utc_iso(),
+            "runtime_identity": self.runtime_identity.to_dict(),
+            "config": self.config.public_dict(),
+            "schema_runtime_capability": dict(self.capability),
+            "stats": asdict(DispatchStats()),
+            "effect_lease_keeper": {
+                "enabled": False,
+                "active": False,
+                "renew_interval_seconds": EFFECT_LEASE_RENEW_INTERVAL_SECONDS,
+                "started": 0,
+                "stopped": 0,
+                "renewals": 0,
+                "failures": 0,
+            },
+            "last_outcome": None,
+            "circuit": {"state": "not_observed_successor_read_only"},
+            "circuits": {},
+            "store": self.store.health(
+                activation_required=self.config.activation_required,
+            ),
+            "release": {},
+            "release_error": "",
+        }
+        path = self.config.health_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+
+
+def run_successor_read_only_loop(
+    config: DispatcherConfig,
+    store: RcaDeliveryStore,
+    capability: Mapping[str, Any],
+    *,
+    once: bool = False,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    reporter = SuccessorReadOnlyHealthReporter(config, store, capability)
+    stop = False
+
+    def request_stop(_signum, _frame):
+        nonlocal stop
+        stop = True
+
+    previous: dict[int, Any] = {}
+    if not once:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous[signum] = signal.signal(signum, request_stop)
+    interval = min(
+        float(config.poll_interval_seconds),
+        _heartbeat_interval_seconds(config.health_max_age_seconds),
+    )
+    try:
+        while not stop:
+            reporter.write()
+            if once:
+                return 0
+            sleep(interval)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+    reporter.write(state="stopped")
+    return 0
+
+
 def read_health(
     path: Path,
     *,
@@ -6085,6 +6242,17 @@ def read_health(
         result["error"] = "heartbeat_from_future"
     elif age > max_age_seconds:
         result["error"] = "heartbeat_stale"
+    if payload.get("mode") == SUCCESSOR_READ_ONLY_MODE:
+        result["liveness_ok"] = bool(
+            fresh
+            and payload.get("healthy") is True
+            and payload.get("process_healthy") is True
+            and payload.get("business_ready") is False
+            and payload.get("ready") is False
+            and payload.get("processing") is False
+        )
+        result.setdefault("error", "successor_read_only_not_ready")
+        return False, result
     return payload.get("healthy") is True and fresh, result
 
 
@@ -6435,7 +6603,21 @@ def main(argv: list[str] | None = None) -> int:
                     require_current=True,
                     read_only=True,
                     ensure_current_rows=False,
+                    allow_successor_read_only=True,
                 )
+                capability = _schema_runtime_capability(check_store)
+                if capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
+                    print(
+                        json.dumps(
+                            _successor_read_only_diagnostic(
+                                config,
+                                capability,
+                                operation="check_config",
+                            ),
+                            ensure_ascii=False,
+                        )
+                    )
+                    return 2
                 release_binding = validate_bound_resident_release(
                     check_store,
                     release_note_path=config.release_note_path,
@@ -6498,35 +6680,44 @@ def main(argv: list[str] | None = None) -> int:
         args.clear_circuit
         or args.materialize_reset
     )
+    successor_store: RcaDeliveryStore | None = None
+    successor_capability: dict[str, Any] | None = None
     if config.enabled and not args.dry_run and not reset_mode:
         try:
             gate_store = RcaDeliveryStore(
                 config.control_db_path,
                 require_current=True,
-                read_only=True,
                 ensure_current_rows=False,
+                allow_successor_read_only=True,
             )
-            release_binding = validate_bound_resident_release(
-                gate_store,
-                release_note_path=config.release_note_path,
-                runtime_root=os.environ.get("PNC_LIVE_RUNTIME_ROOT", ""),
-                runtime_commit=os.environ.get("PNC_LIVE_RUNTIME_COMMIT", ""),
-                runtime_tree=os.environ.get("PNC_LIVE_RUNTIME_TREE", ""),
-                live_manifest_sha256=os.environ.get("PNC_LIVE_MANIFEST_SHA256", ""),
-                live_env_path=loaded_env_path,
-            )
-            config = replace(
-                config,
-                observation_release_id=release_binding["release_id"],
-                release_env_path=loaded_env_path,
-                resident_release_enforced=True,
-                release_id=release_binding["release_id"],
-                release_epoch_id=release_binding["epoch_id"],
-                release_fingerprint_sha256=release_binding[
-                    "release_fingerprint_sha256"
-                ],
-                release_note_sha256=release_binding["release_note_sha256"],
-            )
+            gate_capability = _schema_runtime_capability(gate_store)
+            if gate_capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
+                successor_store = gate_store
+                successor_capability = gate_capability
+            else:
+                release_binding = validate_bound_resident_release(
+                    gate_store,
+                    release_note_path=config.release_note_path,
+                    runtime_root=os.environ.get("PNC_LIVE_RUNTIME_ROOT", ""),
+                    runtime_commit=os.environ.get("PNC_LIVE_RUNTIME_COMMIT", ""),
+                    runtime_tree=os.environ.get("PNC_LIVE_RUNTIME_TREE", ""),
+                    live_manifest_sha256=os.environ.get(
+                        "PNC_LIVE_MANIFEST_SHA256", ""
+                    ),
+                    live_env_path=loaded_env_path,
+                )
+                config = replace(
+                    config,
+                    observation_release_id=release_binding["release_id"],
+                    release_env_path=loaded_env_path,
+                    resident_release_enforced=True,
+                    release_id=release_binding["release_id"],
+                    release_epoch_id=release_binding["epoch_id"],
+                    release_fingerprint_sha256=release_binding[
+                        "release_fingerprint_sha256"
+                    ],
+                    release_note_sha256=release_binding["release_note_sha256"],
+                )
         except (ExternalWriteFenceError, OSError, RuntimeError, sqlite3.Error) as exc:
             print(
                 json.dumps(
@@ -6539,21 +6730,56 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 2
-    try:
-        store = RcaDeliveryStore(
-            config.control_db_path,
-            require_current=True,
-            read_only=(reset_mode and not args.apply) or args.dry_run,
-            ensure_current_rows=not reset_mode and not args.dry_run,
-        )
-    except (OSError, RuntimeError, sqlite3.Error) as exc:
-        print(
-            json.dumps(
-                {"ok": False, "error": f"delivery_store_unavailable: {exc}"},
-                ensure_ascii=False,
+    if successor_store is not None:
+        store = successor_store
+        assert successor_capability is not None
+        capability = successor_capability
+    else:
+        try:
+            store = RcaDeliveryStore(
+                config.control_db_path,
+                require_current=True,
+                read_only=(reset_mode and not args.apply) or args.dry_run,
+                ensure_current_rows=not reset_mode and not args.dry_run,
+                allow_successor_read_only=True,
             )
+            capability = _schema_runtime_capability(store)
+        except (OSError, RuntimeError, sqlite3.Error) as exc:
+            print(
+                json.dumps(
+                    {"ok": False, "error": f"delivery_store_unavailable: {exc}"},
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+    if capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
+        if args.dry_run or reset_mode:
+            operation = (
+                "dry_run"
+                if args.dry_run
+                else (
+                    "materialize_reset"
+                    if args.materialize_reset
+                    else "clear_circuit"
+                )
+            )
+            print(
+                json.dumps(
+                    _successor_read_only_diagnostic(
+                        config,
+                        capability,
+                        operation=operation,
+                    ),
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+        return run_successor_read_only_loop(
+            config,
+            store,
+            capability,
+            once=args.once,
         )
-        return 2
     if args.clear_circuit or args.materialize_reset:
         try:
             return _run_circuit_reset_command(

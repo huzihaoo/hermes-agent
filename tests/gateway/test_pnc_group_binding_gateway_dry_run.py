@@ -38,6 +38,23 @@ from hermes_constants import reset_hermes_home_override, set_hermes_home_overrid
 G1Q3_GROUP_ID = "oc_6cfc782212009ff4cd815349909dd423"
 
 
+def _steady_control_store(path):
+    from gateway.pnc_rca_control_store import RcaControlStore
+
+    store = RcaControlStore(path)
+    store.activate_direct_steady_epoch(
+        epoch_id="rca-gateway-test-steady",
+        release_fingerprint_sha256="1" * 64,
+        release_note_sha256="a" * 64,
+        config_sha256="2" * 64,
+        db_logical_identity={"database": "gateway-test"},
+        partition_start_fence={},
+        operator="gateway-test",
+        reason="activate steady gateway test runtime",
+    )
+    return store
+
+
 def test_rca_manual_chat_allowlist_accepts_canonical_three_group_subset(monkeypatch):
     groups = gateway_run.G1Q3_RCA_MANUAL_GROUP_IDS
     monkeypatch.setenv("HERMES_RCA_MANUAL_CHAT_IDS", ",".join(sorted(groups)))
@@ -1076,7 +1093,7 @@ def test_manual_gateway_passes_exact_kafka_policy_and_high_watermark(
 
     from gateway.pnc_rca_control_store import RcaControlStore
 
-    RcaControlStore(control_path)
+    _steady_control_store(control_path)
 
     result = gateway_run._admit_g1q3_manual_trigger(
         issue_url="https://project.feishu.cn/g1q3/issue/detail/7013527412",
@@ -1109,7 +1126,7 @@ def test_manual_gateway_w3_uses_official_preread_before_admission(
     control_path = tmp_path / "control.sqlite3"
     monkeypatch.setenv("HERMES_RCA_KAFKA_CONTROL_DB_PATH", str(control_path))
     monkeypatch.setenv("HERMES_RCA_ACTIVATION_REQUIRED", "false")
-    RcaControlStore(control_path)
+    _steady_control_store(control_path)
     config = _w3_manual_admission_runtime_config()
     preread_calls = []
 

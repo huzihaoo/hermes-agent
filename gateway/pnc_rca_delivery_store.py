@@ -40,10 +40,12 @@ from gateway.pnc_rca_delivery_contract import (
 )
 from gateway.pnc_rca_delivery_observability import validate_delivery_observation
 from gateway.pnc_rca_control_store import (
+    CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+    CONTROL_STORE_SCHEMA_VERSION,
     OUTBOX_CIRCUIT_RESET_SCHEMA_VERSION,
     ActivationEpochError,
+    ControlStoreSchemaSnapshot,
     RcaControlStore,
-    _V14_COMPAT_RELEASE_BINDING_COLUMNS,
     _validate_dispatcher_circuit_reset_audit,
 )
 from gateway.pnc_rca_conclusion_adjudication import (
@@ -81,6 +83,9 @@ from gateway.pnc_rca_write_fence import (
 
 
 DELIVERY_STORE_SCHEMA_VERSION = "pnc_rca_delivery_store_v12"
+DELIVERY_STORE_SUCCESSOR_READ_ONLY_ERROR = (
+    "rca_delivery_store_successor_read_only"
+)
 W5_EXTERNAL_WRITE_FENCE_CUTOFF_META_KEY = "w5_external_write_fence_cutoff"
 # Persisted once at delivery-store initialization; never controlled by env.
 W5_EXTERNAL_WRITE_FENCE_CUTOFF = "2026-07-25T00:00:00+00:00"
@@ -851,6 +856,7 @@ class RcaDeliveryStore:
         require_current: bool = False,
         read_only: bool = False,
         ensure_current_rows: bool = True,
+        allow_successor_read_only: bool = False,
     ):
         self.db_path = Path(db_path).expanduser()
         if not isinstance(require_current, bool):
@@ -859,20 +865,163 @@ class RcaDeliveryStore:
             raise TypeError("read_only must be true or false")
         if not isinstance(ensure_current_rows, bool):
             raise TypeError("ensure_current_rows must be true or false")
+        if not isinstance(allow_successor_read_only, bool):
+            raise TypeError("allow_successor_read_only must be true or false")
         if read_only and not require_current:
             raise ValueError("read_only delivery store requires current schema")
+        if allow_successor_read_only and not require_current:
+            raise ValueError(
+                "successor read-only delivery store requires current schema"
+            )
         self.require_current = require_current
+        self.requested_read_only = read_only
         self.read_only = read_only
         self.ensure_current_rows = ensure_current_rows
+        self.allow_successor_read_only = allow_successor_read_only
+        self._successor_read_only = False
+        self._enforce_binary_write_schema = False
+        self._schema_probe_snapshot: ControlStoreSchemaSnapshot | None = None
+        self._observed_delivery_schema_version: str | None = None
+        self._observed_control_schema_version: str | None = None
         if require_current:
             self._validate_runtime_fences()
             self._validate_existing_path()
         else:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.busy_timeout_ms = max(1, int(busy_timeout_ms))
-        self._initialize()
+        source_snapshot_verified = False
+        try:
+            if self.db_path.is_file() and self.db_path.stat().st_size > 0:
+                if self.requested_read_only:
+                    self._schema_probe_snapshot = (
+                        RcaControlStore.create_schema_probe_snapshot(
+                            self.db_path,
+                            allow_successor_read_only=True,
+                        )
+                    )
+                    source_control_schema_version = (
+                        self._schema_probe_snapshot.schema_version
+                    )
+                else:
+                    (
+                        source_control_schema_version,
+                        self._schema_probe_snapshot,
+                    ) = RcaControlStore.probe_writable_schema_source(
+                        self.db_path
+                    )
+                if (
+                    source_control_schema_version
+                    == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+                    and (not require_current or not allow_successor_read_only)
+                ):
+                    raise RuntimeError(
+                        "rca_delivery_store_control_schema_not_current"
+                    )
+                if (
+                    source_control_schema_version
+                    == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+                    and self._schema_probe_snapshot is None
+                ):
+                    self._schema_probe_snapshot = (
+                        RcaControlStore.create_schema_probe_snapshot(
+                            self.db_path,
+                            allow_successor_read_only=True,
+                        )
+                    )
+                    if (
+                        self._schema_probe_snapshot.schema_version
+                        != CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+                    ):
+                        raise RuntimeError(
+                            "rca_delivery_store_control_schema_source_changed"
+                        )
+            self._initialize()
+            if not require_current:
+                self._observed_delivery_schema_version = (
+                    self._preflight_schema_version()
+                )
+                self._observed_control_schema_version = (
+                    self._preflight_control_schema_version()
+                )
+            if self._schema_probe_snapshot is not None:
+                RcaControlStore._verify_schema_probe_source_unchanged(
+                    self._schema_probe_snapshot
+                )
+                source_snapshot_verified = True
+            if not self.read_only:
+                self._discard_schema_probe_snapshot()
+        except Exception:
+            self._discard_schema_probe_snapshot()
+            raise
+        self._enforce_binary_write_schema = True
+        if (
+            not self.read_only
+            and not source_snapshot_verified
+            and self._observed_control_schema_version
+            == CONTROL_STORE_SCHEMA_VERSION
+        ):
+            conn = self._connect_read_only()
+            conn.close()
         if require_current:
             self._validate_runtime_fences()
+
+    def _discard_schema_probe_snapshot(self) -> None:
+        if self._schema_probe_snapshot is not None:
+            self._schema_probe_snapshot.close()
+        self._schema_probe_snapshot = None
+
+    @property
+    def _read_db_path(self) -> Path:
+        if self.read_only:
+            if self._schema_probe_snapshot is None:
+                raise RuntimeError("rca_delivery_store_read_only_snapshot_missing")
+            return self._schema_probe_snapshot.db_path
+        return self.db_path
+
+    @property
+    def _schema_probe_db_path(self) -> Path:
+        if self._schema_probe_snapshot is not None:
+            return self._schema_probe_snapshot.db_path
+        return self.db_path
+
+    def schema_runtime_capability(self) -> dict[str, Any]:
+        """Report the exact schema mode this binary may use."""
+
+        control_schema_version = str(
+            self._observed_control_schema_version or ""
+        )
+        delivery_schema_version = str(
+            self._observed_delivery_schema_version or ""
+        )
+        read_supported = (
+            delivery_schema_version == DELIVERY_STORE_SCHEMA_VERSION
+            and control_schema_version
+            in {
+                CONTROL_STORE_SCHEMA_VERSION,
+                CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+            }
+        )
+        write_enabled = (
+            read_supported
+            and control_schema_version == CONTROL_STORE_SCHEMA_VERSION
+            and not self.read_only
+        )
+        if self._successor_read_only:
+            mode = "successor_read_only"
+        elif self.read_only:
+            mode = "explicit_read_only"
+        else:
+            mode = "current_write"
+        return {
+            "observed_control_schema_version": control_schema_version,
+            "binary_write_schema_version": CONTROL_STORE_SCHEMA_VERSION,
+            "mode": mode,
+            "read_supported": read_supported,
+            "write_enabled": write_enabled,
+            "work_admission_enabled": write_enabled,
+            "lease_acquisition_enabled": write_enabled,
+            "external_effect_enabled": write_enabled,
+        }
 
     def _validate_runtime_fences(self) -> None:
         for suffix in (".pnc-rca-maintenance", ".pnc-rca-tombstone"):
@@ -902,12 +1051,34 @@ class RcaDeliveryStore:
         ):
             raise RuntimeError("rca_delivery_store_existing_path_invalid")
 
+    def _validate_binary_write_schema_tx(
+        self,
+        conn: sqlite3.Connection,
+    ) -> None:
+        if (
+            self.read_only
+            or not self._enforce_binary_write_schema
+            or self._observed_control_schema_version
+            != CONTROL_STORE_SCHEMA_VERSION
+        ):
+            return
+        try:
+            observed = RcaControlStore._activation_schema_version_tx(conn)
+        except (RuntimeError, sqlite3.Error) as exc:
+            raise RuntimeError(
+                "incompatible_control_store_schema:write_marker"
+            ) from exc
+        if observed != CONTROL_STORE_SCHEMA_VERSION:
+            raise RuntimeError("incompatible_control_store_schema:write_marker")
+
     def _connect(self) -> sqlite3.Connection:
+        if self._successor_read_only:
+            raise RuntimeError(DELIVERY_STORE_SUCCESSOR_READ_ONLY_ERROR)
         if self.require_current:
             self._validate_runtime_fences()
         if self.read_only:
             conn = sqlite3.connect(
-                f"{self.db_path.resolve().as_uri()}?mode=ro",
+                f"{self._read_db_path.resolve().as_uri()}?mode=ro",
                 uri=True,
                 timeout=self.busy_timeout_ms / 1000,
                 isolation_level=None,
@@ -919,6 +1090,11 @@ class RcaDeliveryStore:
                 isolation_level=None,
             )
         conn.row_factory = sqlite3.Row
+        try:
+            self._validate_binary_write_schema_tx(conn)
+        except Exception:
+            conn.close()
+            raise
         conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
         conn.execute("PRAGMA foreign_keys=ON")
         if self.read_only:
@@ -926,6 +1102,25 @@ class RcaDeliveryStore:
         else:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=FULL")
+            if (
+                self._enforce_binary_write_schema
+                and self._observed_control_schema_version
+                == CONTROL_STORE_SCHEMA_VERSION
+            ):
+                try:
+                    conn.execute("BEGIN")
+                    RcaControlStore._install_v14_connection_write_guards_tx(
+                        conn,
+                        require_exact_schema_cookie=self.require_current,
+                    )
+                    conn.commit()
+                except (RuntimeError, sqlite3.Error) as exc:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    conn.close()
+                    raise RuntimeError(
+                        "incompatible_control_store_schema:write_marker"
+                    ) from exc
         if self.require_current:
             try:
                 self._validate_runtime_fences()
@@ -940,12 +1135,17 @@ class RcaDeliveryStore:
         if self.require_current:
             self._validate_runtime_fences()
         conn = sqlite3.connect(
-            f"{self.db_path.resolve().as_uri()}?mode=ro",
+            f"{self._read_db_path.resolve().as_uri()}?mode=ro",
             uri=True,
             timeout=self.busy_timeout_ms / 1000,
             isolation_level=None,
         )
         conn.row_factory = sqlite3.Row
+        try:
+            self._validate_binary_write_schema_tx(conn)
+        except Exception:
+            conn.close()
+            raise
         conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA query_only=ON")
@@ -961,7 +1161,11 @@ class RcaDeliveryStore:
     def _validate_current_v14_activation_binding_tx(
         conn: sqlite3.Connection,
     ) -> sqlite3.Row:
-        """Fail provider writes closed on current v14 epoch/audit drift."""
+        """Fail provider writes closed on current v14 epoch/audit drift.
+
+        This is a writer-only fence; neutral successor reads use the shared
+        schema-versioned activation helpers instead.
+        """
 
         epoch = RcaControlStore._current_activation_epoch_unchecked_tx(conn)
         if epoch is None:
@@ -980,6 +1184,8 @@ class RcaDeliveryStore:
         fence: Mapping[str, Any],
     ) -> dict[str, Any]:
         """Validate the exact current activation ledger for a delivery fence."""
+        if self._successor_read_only:
+            raise RuntimeError(DELIVERY_STORE_SUCCESSOR_READ_ONLY_ERROR)
         epoch_id = str(fence.get("activation_epoch_id") or "").strip()
         ledger_id = fence.get("activation_ledger_id")
         admission_key = str(fence.get("admission_key") or "").strip()
@@ -1072,6 +1278,8 @@ class RcaDeliveryStore:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Reopen the exact Kafka profile-terminal lease for one issue comment."""
+        if self._successor_read_only:
+            raise RuntimeError(DELIVERY_STORE_SUCCESSOR_READ_ONLY_ERROR)
         text_values = (
             effect_key,
             delivery_id,
@@ -1095,7 +1303,7 @@ class RcaDeliveryStore:
         if operation != "feishu_issue_comment":
             raise RuntimeError("external_write_fence_operation_denied")
         current = _utc_datetime(now)
-        conn = self._connect()
+        conn = self._connect_read_only()
         try:
             conn.execute("BEGIN")
             self._validate_current_v14_activation_binding_tx(conn)
@@ -1298,6 +1506,8 @@ class RcaDeliveryStore:
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Reopen exact authority-bound terminal correction issue writes."""
+        if self._successor_read_only:
+            raise RuntimeError(DELIVERY_STORE_SUCCESSOR_READ_ONLY_ERROR)
         text_values = (
             effect_key,
             delivery_id,
@@ -1319,7 +1529,7 @@ class RcaDeliveryStore:
         ):
             raise RuntimeError("external_write_fence_schema_invalid")
         current = _utc_datetime(now)
-        conn = self._connect()
+        conn = self._connect_read_only()
         try:
             conn.execute("BEGIN")
             self._validate_current_v14_activation_binding_tx(conn)
@@ -1486,10 +1696,16 @@ class RcaDeliveryStore:
             if row is None:
                 conn.commit()
                 return None
-            RcaControlStore._v14_compat_activation_transition_binding_tx(
-                conn, epoch=row
+            schema_version = RcaControlStore._activation_schema_version_tx(conn)
+            RcaControlStore._activation_transition_binding_tx(
+                conn,
+                epoch=row,
+                schema_version=schema_version,
             )
-            binding = RcaControlStore._v14_compat_release_epoch_projection(row)
+            binding = RcaControlStore._activation_release_epoch_projection(
+                row,
+                schema_version=schema_version,
+            )
             value = {
                 "epoch_id": str(row["epoch_id"]),
                 "state": str(row["state"]),
@@ -1572,7 +1788,12 @@ class RcaDeliveryStore:
         )
 
     @classmethod
-    def _activation_schema_ready(cls, conn: sqlite3.Connection) -> bool:
+    def _activation_schema_ready(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        schema_version: str | None = None,
+    ) -> bool:
         present = {
             str(row["name"])
             for row in conn.execute(
@@ -1581,13 +1802,18 @@ class RcaDeliveryStore:
         }
         if not _ACTIVATION_REQUIRED_TABLES.issubset(present):
             return False
+        try:
+            observed_schema_version = (
+                RcaControlStore._activation_schema_version_tx(conn)
+            )
+        except (ActivationEpochError, RuntimeError):
+            return False
+        if (
+            schema_version is not None
+            and schema_version != observed_schema_version
+        ):
+            return False
         required_columns = {
-            "rca_activation_epochs": {
-                "epoch_id",
-                "state",
-                "is_current",
-                *_V14_COMPAT_RELEASE_BINDING_COLUMNS,
-            },
             "rca_activation_admission_ledger": {
                 "ledger_id",
                 "epoch_id",
@@ -1596,14 +1822,6 @@ class RcaDeliveryStore:
                 "business_key",
                 "submission_key",
                 "generation",
-            },
-            "rca_activation_transition_audit": {
-                "audit_id",
-                "epoch_id",
-                "from_state",
-                "to_state",
-                "binding_fingerprint",
-                "transitioned_at",
             },
             "business_triggers": {"activation_epoch_id", "activation_ledger_id"},
             "rca_outbox": {"activation_epoch_id", "activation_ledger_id"},
@@ -1864,13 +2082,55 @@ class RcaDeliveryStore:
 
     def _initialize(self) -> None:
         marker_value = self._preflight_schema_version()
+        control_marker_value = self._preflight_control_schema_version()
+        self._observed_delivery_schema_version = marker_value
+        self._observed_control_schema_version = control_marker_value
+        if control_marker_value not in {
+            None,
+            CONTROL_STORE_SCHEMA_VERSION,
+            CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        }:
+            raise RuntimeError(
+                "rca_delivery_store_control_schema_not_current"
+            )
+        if control_marker_value == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:
+            if not self.require_current or not self.allow_successor_read_only:
+                raise RuntimeError(
+                    "rca_delivery_store_control_schema_not_current"
+                )
+            self._successor_read_only = True
+            self.read_only = True
         if self.require_current:
             if marker_value != DELIVERY_STORE_SCHEMA_VERSION:
                 raise RuntimeError("rca_delivery_store_schema_not_current")
-            uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+            if control_marker_value not in {
+                None,
+                CONTROL_STORE_SCHEMA_VERSION,
+                CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+            }:
+                raise RuntimeError(
+                    "rca_delivery_store_control_schema_not_current"
+                )
+            uri = f"{self._schema_probe_db_path.resolve().as_uri()}?mode=ro"
             conn = sqlite3.connect(uri, uri=True)
             conn.row_factory = sqlite3.Row
+            conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA query_only=ON")
             try:
+                if control_marker_value is not None:
+                    observed_activation_schema = (
+                        RcaControlStore._activation_schema_version_tx(conn)
+                    )
+                    if observed_activation_schema != control_marker_value:
+                        raise RuntimeError(
+                            "rca_delivery_store_control_schema_not_current"
+                        )
+                    if (
+                        observed_activation_schema
+                        == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+                    ):
+                        RcaControlStore._validate_v15_activation_schema_tx(conn)
                 validate_conclusion_adjudication_schema(conn)
                 self._validate_failure_route_schema(conn)
                 self._validate_comment_slot_schema(conn)
@@ -1880,8 +2140,18 @@ class RcaDeliveryStore:
             finally:
                 conn.close()
             if self.ensure_current_rows and not self.read_only:
+                if self._schema_probe_snapshot is not None:
+                    RcaControlStore._verify_schema_probe_source_unchanged(
+                        self._schema_probe_snapshot
+                    )
+                self._discard_schema_probe_snapshot()
                 self._ensure_card_patch_circuit_row()
             return
+        # Legacy schema initialization is serialized by SQLite and may race with
+        # another writer after probing. The probe still prevents a successor
+        # schema from entering this path; require_current snapshot admission
+        # retains the stricter source-identity check above.
+        self._discard_schema_probe_snapshot()
         conn = self._connect()
         try:
             conn.executescript(
@@ -2200,9 +2470,22 @@ class RcaDeliveryStore:
             timeout=max(1, int(busy_timeout_ms)) / 1000,
             isolation_level=None,
         )
+        conn.row_factory = sqlite3.Row
         try:
             conn.execute(f"PRAGMA busy_timeout={max(1, int(busy_timeout_ms))}")
             conn.execute("BEGIN IMMEDIATE")
+            try:
+                control_schema_version = (
+                    RcaControlStore._activation_schema_version_tx(conn)
+                )
+            except (RuntimeError, sqlite3.Error) as exc:
+                raise RuntimeError(
+                    "incompatible_control_store_schema:write_marker"
+                ) from exc
+            if control_schema_version != CONTROL_STORE_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "incompatible_control_store_schema:write_marker"
+                )
             marker = conn.execute(
                 "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
             ).fetchone()
@@ -2226,9 +2509,10 @@ class RcaDeliveryStore:
             conn.close()
 
     def _preflight_schema_version(self) -> str | None:
-        if not self.db_path.is_file() or self.db_path.stat().st_size == 0:
+        probe_path = self._schema_probe_db_path
+        if not probe_path.is_file() or probe_path.stat().st_size == 0:
             return None
-        uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+        uri = f"{probe_path.resolve().as_uri()}?mode=ro"
         try:
             conn = sqlite3.connect(uri, uri=True)
             conn.row_factory = sqlite3.Row
@@ -2251,6 +2535,33 @@ class RcaDeliveryStore:
             and str(marker["value"]) not in SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS
         ):
             raise RuntimeError("incompatible_delivery_store_schema:version")
+        return str(marker["value"]) if marker is not None else None
+
+    def _preflight_control_schema_version(self) -> str | None:
+        if self._schema_probe_snapshot is not None:
+            return self._schema_probe_snapshot.schema_version
+        if not self.db_path.is_file() or self.db_path.stat().st_size == 0:
+            return None
+        uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+        try:
+            conn = sqlite3.connect(uri, uri=True)
+            conn.row_factory = sqlite3.Row
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'control_meta'"
+            ).fetchone()
+            if table is None:
+                return None
+            marker = conn.execute(
+                "SELECT value FROM control_meta WHERE key = 'schema_version'"
+            ).fetchone()
+        except sqlite3.Error as exc:
+            raise RuntimeError(
+                "incompatible_delivery_store_schema:control_preflight"
+            ) from exc
+        finally:
+            if "conn" in locals():
+                conn.close()
         return str(marker["value"]) if marker is not None else None
 
     @staticmethod
@@ -3026,18 +3337,19 @@ class RcaDeliveryStore:
                 "incompatible_delivery_store_schema:"
                 "terminal_rerun_authority_table_missing"
             )
-        from gateway.pnc_rca_control_store import (
+        try:
+            control_schema_version = (
+                RcaControlStore._activation_schema_version_tx(conn)
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "incompatible_delivery_store_schema:"
+                "terminal_rerun_authority_control_schema"
+            ) from exc
+        if control_schema_version not in {
             CONTROL_STORE_SCHEMA_VERSION,
-            RcaControlStore,
-        )
-
-        control_marker = conn.execute(
-            "SELECT value FROM control_meta WHERE key = 'schema_version'"
-        ).fetchone()
-        if (
-            control_marker is None
-            or str(control_marker["value"]) != CONTROL_STORE_SCHEMA_VERSION
-        ):
+            CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        }:
             raise RuntimeError(
                 "incompatible_delivery_store_schema:"
                 "terminal_rerun_authority_control_schema"
@@ -3519,11 +3831,8 @@ class RcaDeliveryStore:
     ) -> tuple[ConclusionReviewQueueItem, ...]:
         """List recomputed medium-confidence conclusions awaiting owner review."""
 
-        uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True)
-        conn.row_factory = sqlite3.Row
+        conn = self._connect_read_only()
         try:
-            conn.execute("PRAGMA query_only=ON")
             return list_conclusion_review_queue_tx(conn, limit=limit)
         finally:
             conn.close()
@@ -9865,13 +10174,30 @@ class RcaDeliveryStore:
         busy_timeout_ms: int = 5000,
         activation_required: bool = False,
     ) -> DeliveryBackpressureSnapshot:
-        """Read the delivery backlog and circuit from one immutable DB snapshot."""
+        """Read the delivery backlog and circuit from one live read transaction."""
         cls._validate_activation_required(activation_required)
         path = Path(db_path).expanduser()
         if not path.is_file():
             raise RuntimeError("delivery_backpressure_store_unavailable:file_missing")
         current_dt = _utc_datetime(now)
         current = _iso(current_dt)
+        if not Path(f"{path}-wal").is_file():
+            try:
+                preflight_schema_version = (
+                    RcaControlStore._preflight_schema_version_at(
+                        path,
+                        allow_successor_read_only=True,
+                        immutable=True,
+                    )
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "delivery_backpressure_contract_invalid:control_schema_version"
+                ) from exc
+            if preflight_schema_version != CONTROL_STORE_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "delivery_backpressure_contract_invalid:control_schema_version"
+                )
         uri = f"{path.resolve().as_uri()}?mode=ro"
         try:
             conn = sqlite3.connect(
@@ -9884,6 +10210,18 @@ class RcaDeliveryStore:
             conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
             conn.execute("PRAGMA query_only=ON")
             conn.execute("BEGIN")
+            try:
+                control_schema_version = (
+                    RcaControlStore._activation_schema_version_tx(conn)
+                )
+            except (RuntimeError, sqlite3.Error) as exc:
+                raise RuntimeError(
+                    "delivery_backpressure_contract_invalid:control_schema_version"
+                ) from exc
+            if control_schema_version != CONTROL_STORE_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "delivery_backpressure_contract_invalid:control_schema_version"
+                )
             marker = conn.execute(
                 "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
             ).fetchone()
@@ -10242,12 +10580,20 @@ class RcaDeliveryStore:
         conn: sqlite3.Connection,
         *,
         activation_required: bool,
+        successor_read_only: bool = False,
     ) -> dict[str, Any]:
         activation_enforced = cls._activation_enforced_tx(
             conn,
             activation_required=activation_required,
         )
-        schema_ready = cls._activation_schema_ready(conn)
+        try:
+            schema_version = RcaControlStore._activation_schema_version_tx(conn)
+        except (ActivationEpochError, RuntimeError):
+            schema_version = ""
+        schema_ready = cls._activation_schema_ready(
+            conn,
+            schema_version=schema_version,
+        )
         empty = {
             "completed_submissions": 0,
             "active_watches": 0,
@@ -10258,13 +10604,16 @@ class RcaDeliveryStore:
             return {
                 "required": activation_enforced,
                 "schema_ready": False,
+                "schema_version": schema_version,
                 "current_epoch_id": "",
                 "current_epoch_state": "unconfigured",
                 "binding_valid": False,
                 "release_fingerprint_sha256": "",
                 "release_note_sha256": "",
                 "production_ready": False,
-                "processing_enabled": not activation_enforced,
+                "processing_enabled": (
+                    not activation_enforced and not successor_read_only
+                ),
                 "eligible_counts": dict(empty),
                 "held_current_counts": dict(empty),
                 "blocked_historical_counts": dict(empty),
@@ -10280,15 +10629,18 @@ class RcaDeliveryStore:
         }
         if epoch is not None:
             try:
-                RcaControlStore._v14_compat_activation_transition_binding_tx(
-                    conn, epoch=epoch
+                RcaControlStore._activation_transition_binding_tx(
+                    conn,
+                    epoch=epoch,
+                    schema_version=schema_version,
                 )
             except ActivationEpochError:
                 pass
             else:
                 binding_valid = True
-                release_binding = (
-                    RcaControlStore._v14_compat_release_epoch_projection(epoch)
+                release_binding = RcaControlStore._activation_release_epoch_projection(
+                    epoch,
+                    schema_version=schema_version,
                 )
         release_fingerprint_sha256 = release_binding[
             "release_fingerprint_sha256"
@@ -10307,18 +10659,20 @@ class RcaDeliveryStore:
             and state == "steady_active"
             and release_fingerprint_valid
             and release_note_valid
+            and not successor_read_only
         )
         if not activation_enforced:
             return {
                 "required": False,
                 "schema_ready": True,
+                "schema_version": schema_version,
                 "current_epoch_id": "",
                 "current_epoch_state": state,
                 "binding_valid": binding_valid,
                 "release_fingerprint_sha256": release_fingerprint_sha256,
                 "release_note_sha256": release_note_sha256,
                 "production_ready": production_ready,
-                "processing_enabled": True,
+                "processing_enabled": not successor_read_only,
                 "eligible_counts": dict(empty),
                 "held_current_counts": dict(empty),
                 "blocked_historical_counts": dict(empty),
@@ -10396,6 +10750,7 @@ class RcaDeliveryStore:
         return {
             "required": activation_enforced,
             "schema_ready": True,
+            "schema_version": schema_version,
             "current_epoch_id": str(epoch["epoch_id"]) if epoch is not None else "",
             "current_epoch_state": state,
             "binding_valid": binding_valid,
@@ -10404,6 +10759,7 @@ class RcaDeliveryStore:
             "production_ready": production_ready,
             "processing_enabled": (
                 binding_valid and state in ACTIVATION_DELIVERY_STATES
+                and not successor_read_only
             ),
             "eligible_counts": {
                 name: values["eligible"] for name, values in sorted(rows.items())
@@ -10856,9 +11212,14 @@ class RcaDeliveryStore:
         conn = self._connect_read_only()
         try:
             conn.execute("BEGIN")
+            schema_runtime_capability = self.schema_runtime_capability()
             activation = self._activation_health_tx(
                 conn,
                 activation_required=activation_required,
+                successor_read_only=(
+                    schema_runtime_capability["mode"]
+                    == "successor_read_only"
+                ),
             )
             watch = {
                 row["state"]: int(row["count"])
@@ -11030,6 +11391,10 @@ class RcaDeliveryStore:
                 ).fetchone()[0]
             )
             business_blockers = {
+                "schema_successor_read_only": int(
+                    schema_runtime_capability["mode"]
+                    == "successor_read_only"
+                ),
                 "activation_schema_unavailable": int(
                     activation["required"] and not activation["schema_ready"]
                 ),
@@ -11050,6 +11415,9 @@ class RcaDeliveryStore:
             # Keep ordinary backlog and historical outcome counts visible without
             # turning them into admission gates.
             production_blockers = {
+                "schema_successor_read_only": business_blockers[
+                    "schema_successor_read_only"
+                ],
                 "activation_schema_unavailable": business_blockers[
                     "activation_schema_unavailable"
                 ],
@@ -11105,6 +11473,7 @@ class RcaDeliveryStore:
                 "process_healthy": True,
                 "business_ready": ready,
                 "schema_version": DELIVERY_STORE_SCHEMA_VERSION,
+                "schema_runtime_capability": schema_runtime_capability,
                 "db_path": str(self.db_path),
                 "execution_watch": watch,
                 "delivery_jobs": jobs,

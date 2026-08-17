@@ -118,6 +118,17 @@ DEFAULT_SSH_MINI_AGENT = str(Path.home() / ".local" / "bin" / "ssh-mini-agent")
 MAX_ARTIFACT_READ_TIMEOUT_SECONDS = 110
 ARTIFACT_READ_LEASE_MARGIN_SECONDS = 15
 MAX_HEALTH_HEARTBEAT_INTERVAL_SECONDS = 15.0
+SUCCESSOR_READ_ONLY_MODE = "successor_read_only"
+SCHEMA_RUNTIME_CAPABILITY_KEYS = frozenset({
+    "observed_control_schema_version",
+    "binary_write_schema_version",
+    "mode",
+    "read_supported",
+    "write_enabled",
+    "work_admission_enabled",
+    "lease_acquisition_enabled",
+    "external_effect_enabled",
+})
 MAX_FAILURE_RECEIPT_BYTES = 256 * 1024
 FAILURE_RECEIPT_SCHEMA_VERSION = "g1q3_rca_service_result_v2"
 VM_EXECUTION_IDENTITY_EVIDENCE_SCHEMA_VERSION = (
@@ -3995,6 +4006,155 @@ class HealthReporter:
         tmp.replace(path)
 
 
+def _schema_runtime_capability(store: RcaDeliveryStore) -> dict[str, Any]:
+    capability = dict(store.schema_runtime_capability())
+    if set(capability) != SCHEMA_RUNTIME_CAPABILITY_KEYS:
+        raise RuntimeError("rca_schema_runtime_capability_invalid")
+    if capability.get("mode") == SUCCESSOR_READ_ONLY_MODE and (
+        capability.get("read_supported") is not True
+        or any(
+            capability.get(name) is not False
+            for name in (
+                "write_enabled",
+                "work_admission_enabled",
+                "lease_acquisition_enabled",
+                "external_effect_enabled",
+            )
+        )
+    ):
+        raise RuntimeError("rca_successor_read_only_capability_invalid")
+    return capability
+
+
+def _successor_read_only_diagnostic(
+    config: CollectorConfig,
+    capability: Mapping[str, Any],
+    *,
+    operation: str,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": "rca_resident_successor_read_only",
+        "operation": operation,
+        "mode": SUCCESSOR_READ_ONLY_MODE,
+        "ready": False,
+        "processing": False,
+        "config": config.public_dict(),
+        "schema_runtime_capability": dict(capability),
+    }
+
+
+class SuccessorReadOnlyHealthReporter:
+    """Publish collector liveness without probing or producing delivery work."""
+
+    def __init__(
+        self,
+        config: CollectorConfig,
+        store: RcaDeliveryStore,
+        capability: Mapping[str, Any],
+    ) -> None:
+        self.config = config
+        self.store = store
+        self.capability = dict(capability)
+        self.started_at = _utc_iso()
+        self.runtime_identity = build_runtime_identity(
+            service_label=SERVICE_LABEL,
+            script_path=Path(__file__),
+            public_config=config.public_dict(),
+            loaded_dependencies={
+                distribution: module
+                for distribution, module in (
+                    RCA_DELIVERY_COLLECTOR_LOADED_DEPENDENCIES.items()
+                )
+                if distribution != REMOTE_CSS_PARSER_DISTRIBUTION
+            },
+        )
+
+    def write(self, *, state: str = SUCCESSOR_READ_ONLY_MODE) -> None:
+        payload = {
+            "schema_version": HEALTH_SCHEMA_VERSION,
+            "state": state,
+            "mode": SUCCESSOR_READ_ONLY_MODE,
+            "ok": False,
+            "healthy": True,
+            "process_healthy": True,
+            "business_ready": False,
+            "ready": False,
+            "processing": False,
+            "enabled": self.config.enabled,
+            "external_writes": False,
+            "started_at": self.started_at,
+            "updated_at": _utc_iso(),
+            "runtime_identity": self.runtime_identity.to_dict(),
+            "config": self.config.public_dict(),
+            "schema_runtime_capability": dict(self.capability),
+            "dependencies": {
+                "remote_css_parser": {
+                    "status": "not_evaluated_successor_read_only",
+                },
+                "failure_route_outlet": {
+                    "status": "not_evaluated_successor_read_only",
+                    "ready": False,
+                    "read_only": True,
+                    "external_writes": False,
+                },
+            },
+            "dependency_error": "",
+            "release": {},
+            "release_error": "",
+            "stats": asdict(CollectorStats()),
+            "store": self.store.health(
+                activation_required=self.config.activation_required,
+            ),
+            "last_outcome": None,
+            "error": "",
+        }
+        path = self.config.health_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+
+
+def run_successor_read_only_loop(
+    config: CollectorConfig,
+    store: RcaDeliveryStore,
+    capability: Mapping[str, Any],
+    *,
+    once: bool = False,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    reporter = SuccessorReadOnlyHealthReporter(config, store, capability)
+    stop = False
+
+    def request_stop(_signum, _frame):
+        nonlocal stop
+        stop = True
+
+    previous: dict[int, Any] = {}
+    if not once:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous[signum] = signal.signal(signum, request_stop)
+    interval = min(
+        float(config.poll_interval_seconds),
+        _heartbeat_interval_seconds(config.health_max_age_seconds),
+    )
+    try:
+        while not stop:
+            reporter.write()
+            if once:
+                return 0
+            sleep(interval)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+    reporter.write(state="stopped")
+    return 0
+
+
 def run_collector_loop(
     collector: DeliveryCollector,
     *,
@@ -4122,6 +4282,17 @@ def read_health(
         result["error"] = "heartbeat_from_future"
     elif age > max_age_seconds:
         result["error"] = "heartbeat_stale"
+    if payload.get("mode") == SUCCESSOR_READ_ONLY_MODE:
+        result["liveness_ok"] = bool(
+            fresh
+            and payload.get("healthy") is True
+            and payload.get("process_healthy") is True
+            and payload.get("business_ready") is False
+            and payload.get("ready") is False
+            and payload.get("processing") is False
+        )
+        result.setdefault("error", "successor_read_only_not_ready")
+        return False, result
     return payload.get("healthy") is True and fresh, result
 
 
@@ -4159,14 +4330,51 @@ def main(argv: list[str] | None = None) -> int:
     if args.check_config:
         release_binding: dict[str, Any] = {}
         store_health: dict[str, Any] = {"ok": True, "activation": {}}
-        if config.enabled:
+        check_store: RcaDeliveryStore | None = None
+        if config.enabled and config.control_db_path.is_file():
             try:
                 check_store = RcaDeliveryStore(
                     config.control_db_path,
                     require_current=True,
                     read_only=True,
                     ensure_current_rows=False,
+                    allow_successor_read_only=True,
                 )
+                capability = _schema_runtime_capability(check_store)
+                if capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
+                    print(
+                        json.dumps(
+                            _successor_read_only_diagnostic(
+                                config,
+                                capability,
+                                operation="check_config",
+                            ),
+                            ensure_ascii=False,
+                        )
+                    )
+                    return 2
+            except (OSError, RuntimeError, sqlite3.Error) as exc:
+                print(
+                    json.dumps(
+                        {
+                            "ok": False,
+                            "error": getattr(exc, "code", type(exc).__name__),
+                            "detail": str(exc),
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 2
+        if config.enabled:
+            try:
+                if check_store is None:
+                    check_store = RcaDeliveryStore(
+                        config.control_db_path,
+                        require_current=True,
+                        read_only=True,
+                        ensure_current_rows=False,
+                        allow_successor_read_only=True,
+                    )
                 release_binding = validate_bound_resident_release(
                     check_store,
                     release_note_path=config.release_note_path,
@@ -4243,23 +4451,32 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(payload, ensure_ascii=False))
         return 0 if healthy else 2
+    successor_store: RcaDeliveryStore | None = None
+    successor_capability: dict[str, Any] | None = None
     if config.enabled and not args.dry_run:
         try:
             gate_store = RcaDeliveryStore(
                 config.control_db_path,
                 require_current=True,
-                read_only=True,
                 ensure_current_rows=False,
+                allow_successor_read_only=True,
             )
-            release_binding = validate_bound_resident_release(
-                gate_store,
-                release_note_path=config.release_note_path,
-                runtime_root=os.environ.get("PNC_LIVE_RUNTIME_ROOT", ""),
-                runtime_commit=os.environ.get("PNC_LIVE_RUNTIME_COMMIT", ""),
-                runtime_tree=os.environ.get("PNC_LIVE_RUNTIME_TREE", ""),
-                live_manifest_sha256=os.environ.get("PNC_LIVE_MANIFEST_SHA256", ""),
-                live_env_path=loaded_env_path,
-            )
+            gate_capability = _schema_runtime_capability(gate_store)
+            if gate_capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
+                successor_store = gate_store
+                successor_capability = gate_capability
+            else:
+                release_binding = validate_bound_resident_release(
+                    gate_store,
+                    release_note_path=config.release_note_path,
+                    runtime_root=os.environ.get("PNC_LIVE_RUNTIME_ROOT", ""),
+                    runtime_commit=os.environ.get("PNC_LIVE_RUNTIME_COMMIT", ""),
+                    runtime_tree=os.environ.get("PNC_LIVE_RUNTIME_TREE", ""),
+                    live_manifest_sha256=os.environ.get(
+                        "PNC_LIVE_MANIFEST_SHA256", ""
+                    ),
+                    live_env_path=loaded_env_path,
+                )
         except (ExternalWriteFenceError, OSError, RuntimeError, sqlite3.Error) as exc:
             print(
                 json.dumps(
@@ -4272,32 +4489,59 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 2
-        config = replace(
-            config,
-            release_env_path=loaded_env_path,
-            resident_release_enforced=True,
-            release_id=release_binding["release_id"],
-            release_epoch_id=release_binding["epoch_id"],
-            release_fingerprint_sha256=release_binding[
-                "release_fingerprint_sha256"
-            ],
-            release_note_sha256=release_binding["release_note_sha256"],
-        )
-    try:
-        store = RcaDeliveryStore(
-            config.control_db_path,
-            require_current=True,
-            read_only=args.dry_run,
-            ensure_current_rows=not args.dry_run,
-        )
-    except (OSError, RuntimeError, sqlite3.Error) as exc:
-        print(
-            json.dumps(
-                {"ok": False, "error": f"delivery_store_unavailable: {exc}"},
-                ensure_ascii=False,
+        if successor_store is None:
+            config = replace(
+                config,
+                release_env_path=loaded_env_path,
+                resident_release_enforced=True,
+                release_id=release_binding["release_id"],
+                release_epoch_id=release_binding["epoch_id"],
+                release_fingerprint_sha256=release_binding[
+                    "release_fingerprint_sha256"
+                ],
+                release_note_sha256=release_binding["release_note_sha256"],
             )
+    if successor_store is not None:
+        store = successor_store
+        assert successor_capability is not None
+        capability = successor_capability
+    else:
+        try:
+            store = RcaDeliveryStore(
+                config.control_db_path,
+                require_current=True,
+                read_only=args.dry_run,
+                ensure_current_rows=not args.dry_run,
+                allow_successor_read_only=True,
+            )
+            capability = _schema_runtime_capability(store)
+        except (OSError, RuntimeError, sqlite3.Error) as exc:
+            print(
+                json.dumps(
+                    {"ok": False, "error": f"delivery_store_unavailable: {exc}"},
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+    if capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
+        if args.dry_run:
+            print(
+                json.dumps(
+                    _successor_read_only_diagnostic(
+                        config,
+                        capability,
+                        operation="dry_run",
+                    ),
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+        return run_successor_read_only_loop(
+            config,
+            store,
+            capability,
+            once=args.once,
         )
-        return 2
     collector = DeliveryCollector(store=store, config=config)
     if args.dry_run:
         print(json.dumps(collector.dry_run_once(), ensure_ascii=False))
