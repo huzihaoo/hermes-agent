@@ -44,7 +44,6 @@ def _config_env(tmp_path) -> dict[str, str]:
         "HERMES_RCA_DELIVERY_COLLECTOR_SSH_MINI_AGENT": "/safe/ssh-mini-agent",
         "HERMES_RCA_DELIVERY_COLLECTOR_ARTIFACT_READ_TIMEOUT_SECONDS": "30",
         "HERMES_RCA_DELIVERY_COLLECTOR_LEASE_SECONDS": "60",
-        "HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED": "true",
     }
 
 
@@ -312,6 +311,161 @@ def _run_remote_bundle_reader(
     return json.loads(process.stdout)
 
 
+def _init_identity_repo(root, files):
+    root.mkdir(parents=True)
+    for relative, raw in files.items():
+        path = root.joinpath(*PurePosixPath(relative).parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+    subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+    subprocess.run(["/usr/bin/git", "-C", str(root), "add", "."], check=True)
+    subprocess.run(
+        [
+            "/usr/bin/git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=collector-test",
+            "-c",
+            "user.email=collector-test@example.invalid",
+            "commit",
+            "-qm",
+            "identity fixture",
+        ],
+        check=True,
+    )
+
+    def rev_parse(revision):
+        return subprocess.run(
+            [
+                "/usr/bin/git",
+                "-C",
+                str(root),
+                "rev-parse",
+                "--verify",
+                revision,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    return {"commit": rev_parse("HEAD"), "tree": rev_parse("HEAD^{tree}")}
+
+
+def _execution_identity_reader_fixture(tmp_path, monkeypatch):
+    submission_key = "g1q3-rca-s1-" + "e" * 64
+    worker_root = tmp_path / "worker-state"
+    pipeline_root = tmp_path / "pipeline-runtime"
+    worker_entrypoint = worker_root / collector.REMOTE_WORKER_ENTRYPOINT_RELATIVE
+    service_entrypoint = pipeline_root.joinpath(
+        *PurePosixPath(collector.REMOTE_PIPELINE_ENTRYPOINT_RELATIVE).parts
+    )
+    report_entrypoint = pipeline_root.joinpath(
+        *PurePosixPath(collector.REMOTE_REPORT_ENTRYPOINT_RELATIVE).parts
+    )
+    worker_raw = b"#!/usr/bin/env python3\nprint('worker')\n"
+    service_raw = b"#!/usr/bin/env python3\nprint('service')\n"
+    report_raw = b"#!/usr/bin/env python3\nprint('report')\n"
+    worker_identity = _init_identity_repo(
+        worker_root,
+        {collector.REMOTE_WORKER_ENTRYPOINT_RELATIVE: worker_raw},
+    )
+    pipeline_identity = _init_identity_repo(
+        pipeline_root,
+        {
+            collector.REMOTE_PIPELINE_ENTRYPOINT_RELATIVE: service_raw,
+            collector.REMOTE_REPORT_ENTRYPOINT_RELATIVE: report_raw,
+        },
+    )
+    shared_root = tmp_path / "shared-state"
+    report_manifest_path = tmp_path / "config" / "report-runtime-manifest.json"
+    monkeypatch.setattr(collector, "REMOTE_SHARED_STATE_ROOT", str(shared_root))
+    monkeypatch.setattr(collector, "REMOTE_WORKER_REPO_ROOT", str(worker_root))
+    monkeypatch.setattr(
+        collector,
+        "REMOTE_REPORT_RUNTIME_MANIFEST_PATH",
+        str(report_manifest_path),
+    )
+    output_root = tmp_path / "bundle"
+    worker_result = {
+        "schema_version": "g1q3_rca_worker_result_v1",
+        "task_id": submission_key,
+        "rca_submission_key": submission_key,
+        "execution_route": "rca_direct_cli",
+        "repo_root": str(pipeline_root),
+        "execution_attestation": {
+            "schema_version": "g1q3_rca_worker_execution_attestation_v2",
+            "task_id": submission_key,
+            "available": True,
+            "agent_backend": "none",
+            "cwd": str(pipeline_root),
+            "worker_source_commit": worker_identity["commit"],
+            "worker_tree_clean": True,
+            "worker_entrypoint_path": str(worker_entrypoint),
+            "worker_entrypoint_sha256": hashlib.sha256(worker_raw).hexdigest(),
+        },
+    }
+    service_result = {
+        "schema_version": "g1q3_rca_service_result_v2",
+        "task_id": submission_key,
+        "output_dir": str(output_root),
+        "success": True,
+        "status": "completed",
+        "service_provenance": {
+            "schema_version": "g1q3_rca_service_provenance_v1",
+            "available": True,
+            "vm_source_commit": pipeline_identity["commit"],
+            "vm_tree_clean": True,
+            "service_entrypoint_path": str(service_entrypoint),
+            "service_entrypoint_sha256": hashlib.sha256(service_raw).hexdigest(),
+        },
+    }
+    report_manifest = {
+        "schema_version": "pnc_rca_report_manifest_v1",
+        "runtime_root": str(pipeline_root),
+        "pipeline_commit": pipeline_identity["commit"],
+        "pipeline_tree": pipeline_identity["tree"],
+        "report_script_sha256": hashlib.sha256(report_raw).hexdigest(),
+    }
+    fixture = {
+        "submission_key": submission_key,
+        "worker_root": worker_root,
+        "pipeline_root": pipeline_root,
+        "worker_entrypoint": worker_entrypoint,
+        "service_entrypoint": service_entrypoint,
+        "report_entrypoint": report_entrypoint,
+        "worker_identity": worker_identity,
+        "pipeline_identity": pipeline_identity,
+        "worker_result": worker_result,
+        "service_result": service_result,
+        "report_manifest": report_manifest,
+        "report_manifest_path": report_manifest_path,
+        "script_mutator": lambda script: script,
+    }
+
+    def write_identity_inputs(script):
+        result_path = shared_root / "tasks" / submission_key / "result.md"
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(
+            f"# Result: {submission_key}\n\n"
+            "## Result JSON\n\n"
+            "```json\n"
+            + json.dumps(fixture["worker_result"], sort_keys=True)
+            + "\n```\n",
+            encoding="utf-8",
+        )
+        (output_root / "rca_service_result.json").write_bytes(
+            _json_bytes(fixture["service_result"])
+        )
+        report_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        report_manifest_path.write_bytes(_json_bytes(fixture["report_manifest"]))
+        return fixture["script_mutator"](script)
+
+    fixture["script_transform"] = write_identity_inputs
+    return fixture
+
+
 def test_remote_bundle_reader_uses_formal_viz_publication_root():
     submission_key = "g1q3-rca-s1-" + "a" * 64
     formal_root = str(PurePosixPath(canonical_viz_mcap_path(submission_key)).parent)
@@ -371,6 +525,374 @@ def test_remote_bundle_reader_returns_manifest_bound_issue_focus(tmp_path, monke
 
     assert payload["ok"] is True
     assert payload["report_issue_focus"] == focus
+
+
+def test_remote_bundle_reader_parses_canonical_worker_result_markdown(
+    tmp_path, monkeypatch
+):
+    submission_key = "g1q3-rca-s1-" + "e" * 64
+    shared_root = tmp_path / "shared-state"
+    result_path = shared_root / "tasks" / submission_key / "result.md"
+    result_path.parent.mkdir(parents=True)
+    result_path.write_bytes(
+        (
+            f"# Result: {submission_key}\n\n"
+            "## Result JSON\n\n"
+            "```json\n{}\n```\n"
+        ).encode()
+    )
+    monkeypatch.setattr(collector, "REMOTE_SHARED_STATE_ROOT", str(shared_root))
+
+    payload = _run_remote_bundle_reader(tmp_path, monkeypatch)
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == "service_terminal_receipt_missing"
+
+
+def test_remote_bundle_reader_reads_actual_git_and_entrypoint_identity(
+    tmp_path, monkeypatch
+):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    evidence = payload["execution_identity_evidence"]
+    assert payload["execution_identity_error"] == ""
+    assert evidence["worker"]["commit"] == fixture["worker_identity"]["commit"]
+    assert evidence["worker"]["tree"] == fixture["worker_identity"]["tree"]
+    assert evidence["worker"]["clean"] is True
+    assert evidence["worker"]["entrypoint_sha256"] == hashlib.sha256(
+        fixture["worker_entrypoint"].read_bytes()
+    ).hexdigest()
+    assert evidence["pipeline"]["commit"] == fixture["pipeline_identity"]["commit"]
+    assert evidence["pipeline"]["tree"] == fixture["pipeline_identity"]["tree"]
+    assert evidence["pipeline"]["clean"] is True
+    assert evidence["pipeline"]["entrypoint_path"] == str(
+        fixture["service_entrypoint"]
+    )
+    assert evidence["report_service"]["report_script_sha256"] == hashlib.sha256(
+        fixture["report_entrypoint"].read_bytes()
+    ).hexdigest()
+    assert evidence["report_service"]["manifest_sha256"] == hashlib.sha256(
+        fixture["report_manifest_path"].read_bytes()
+    ).hexdigest()
+
+
+def test_remote_bundle_reader_ignores_inherited_git_environment(
+    tmp_path, monkeypatch
+):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    hostile = tmp_path / "hostile-git-override"
+    for key, value in {
+        "GIT_DIR": str(hostile / "git-dir"),
+        "GIT_WORK_TREE": str(hostile / "work-tree"),
+        "GIT_OBJECT_DIRECTORY": str(hostile / "objects"),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(hostile / "alternates"),
+        "GIT_INDEX_FILE": str(hostile / "index"),
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.repositoryformatversion",
+        "GIT_CONFIG_VALUE_0": "999",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_error"] == ""
+    assert payload["execution_identity_evidence"]["worker"]["commit"] == (
+        fixture["worker_identity"]["commit"]
+    )
+    assert payload["execution_identity_evidence"]["pipeline"]["commit"] == (
+        fixture["pipeline_identity"]["commit"]
+    )
+
+
+def test_remote_bundle_reader_detects_untracked_files_despite_local_git_config(
+    tmp_path, monkeypatch
+):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    subprocess.run(
+        [
+            "/usr/bin/git",
+            "-C",
+            str(fixture["worker_root"]),
+            "config",
+            "status.showUntrackedFiles",
+            "no",
+        ],
+        check=True,
+    )
+    (fixture["worker_root"] / "untracked-runtime-hook.py").write_text(
+        "raise SystemExit('must be detected')\n",
+        encoding="utf-8",
+    )
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == "worker_git_dirty"
+
+
+@pytest.mark.parametrize("face", ["worker", "pipeline"])
+def test_remote_bundle_reader_rejects_receipt_head_drift(tmp_path, monkeypatch, face):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    if face == "worker":
+        fixture["worker_result"]["execution_attestation"][
+            "worker_source_commit"
+        ] = "f" * 40
+    else:
+        fixture["service_result"]["service_provenance"]["vm_source_commit"] = (
+            "f" * 40
+        )
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == f"{face}_git_head_receipt_mismatch"
+
+
+@pytest.mark.parametrize("face", ["worker", "pipeline"])
+def test_remote_bundle_reader_rejects_dirty_runtime(tmp_path, monkeypatch, face):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    (fixture[f"{face}_root"] / "untracked.txt").write_text(
+        "dirty", encoding="utf-8"
+    )
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == f"{face}_git_dirty"
+
+
+@pytest.mark.parametrize("face", ["worker", "pipeline"])
+def test_remote_bundle_reader_rejects_entrypoint_hash_mismatch(
+    tmp_path, monkeypatch, face
+):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    if face == "worker":
+        fixture["worker_result"]["execution_attestation"][
+            "worker_entrypoint_sha256"
+        ] = "f" * 64
+    else:
+        fixture["service_result"]["service_provenance"][
+            "service_entrypoint_sha256"
+        ] = "f" * 64
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    expected_prefix = "worker" if face == "worker" else "service"
+    assert payload["execution_identity_error"] == (
+        f"{expected_prefix}_entrypoint_sha256_mismatch"
+    )
+
+
+def test_remote_bundle_reader_rejects_report_script_hash_mismatch(
+    tmp_path, monkeypatch
+):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    fixture["report_manifest"]["report_script_sha256"] = "f" * 64
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == "report_script_sha256_mismatch"
+
+
+def test_remote_bundle_reader_rejects_service_entrypoint_path_traversal(
+    tmp_path, monkeypatch
+):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    fixture["service_result"]["service_provenance"]["service_entrypoint_path"] = (
+        str(fixture["pipeline_root"] / "api" / ".." / "escape.py")
+    )
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == (
+        "service_terminal_receipt_identity_invalid"
+    )
+
+
+def test_remote_bundle_reader_rejects_git_identity_toctou(tmp_path, monkeypatch):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    needle = (
+        "    worker_identity_after = git_identity(\n"
+        "        WORKER_REPO_ROOT, 'worker_git'\n"
+        "    )"
+    )
+
+    def commit_during_read(script):
+        assert needle in script
+        mutation = (
+            "    with open(WORKER_ENTRYPOINT_PATH, 'ab') as handle:\n"
+            "        handle.write(b'\\n# identity drift\\n')\n"
+            "    subprocess.run(\n"
+            "        ['/usr/bin/git', '-C', WORKER_REPO_ROOT, 'add', "
+            "WORKER_ENTRYPOINT_PATH], check=True\n"
+            "    )\n"
+            "    subprocess.run(\n"
+            "        ['/usr/bin/git', '-C', WORKER_REPO_ROOT, "
+            "'-c', 'user.name=collector-test', "
+            "'-c', 'user.email=collector-test@example.invalid', "
+            "'commit', '-qm', 'identity drift'], check=True\n"
+            "    )\n"
+        )
+        return script.replace(needle, mutation + needle, 1)
+
+    fixture["script_mutator"] = commit_during_read
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == (
+        "worker_git_identity_changed_during_read"
+    )
+
+
+def _vm_execution_identity_evidence(submission_key):
+    artifact_root = f"/mnt/tmp/{submission_key}/"
+    worker_root = "/home/mini/.hermes/worker-state"
+    pipeline_root = "/home/mini/.hermes/rca-prod-runtime/releases/r15aw"
+    return {
+        "schema_version": collector.VM_EXECUTION_IDENTITY_EVIDENCE_SCHEMA_VERSION,
+        "source": "canonical_vm_terminal_service_report_receipts",
+        "task_id": submission_key,
+        "submission_key": submission_key,
+        "worker": {
+            "commit": "1" * 40,
+            "tree": "2" * 40,
+            "runtime_root": worker_root,
+            "clean": True,
+            "entrypoint_path": worker_root + "/vm_coding_worker_v2.py",
+            "entrypoint_sha256": "3" * 64,
+            "receipt_path": (
+                f"/home/mini/.hermes/shared-state/tasks/{submission_key}/result.md"
+            ),
+            "receipt_sha256": "4" * 64,
+        },
+        "pipeline": {
+            "commit": "5" * 40,
+            "tree": "6" * 40,
+            "runtime_root": pipeline_root,
+            "clean": True,
+            "entrypoint_path": (
+                pipeline_root + "/" + collector.REMOTE_PIPELINE_ENTRYPOINT_RELATIVE
+            ),
+            "entrypoint_sha256": "7" * 64,
+            "receipt_path": artifact_root + "rca_service_result.json",
+            "receipt_sha256": "8" * 64,
+        },
+        "report_service": {
+            "manifest_path": collector.REMOTE_REPORT_RUNTIME_MANIFEST_PATH,
+            "manifest_sha256": "9" * 64,
+            "pipeline_commit": "5" * 40,
+            "pipeline_tree": "6" * 40,
+            "runtime_root": pipeline_root,
+            "report_script_sha256": "a" * 64,
+        },
+        "delivery_manifest": {
+            "path": artifact_root + "delivery_manifest.json",
+            "sha256": "b" * 64,
+        },
+    }
+
+
+def test_execution_identity_readback_binds_canonical_vm_receipt_paths_and_hashes():
+    submission_key = "g1q3-rca-s1-" + "f" * 64
+    evidence = _vm_execution_identity_evidence(submission_key)
+    result = collector._execution_identity_readback(
+        claim=SimpleNamespace(task_id=submission_key, submission_key=submission_key),
+        bundle={
+            "execution_identity_evidence": evidence,
+            "execution_identity_error": "",
+        },
+        release_binding={
+            "release_id": "rca-r15aw-20260817",
+            "epoch_id": "rca-activation-r15aw-20260817",
+            "release_fingerprint_sha256": "c" * 64,
+            "release_note_sha256": "d" * 64,
+        },
+    )
+
+    assert result["source"] == "host_collector_canonical_vm_receipts_v1"
+    assert result["worker"]["receipt_path"].endswith("/result.md")
+    assert result["worker"]["receipt_sha256"] == "4" * 64
+    assert result["pipeline"]["receipt_sha256"] == "8" * 64
+    assert result["report_service"]["manifest_sha256"] == "9" * 64
+    assert result["delivery_manifest"]["sha256"] == "b" * 64
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("worker", "clean", False),
+        ("worker", "receipt_path", "/tmp/operator-filled.json"),
+        (
+            "pipeline",
+            "entrypoint_path",
+            "/home/mini/.hermes/rca-prod-runtime/releases/r15aw/../../escape.py",
+        ),
+        ("report_service", "manifest_sha256", "0" * 64),
+        ("delivery_manifest", "path", "/tmp/delivery_manifest.json"),
+    ],
+)
+def test_execution_identity_readback_rejects_noncanonical_evidence(
+    section, field, value
+):
+    submission_key = "g1q3-rca-s1-" + "f" * 64
+    evidence = _vm_execution_identity_evidence(submission_key)
+    evidence[section][field] = value
+
+    with pytest.raises(DeliveryContractError, match="execution_identity_readback_invalid"):
+        collector._execution_identity_readback(
+            claim=SimpleNamespace(task_id=submission_key, submission_key=submission_key),
+            bundle={
+                "execution_identity_evidence": evidence,
+                "execution_identity_error": "",
+            },
+            release_binding={
+                "release_id": "rca-r15aw-20260817",
+                "epoch_id": "rca-activation-r15aw-20260817",
+                "release_fingerprint_sha256": "c" * 64,
+                "release_note_sha256": "d" * 64,
+            },
+        )
 
 
 def test_remote_bundle_reader_rejects_missing_report_role(tmp_path, monkeypatch):
@@ -730,16 +1252,23 @@ def test_viz_surface_errors_retry_internally_instead_of_becoming_user_results():
     assert "if viz_publication:" in script
 
 
-def test_config_exposes_capacity_sampling_and_activation_required(tmp_path):
+def test_config_ignores_retired_capacity_sampling_env(tmp_path):
     env = _config_env(tmp_path)
     env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = "true"
+    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "not-a-bool"
+    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_BATCH_SIZE"] = "invalid"
+    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_LOCK_TIMEOUT_SECONDS"] = (
+        "invalid"
+    )
+    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_TERMINAL_RECEIPT_TIMEOUT_SECONDS"] = (
+        "invalid"
+    )
     config = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
 
     public = config.public_dict()
     assert config.activation_required is True
     assert public["activation_required"] is True
-    assert public["capacity_sample_enabled"] is True
-    assert public["capacity_sample_batch_size"] == 20
+    assert not any(key.startswith("capacity_") for key in public)
 
 
 def test_activation_required_defaults_false(tmp_path):
@@ -788,10 +1317,10 @@ def test_enabled_startup_locks_minimal_release_before_writable_collector(
     tmp_path,
     monkeypatch,
 ):
-    control, result = _control(tmp_path)
+    fixture = _release_note(tmp_path)
+    control, result = _control(tmp_path, db_path=fixture.control_db_path)
     _bind_activation_execution(control, result, state="steady_active")
     RcaDeliveryStore(control.db_path)
-    fixture = _release_note(tmp_path)
     _bind_minimal_release(control, fixture)
     _set_live_release_environment(monkeypatch, fixture)
     config = replace(
@@ -799,6 +1328,7 @@ def test_enabled_startup_locks_minimal_release_before_writable_collector(
             _config_env(tmp_path),
             hermes_home=tmp_path,
         ),
+        control_db_path=control.db_path,
         release_note_path=fixture.path,
     )
     events = []
@@ -867,14 +1397,13 @@ def test_collector_epoch_switch_rejects_batch_before_backfill_or_claim(
     tmp_path,
     monkeypatch,
 ):
-    control, result = _control(tmp_path)
+    fixture = _release_note(tmp_path)
+    control, result = _control(tmp_path, db_path=fixture.control_db_path)
     _bind_activation_execution(control, result, state="steady_active")
     store = RcaDeliveryStore(control.db_path)
-    fixture = _release_note(tmp_path)
     _bind_minimal_release(control, fixture)
     _set_live_release_environment(monkeypatch, fixture)
     env = _config_env(tmp_path)
-    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "false"
     base = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
     binding = collector.validate_bound_resident_release(
         store,
@@ -887,6 +1416,7 @@ def test_collector_epoch_switch_rejects_batch_before_backfill_or_claim(
     )
     config = replace(
         base,
+        control_db_path=control.db_path,
         release_note_path=fixture.path,
         release_env_path=fixture.env_path,
         resident_release_enforced=True,
@@ -938,8 +1468,23 @@ def test_activation_gate_does_not_backfill_claim_or_preview_legacy_null_row(
     tmp_path,
 ):
     control, legacy = _control(tmp_path)
+    with sqlite3.connect(control.db_path) as conn:
+        trigger_update = conn.execute(
+            "UPDATE business_triggers "
+            "SET activation_epoch_id = NULL, activation_ledger_id = NULL "
+            "WHERE submission_key = ?",
+            (legacy.submission_key,),
+        )
+        outbox_update = conn.execute(
+            "UPDATE rca_outbox "
+            "SET activation_epoch_id = NULL, activation_ledger_id = NULL "
+            "WHERE submission_key = ?",
+            (legacy.submission_key,),
+        )
+    assert trigger_update.rowcount == 1
+    assert outbox_update.rowcount == 1
+    ledger_before = control.list_rows("rca_activation_admission_ledger")
     env = _config_env(tmp_path)
-    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "false"
     env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = "true"
     instance = collector.DeliveryCollector(
         store=RcaDeliveryStore(control.db_path),
@@ -960,6 +1505,11 @@ def test_activation_gate_does_not_backfill_claim_or_preview_legacy_null_row(
     assert row["activation_epoch_id"] is None
     assert row["activation_ledger_id"] is None
     assert row["status"] == "completed"
+    [trigger] = control.list_rows("business_triggers")
+    assert trigger["submission_key"] == legacy.submission_key
+    assert trigger["activation_epoch_id"] is None
+    assert trigger["activation_ledger_id"] is None
+    assert control.list_rows("rca_activation_admission_ledger") == ledger_before
 
 
 def test_activation_required_reaches_watch_claim_and_successful_create(
@@ -994,7 +1544,6 @@ def test_activation_required_reaches_watch_claim_and_successful_create(
         ),
     )
     env = _config_env(tmp_path)
-    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "false"
     env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = "true"
     instance = collector.DeliveryCollector(
         store=store,
@@ -1025,7 +1574,6 @@ def test_activation_required_reaches_watch_claim_and_successful_create(
 
 def test_terminal_failure_is_silent_and_does_not_create_delivery(tmp_path):
     env = _config_env(tmp_path)
-    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "false"
     env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = "true"
     calls = []
     instance = object.__new__(collector.DeliveryCollector)
@@ -1063,38 +1611,31 @@ def test_terminal_failure_is_silent_and_does_not_create_delivery(tmp_path):
     assert "activation_required" not in calls[0]
 
 
-def test_collect_batch_collects_delivery_then_capacity_samples():
+def test_collect_batch_collects_delivery_until_idle():
     instance = collector.DeliveryCollector.__new__(collector.DeliveryCollector)
     instance.config = SimpleNamespace(batch_size=3)
     instance.stats = collector.CollectorStats()
+    instance._validate_runtime_release = lambda: {}
     instance.backfill = lambda: 0
     outcomes = iter([
         collector.CollectOutcome(status="running"),
         collector.CollectOutcome(status="idle"),
     ])
     instance.collect_one = lambda: next(outcomes)
-    capacity_calls = []
-    instance.collect_capacity_samples = lambda: capacity_calls.append(True)
 
     result = instance.collect_batch()
 
     assert [item.status for item in result] == ["running", "idle"]
-    assert capacity_calls == [True]
 
 
-def test_collector_stats_expose_capacity_counters_without_activation_counter():
+def test_collector_stats_omit_retired_capacity_counters():
     public = collector.asdict(collector.CollectorStats())
     assert "activation_blocked" not in public
-    assert public["capacity_scanned"] == 0
-    assert public["capacity_eligible"] == 0
-    assert public["capacity_appended"] == 0
-    assert public["capacity_rejected"] == 0
-    assert public["capacity_frozen"] == 0
-    assert public["capacity_last_error"] == ""
+    assert not any(key.startswith("capacity_") for key in public)
     assert public["stale_lease"] == 0
 
 
-def test_capacity_observation_error_does_not_mark_delivery_unhealthy(tmp_path):
+def test_health_omits_retired_capacity_sample_projection(tmp_path):
     env = _config_env(tmp_path)
     env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = "true"
     config = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
@@ -1112,16 +1653,13 @@ def test_capacity_observation_error_does_not_mark_delivery_unhealthy(tmp_path):
     reporter._failure_route_outlet_receipt = {"ready": True, "status": "ready"}
     reporter._failure_route_outlet_error = ""
 
-    stats = collector.CollectorStats(
-        capacity_last_error="rca_capacity_vm_measurement_time_invalid"
-    )
+    stats = collector.CollectorStats()
     reporter.write(state="idle", stats=stats, refresh_dependencies=False)
 
     payload = json.loads(config.health_path.read_text(encoding="utf-8"))
     assert health_calls[0]["activation_required"] is True
     assert payload["healthy"] is True
-    assert payload["capacity_samples"]["observation_healthy"] is False
-    assert payload["capacity_samples"]["blocks_delivery_health"] is False
+    assert "capacity_samples" not in payload
 
 
 def _remote_event_blocker():
@@ -1170,7 +1708,6 @@ def _real_terminal_collector(
 ):
     _control(tmp_path)
     env = _config_env(tmp_path)
-    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "false"
     config = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
     instance = collector.DeliveryCollector(
         store=RcaDeliveryStore(tmp_path / "control.sqlite3"),

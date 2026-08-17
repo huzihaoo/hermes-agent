@@ -16,6 +16,7 @@ from gateway.pnc_rca_abstention_projection import (
 from gateway.pnc_rca_issue_focus import ANALYSIS_INSUFFICIENT_STATEMENT
 from scripts import pnc_rca_batch_rerun as batch_rerun
 from scripts.pnc_rca_batch_rerun import (
+    ACCEPTANCE_AXES,
     CONTROL_STORE_SCHEMA_VERSION,
     DRY_RUN_SCHEMA_VERSION,
     OWNER_RECEIPT_EFFECT_SCOPE,
@@ -27,6 +28,7 @@ from scripts.pnc_rca_batch_rerun import (
     SCHEMA_VERSION,
     BatchRerunError,
     _approval,
+    _acceptance_axes,
     _batch_completion,
     _batch_terminal_authority,
     _historical_epoch_rerun_authority,
@@ -226,6 +228,9 @@ def test_approval_accepts_issue_only_official_readback():
     assert approval["official_field_keys"] == ["field_8c912e", "field_9193cb"]
     assert approval["quality"]["status"] == "causal_candidate"
     assert approval["quality"]["responsibility"] == "ACC decoded 证据"
+    assert approval["acceptance_axis"] == "causal"
+    assert approval["acceptance"]["transport"]["status"] == "pass"
+    assert approval["acceptance"]["causal_attribution"]["status"] == "pass"
 
 
 def test_approval_rejects_delivered_noncausal_result():
@@ -235,12 +240,109 @@ def test_approval_rejects_delivered_noncausal_result():
     failure = _terminal_failure(snapshot)
     assert failure is not None
     assert failure["job_status"] == "delivered"
+    assert failure["acceptance_axis"] == "causal"
+    assert failure["acceptance"]["transport"]["status"] == "pass"
+    assert failure["acceptance"]["causal_attribution"] == {
+        "status": "not_ready",
+        "reason": "causal_quality_not_satisfied",
+    }
 
 
 def test_batch_completion_rejects_confirmed_noncausal_field_write():
     snapshot = _snapshot(causal=False)
 
     assert _batch_completion(snapshot) is None
+
+
+def test_transport_completion_keeps_gate_a_observation_semantically_not_ready():
+    snapshot = _snapshot(causal=False)
+    snapshot["contract_json"] = json.dumps(_observational_contract())
+
+    completion = _batch_completion(snapshot, acceptance_axis="transport")
+
+    assert completion is not None
+    assert completion["acceptance_axis"] == "transport"
+    assert completion["acceptance"]["transport"] == {
+        "status": "pass",
+        "official_comment_id": "7665000000000000000",
+        "official_field_keys": ["field_8c912e", "field_9193cb"],
+        "official_readback_source": "read_after_write",
+    }
+    assert completion["acceptance"]["causal_attribution"] == {
+        "status": "not_ready",
+        "reason": "gate_a_projection_not_causal",
+    }
+    assert completion["quality"] == {
+        "status": "not_ready",
+        "reason": "gate_a_projection_not_causal",
+    }
+    assert _approval(snapshot) is None
+    assert _terminal_failure(snapshot, acceptance_axis="transport") is None
+    causal_failure = _terminal_failure(snapshot)
+    assert causal_failure is not None
+    assert causal_failure["acceptance"] == completion["acceptance"]
+
+
+def test_transport_completion_projects_collector_execution_identity():
+    readback = {
+        "schema_version": "pnc_rca_execution_identity_readback_v1",
+        "source": "host_collector_canonical_vm_receipts_v1",
+    }
+    snapshot = {
+        **_snapshot(causal=False),
+        "execution_identity_readback": readback,
+    }
+
+    completion = _batch_completion(snapshot, acceptance_axis="transport")
+
+    assert completion is not None
+    assert completion["execution_identity_readback"] == readback
+
+
+def test_watch_execution_identity_reads_only_collector_status_projection():
+    readback = {
+        "schema_version": "pnc_rca_execution_identity_readback_v1",
+        "source": "host_collector_canonical_vm_receipts_v1",
+    }
+
+    assert batch_rerun._watch_execution_identity(
+        json.dumps({"execution_identity_readback": readback})
+    ) == readback
+    assert batch_rerun._watch_execution_identity(json.dumps(readback)) is None
+    assert batch_rerun._watch_execution_identity("not-json") is None
+
+
+def test_transport_completion_requires_official_provider_readback():
+    snapshot = _snapshot(causal=False)
+    snapshot["effects"][0]["remote_receipt"]["source"] = "write_response"
+
+    assert _batch_completion(snapshot, acceptance_axis="transport") is None
+    assert _acceptance_axes(snapshot) == {
+        "transport": {
+            "status": "not_ready",
+            "reason": "write_readback_not_confirmed",
+        },
+        "causal_attribution": {
+            "status": "not_ready",
+            "reason": "causal_quality_not_satisfied",
+        },
+    }
+
+
+@pytest.mark.parametrize("source", ["read_before_write", "recovery_read_before_write"])
+def test_transport_axis_does_not_treat_reconciliation_as_release_write(source):
+    snapshot = _snapshot()
+    snapshot["effects"][0]["remote_receipt"]["source"] = source
+
+    causal_completion = _batch_completion(snapshot)
+
+    assert causal_completion is not None
+    assert causal_completion["acceptance"]["transport"] == {
+        "status": "not_ready",
+        "reason": "write_readback_not_confirmed",
+    }
+    assert causal_completion["acceptance"]["causal_attribution"]["status"] == "pass"
+    assert _batch_completion(snapshot, acceptance_axis="transport") is None
 
 
 def test_batch_completion_requires_provider_readback():
@@ -524,107 +626,6 @@ def test_silent_terminal_authority_requires_exact_deadline_no_delivery(
         ) is None
 
 
-def test_silent_terminal_authority_accepts_exact_pre_w3_no_write_preread_failure(
-    tmp_path,
-):
-    status = {
-        "success": False,
-        "state": "quarantined",
-        "error_code": "w3_execution_snapshot_missing",
-        "external_writes": False,
-        "terminal_delivery_policy": "silent_internal_alert_only",
-    }
-    snapshot = {
-        **_snapshot(job_status="", job_outcome=""),
-        "generation": 2,
-        "business_key": "g1q3-rca-business-v1-" + "b" * 64,
-        "submission_key": "g1q3-rca-s1-" + "a" * 64,
-        "delivery_id": None,
-        "effects": [],
-        "trigger_state": "quarantined",
-        "outbox_status": "quarantined",
-        "outbox_error_code": "host_issue_preread_failed",
-        "outbox_error_detail": "transient preread failure",
-        "outbox_attempt": 1,
-        "outbox_next_attempt_at": None,
-        "outbox_claimed_at": "2026-08-09T19:09:49+00:00",
-        "outbox_completed_at": None,
-        "outbox_quarantined_at": "2026-08-09T19:09:50+00:00",
-        "outbox_result_json": None,
-        "outbox_lease_token": None,
-        "outbox_lease_owner": None,
-        "outbox_lease_expires_at": None,
-        "watch_state": "quarantined",
-        "watch_business_key": "g1q3-rca-business-v1-" + "b" * 64,
-        "watch_generation": 2,
-        "watch_task_id": None,
-        "watch_delivery_id": None,
-        "watch_error_code": "w3_execution_snapshot_missing",
-        "watch_error_detail": "pre-W3 quarantine",
-        "watch_status_json": json.dumps(status),
-        "watch_terminal_at": "2026-08-09T19:09:50+00:00",
-        "watch_lease_token": None,
-        "watch_lease_owner": None,
-        "watch_lease_expires_at": None,
-        "admission_snapshot_count": 0,
-        "delivery_job_count": 0,
-        "delivery_effect_count": 0,
-        "provider_attempt_count": 0,
-        "subscriptions": [
-            {
-                "required": 1,
-                "status": "quarantined",
-                "delivery_id": None,
-                "effect_key": None,
-                "reason": "w3_execution_snapshot_missing",
-            }
-        ],
-    }
-    kwargs = {
-        "batch_id": "gray-20260724",
-        "queue_sha256": "1" * 64,
-        "issue_id": "7048803418",
-        "owner_receipt_path": str(tmp_path / "owner.json"),
-        "owner_receipt_sha256": "2" * 64,
-        "requester_id": "automation:rca-batch-rerun",
-        "reason": "production_gray_batch:gray-20260724",
-    }
-
-    authority = _silent_terminal_authority(snapshot=snapshot, **kwargs)
-
-    assert authority is not None
-    assert authority["prior_generation"] == 2
-    for changes in (
-        {"watch_task_id": "unexpected-task"},
-        {"outbox_error_code": "host_issue_preread_empty"},
-        {"subscriptions": []},
-        {"delivery_id": "unexpected-delivery"},
-        {"admission_snapshot_count": 1},
-        {"delivery_job_count": 1},
-        {"delivery_effect_count": 1},
-        {"provider_attempt_count": 1},
-        {"outbox_error_detail": ""},
-        {"outbox_quarantined_at": ""},
-        {"watch_business_key": "other-business"},
-        {"watch_generation": 1},
-        {
-            "subscriptions": [
-                *snapshot["subscriptions"],
-                {
-                    "required": 0,
-                    "status": "materialized",
-                    "delivery_id": "unexpected-delivery",
-                    "effect_key": "unexpected-effect",
-                    "reason": "delivery_effect_materialized",
-                },
-            ]
-        },
-    ):
-        assert _silent_terminal_authority(
-            snapshot={**snapshot, **changes}, **kwargs
-        ) is None
-
-
 def test_batch_terminal_authority_accepts_any_settled_owner_approved_delivery(
     tmp_path,
 ):
@@ -740,6 +741,7 @@ def test_batch_state_v4_binds_owner_receipt_path_hash_selection_and_gate(tmp_pat
         "owner_receipt_path": owner_path,
         "owner_receipt_sha256": "3" * 64,
         "selected_issue_ids": ["7048803418"],
+        "acceptance_axis": "transport",
     }
     state = _load_or_create_state(state_path, **values)
     _write_state(state_path, state)
@@ -750,6 +752,7 @@ def test_batch_state_v4_binds_owner_receipt_path_hash_selection_and_gate(tmp_pat
     assert state["selected_issue_ids"] == ["7048803418"]
     assert state["activation_required"] is True
     assert state["runtime_tree"] == "4" * 40
+    assert state["acceptance_axis"] == "transport"
     with pytest.raises(BatchRerunError, match="batch_state_binding_mismatch"):
         _load_or_create_state(
             state_path,
@@ -760,6 +763,30 @@ def test_batch_state_v4_binds_owner_receipt_path_hash_selection_and_gate(tmp_pat
             state_path,
             **{**values, "runtime_commit": "5" * 40},
         )
+    with pytest.raises(BatchRerunError, match="batch_state_binding_mismatch"):
+        _load_or_create_state(
+            state_path,
+            **{**values, "acceptance_axis": "causal"},
+        )
+
+
+def test_batch_acceptance_axis_contract_is_explicit_and_defaults_to_causal():
+    parser = batch_rerun._parser()
+    required = [
+        "--control-db", "control.sqlite3",
+        "--queue", "queue.json",
+        "--state", "state.json",
+        "--batch-id", "release-canary",
+        "--expected-runtime-commit", "a" * 40,
+        "--expected-runtime-tree", "b" * 40,
+    ]
+
+    assert ACCEPTANCE_AXES == {"causal", "transport"}
+    assert parser.parse_args(required).acceptance_axis == "causal"
+    assert (
+        parser.parse_args([*required, "--acceptance-axis", "transport"]).acceptance_axis
+        == "transport"
+    )
 
 
 def _queue_value(*, current_submission_key=None, current_generation=1):
@@ -963,6 +990,7 @@ def test_dry_run_without_owner_receipt_is_read_only_and_not_authorized(
     }
     assert result["execution_policy"] == {
         "activation_required": True,
+        "acceptance_axis": "causal",
         "daily_started_attempt_quota": None,
         "fixed_issue_allowlist": None,
         "selected_issue_count": 1,

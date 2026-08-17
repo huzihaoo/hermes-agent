@@ -65,10 +65,10 @@ from scripts.pnc_rca_delivery_dispatcher import (
 from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path, foxglove_url
 from tests.gateway.test_pnc_rca_delivery_store import (
     NOW,
+    _activate_direct_steady,
     _bind_activation_execution,
     _control,
     _insert_subscription,
-    _legacy_pre_w3_pending_effects,
     _switch_activation_epoch,
 )
 from tests.gateway.test_pnc_rca_delivery_contract import (
@@ -157,7 +157,7 @@ def _test_provider_revalidate(
 ):
     binding = {
         "epoch_id": "epoch-test-active",
-        "state": "bounded_active",
+        "state": "steady_active",
         "ledger_id": 1,
     }
     if operation == "feishu_thread_reply":
@@ -247,13 +247,17 @@ def test_enabled_startup_locks_minimal_release_before_writable_store_and_provide
     tmp_path,
     monkeypatch,
 ):
-    control, result = _control(tmp_path)
+    fixture = _release_note(tmp_path)
+    control, result = _control(tmp_path, db_path=fixture.control_db_path)
     _bind_activation_execution(control, result, state="steady_active")
     RcaDeliveryStore(control.db_path)
-    fixture = _release_note(tmp_path)
     _bind_minimal_release(control, fixture)
     _set_live_release_environment(monkeypatch, fixture)
-    config = replace(_config(tmp_path), release_note_path=fixture.path)
+    config = replace(
+        _config(tmp_path),
+        control_db_path=control.db_path,
+        release_note_path=fixture.path,
+    )
     events = []
     captured = {}
     real_store = dispatcher_module.RcaDeliveryStore
@@ -353,10 +357,10 @@ def test_dispatcher_epoch_switch_rejects_claim_and_provider_boundaries(
     monkeypatch,
     boundary,
 ):
-    control, result = _control(tmp_path)
+    fixture = _release_note(tmp_path)
+    control, result = _control(tmp_path, db_path=fixture.control_db_path)
     _bind_activation_execution(control, result, state="steady_active")
     store = RcaDeliveryStore(control.db_path)
-    fixture = _release_note(tmp_path)
     _bind_minimal_release(control, fixture)
     _set_live_release_environment(monkeypatch, fixture)
     binding = dispatcher_module.validate_bound_resident_release(
@@ -370,6 +374,7 @@ def test_dispatcher_epoch_switch_rejects_claim_and_provider_boundaries(
     )
     config = replace(
         _config(tmp_path),
+        control_db_path=control.db_path,
         release_note_path=fixture.path,
         release_env_path=fixture.env_path,
         resident_release_enforced=True,
@@ -519,12 +524,16 @@ def test_delivery_dispatcher_environment_loader_preserves_literal_expansion_synt
 
 def _patch_circuit_reset_cli(monkeypatch, config, tmp_path):
     binding = {
-        "path": str((tmp_path / "active-release-binding.json").absolute()),
-        "sha256": "1" * 64,
+        "epoch_id": "rca-steady-test",
         "release_id": "rca-test-release",
-        "authority_sha256": "2" * 64,
-        "authority_epoch_id": "rca-authority-test",
-        "bootstrap_epoch_id": "rca-bootstrap-test",
+        "release_fingerprint_sha256": "1" * 64,
+        "release_note_path": str((tmp_path / "release-note.json").absolute()),
+        "release_note_sha256": "2" * 64,
+        "runtime_root": str(tmp_path.absolute()),
+        "runtime_commit": "3" * 40,
+        "runtime_tree": "4" * 40,
+        "live_manifest_sha256": "5" * 64,
+        "live_env_sha256": "6" * 64,
     }
     provenance = {
         "entrypoint_path": str((tmp_path / "dispatcher.py").absolute()),
@@ -535,8 +544,6 @@ def _patch_circuit_reset_cli(monkeypatch, config, tmp_path):
         "receipt_helper_sha256": "5" * 64,
         "control_store_path": str((tmp_path / "control-store.py").absolute()),
         "control_store_sha256": "6" * 64,
-        "bootstrap_path": str((tmp_path / "bootstrap.py").absolute()),
-        "bootstrap_sha256": "7" * 64,
     }
     monkeypatch.setattr(
         dispatcher_module, "load_delivery_dispatcher_environment", lambda: None
@@ -548,8 +555,8 @@ def _patch_circuit_reset_cli(monkeypatch, config, tmp_path):
     )
     monkeypatch.setattr(
         dispatcher_module,
-        "_active_release_binding_snapshot",
-        lambda _config: dict(binding),
+        "_current_release_binding_snapshot",
+        lambda _config, _store: dict(binding),
     )
     monkeypatch.setattr(
         dispatcher_module,
@@ -557,349 +564,6 @@ def _patch_circuit_reset_cli(monkeypatch, config, tmp_path):
         lambda: dict(provenance),
     )
     return binding
-
-
-def test_circuit_reset_binding_observes_live_env_drift(monkeypatch, tmp_path):
-    live_env = tmp_path / ".env"
-    live_env.write_text("CURRENT=true\n", encoding="utf-8")
-    active_binding = tmp_path / "active-release-binding.json"
-    active_binding.write_text("{}\n", encoding="utf-8")
-    config = replace(
-        _config(tmp_path, enabled=False),
-        quarantine_release_id="rca-test-release",
-        quarantine_bootstrap_epoch_id="rca-bootstrap-test",
-        quarantine_active_release_binding_path=active_binding,
-        quarantine_live_env_path=live_env,
-    )
-    calls = []
-
-    def load_binding(**kwargs):
-        calls.append(kwargs)
-        return {
-            "binding_receipt_sha256": "1" * 64,
-            "release_id": "rca-test-release",
-            "authority_sha256": "2" * 64,
-            "authority_epoch_id": "rca-authority-test",
-            "bootstrap_epoch_id": "rca-bootstrap-test",
-            "candidate_env_sha256": "3" * 64,
-        }
-
-    monkeypatch.setattr(dispatcher_module, "load_active_release_binding", load_binding)
-
-    observed = dispatcher_module._active_release_binding_snapshot(config)
-
-    assert calls[0]["verify_live_env"] is False
-    assert observed["live_env_matches_candidate"] is False
-    assert observed["live_env_sha256"] == hashlib.sha256(
-        live_env.read_bytes()
-    ).hexdigest()
-    assert observed["mismatch_policy"] == (
-        "observed_only_operator_authorized_reset"
-    )
-
-
-def _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path):
-    _patch_circuit_reset_cli(monkeypatch, config, tmp_path)
-    binding = {
-        "path": str((tmp_path / "active-release-binding.json").absolute()),
-        "sha256": "1" * 64,
-        "release_id": "rca-test-release",
-        "authority_sha256": "2" * 64,
-        "authority_epoch_id": "rca-authority-test",
-        "bootstrap_epoch_id": "rca-bootstrap-test",
-        "release_bom_sha256": "3" * 64,
-        "candidate_env_sha256": "4" * 64,
-        "live_env_path": str((tmp_path / ".env").absolute()),
-        "live_env_sha256": "5" * 64,
-        "live_env_matches_candidate": False,
-        "mismatch_policy": "observed_only_no_external_write",
-    }
-    monkeypatch.setattr(
-        dispatcher_module,
-        "_pre_w3_effect_disposition_active_release_binding",
-        lambda _config: dict(binding),
-    )
-    return binding
-
-
-def _sqlite_backup(source_path, backup_path):
-    source = sqlite3.connect(source_path)
-    destination = sqlite3.connect(backup_path)
-    try:
-        source.backup(destination)
-        destination.execute("PRAGMA journal_mode=DELETE")
-        destination.commit()
-    finally:
-        destination.close()
-        source.close()
-    backup_path.chmod(0o600)
-    return hashlib.sha256(backup_path.read_bytes()).hexdigest()
-
-
-def _pre_w3_cli_args(keys, *, receipt, backup, backup_sha256):
-    args = []
-    for key in keys:
-        args.extend(("--dispose-pre-w3-effect", key))
-    args.extend((
-        "--operator",
-        "test-operator",
-        "--reason",
-        "exact pre-W3 disposition without provider calls",
-        "--receipt",
-        str(receipt),
-        "--backup",
-        str(backup),
-        "--backup-sha256",
-        backup_sha256,
-    ))
-    return args
-
-
-def test_pre_w3_disposition_cli_plan_apply_and_recovery_never_builds_provider(
-    tmp_path, monkeypatch, capsys
-):
-    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path)
-    config = _config(tmp_path, enabled=False)
-    _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
-    provider_created = False
-
-    def unexpected_provider(*_args, **_kwargs):
-        nonlocal provider_created
-        provider_created = True
-        raise AssertionError("provider must not be built for disposition")
-
-    monkeypatch.setattr(
-        dispatcher_module,
-        "MeegleIssueCommentAdapter",
-        unexpected_provider,
-    )
-    backup = (tmp_path / "control.before.sqlite3").absolute()
-    backup_sha256 = _sqlite_backup(config.control_db_path, backup)
-    receipt = (tmp_path / "pre-w3-disposition.json").absolute()
-    base_args = _pre_w3_cli_args(
-        reversed(keys),
-        receipt=receipt,
-        backup=backup,
-        backup_sha256=backup_sha256,
-    )
-    before = store.list_rows("rca_delivery_effects")
-
-    assert dispatcher_module.main(base_args) == 0
-    plan_output = json.loads(capsys.readouterr().out)
-    assert plan_output["mode"] == "plan"
-    assert plan_output["external_effects_triggered"] is False
-    assert plan_output["provider_calls_performed"] == 0
-    assert store.list_rows("rca_delivery_effects") == before
-    assert not receipt.exists()
-
-    expected = plan_output["expected_apply"]
-    apply_args = [*base_args, "--apply"]
-    for name, value in expected.items():
-        apply_args.extend((f"--{name.replace('_', '-')}", value))
-    assert dispatcher_module.main(apply_args) == 0
-    applied = json.loads(capsys.readouterr().out)
-    assert applied["applied"] is True
-    assert applied["provider_calls_performed"] == 0
-    assert provider_created is False
-    assert receipt.stat().st_mode & 0o777 == 0o444
-    assert Path(f"{receipt}.sha256").is_file()
-    body = json.loads(receipt.read_text(encoding="utf-8"))
-    assert body["disposition_id"] == applied["disposition_id"]
-    assert body["active_release_binding"]["live_env_matches_candidate"] is False
-    effects = store.list_rows("rca_delivery_effects")
-    assert {row["status"] for row in effects} == {"quarantined"}
-    assert {row["attempt"] for row in effects} == {0}
-    assert all(row["remote_receipt_json"] is None for row in effects)
-
-    before_retry = {
-        table: store.list_rows(table)
-        for table in (
-            "rca_delivery_effects",
-            "rca_delivery_jobs",
-            "rca_delivery_attempts",
-        )
-    }
-    # A crash after the immutable main receipt but before its sidecar must be
-    # recoverable without another database mutation.
-    Path(f"{receipt}.sha256").unlink()
-    assert dispatcher_module.main(apply_args) == 0
-    repaired = json.loads(capsys.readouterr().out)
-    assert repaired["applied"] is False
-    assert repaired["idempotent"] is True
-    assert Path(f"{receipt}.sha256").read_text(encoding="ascii") == (
-        f"{repaired['receipt_sha256']}  {receipt.name}\n"
-    )
-    assert dispatcher_module.main(apply_args) == 0
-    retried = json.loads(capsys.readouterr().out)
-    assert retried["applied"] is False
-    assert retried["idempotent"] is True
-    assert retried["disposition_id"] == applied["disposition_id"]
-    assert before_retry == {
-        table: store.list_rows(table) for table in before_retry
-    }
-
-    recovered = (tmp_path / "pre-w3-disposition.recovered.json").absolute()
-    assert dispatcher_module.main([
-        "--materialize-pre-w3-disposition",
-        applied["disposition_id"],
-        "--receipt",
-        str(recovered),
-    ]) == 0
-    recovery = json.loads(capsys.readouterr().out)
-    assert recovery["recovered"] is True
-    assert recovery["provider_calls_performed"] == 0
-    envelope = json.loads(recovered.read_text(encoding="utf-8"))
-    assert envelope["source_disposition_id"] == applied["disposition_id"]
-    assert envelope["audit"] == body
-    assert provider_created is False
-
-
-def test_pre_w3_disposition_cli_rejects_active_binding_drift_before_mutation(
-    tmp_path, monkeypatch, capsys
-):
-    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
-    config = _config(tmp_path, enabled=False)
-    binding = _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
-    backup = (tmp_path / "control.before.sqlite3").absolute()
-    backup_sha256 = _sqlite_backup(config.control_db_path, backup)
-    receipt = (tmp_path / "pre-w3-drift.json").absolute()
-    base_args = _pre_w3_cli_args(
-        keys,
-        receipt=receipt,
-        backup=backup,
-        backup_sha256=backup_sha256,
-    )
-    assert dispatcher_module.main(base_args) == 0
-    planned = json.loads(capsys.readouterr().out)
-    binding["sha256"] = "9" * 64
-    apply_args = [*base_args, "--apply"]
-    for name, value in planned["expected_apply"].items():
-        apply_args.extend((f"--{name.replace('_', '-')}", value))
-
-    assert dispatcher_module.main(apply_args) == 2
-    error = json.loads(capsys.readouterr().out)
-    assert "plan_changed" in error["message"]
-    [effect] = store.list_rows("rca_delivery_effects")
-    assert effect["status"] == "pending"
-    assert store.list_rows("rca_delivery_attempts") == []
-    assert not receipt.exists()
-
-
-def test_pre_w3_disposition_cli_rejects_live_db_as_backup(
-    tmp_path, monkeypatch, capsys
-):
-    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
-    config = _config(tmp_path, enabled=False)
-    _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
-    live_sha256 = hashlib.sha256(config.control_db_path.read_bytes()).hexdigest()
-    receipt = (tmp_path / "pre-w3-live-db-backup.json").absolute()
-    args = _pre_w3_cli_args(
-        keys,
-        receipt=receipt,
-        backup=config.control_db_path.absolute(),
-        backup_sha256=live_sha256,
-    )
-
-    assert dispatcher_module.main(args) == 2
-    error = json.loads(capsys.readouterr().out)
-    assert "backup_invalid" in error["message"]
-    [effect] = store.list_rows("rca_delivery_effects")
-    assert effect["status"] == "pending"
-    assert store.list_rows("rca_delivery_attempts") == []
-    assert not receipt.exists()
-
-
-def test_pre_w3_disposition_cli_rejects_unrelated_sqlite_backup(
-    tmp_path, monkeypatch, capsys
-):
-    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
-    config = _config(tmp_path, enabled=False)
-    _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
-    unrelated_root = tmp_path / "unrelated"
-    _other_control, other_store, _other_keys = _legacy_pre_w3_pending_effects(
-        unrelated_root,
-        count=1,
-    )
-    with sqlite3.connect(other_store.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_activation_epochs SET production_fingerprint = ? "
-            "WHERE is_current = 1",
-            ("9" * 64,),
-        )
-    backup = (tmp_path / "unrelated.before.sqlite3").absolute()
-    backup_sha256 = _sqlite_backup(other_store.db_path, backup)
-    receipt = (tmp_path / "pre-w3-unrelated-backup.json").absolute()
-    args = _pre_w3_cli_args(
-        keys,
-        receipt=receipt,
-        backup=backup,
-        backup_sha256=backup_sha256,
-    )
-
-    assert dispatcher_module.main(args) == 2
-    error = json.loads(capsys.readouterr().out)
-    assert "backup" in error["message"]
-    [effect] = store.list_rows("rca_delivery_effects")
-    assert effect["status"] == "pending"
-    assert store.list_rows("rca_delivery_attempts") == []
-    assert not receipt.exists()
-
-
-@pytest.mark.parametrize("mutation_sql", [
-    "INSERT INTO control_meta(key, value) VALUES('unrelated-backup-row', 'x')",
-    "INSERT INTO rca_delivery_meta(key, value) VALUES('unrelated-backup-row', 'x')",
-])
-def test_pre_w3_disposition_cli_rejects_backup_with_unrelated_row(
-    tmp_path, monkeypatch, capsys, mutation_sql
-):
-    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
-    config = _config(tmp_path, enabled=False)
-    _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
-    backup = (tmp_path / "control.before.extra-row.sqlite3").absolute()
-    _sqlite_backup(config.control_db_path, backup)
-    with sqlite3.connect(backup) as conn:
-        conn.execute(mutation_sql)
-    backup_sha256 = hashlib.sha256(backup.read_bytes()).hexdigest()
-    receipt = (tmp_path / "pre-w3-extra-row.json").absolute()
-    args = _pre_w3_cli_args(
-        keys,
-        receipt=receipt,
-        backup=backup,
-        backup_sha256=backup_sha256,
-    )
-
-    assert dispatcher_module.main(args) == 2
-    error = json.loads(capsys.readouterr().out)
-    assert "backup" in error["message"]
-    assert store.list_rows("rca_delivery_attempts") == []
-    assert not receipt.exists()
-
-
-def test_pre_w3_disposition_cli_rejects_live_unrelated_row_drift(
-    tmp_path, monkeypatch, capsys
-):
-    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
-    config = _config(tmp_path, enabled=False)
-    _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
-    backup = (tmp_path / "control.before.sqlite3").absolute()
-    backup_sha256 = _sqlite_backup(config.control_db_path, backup)
-    with sqlite3.connect(config.control_db_path) as conn:
-        conn.execute(
-            "INSERT INTO control_meta(key, value) VALUES('live-unrelated-row', 'x')"
-        )
-    receipt = (tmp_path / "pre-w3-live-extra-row.json").absolute()
-    args = _pre_w3_cli_args(
-        keys,
-        receipt=receipt,
-        backup=backup,
-        backup_sha256=backup_sha256,
-    )
-
-    assert dispatcher_module.main(args) == 2
-    error = json.loads(capsys.readouterr().out)
-    assert "backup" in error["message"] or "snapshot" in error["message"]
-    assert store.list_rows("rca_delivery_attempts") == []
-    assert not receipt.exists()
 
 
 def test_bound_source_rejects_group_or_world_writable_file(tmp_path):
@@ -943,7 +607,7 @@ def test_clear_circuit_cli_plans_then_applies_without_claiming_effects(
     plan = json.loads(capsys.readouterr().out)
     assert plan["mode"] == "plan"
     assert plan["applied"] is False
-    assert plan["plan"]["active_release_binding"]["sha256"] == binding["sha256"]
+    assert plan["plan"]["release_binding"] == binding
     assert plan["plan"]["effect_delta"]["external_writes"] == 0
     config_sha = plan["plan"]["config_binding_sha256"]
     plan_id = plan["plan"]["plan_id"]
@@ -962,8 +626,8 @@ def test_clear_circuit_cli_plans_then_applies_without_claiming_effects(
             "--reason",
             "validated provider recovery",
             "--apply",
-            "--expected-active-release-binding-sha256",
-            binding["sha256"],
+            "--expected-release-note-sha256",
+            binding["release_note_sha256"],
             "--expected-config-binding-sha256",
             config_sha,
             "--expected-plan-id",
@@ -980,7 +644,7 @@ def test_clear_circuit_cli_plans_then_applies_without_claiming_effects(
     assert payload["ok"] is True
     assert payload["applied"] is True
     assert payload["effect_delta"]["external_effects_triggered"] is False
-    assert body["active_release_binding"] == binding
+    assert body["release_binding"] == binding
     assert body["effect_delta"]["delivery_effect_rows"] == 0
     assert body["effect_delta"]["database_rows"]["total"] == 3
     assert receipt.stat().st_mode & 0o777 == 0o444
@@ -1018,11 +682,11 @@ def test_clear_circuit_rejects_binding_drift_before_mutation(
     ]) == 0
     plan = json.loads(capsys.readouterr().out)
     changed = dict(binding)
-    changed["sha256"] = "6" * 64
+    changed["release_note_sha256"] = "7" * 64
     monkeypatch.setattr(
         dispatcher_module,
-        "_active_release_binding_snapshot",
-        lambda _config: changed,
+        "_current_release_binding_snapshot",
+        lambda _config, _store: changed,
     )
     assert dispatcher_module.main([
         "--clear-circuit",
@@ -1033,8 +697,8 @@ def test_clear_circuit_rejects_binding_drift_before_mutation(
         "--reason",
         "plan binding",
         "--apply",
-        "--expected-active-release-binding-sha256",
-        binding["sha256"],
+        "--expected-release-note-sha256",
+        binding["release_note_sha256"],
         "--expected-config-binding-sha256",
         plan["plan"]["config_binding_sha256"],
         "--expected-plan-id",
@@ -1044,7 +708,7 @@ def test_clear_circuit_rejects_binding_drift_before_mutation(
         "--receipt",
         str(receipt),
     ]) == 2
-    assert "active_binding_changed" in capsys.readouterr().out
+    assert "release_binding_changed" in capsys.readouterr().out
     assert store.delivery_dispatcher_circuit(DELIVERY_EFFECT_KIND).state == "open"
     assert not receipt.exists()
 
@@ -1089,8 +753,8 @@ def test_clear_circuit_rejects_config_drift_before_mutation(
         "--reason",
         "plan config",
         "--apply",
-        "--expected-active-release-binding-sha256",
-        binding["sha256"],
+        "--expected-release-note-sha256",
+        binding["release_note_sha256"],
         "--expected-config-binding-sha256",
         plan["config_binding_sha256"],
         "--expected-plan-id",
@@ -1144,8 +808,8 @@ def test_clear_circuit_rejects_exact_before_state_drift(
         "--reason",
         "exact before",
         "--apply",
-        "--expected-active-release-binding-sha256",
-        binding["sha256"],
+        "--expected-release-note-sha256",
+        binding["release_note_sha256"],
         "--expected-config-binding-sha256",
         plan["config_binding_sha256"],
         "--expected-plan-id",
@@ -1197,8 +861,8 @@ def test_clear_circuit_rejects_destination_drift_from_reviewed_plan(
         "--reason",
         "destination binding",
         "--apply",
-        "--expected-active-release-binding-sha256",
-        binding["sha256"],
+        "--expected-release-note-sha256",
+        binding["release_note_sha256"],
         "--expected-config-binding-sha256",
         plan["config_binding_sha256"],
         "--expected-plan-id",
@@ -1263,8 +927,8 @@ def test_clear_circuit_parent_swap_is_rejected_before_receipt_write(
         "--reason",
         "parent swap",
         "--apply",
-        "--expected-active-release-binding-sha256",
-        binding["sha256"],
+        "--expected-release-note-sha256",
+        binding["release_note_sha256"],
         "--expected-config-binding-sha256",
         plan["config_binding_sha256"],
         "--expected-plan-id",
@@ -1341,8 +1005,8 @@ def test_clear_circuit_receipt_materialization_failure_is_recoverable(
         "--reason",
         "recover durable audit",
         "--apply",
-        "--expected-active-release-binding-sha256",
-        binding["sha256"],
+        "--expected-release-note-sha256",
+        binding["release_note_sha256"],
         "--expected-config-binding-sha256",
         plan["config_binding_sha256"],
         "--expected-plan-id",
@@ -1663,19 +1327,12 @@ def _seed_terminal(tmp_path, *, with_thread: bool = False):
 def _seed_profile_terminal(tmp_path, *, split_project_identity: bool = False):
     """Materialize one current Kafka profile terminal without a W3 snapshot."""
     from tests.gateway.test_pnc_rca_control_store import (
-        _create_activation_epoch,
         _profile_snapshot_policy,
         _profile_snapshot_record,
     )
 
     control = RcaControlStore(tmp_path / "control.sqlite3")
-    epoch = _create_activation_epoch(control, start_offset=20)
-    with sqlite3.connect(control.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_activation_epochs SET state='steady_active' "
-            "WHERE epoch_id=? AND is_current=1",
-            (epoch["epoch_id"],),
-        )
+    _activate_direct_steady(control, start_offset=20)
     policy = _profile_snapshot_policy()
     record = _profile_snapshot_record(20, "7019637554")
     if split_project_identity:
@@ -1696,7 +1353,6 @@ def _seed_profile_terminal(tmp_path, *, split_project_identity: bool = False):
         policy=policy,
         submit_enabled=True,
         activation_required=True,
-        activation_slot_kind="kafka_success",
     )
     assert result.decision == "accepted"
     with sqlite3.connect(control.db_path) as conn:
@@ -3504,7 +3160,7 @@ def test_current_profile_terminal_without_w3_dispatches_comment_only_with_scoped
     )
 
 
-def test_pre_submit_quarantine_keeps_specific_safe_diagnostic_only(tmp_path):
+def test_pre_submit_quarantine_without_w3_remains_internal_and_redacted(tmp_path):
     control, _result = _control(tmp_path, completed=False)
     outbox = control.claim_outbox(lease_owner="submission-worker", now=NOW)
     assert outbox is not None
@@ -3519,15 +3175,17 @@ def test_pre_submit_quarantine_keeps_specific_safe_diagnostic_only(tmp_path):
 
     assert store.backfill_completed_submissions(now=NOW + timedelta(seconds=2)) == 1
 
-    [job] = store.list_rows("rca_delivery_jobs")
-    [effect] = store.list_rows("rca_delivery_effects")
-    contract = json.loads(job["contract_json"])
-    payload = json.loads(effect["payload_json"])
-    assert contract["diagnostic_code"] == "input_frame_required"
-    assert payload["diagnostic_code"] == "input_frame_required"
-    assert payload["error_code"] == "outbox_submission_quarantined"
-    assert "issue_field_invalid_frame_reference" not in effect["payload_json"]
-    assert "SECRET-MUST-NOT-LEAK" not in effect["payload_json"]
+    [watch] = store.list_rows("rca_execution_watch")
+    assert watch["state"] == "quarantined"
+    assert watch["delivery_id"] is None
+    status = json.loads(watch["last_status_json"])
+    assert status["external_writes"] is False
+    assert status["terminal_delivery_policy"] == "silent_internal_alert_only"
+    assert status["error_code"] == "w3_execution_snapshot_missing"
+    assert "issue_field_invalid_frame_reference" not in watch["last_status_json"]
+    assert "SECRET-MUST-NOT-LEAK" not in watch["last_status_json"]
+    assert store.list_rows("rca_delivery_jobs") == []
+    assert store.list_rows("rca_delivery_effects") == []
 
 
 def test_older_terminal_generation_is_suppressed_before_any_remote_call(tmp_path):

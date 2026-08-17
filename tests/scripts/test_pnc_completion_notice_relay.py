@@ -143,8 +143,8 @@ def test_hot_sender_auth_retry_revalidates_epoch_before_second_provider_call(
                 "external_write_fence_epoch_not_current"
             )
         return {
-            "epoch_id": "epoch-gray-1",
-            "state": "bounded_active",
+            "epoch_id": "epoch-steady-1",
+            "state": "steady_active",
             "ledger_id": 1,
             "chat_id": pnc_completion_notice_relay.G1Q3_RCA_CHAT_ID,
             "thread_id": "topic:om_root",
@@ -276,8 +276,8 @@ def test_fenced_one_shot_relay_never_uses_send_message_tool(monkeypatch):
     chat_id = pnc_completion_notice_relay.G1Q3_RCA_CHAT_ID
     thread_id = "topic:om_root"
     live = {
-        "epoch_id": "epoch-gray-1",
-        "state": "bounded_active",
+        "epoch_id": "epoch-steady-1",
+        "state": "steady_active",
         "ledger_id": 1,
         "business_key": "business-1",
         "submission_key": task_id,
@@ -344,7 +344,7 @@ def test_fenced_one_shot_relay_never_uses_send_message_tool(monkeypatch):
             {
                 "action": "send",
                 "target": f"feishu:{chat_id}:om_root",
-                "message": "bounded notice",
+                "message": "steady notice",
             }
         )
     )
@@ -354,6 +354,90 @@ def test_fenced_one_shot_relay_never_uses_send_message_tool(monkeypatch):
     assert type(calls[0]["_pnc_rca_external_write_guard"]) is (
         pnc_completion_notice_relay.RcaProviderWriteClaim
     )
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_code"),
+    [
+        ("bounded_active", "external_write_fence_epoch_not_current"),
+        ("steady_active", None),
+    ],
+)
+def test_relay_live_fence_binding_requires_direct_steady_epoch(
+    monkeypatch,
+    tmp_path,
+    state,
+    expected_code,
+):
+    row = {
+        "epoch_id": "epoch-steady-1",
+        "state": state,
+        "is_current": 1,
+        "ledger_id": 7,
+        "admission_key": "admission-1",
+        "business_key": "business-1",
+        "submission_key": "submission-1",
+        "generation": 2,
+        "decision": "admit",
+        "bound_at": "2026-08-17T00:00:00+00:00",
+        "admission_snapshot_json": "{}",
+        "source_envelope_json": "{}",
+    }
+
+    class FakeConnection:
+        row_factory = None
+
+        def execute(self, _query, _params):
+            return self
+
+        def fetchone(self):
+            return row
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "_relay_control_db_path",
+        lambda: tmp_path / "control.sqlite3",
+    )
+    monkeypatch.setattr(
+        pnc_completion_notice_relay.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: FakeConnection(),
+    )
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "validate_write_fence_source_binding",
+        lambda *_args, **_kwargs: {
+            "chat_id": pnc_completion_notice_relay.G1Q3_RCA_CHAT_ID,
+            "thread_id": "topic:om_root",
+        },
+    )
+    fence = {
+        "activation_epoch_id": "epoch-steady-1",
+        "activation_ledger_id": 7,
+        "admission_key": "admission-1",
+    }
+
+    if expected_code:
+        with pytest.raises(
+            pnc_completion_notice_relay.ExternalWriteFenceError,
+            match=expected_code,
+        ):
+            pnc_completion_notice_relay._relay_live_fence_binding(fence)
+        return
+
+    assert pnc_completion_notice_relay._relay_live_fence_binding(fence) == {
+        "epoch_id": "epoch-steady-1",
+        "state": "steady_active",
+        "ledger_id": 7,
+        "business_key": "business-1",
+        "submission_key": "submission-1",
+        "generation": 2,
+        "chat_id": pnc_completion_notice_relay.G1Q3_RCA_CHAT_ID,
+        "thread_id": "topic:om_root",
+    }
 
 
 def test_l4_sealed_clock_and_business_timestamp_format_are_idempotent(monkeypatch):

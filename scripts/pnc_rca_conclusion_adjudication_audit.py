@@ -540,9 +540,7 @@ def audit_conclusion_adjudications(
                         )
                         AND (
                             epoch.is_current != 1
-                            OR epoch.state NOT IN (
-                                'bounded_active', 'steady_active'
-                            )
+                            OR epoch.state != 'steady_active'
                         )
                     )
                 """,

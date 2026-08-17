@@ -8,12 +8,10 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
-import plistlib
 from pathlib import Path
 import re
 import sqlite3
 import stat
-import subprocess
 import tempfile
 from typing import Any, Callable, Iterable, Literal, Mapping
 import uuid
@@ -30,13 +28,6 @@ from gateway.pnc_rca_kafka_contract import (
     WorkflowEventPolicy,
     build_event_admission,
     classify_workflow_event,
-)
-from gateway.pnc_rca_gray_samples import (
-    GRAY_SAMPLE_REQUESTER_ID,
-    build_gray_sample_message_id,
-    build_gray_sample_reason,
-    gray_sample_issue_url,
-    normalize_gray_sample_automation_authority,
 )
 from gateway.pnc_rca_runtime_transition import (
     ensure_host_runtime_transition_schema,
@@ -91,297 +82,6 @@ OUTBOX_CIRCUIT_RESET_REQUIRED_FIELDS = frozenset(
         "receipt_fingerprint",
     }
 )
-EXACT_OUTBOX_HOLD_META_PREFIX = "rca_exact_outbox_hold:"
-EXACT_OUTBOX_HOLD_SCHEMA_VERSION = "pnc_rca_exact_outbox_hold_v1"
-EXACT_OUTBOX_HOLD_ROW_SCHEMA_VERSION = "pnc_rca_exact_outbox_hold_row_v1"
-EXACT_OUTBOX_HOLD_SNAPSHOT_SCHEMA_VERSION = "pnc_rca_exact_outbox_hold_snapshot_v1"
-EXACT_OUTBOX_HOLD_UNTIL = "9999-12-31T23:59:59.999999+00:00"
-EXACT_OUTBOX_HOLD_MAX_AUDIT_BYTES = 512 * 1024
-# A hold is an operational gate for a predecessor canary, not a generic retry
-# delay.  Keep a fixed margin for the canary, collector, and manual review.
-EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS = 6 * 60 * 60
-EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS = 60
-EXACT_OUTBOX_HOLD_MAX_FUTURE_SKEW_SECONDS = 5
-EXACT_OUTBOX_RUNTIME_PROVENANCE_SCHEMA_VERSION = (
-    "pnc_rca_exact_outbox_runtime_provenance_v2"
-)
-EXACT_OUTBOX_RUNTIME_PLIST_LABELS = (
-    "local.pnc.rca-kafka-consumer",
-    "local.pnc.rca-outbox-dispatcher",
-    "local.pnc.rca-delivery-collector",
-    "local.pnc.rca-delivery-dispatcher",
-    "local.pnc.completion-notice-relay",
-    "local.pnc.feishu-delivery-repair",
-)
-EXACT_OUTBOX_CONFIG_KEYS = frozenset(
-    {
-        "dispatch_enabled",
-        "activation_required",
-        "control_db_path",
-        "delivery_db_path",
-        "health_path",
-        "service_id",
-        "service_capability",
-        "service_operation",
-        "lease_seconds",
-        "max_age_seconds",
-        "input_wait_max_age_seconds",
-        "poll_interval_seconds",
-        "circuit_poll_interval_seconds",
-        "batch_size",
-        "data_access_mode",
-        "allow_download",
-        "allow_feishu_writeback",
-        "group_response_cap",
-        "translate_baseline",
-        "translate_contract_path",
-        "storage_admission_enabled",
-        "storage_reservation_enabled",
-        "derived_capacity_reservation_enabled",
-        "delivery_backpressure_enabled",
-        "delivery_high_watermark",
-        "delivery_resume_watermark",
-        "storage_concurrency_reserve_cases",
-        "storage_cases_per_day",
-        "storage_capacity_scope",
-        "derived_capacity_atomic_reservation",
-        "storage_expected_artifact_cache_bytes",
-        "storage_reserve_percent",
-        "storage_timeout_seconds",
-        "derived_capacity_reservation_timeout_seconds",
-        "capacity_mode",
-        "release_id",
-        "bootstrap_epoch_id",
-        "active_release_binding_path",
-        "live_env_path",
-        "w3_snapshot_read",
-    }
-)
-EXACT_OUTBOX_HOLD_REQUIRED_FIELDS = frozenset(
-    {
-        "schema_version",
-        "command",
-        "phase",
-        "hold_id",
-        "plan_id",
-        "recorded_at",
-        "operator",
-        "reason",
-        "target_outbox_id",
-        "predecessor_outbox_id",
-        "control_db_identity",
-        "activation_required",
-        "max_age_seconds",
-        "active_activation",
-        "active_release_binding",
-        "config_binding",
-        "config_binding_sha256",
-        "tool_provenance",
-        "tool_provenance_sha256",
-        "resident_census",
-        "destination_path",
-        "destination_binding",
-        "target_before",
-        "target_after",
-        "predecessor",
-        "eligible_queue_before",
-        "eligible_queue_after",
-        "retry_horizon",
-        "effect_delta",
-        "receipt_fingerprint",
-    }
-)
-EXACT_OUTBOX_HOLD_CONTROL_IDENTITY_FIELDS = frozenset(
-    {
-        "schema_version",
-        "path",
-        "present",
-        "device",
-        "inode",
-        "size",
-        "mtime_ns",
-        "sha256",
-        "wal",
-        "shm",
-        "logical_db_identity",
-        "coordination_observation",
-    }
-)
-EXACT_OUTBOX_HOLD_SOURCE_FILE_FIELDS = frozenset(
-    {"present", "device", "inode", "size", "mtime_ns", "sha256"}
-)
-EXACT_OUTBOX_HOLD_LOGICAL_DB_FIELDS = frozenset({"database", "wal"})
-EXACT_OUTBOX_HOLD_COORDINATION_FIELDS = frozenset({"shm"})
-EXACT_OUTBOX_HOLD_W3_READ_DISABLED_FIELDS = frozenset({"enabled", "mode"})
-EXACT_OUTBOX_HOLD_W3_READ_ENABLED_FIELDS = frozenset(
-    {"enabled", "mode", "schema_version", "authority_sha256", "policy_sha256s"}
-)
-EXACT_OUTBOX_HOLD_W3_POLICY_FIELDS = frozenset(
-    {
-        "creation_policy",
-        "business_profile",
-        "execution_policy",
-        "publication_policy",
-        "correction_lineage_policy",
-    }
-)
-EXACT_OUTBOX_HOLD_ACTIVE_BINDING_FIELDS = frozenset(
-    {
-        "path",
-        "sha256",
-        "release_id",
-        "authority_sha256",
-        "authority_epoch_id",
-        "bootstrap_epoch_id",
-        "release_bom_sha256",
-        "candidate_env_sha256",
-        "authorization_fingerprint",
-        "authorization_receipt_sha256",
-        "approval_evidence_sha256",
-        "runtime_manifest_sha256",
-        "runtime_release_target",
-        "runtime_git_head",
-        "runtime_git_tree",
-        "raw_sha256",
-        "live_env_path",
-        "live_env_sha256",
-    }
-)
-EXACT_OUTBOX_HOLD_TOOL_FIELDS = frozenset(
-    {
-        "entrypoint_path",
-        "entrypoint_sha256",
-        "control_store_path",
-        "control_store_sha256",
-        "bootstrap_path",
-        "bootstrap_sha256",
-        "git_head",
-        "git_tree",
-        "git_status_returncode",
-        "git_clean",
-        "runtime_provenance",
-    }
-)
-EXACT_OUTBOX_HOLD_RUNTIME_FIELDS = frozenset(
-    {
-        "schema_version",
-        "manifest",
-        "manifest_runtime_root",
-        "runtime_venv",
-        "runtime_python",
-        "manifest_runtime_release_target",
-        "manifest_gateway_release_target",
-        "manifest_commit",
-        "manifest_tree",
-        "runtime_git_head",
-        "runtime_git_tree",
-        "release_bom_sha256",
-        "plists",
-        "stable_target_registry",
-        "launcher_source",
-        "installed_launcher",
-        "runtime_scripts",
-    }
-)
-EXACT_OUTBOX_HOLD_RUNTIME_FILE_FIELDS = frozenset(
-    {"present", "path", "sha256", "size", "mode", "uid", "nlink"}
-)
-EXACT_OUTBOX_HOLD_RUNTIME_PLIST_FIELDS = frozenset(
-    {"present", "label", "path", "sha256", "size", "mode", "uid", "nlink"}
-)
-EXACT_OUTBOX_HOLD_RESIDENT_FIELDS = frozenset(
-    {
-        "schema_version",
-        "observed_at",
-        "forbidden_labels",
-        "observations",
-        "loaded_labels",
-        "loaded_count",
-        "all_unloaded",
-        "source_kind",
-        "domain",
-        "active_release_binding_path",
-        "source_sha256",
-    }
-)
-EXACT_OUTBOX_HOLD_RESIDENT_OBSERVATION_FIELDS = frozenset(
-    {"label", "loaded", "returncode", "unloaded_proven", "output_sha256"}
-)
-EXACT_OUTBOX_HOLD_ACTIVATION_FIELDS = frozenset(
-    {
-        "configured",
-        "epoch_id",
-        "state",
-        "is_current",
-        "config_sha256",
-        "db_logical_identity_sha256",
-        "db_logical_identity",
-        "preproduction_fingerprint",
-        "preproduction_gate_receipt_sha256",
-        "production_fingerprint",
-        "production_gate_receipt_sha256",
-        "sha256",
-    }
-)
-EXACT_OUTBOX_HOLD_ACTIVATION_DB_FIELDS = frozenset(
-    {"device", "inode", "logical_store_id"}
-)
-EXACT_OUTBOX_HOLD_ROW_FIELDS = frozenset(
-    {
-        "schema_version",
-        "outbox_id",
-        "submission_key",
-        "business_key",
-        "generation",
-        "status",
-        "attempt",
-        "fence",
-        "next_attempt_at",
-        "retry_window_started_at",
-        "lease_token",
-        "lease_owner",
-        "lease_expires_at",
-        "claimed_at",
-        "completed_at",
-        "quarantined_at",
-        "result_json",
-        "updated_at",
-        "activation_epoch_id",
-        "activation_ledger_id",
-        "row_sha256",
-        "created_at",
-    }
-)
-EXACT_OUTBOX_HOLD_QUEUE_FIELDS = frozenset(
-    {"outbox_ids", "entries", "sha256"}
-)
-EXACT_OUTBOX_HOLD_QUEUE_ENTRY_FIELDS = frozenset({"outbox_id", "row_sha256"})
-EXACT_OUTBOX_HOLD_RETRY_FIELDS = frozenset(
-    {
-        "target_outbox_id",
-        "anchor",
-        "expires_at",
-        "min_remaining_seconds",
-        "safety_headroom_seconds",
-        "record_max_age_seconds",
-        "plan_remaining_seconds",
-        "apply_observed_at",
-        "apply_remaining_seconds",
-    }
-)
-EXACT_OUTBOX_HOLD_EFFECT_FIELDS = frozenset(
-    {
-        "external_writes",
-        "external_effects_triggered",
-        "target_rows_updated",
-        "control_meta_inserted",
-        "business_trigger_rows_updated",
-        "mutation",
-    }
-)
-EXACT_OUTBOX_HOLD_EFFECT_MUTATION_FIELDS = frozenset(
-    {"next_attempt_at", "updated_at"}
-)
 DEFAULT_MANUAL_OPERATOR_RATE_LIMIT = 3
 DEFAULT_MANUAL_OPERATOR_RATE_WINDOW_SECONDS = 600
 GROUP_USER_RERUN_SCHEMA_VERSION = "pnc_rca_group_user_rerun_v1"
@@ -401,9 +101,6 @@ SILENT_TERMINAL_RERUN_ERROR_CODES = frozenset({
     "taxonomy_gap:viz_evidence_unavailable",
     "remote_evidence_domain_unsupported",
     "taxonomy_gap:remote_evidence_domain_unsupported",
-})
-PRE_W3_NO_WRITE_RERUN_OUTBOX_ERROR_CODES = frozenset({
-    "host_issue_preread_failed",
 })
 SILENT_TERMINAL_RERUN_AUTHORITY_FIELDS = frozenset({
     "schema_version",
@@ -467,7 +164,6 @@ REPLAY_RAW_PRUNE_BATCH = 1000
 INPUT_WAIT_QUARANTINE_REARMED_REASON = "input_wait_quarantine_rearmed"
 INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON = "input_wait_terminal_new_generation_created"
 INPUT_WAIT_EXECUTION_WATCH_PRESENT_REASON = "input_wait_execution_watch_present"
-MANUAL_SHADOW_PROMOTED_REASON = "manual_shadow_promoted"
 W3_KAFKA_OBSERVATION_JOIN_REASON = "w3_automatic_generation_observation_joined"
 W3_LEGACY_PARENT_SNAPSHOT_MISSING_REASON = "w3_legacy_parent_snapshot_missing"
 W3_AUTOMATIC_OBSERVATION_SNAPSHOT_MISMATCH_REASON = (
@@ -533,110 +229,20 @@ TERMINAL_RERUN_DELIVERY_AUTHORITY_SCHEMA_VERSION = (
 TERMINAL_RERUN_DELIVERY_AUTHORITY_KINDS = frozenset(
     {"silent_terminal", "batch_terminal"}
 )
-ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION = (
-    "pnc_rca_activation_historical_outbox_hold_v1"
-)
-ACTIVATION_HISTORICAL_OUTBOX_ROW_SCHEMA_VERSION = (
-    "pnc_rca_activation_historical_outbox_row_v1"
-)
-ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_SCHEMA_VERSION = (
-    "pnc_rca_activation_historical_outbox_disposition_v1"
-)
-ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_ERROR_CODE = (
-    "activation_historical_hold_owner_disposed"
-)
-ACTIVATION_HISTORICAL_OUTBOX_ROW_FIELDS = (
-    "outbox_id",
-    "action",
-    "business_key",
-    "submission_key",
-    "creation_rule_version",
-    "generation",
-    "activation_epoch_id",
-    "activation_ledger_id",
-    "origin_source_id",
-    "source_event_id",
-    "source_topic",
-    "source_partition",
-    "source_offset",
-    "payload_json",
-    "status",
-    "attempt",
-    "next_attempt_at",
-    "fence",
-    "lease_token",
-    "lease_owner",
-    "lease_expires_at",
-    "claimed_at",
-    "completed_at",
-    "quarantined_at",
-    "last_error_code",
-    "last_error_detail",
-    "result_json",
-    "retry_window_started_at",
-    "created_at",
-    "updated_at",
-)
-ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_MUTABLE_FIELDS = frozenset(
-    {
-        "status",
-        "next_attempt_at",
-        "quarantined_at",
-        "last_error_code",
-        "last_error_detail",
-        "updated_at",
-    }
-)
-ACTIVATION_HISTORICAL_OUTBOX_IMMUTABLE_ROW_FIELDS = tuple(
-    field
-    for field in ACTIVATION_HISTORICAL_OUTBOX_ROW_FIELDS
-    if field not in ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_MUTABLE_FIELDS
-)
 # The W6 stock boundary is a release contract, not an operator-controlled flag.
 STOCK_CUTOFF = "2026-07-25T10:15:43.473251+00:00"
 LEARNING_LANE_ALLOWED_WRITE_KINDS = ("internal_alert", "vm_submit")
-ACTIVATION_EPOCH_STATES = frozenset(
-    {
-        "safe_off",
-        "preauthorized",
-        "bounded_active",
-        "confirmed",
-        "steady_active",
-        "aborted",
-    }
-)
-ACTIVATION_SLOT_KINDS = (
-    "kafka_success",
-    "manual_success",
-    "manual_terminal_failure",
-)
-# Kafka is a passive production ingress. Its broker/ACL/offset connectivity is
-# sealed by the preauthorization gate; bounded activation actively exercises
-# the two exact manual paths without fabricating an upstream Kafka event.
-ACTIVATION_RELEASE_SLOT_KINDS = (
-    "manual_success",
-    "manual_terminal_failure",
-)
-ACTIVATION_KAFKA_PROOF_MODE = "passive_connectivity"
-_ACTIVATION_RELEASE_SLOT_SQL = "'manual_success', 'manual_terminal_failure'"
-_ACTIVATION_SILENT_TERMINAL_POLICY = "silent_internal_alert_only"
-_ACTIVATION_SILENT_TERMINAL_ROUTE_LANES = frozenset(
+ACTIVATION_ENTRYPOINTS = frozenset({"kafka_ingest", "manual_admit"})
+ACTIVATION_SOURCE_KINDS = frozenset({"kafka", "manual"})
+_SILENT_TERMINAL_POLICY = "silent_internal_alert_only"
+_SILENT_TERMINAL_ROUTE_LANES = frozenset(
     {
         ("internal_alert", "hard_defect"),
         ("internal_backlog", "needs_human_input"),
     }
 )
-ACTIVATION_ENTRYPOINTS = frozenset(
-    {"kafka_ingest", "manual_admit", "shadow_promotion"}
-)
-ACTIVATION_SOURCE_KINDS = frozenset({"kafka", "manual"})
 _ACTIVATION_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ACTIVATION_EPOCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-CAPACITY_BOOTSTRAP_PRODUCTION = "BOOTSTRAP_PRODUCTION"
-CAPACITY_STEADY_ACTIVE = "STEADY_ACTIVE"
-CAPACITY_TRANSITION_STATES = frozenset(
-    {CAPACITY_BOOTSTRAP_PRODUCTION, CAPACITY_STEADY_ACTIVE}
-)
 _CONTROL_STORE_INSTALLATION_MARKERS = (
     ("maintenance", ".pnc-rca-maintenance"),
     ("rollback_tombstone", ".pnc-rca-tombstone"),
@@ -865,20 +471,6 @@ def build_historical_epoch_rerun_authority(
     }
 
 
-def _exact_canonical_json(value: Any) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-        allow_nan=False,
-    )
-
-
-def _exact_canonical_sha256(value: Any) -> str:
-    return hashlib.sha256(_exact_canonical_json(value).encode("utf-8")).hexdigest()
-
-
 def _dispatcher_circuit_reset_fingerprint(value: Mapping[str, Any]) -> str:
     payload = dict(value)
     payload.pop("receipt_fingerprint", None)
@@ -1019,1170 +611,6 @@ def _validate_dispatcher_circuit_reset_audit(
         raise ValueError("dispatcher_circuit_reset_audit_json_invalid") from exc
     if len(serialized.encode("utf-8")) > OUTBOX_CIRCUIT_RESET_MAX_AUDIT_BYTES:
         raise ValueError("dispatcher_circuit_reset_audit_too_large")
-    return normalized
-
-
-def _exact_outbox_hold_fingerprint(value: Mapping[str, Any]) -> str:
-    payload = dict(value)
-    payload.pop("receipt_fingerprint", None)
-    return _exact_canonical_sha256(payload)
-
-
-def _exact_outbox_hold_plan_id(value: Mapping[str, Any]) -> str:
-    control_identity = dict(value["control_db_identity"])
-    logical_identity = dict(control_identity.get("logical_db_identity") or {})
-    wal = dict(logical_identity.get("wal") or {})
-    if wal.get("present") is True and int(wal.get("size", 0)) == 0:
-        wal = {"present": False}
-    logical_identity["wal"] = wal
-    control_identity = {
-        "path": control_identity.get("path"),
-        "logical_db_identity": logical_identity,
-    }
-    return _exact_canonical_sha256(
-        {
-            "command": "hold-exact-outbox",
-            "operator": value["operator"],
-            "reason": value["reason"],
-            "target_outbox_id": value["target_outbox_id"],
-            "predecessor_outbox_id": value["predecessor_outbox_id"],
-            "activation_required": value["activation_required"],
-            "max_age_seconds": value["max_age_seconds"],
-            "active_activation": value["active_activation"],
-            "active_release_binding": value["active_release_binding"],
-            # WAL is durable logical state. SHM contains volatile lock bytes,
-            # so bind only its presence while preserving its full hash in the
-            # audit evidence outside the deterministic plan id.
-            "control_db_identity": control_identity,
-            "config_binding_sha256": value["config_binding_sha256"],
-            "tool_provenance_sha256": value["tool_provenance_sha256"],
-            "target_row_sha256": value["target_before"]["row_sha256"],
-            "predecessor_row_sha256": value["predecessor"]["row_sha256"],
-            "eligible_queue_sha256": value["eligible_queue_before"]["sha256"],
-            # Remaining seconds and observation timestamps are evidence, not
-            # plan identity.  Bind only the fixed policy and expiry anchor.
-            "retry_horizon": {
-                key: value["retry_horizon"][key]
-                for key in (
-                    "target_outbox_id",
-                    "anchor",
-                    "expires_at",
-                    "min_remaining_seconds",
-                    "safety_headroom_seconds",
-                    "record_max_age_seconds",
-                )
-            },
-            "destination_path": value["destination_path"],
-            "destination_binding": value["destination_binding"],
-            "resident_census_policy": {
-                "schema_version": value["resident_census"]["schema_version"],
-                "source_kind": value["resident_census"]["source_kind"],
-                "domain": value["resident_census"]["domain"],
-                "forbidden_labels": value["resident_census"]["forbidden_labels"],
-                "all_unloaded": value["resident_census"]["all_unloaded"],
-            },
-        }
-    )
-
-
-def _exact_hold_require_mapping(
-    value: Any,
-    expected_fields: frozenset[str],
-    error_code: str,
-) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != expected_fields:
-        raise ValueError(error_code)
-    return value
-
-
-def _exact_hold_require_type(
-    value: Any,
-    expected_type: type[Any],
-    error_code: str,
-    *,
-    nullable: bool = False,
-) -> None:
-    if nullable and value is None:
-        return
-    if type(value) is not expected_type:
-        raise ValueError(error_code)
-
-
-def _exact_hold_require_sha(value: Any, error_code: str) -> None:
-    if (
-        not isinstance(value, str)
-        or _ACTIVATION_SHA256_RE.fullmatch(value) is None
-        or value == "0" * 64
-    ):
-        raise ValueError(error_code)
-
-
-def _validate_exact_outbox_hold_nested(value: Mapping[str, Any]) -> None:
-    """Reject structural drift before any live binding or database work."""
-    error = "exact_outbox_hold_nested_schema_invalid"
-
-    def require_string(item: Any, code: str = error) -> None:
-        _exact_hold_require_type(item, str, code)
-
-    def require_int(item: Any, code: str = error) -> None:
-        _exact_hold_require_type(item, int, code)
-
-    def require_bool(item: Any, code: str = error) -> None:
-        _exact_hold_require_type(item, bool, code)
-
-    def require_nullable_string(item: Any, code: str = error) -> None:
-        _exact_hold_require_type(item, str, code, nullable=True)
-
-    def require_nullable_int(item: Any, code: str = error) -> None:
-        _exact_hold_require_type(item, int, code, nullable=True)
-
-    def require_path(item: Any, code: str = error) -> None:
-        require_string(item, code)
-        if not Path(item).is_absolute():
-            raise ValueError(code)
-
-    def require_source_file(item: Any, *, allow_label: bool = False) -> None:
-        fields = (
-            EXACT_OUTBOX_HOLD_RUNTIME_PLIST_FIELDS
-            if allow_label
-            else EXACT_OUTBOX_HOLD_RUNTIME_FILE_FIELDS
-        )
-        source = _exact_hold_require_mapping(item, fields, error)
-        require_bool(source["present"])
-        if source["present"] is not True:
-            raise ValueError(error)
-        require_path(source["path"])
-        _exact_hold_require_sha(source["sha256"], error)
-        for field in ("size", "mode", "uid", "nlink"):
-            require_int(source[field])
-        if source["size"] < 1 or source["nlink"] != 1:
-            raise ValueError(error)
-        if allow_label:
-            require_string(source["label"])
-
-    identity = _exact_hold_require_mapping(
-        value["control_db_identity"],
-        EXACT_OUTBOX_HOLD_CONTROL_IDENTITY_FIELDS,
-        "exact_outbox_hold_control_db_identity_invalid",
-    )
-    require_string(identity["schema_version"])
-    require_path(identity["path"])
-    require_bool(identity["present"])
-    for field in ("device", "inode", "size", "mtime_ns"):
-        require_int(identity[field])
-    _exact_hold_require_sha(identity["sha256"], error)
-
-    def require_sidecar(item: Any) -> None:
-        sidecar = _exact_hold_require_mapping(
-            item,
-            (
-                frozenset({"present"})
-                if isinstance(item, Mapping) and item.get("present") is False
-                else EXACT_OUTBOX_HOLD_SOURCE_FILE_FIELDS
-            ),
-            "exact_outbox_hold_control_db_identity_invalid",
-        )
-        require_bool(sidecar["present"])
-        if sidecar["present"]:
-            for field in ("device", "inode", "size", "mtime_ns"):
-                require_int(sidecar[field])
-            _exact_hold_require_sha(sidecar["sha256"], error)
-
-    require_sidecar(identity["wal"])
-    require_sidecar(identity["shm"])
-    logical_identity = _exact_hold_require_mapping(
-        identity["logical_db_identity"],
-        EXACT_OUTBOX_HOLD_LOGICAL_DB_FIELDS,
-        "exact_outbox_hold_control_db_identity_invalid",
-    )
-    require_sidecar(logical_identity["database"])
-    require_sidecar(logical_identity["wal"])
-    coordination = _exact_hold_require_mapping(
-        identity["coordination_observation"],
-        EXACT_OUTBOX_HOLD_COORDINATION_FIELDS,
-        "exact_outbox_hold_control_db_identity_invalid",
-    )
-    require_sidecar(coordination["shm"])
-
-    config = _exact_hold_require_mapping(
-        value["config_binding"],
-        EXACT_OUTBOX_CONFIG_KEYS,
-        "exact_outbox_hold_config_binding_invalid",
-    )
-    for field in (
-        "dispatch_enabled",
-        "activation_required",
-        "allow_download",
-        "allow_feishu_writeback",
-        "storage_admission_enabled",
-        "storage_reservation_enabled",
-        "derived_capacity_reservation_enabled",
-        "delivery_backpressure_enabled",
-        "derived_capacity_atomic_reservation",
-    ):
-        require_bool(config[field])
-    for field in (
-        "lease_seconds",
-        "max_age_seconds",
-        "input_wait_max_age_seconds",
-        "poll_interval_seconds",
-        "circuit_poll_interval_seconds",
-        "batch_size",
-        "delivery_high_watermark",
-        "delivery_resume_watermark",
-        "storage_concurrency_reserve_cases",
-        "storage_cases_per_day",
-        "storage_expected_artifact_cache_bytes",
-        "storage_reserve_percent",
-        "storage_timeout_seconds",
-        "derived_capacity_reservation_timeout_seconds",
-    ):
-        require_int(config[field])
-    for field in (
-        "control_db_path",
-        "delivery_db_path",
-        "health_path",
-        "service_id",
-        "service_capability",
-        "service_operation",
-        "data_access_mode",
-        "group_response_cap",
-        "translate_baseline",
-        "translate_contract_path",
-        "storage_capacity_scope",
-        "capacity_mode",
-        "release_id",
-        "bootstrap_epoch_id",
-        "active_release_binding_path",
-        "live_env_path",
-    ):
-        require_string(config[field])
-    w3_read = config["w3_snapshot_read"]
-    if not isinstance(w3_read, Mapping):
-        raise ValueError("exact_outbox_hold_config_binding_invalid")
-    require_bool(w3_read.get("enabled"))
-    require_string(w3_read.get("mode"))
-    w3_fields = (
-        EXACT_OUTBOX_HOLD_W3_READ_ENABLED_FIELDS
-        if w3_read["enabled"]
-        else EXACT_OUTBOX_HOLD_W3_READ_DISABLED_FIELDS
-    )
-    w3_read = _exact_hold_require_mapping(
-        w3_read, w3_fields, "exact_outbox_hold_config_binding_invalid"
-    )
-    if w3_read["enabled"]:
-        require_string(w3_read["schema_version"])
-        _exact_hold_require_sha(w3_read["authority_sha256"], error)
-        policy_sha256s = _exact_hold_require_mapping(
-            w3_read["policy_sha256s"],
-            EXACT_OUTBOX_HOLD_W3_POLICY_FIELDS,
-            "exact_outbox_hold_config_binding_invalid",
-        )
-        for item in policy_sha256s.values():
-            _exact_hold_require_sha(item, error)
-
-    active_binding = _exact_hold_require_mapping(
-        value["active_release_binding"],
-        EXACT_OUTBOX_HOLD_ACTIVE_BINDING_FIELDS,
-        "exact_outbox_hold_active_binding_invalid",
-    )
-    for field in (
-        "path",
-        "release_id",
-        "authority_epoch_id",
-        "bootstrap_epoch_id",
-        "runtime_release_target",
-        "live_env_path",
-    ):
-        require_string(active_binding[field])
-    require_path(active_binding["path"])
-    require_path(active_binding["live_env_path"])
-    for field in (
-        "sha256",
-        "authority_sha256",
-        "release_bom_sha256",
-        "candidate_env_sha256",
-        "authorization_fingerprint",
-        "authorization_receipt_sha256",
-        "approval_evidence_sha256",
-        "runtime_manifest_sha256",
-        "raw_sha256",
-        "live_env_sha256",
-    ):
-        _exact_hold_require_sha(active_binding[field], error)
-    for field in ("runtime_git_head", "runtime_git_tree"):
-        if not isinstance(active_binding[field], str) or re.fullmatch(
-            r"[0-9a-f]{40}", active_binding[field]
-        ) is None:
-            raise ValueError("exact_outbox_hold_active_binding_invalid")
-
-    tool = _exact_hold_require_mapping(
-        value["tool_provenance"],
-        EXACT_OUTBOX_HOLD_TOOL_FIELDS,
-        "exact_outbox_hold_tool_provenance_invalid",
-    )
-    for field in ("entrypoint_path", "control_store_path", "bootstrap_path"):
-        require_path(tool[field])
-    for field in (
-        "entrypoint_sha256",
-        "control_store_sha256",
-        "bootstrap_sha256",
-    ):
-        _exact_hold_require_sha(tool[field], error)
-    for field in ("git_head", "git_tree"):
-        if not isinstance(tool[field], str) or re.fullmatch(
-            r"[0-9a-f]{40}", tool[field]
-        ) is None:
-            raise ValueError("exact_outbox_hold_tool_provenance_invalid")
-    require_int(tool["git_status_returncode"])
-    require_bool(tool["git_clean"])
-    runtime = _exact_hold_require_mapping(
-        tool["runtime_provenance"],
-        EXACT_OUTBOX_HOLD_RUNTIME_FIELDS,
-        "exact_outbox_hold_runtime_provenance_invalid",
-    )
-    for field in (
-        "schema_version",
-        "manifest_runtime_root",
-        "runtime_venv",
-        "runtime_python",
-        "manifest_runtime_release_target",
-        "manifest_gateway_release_target",
-        "manifest_commit",
-        "manifest_tree",
-        "runtime_git_head",
-        "runtime_git_tree",
-    ):
-        require_string(runtime[field])
-    for field in ("manifest_runtime_root", "runtime_venv", "runtime_python"):
-        require_path(runtime[field])
-    for field in ("manifest_commit", "manifest_tree", "runtime_git_head", "runtime_git_tree"):
-        if re.fullmatch(r"[0-9a-f]{40}", runtime[field]) is None:
-            raise ValueError("exact_outbox_hold_runtime_provenance_invalid")
-    _exact_hold_require_sha(runtime["release_bom_sha256"], error)
-    require_source_file(runtime["manifest"])
-    require_source_file(runtime["stable_target_registry"])
-    require_source_file(runtime["launcher_source"])
-    require_source_file(runtime["installed_launcher"])
-    plists = runtime["plists"]
-    if type(plists) is not list or len(plists) != len(EXACT_OUTBOX_RUNTIME_PLIST_LABELS):
-        raise ValueError("exact_outbox_hold_runtime_provenance_invalid")
-    for label, plist in zip(EXACT_OUTBOX_RUNTIME_PLIST_LABELS, plists, strict=True):
-        require_source_file(plist, allow_label=True)
-        if plist["label"] != label:
-            raise ValueError("exact_outbox_hold_runtime_provenance_invalid")
-    runtime_scripts = runtime["runtime_scripts"]
-    if type(runtime_scripts) is not list or len(runtime_scripts) != len(
-        EXACT_OUTBOX_RUNTIME_PLIST_LABELS
-    ):
-        raise ValueError("exact_outbox_hold_runtime_provenance_invalid")
-    for label, script in zip(
-        EXACT_OUTBOX_RUNTIME_PLIST_LABELS, runtime_scripts, strict=True
-    ):
-        require_source_file(script, allow_label=True)
-        if script["label"] != label:
-            raise ValueError("exact_outbox_hold_runtime_provenance_invalid")
-
-    resident = _exact_hold_require_mapping(
-        value["resident_census"],
-        EXACT_OUTBOX_HOLD_RESIDENT_FIELDS,
-        "exact_outbox_hold_resident_census_invalid",
-    )
-    for field in ("schema_version", "observed_at", "source_kind", "domain"):
-        require_string(resident[field])
-    require_path(resident["active_release_binding_path"])
-    require_bool(resident["all_unloaded"])
-    require_int(resident["loaded_count"])
-    if type(resident["forbidden_labels"]) is not list or type(
-        resident["observations"]
-    ) is not list or type(resident["loaded_labels"]) is not list:
-        raise ValueError("exact_outbox_hold_resident_census_invalid")
-    for label in resident["forbidden_labels"]:
-        require_string(label)
-    for label in resident["loaded_labels"]:
-        require_string(label)
-    observations = resident["observations"]
-    if len(observations) != len(resident["forbidden_labels"]):
-        raise ValueError("exact_outbox_hold_resident_census_invalid")
-    for observation in observations:
-        item = _exact_hold_require_mapping(
-            observation,
-            EXACT_OUTBOX_HOLD_RESIDENT_OBSERVATION_FIELDS,
-            "exact_outbox_hold_resident_census_invalid",
-        )
-        require_string(item["label"])
-        require_bool(item["loaded"])
-        require_int(item["returncode"])
-        require_bool(item["unloaded_proven"])
-        _exact_hold_require_sha(item["output_sha256"], error)
-    _exact_hold_require_sha(resident["source_sha256"], error)
-
-    activation = _exact_hold_require_mapping(
-        value["active_activation"],
-        EXACT_OUTBOX_HOLD_ACTIVATION_FIELDS,
-        "exact_outbox_hold_activation_invalid",
-    )
-    require_bool(activation["configured"])
-    for field in ("epoch_id", "state"):
-        require_string(activation[field])
-    require_int(activation["is_current"])
-    for field in (
-        "config_sha256",
-        "db_logical_identity_sha256",
-        "preproduction_fingerprint",
-        "preproduction_gate_receipt_sha256",
-        "production_fingerprint",
-        "production_gate_receipt_sha256",
-    ):
-        require_string(activation[field])
-    db_identity = _exact_hold_require_mapping(
-        activation["db_logical_identity"],
-        EXACT_OUTBOX_HOLD_ACTIVATION_DB_FIELDS,
-        "exact_outbox_hold_activation_invalid",
-    )
-    require_int(db_identity["device"])
-    require_int(db_identity["inode"])
-    require_string(db_identity["logical_store_id"])
-    _exact_hold_require_sha(activation["sha256"], error)
-
-    def require_row(item: Any) -> None:
-        row = _exact_hold_require_mapping(
-            item, EXACT_OUTBOX_HOLD_ROW_FIELDS, "exact_outbox_hold_row_binding_invalid"
-        )
-        require_string(row["schema_version"])
-        require_int(row["outbox_id"])
-        for field in (
-            "submission_key",
-            "business_key",
-            "status",
-            "created_at",
-            "updated_at",
-        ):
-            require_string(row[field])
-        for field in ("generation", "attempt", "fence"):
-            require_int(row[field])
-        for field in (
-            "next_attempt_at",
-            "retry_window_started_at",
-            "lease_token",
-            "lease_owner",
-            "lease_expires_at",
-            "claimed_at",
-            "completed_at",
-            "quarantined_at",
-            "result_json",
-            "activation_epoch_id",
-        ):
-            require_nullable_string(row[field])
-        require_nullable_int(row["activation_ledger_id"])
-        _exact_hold_require_sha(row["row_sha256"], error)
-
-    for field in ("target_before", "target_after", "predecessor"):
-        require_row(value[field])
-    for field in ("eligible_queue_before", "eligible_queue_after"):
-        queue = _exact_hold_require_mapping(
-            value[field], EXACT_OUTBOX_HOLD_QUEUE_FIELDS, "exact_outbox_hold_queue_binding_invalid"
-        )
-        if type(queue["outbox_ids"]) is not list or type(queue["entries"]) is not list:
-            raise ValueError("exact_outbox_hold_queue_binding_invalid")
-        _exact_hold_require_sha(queue["sha256"], error)
-        for outbox_id in queue["outbox_ids"]:
-            require_int(outbox_id)
-        for entry in queue["entries"]:
-            queue_entry = _exact_hold_require_mapping(
-                entry,
-                EXACT_OUTBOX_HOLD_QUEUE_ENTRY_FIELDS,
-                "exact_outbox_hold_queue_binding_invalid",
-            )
-            require_int(queue_entry["outbox_id"])
-            _exact_hold_require_sha(queue_entry["row_sha256"], error)
-
-    retry = _exact_hold_require_mapping(
-        value["retry_horizon"],
-        EXACT_OUTBOX_HOLD_RETRY_FIELDS,
-        "exact_outbox_hold_retry_horizon_invalid",
-    )
-    require_int(retry["target_outbox_id"])
-    for field in ("anchor", "expires_at"):
-        require_string(retry[field])
-    for field in (
-        "min_remaining_seconds",
-        "safety_headroom_seconds",
-        "record_max_age_seconds",
-        "plan_remaining_seconds",
-    ):
-        require_int(retry[field])
-    require_nullable_string(retry["apply_observed_at"])
-    require_nullable_int(retry["apply_remaining_seconds"])
-    if (retry["apply_observed_at"] is None) != (
-        retry["apply_remaining_seconds"] is None
-    ):
-        raise ValueError("exact_outbox_hold_retry_horizon_invalid")
-
-    effect = _exact_hold_require_mapping(
-        value["effect_delta"],
-        EXACT_OUTBOX_HOLD_EFFECT_FIELDS,
-        "exact_outbox_hold_effect_delta_invalid",
-    )
-    require_int(effect["external_writes"])
-    require_bool(effect["external_effects_triggered"])
-    for field in (
-        "target_rows_updated",
-        "control_meta_inserted",
-        "business_trigger_rows_updated",
-    ):
-        require_int(effect[field])
-    mutation = _exact_hold_require_mapping(
-        effect["mutation"],
-        EXACT_OUTBOX_HOLD_EFFECT_MUTATION_FIELDS,
-        "exact_outbox_hold_effect_delta_invalid",
-    )
-    require_string(mutation["next_attempt_at"])
-    require_string(mutation["updated_at"])
-
-
-def _validate_exact_outbox_hold_audit(
-    value: Mapping[str, Any],
-) -> dict[str, Any]:
-    if not isinstance(value, Mapping):
-        raise ValueError("exact_outbox_hold_audit_invalid")
-    normalized = dict(value)
-    if set(normalized) != EXACT_OUTBOX_HOLD_REQUIRED_FIELDS:
-        raise ValueError("exact_outbox_hold_audit_fields_invalid")
-    if (
-        normalized.get("schema_version") != EXACT_OUTBOX_HOLD_SCHEMA_VERSION
-        or normalized.get("command") != "hold-exact-outbox"
-        or normalized.get("phase") != "hold"
-    ):
-        raise ValueError("exact_outbox_hold_audit_schema_invalid")
-    for field in ("hold_id", "plan_id"):
-        if (
-            not isinstance(normalized.get(field), str)
-            or _ACTIVATION_SHA256_RE.fullmatch(normalized[field]) is None
-            or normalized[field] == "0" * 64
-        ):
-            raise ValueError(f"exact_outbox_hold_{field}_invalid")
-    for field in ("operator", "reason"):
-        limit = 200 if field == "operator" else 1000
-        item = normalized.get(field)
-        if (
-            not isinstance(item, str)
-            or not item
-            or item != item.strip()
-            or len(item.encode("utf-8")) > limit
-            or any(char in item for char in "\n\r\x00")
-        ):
-            raise ValueError("exact_outbox_hold_audit_text_invalid")
-    recorded_at = normalized.get("recorded_at")
-    try:
-        recorded = datetime.fromisoformat(str(recorded_at).replace("Z", "+00:00"))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("exact_outbox_hold_timestamp_invalid") from exc
-    if recorded.tzinfo is None or recorded.utcoffset() != timedelta(0):
-        raise ValueError("exact_outbox_hold_timestamp_invalid")
-    for field in ("target_outbox_id", "predecessor_outbox_id"):
-        item = normalized.get(field)
-        if isinstance(item, bool) or not isinstance(item, int) or item < 1:
-            raise ValueError("exact_outbox_hold_identity_invalid")
-    if normalized["target_outbox_id"] == normalized["predecessor_outbox_id"]:
-        raise ValueError("exact_outbox_hold_identity_invalid")
-    if normalized.get("activation_required") is not True:
-        raise ValueError("exact_outbox_hold_activation_required_invalid")
-    max_age_seconds = normalized.get("max_age_seconds")
-    if (
-        isinstance(max_age_seconds, bool)
-        or not isinstance(max_age_seconds, int)
-        or max_age_seconds < 1
-    ):
-        raise ValueError("exact_outbox_hold_retry_horizon_invalid")
-    _validate_exact_outbox_hold_nested(normalized)
-    identity = normalized.get("control_db_identity")
-    if (
-        not isinstance(identity, Mapping)
-        or identity.get("schema_version")
-        != "pnc_rca_control_store_source_snapshot_v1"
-        or not isinstance(identity.get("path"), str)
-        or not Path(identity["path"]).is_absolute()
-        or identity.get("present") is not True
-        or isinstance(identity.get("device"), bool)
-        or not isinstance(identity.get("device"), int)
-        or isinstance(identity.get("size"), bool)
-        or not isinstance(identity.get("size"), int)
-        or isinstance(identity.get("mtime_ns"), bool)
-        or not isinstance(identity.get("mtime_ns"), int)
-        or isinstance(identity.get("inode"), bool)
-        or not isinstance(identity.get("inode"), int)
-        or _ACTIVATION_SHA256_RE.fullmatch(str(identity.get("sha256") or ""))
-        is None
-    ):
-        raise ValueError("exact_outbox_hold_control_db_identity_invalid")
-    for sidecar in ("wal", "shm"):
-        item = identity.get(sidecar)
-        if not isinstance(item, Mapping) or not isinstance(
-            item.get("present"), bool
-        ):
-            raise ValueError("exact_outbox_hold_control_db_identity_invalid")
-        expected_keys = (
-            {"present"}
-            if item.get("present") is False
-            else {"present", "device", "inode", "size", "mtime_ns", "sha256"}
-        )
-        if set(item) != expected_keys:
-            raise ValueError("exact_outbox_hold_control_db_identity_invalid")
-        if item["present"] and (
-            _ACTIVATION_SHA256_RE.fullmatch(str(item.get("sha256") or "")) is None
-            or any(
-                isinstance(item.get(field), bool)
-                or not isinstance(item.get(field), int)
-                for field in ("device", "inode", "size", "mtime_ns")
-            )
-        ):
-            raise ValueError("exact_outbox_hold_control_db_identity_invalid")
-    logical_identity = identity.get("logical_db_identity")
-    coordination = identity.get("coordination_observation")
-    if (
-        not isinstance(logical_identity, Mapping)
-        or logical_identity.get("database") != {
-            key: identity[key]
-            for key in ("present", "device", "inode", "size", "mtime_ns", "sha256")
-            if key in identity
-        }
-        or logical_identity.get("wal") != identity.get("wal")
-        or not isinstance(coordination, Mapping)
-        or coordination.get("shm") != identity.get("shm")
-    ):
-        raise ValueError("exact_outbox_hold_control_db_identity_invalid")
-    for field in ("config_binding_sha256", "tool_provenance_sha256"):
-        item = normalized.get(field)
-        if (
-            not isinstance(item, str)
-            or _ACTIVATION_SHA256_RE.fullmatch(item) is None
-            or item == "0" * 64
-        ):
-            raise ValueError("exact_outbox_hold_provenance_invalid")
-    config_binding = normalized.get("config_binding")
-    if (
-        not isinstance(config_binding, Mapping)
-        or set(config_binding) != EXACT_OUTBOX_CONFIG_KEYS
-        or _exact_canonical_sha256(config_binding)
-        != normalized["config_binding_sha256"]
-    ):
-        raise ValueError("exact_outbox_hold_config_binding_invalid")
-    active_binding = normalized.get("active_release_binding")
-    if (
-        not isinstance(active_binding, Mapping)
-        or not isinstance(active_binding.get("path"), str)
-        or not Path(active_binding["path"]).is_absolute()
-        or not isinstance(active_binding.get("live_env_path"), str)
-        or not Path(active_binding["live_env_path"]).is_absolute()
-        or _ACTIVATION_SHA256_RE.fullmatch(str(active_binding.get("raw_sha256") or ""))
-        is None
-        or _ACTIVATION_SHA256_RE.fullmatch(
-            str(active_binding.get("live_env_sha256") or "")
-        )
-        is None
-        or _ACTIVATION_SHA256_RE.fullmatch(
-            str(active_binding.get("sha256") or "")
-        )
-        is None
-        or active_binding.get("sha256") != active_binding.get("raw_sha256")
-        or _ACTIVATION_SHA256_RE.fullmatch(
-            str(active_binding.get("release_bom_sha256") or "")
-        )
-        is None
-        or _ACTIVATION_SHA256_RE.fullmatch(
-            str(active_binding.get("runtime_manifest_sha256") or "")
-        )
-        is None
-        or any(
-            _ACTIVATION_SHA256_RE.fullmatch(str(active_binding.get(field) or ""))
-            is None
-            for field in (
-                "candidate_env_sha256",
-                "authorization_fingerprint",
-                "authorization_receipt_sha256",
-                "approval_evidence_sha256",
-            )
-        )
-        or not re.fullmatch(
-            r"[0-9a-f]{40}", str(active_binding.get("runtime_git_head") or "")
-        )
-        or not re.fullmatch(
-            r"[0-9a-f]{40}", str(active_binding.get("runtime_git_tree") or "")
-        )
-    ):
-        raise ValueError("exact_outbox_hold_active_binding_invalid")
-    tool_provenance = normalized.get("tool_provenance")
-    if (
-        not isinstance(tool_provenance, Mapping)
-        or _exact_canonical_sha256(tool_provenance)
-        != normalized["tool_provenance_sha256"]
-    ):
-        raise ValueError("exact_outbox_hold_tool_provenance_invalid")
-    if (
-        not isinstance(tool_provenance.get("git_clean"), bool)
-        or tool_provenance.get("git_clean") is not True
-        or not re.fullmatch(r"[0-9a-f]{40}", str(tool_provenance.get("git_head") or ""))
-        or not re.fullmatch(r"[0-9a-f]{40}", str(tool_provenance.get("git_tree") or ""))
-    ):
-        raise ValueError("exact_outbox_hold_tool_provenance_invalid")
-    runtime_provenance = tool_provenance.get("runtime_provenance")
-    runtime_plists = (
-        runtime_provenance.get("plists")
-        if isinstance(runtime_provenance, Mapping)
-        else None
-    )
-
-    def _valid_runtime_plists(value: Any) -> bool:
-        if not isinstance(value, list) or len(value) != len(EXACT_OUTBOX_RUNTIME_PLIST_LABELS):
-            return False
-        prefix = Path.home() / "Library" / "LaunchAgents"
-        for label, item in zip(EXACT_OUTBOX_RUNTIME_PLIST_LABELS, value, strict=True):
-            if not isinstance(item, Mapping) or item.get("label") != label:
-                return False
-            expected_path = prefix / f"{label}.plist"
-            if item.get("path") != str(expected_path):
-                return False
-            if (
-                item.get("present") is not True
-                or _ACTIVATION_SHA256_RE.fullmatch(str(item.get("sha256") or "")) is None
-                or isinstance(item.get("mode"), bool)
-                or not isinstance(item.get("mode"), int)
-                or isinstance(item.get("uid"), bool)
-                or not isinstance(item.get("uid"), int)
-                or item.get("nlink") != 1
-            ):
-                return False
-        return True
-
-    if (
-        not isinstance(runtime_provenance, Mapping)
-        or runtime_provenance.get("schema_version")
-        != EXACT_OUTBOX_RUNTIME_PROVENANCE_SCHEMA_VERSION
-        or not isinstance(runtime_provenance.get("manifest"), Mapping)
-        or runtime_provenance["manifest"].get("present") is not True
-        or not isinstance(runtime_provenance["manifest"].get("path"), str)
-        or not Path(runtime_provenance["manifest"]["path"]).is_absolute()
-        or _ACTIVATION_SHA256_RE.fullmatch(
-            str(runtime_provenance["manifest"].get("sha256") or "")
-        )
-        is None
-        or isinstance(runtime_provenance["manifest"].get("mode"), bool)
-        or not isinstance(runtime_provenance["manifest"].get("mode"), int)
-        or isinstance(runtime_provenance["manifest"].get("uid"), bool)
-        or not isinstance(runtime_provenance["manifest"].get("uid"), int)
-        or runtime_provenance["manifest"].get("nlink") != 1
-        or not isinstance(runtime_provenance.get("manifest_runtime_root"), str)
-        or not Path(runtime_provenance["manifest_runtime_root"]).is_absolute()
-        or not isinstance(runtime_provenance.get("manifest_runtime_release_target"), str)
-        or not runtime_provenance["manifest_runtime_release_target"]
-        or runtime_provenance.get("manifest_runtime_release_target")
-        != runtime_provenance.get("manifest_gateway_release_target")
-        or not re.fullmatch(
-            r"[0-9a-f]{40}", str(runtime_provenance.get("runtime_git_head") or "")
-        )
-        or not re.fullmatch(
-            r"[0-9a-f]{40}", str(runtime_provenance.get("runtime_git_tree") or "")
-        )
-        or runtime_provenance.get("runtime_git_head")
-        != runtime_provenance.get("manifest_commit")
-        or runtime_provenance.get("runtime_git_tree")
-        != runtime_provenance.get("manifest_tree")
-        or _ACTIVATION_SHA256_RE.fullmatch(
-            str(runtime_provenance.get("release_bom_sha256") or "")
-        )
-        is None
-        or not _valid_runtime_plists(runtime_plists)
-        or not isinstance(runtime_provenance.get("stable_target_registry"), Mapping)
-        or runtime_provenance["stable_target_registry"].get("present") is not True
-        or not isinstance(runtime_provenance["stable_target_registry"].get("path"), str)
-        or not Path(runtime_provenance["stable_target_registry"]["path"]).is_absolute()
-        or _ACTIVATION_SHA256_RE.fullmatch(
-            str(runtime_provenance["stable_target_registry"].get("sha256") or "")
-        )
-        is None
-        or runtime_provenance["stable_target_registry"].get("nlink") != 1
-        or runtime_provenance["launcher_source"].get("sha256")
-        != runtime_provenance["installed_launcher"].get("sha256")
-        or runtime_provenance["launcher_source"].get("size")
-        != runtime_provenance["installed_launcher"].get("size")
-    ):
-        raise ValueError("exact_outbox_hold_runtime_provenance_invalid")
-    if (
-        active_binding.get("release_bom_sha256")
-        != runtime_provenance.get("release_bom_sha256")
-        or active_binding.get("runtime_manifest_sha256")
-        != runtime_provenance["manifest"].get("sha256")
-        or active_binding.get("runtime_git_head")
-        != runtime_provenance.get("runtime_git_head")
-        or active_binding.get("runtime_git_tree")
-        != runtime_provenance.get("runtime_git_tree")
-        or active_binding.get("runtime_release_target")
-        != runtime_provenance.get("manifest_runtime_release_target")
-    ):
-        raise ValueError("exact_outbox_hold_active_binding_invalid")
-    resident_census = normalized.get("resident_census")
-    if (
-        not isinstance(resident_census, Mapping)
-        or resident_census.get("schema_version")
-        != "pnc_rca_exact_outbox_resident_census_v1"
-        or resident_census.get("all_unloaded") is not True
-        or resident_census.get("loaded_count") != 0
-        or resident_census.get("source_kind") != "launchctl_read_only_print"
-        or resident_census.get("domain") != f"gui/{os.getuid()}"
-        or not isinstance(resident_census.get("forbidden_labels"), list)
-        or not isinstance(resident_census.get("observations"), list)
-        or resident_census.get("forbidden_labels")
-        != [
-            "local.pnc.rca-kafka-consumer",
-            "local.pnc.rca-outbox-dispatcher",
-            "local.pnc.rca-delivery-collector",
-            "local.pnc.rca-delivery-dispatcher",
-            "local.pnc.completion-notice-relay",
-            "local.pnc.feishu-delivery-repair",
-        ]
-        or len(resident_census.get("observations"))
-        != len(resident_census.get("forbidden_labels"))
-        or any(
-            not isinstance(item, Mapping)
-            or item.get("label") != resident_census["forbidden_labels"][index]
-            or item.get("loaded") is not False
-            or item.get("returncode") != 113
-            or item.get("unloaded_proven") is not True
-            for index, item in enumerate(resident_census.get("observations", []))
-        )
-        or resident_census.get("loaded_labels") != []
-        or not isinstance(resident_census.get("source_sha256"), str)
-        or _ACTIVATION_SHA256_RE.fullmatch(resident_census["source_sha256"]) is None
-        or resident_census.get("source_sha256")
-        != _exact_canonical_sha256(
-            {
-                key: item
-                for key, item in resident_census.items()
-                if key != "source_sha256"
-            }
-        )
-    ):
-        raise ValueError("exact_outbox_hold_resident_census_invalid")
-    try:
-        resident_observed_at = datetime.fromisoformat(
-            str(resident_census["observed_at"]).replace("Z", "+00:00")
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("exact_outbox_hold_resident_census_invalid") from exc
-    if (
-        resident_observed_at.tzinfo is None
-        or resident_observed_at.utcoffset() != timedelta(0)
-        or _utc_datetime(resident_observed_at) < recorded
-        or _utc_datetime(resident_observed_at)
-        > datetime.now(timezone.utc)
-        + timedelta(seconds=EXACT_OUTBOX_HOLD_MAX_FUTURE_SKEW_SECONDS)
-    ):
-        raise ValueError("exact_outbox_hold_resident_census_invalid")
-    live_env_path = Path(active_binding["live_env_path"]).expanduser().absolute()
-    canonical_binding_path = (
-        live_env_path.parent
-        / "runtime"
-        / "pnc_agent"
-        / "feishu_issue_kafka_rca"
-        / "active-release-binding.json"
-    )
-    if (
-        resident_census["active_release_binding_path"]
-        != active_binding["path"]
-        or Path(resident_census["active_release_binding_path"])
-        .expanduser()
-        .absolute()
-        != canonical_binding_path
-    ):
-        raise ValueError("exact_outbox_hold_resident_census_invalid")
-    active_activation = normalized.get("active_activation")
-    if (
-        not isinstance(active_activation, Mapping)
-        or active_activation.get("configured") is not True
-        or active_activation.get("state") != "bounded_active"
-        or active_activation.get("is_current") != 1
-        or _ACTIVATION_SHA256_RE.fullmatch(
-            str(active_activation.get("sha256") or "")
-        )
-        is None
-        or any(
-            _ACTIVATION_SHA256_RE.fullmatch(str(active_activation.get(field) or ""))
-            is None
-            for field in (
-                "config_sha256",
-                "db_logical_identity_sha256",
-                "preproduction_fingerprint",
-                "preproduction_gate_receipt_sha256",
-            )
-        )
-        or not isinstance(active_activation.get("db_logical_identity"), Mapping)
-        or active_activation["db_logical_identity"].get("logical_store_id")
-        != "rca-control-primary"
-        or _exact_canonical_sha256(active_activation["db_logical_identity"])
-        != active_activation.get("db_logical_identity_sha256")
-        or active_activation.get("production_fingerprint") != ""
-        or active_activation.get("production_gate_receipt_sha256") != ""
-    ):
-        raise ValueError("exact_outbox_hold_activation_invalid")
-    if active_activation["sha256"] != _exact_canonical_sha256(
-        {
-            key: item
-            for key, item in active_activation.items()
-            if key != "sha256"
-        }
-    ):
-        raise ValueError("exact_outbox_hold_activation_invalid")
-    destination = normalized.get("destination_binding")
-    destination_path = normalized.get("destination_path")
-    if (
-        not isinstance(destination_path, str)
-        or not Path(destination_path).is_absolute()
-        or destination_path != str(Path(destination_path).absolute())
-        or hashlib.sha256(destination_path.encode("utf-8")).hexdigest()
-        != str(destination.get("path_sha256") if isinstance(destination, Mapping) else "")
-        or not isinstance(destination, Mapping)
-        or set(destination) != {"path_sha256", "parent_device", "parent_inode"}
-        or _ACTIVATION_SHA256_RE.fullmatch(str(destination.get("path_sha256") or ""))
-        is None
-        or isinstance(destination.get("parent_device"), bool)
-        or not isinstance(destination.get("parent_device"), int)
-        or isinstance(destination.get("parent_inode"), bool)
-        or not isinstance(destination.get("parent_inode"), int)
-        or destination.get("parent_device") < 1
-        or destination.get("parent_inode") < 1
-    ):
-        raise ValueError("exact_outbox_hold_destination_invalid")
-    for field, expected_id in (
-        ("target_before", normalized["target_outbox_id"]),
-        ("target_after", normalized["target_outbox_id"]),
-        ("predecessor", normalized["predecessor_outbox_id"]),
-    ):
-        item = normalized.get(field)
-        if (
-            not isinstance(item, Mapping)
-            or item.get("schema_version") != EXACT_OUTBOX_HOLD_ROW_SCHEMA_VERSION
-            or item.get("outbox_id") != expected_id
-            or _ACTIVATION_SHA256_RE.fullmatch(
-                str(item.get("row_sha256") or "")
-            )
-            is None
-        ):
-            raise ValueError("exact_outbox_hold_row_binding_invalid")
-    before = normalized["target_before"]
-    after = normalized["target_after"]
-    if (
-        before.get("status") != "pending"
-        or after.get("status") != "pending"
-        or before.get("attempt") != 0
-        or after.get("attempt") != 0
-        or before.get("fence") != 0
-        or after.get("fence") != 0
-        or before.get("next_attempt_at") is not None
-        or after.get("next_attempt_at") != EXACT_OUTBOX_HOLD_UNTIL
-        or after.get("updated_at") != recorded_at
-        or normalized["predecessor"].get("status") != "pending"
-        or normalized["predecessor"].get("attempt") != 0
-        or normalized["predecessor"].get("fence") != 0
-        or normalized["predecessor"].get("next_attempt_at") is not None
-        or before.get("activation_epoch_id") != active_activation.get("epoch_id")
-        or after.get("activation_epoch_id") != active_activation.get("epoch_id")
-        or normalized["predecessor"].get("activation_epoch_id")
-        != active_activation.get("epoch_id")
-    ):
-        raise ValueError("exact_outbox_hold_row_state_invalid")
-    for row in (before, after, normalized["predecessor"]):
-        for field in ("created_at", "retry_window_started_at"):
-            raw_timestamp = row.get(field)
-            if raw_timestamp is None:
-                if field == "created_at":
-                    raise ValueError("exact_outbox_hold_row_state_invalid")
-                continue
-            try:
-                parsed_timestamp = datetime.fromisoformat(
-                    str(raw_timestamp).replace("Z", "+00:00")
-                )
-            except (TypeError, ValueError) as exc:
-                raise ValueError("exact_outbox_hold_row_state_invalid") from exc
-            if (
-                parsed_timestamp.tzinfo is None
-                or parsed_timestamp.utcoffset() != timedelta(0)
-                or _utc_datetime(parsed_timestamp) > recorded
-            ):
-                raise ValueError("exact_outbox_hold_row_state_invalid")
-    mutable_after_fields = {"next_attempt_at", "updated_at", "row_sha256"}
-    if any(
-        before.get(field) != after.get(field)
-        for field in set(before) | set(after)
-        if field not in mutable_after_fields
-    ):
-        raise ValueError("exact_outbox_hold_row_state_invalid")
-    for field, expected_ids in (
-        (
-            "eligible_queue_before",
-            sorted(
-                [
-                    normalized["predecessor_outbox_id"],
-                    normalized["target_outbox_id"],
-                ]
-            ),
-        ),
-        ("eligible_queue_after", [normalized["predecessor_outbox_id"]]),
-    ):
-        item = normalized.get(field)
-        entries = item.get("entries") if isinstance(item, Mapping) else None
-        if (
-            not isinstance(item, Mapping)
-            or item.get("outbox_ids") != expected_ids
-            or not isinstance(entries, list)
-            or [entry.get("outbox_id") for entry in entries] != expected_ids
-            or any(
-                not isinstance(entry, Mapping)
-                or set(entry) != {"outbox_id", "row_sha256"}
-                or _ACTIVATION_SHA256_RE.fullmatch(
-                    str(entry.get("row_sha256") or "")
-                )
-                is None
-                for entry in entries
-            )
-            or _ACTIVATION_SHA256_RE.fullmatch(
-                str(item.get("sha256") or "")
-            )
-            is None
-            or item.get("sha256")
-            != _exact_canonical_sha256(
-                [
-                    {
-                        "outbox_id": int(entry["outbox_id"]),
-                        "row_sha256": str(entry["row_sha256"]),
-                    }
-                    for entry in entries
-                ]
-            )
-        ):
-            raise ValueError("exact_outbox_hold_queue_binding_invalid")
-    before_entries = normalized["eligible_queue_before"]["entries"]
-    after_entries = normalized["eligible_queue_after"]["entries"]
-    expected_before_sha = {
-        normalized["predecessor_outbox_id"]: normalized["predecessor"]["row_sha256"],
-        normalized["target_outbox_id"]: normalized["target_before"]["row_sha256"],
-    }
-    if (
-        any(
-            entry["row_sha256"] != expected_before_sha[entry["outbox_id"]]
-            for entry in before_entries
-        )
-        or after_entries[0]["row_sha256"]
-        != normalized["predecessor"]["row_sha256"]
-    ):
-        raise ValueError("exact_outbox_hold_queue_row_binding_invalid")
-    retry_horizon = normalized.get("retry_horizon")
-    if (
-        not isinstance(retry_horizon, Mapping)
-        or not isinstance(retry_horizon.get("anchor"), str)
-        or not isinstance(retry_horizon.get("expires_at"), str)
-        or retry_horizon.get("target_outbox_id")
-        != normalized["target_outbox_id"]
-        or retry_horizon.get("min_remaining_seconds")
-        != EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS
-        or retry_horizon.get("safety_headroom_seconds")
-        != EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS
-        or retry_horizon.get("record_max_age_seconds")
-        != EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS
-        or isinstance(retry_horizon.get("plan_remaining_seconds"), bool)
-        or not isinstance(retry_horizon.get("plan_remaining_seconds"), int)
-        or retry_horizon.get("plan_remaining_seconds")
-        < EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS
-        or (
-            retry_horizon.get("apply_remaining_seconds") is not None
-            and (
-                isinstance(retry_horizon.get("apply_remaining_seconds"), bool)
-                or not isinstance(retry_horizon.get("apply_remaining_seconds"), int)
-                or retry_horizon.get("apply_remaining_seconds")
-                < EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS
-            )
-        )
-    ):
-        raise ValueError("exact_outbox_hold_retry_horizon_invalid")
-    try:
-        anchor = datetime.fromisoformat(
-            str(retry_horizon["anchor"]).replace("Z", "+00:00")
-        )
-        expires = datetime.fromisoformat(
-            str(retry_horizon["expires_at"]).replace("Z", "+00:00")
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("exact_outbox_hold_retry_horizon_invalid") from exc
-    if (
-        anchor.tzinfo is None
-        or expires.tzinfo is None
-        or _utc_datetime(expires)
-        != _utc_datetime(anchor) + timedelta(seconds=max_age_seconds)
-        or _utc_datetime(expires) <= recorded
-        or int((_utc_datetime(expires) - _utc_datetime(recorded)).total_seconds())
-        < EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS
-        or retry_horizon["plan_remaining_seconds"]
-        != int((_utc_datetime(expires) - _utc_datetime(recorded)).total_seconds())
-    ):
-        raise ValueError("exact_outbox_hold_retry_horizon_invalid")
-    apply_observed_at = retry_horizon.get("apply_observed_at")
-    if apply_observed_at is not None:
-        try:
-            apply_observed = datetime.fromisoformat(
-                str(apply_observed_at).replace("Z", "+00:00")
-            )
-        except (TypeError, ValueError) as exc:
-            raise ValueError("exact_outbox_hold_retry_horizon_invalid") from exc
-        if (
-            apply_observed.tzinfo is None
-            or _utc_datetime(apply_observed) < _utc_datetime(recorded)
-            or int(
-                (_utc_datetime(expires) - _utc_datetime(apply_observed)).total_seconds()
-            )
-            != retry_horizon.get("apply_remaining_seconds")
-        ):
-            raise ValueError("exact_outbox_hold_retry_horizon_invalid")
-    effect_delta = normalized.get("effect_delta")
-    if (
-        not isinstance(effect_delta, Mapping)
-        or effect_delta.get("external_writes") != 0
-        or effect_delta.get("external_effects_triggered") is not False
-        or effect_delta.get("target_rows_updated") != 1
-        or effect_delta.get("control_meta_inserted") != 1
-        or effect_delta.get("business_trigger_rows_updated") != 0
-    ):
-        raise ValueError("exact_outbox_hold_effect_delta_invalid")
-    mutation = effect_delta["mutation"]
-    if (
-        mutation["next_attempt_at"] != EXACT_OUTBOX_HOLD_UNTIL
-        or mutation["next_attempt_at"] != after["next_attempt_at"]
-        or mutation["updated_at"] != recorded_at
-        or mutation["updated_at"] != after["updated_at"]
-    ):
-        raise ValueError("exact_outbox_hold_effect_delta_invalid")
-    fingerprint = normalized.get("receipt_fingerprint")
-    expected_plan_id = _exact_outbox_hold_plan_id(normalized)
-    expected_hold_id = _exact_canonical_sha256(
-        {
-            "plan_id": expected_plan_id,
-            "recorded_at": recorded_at,
-            "target_after_sha256": after["row_sha256"],
-        }
-    )
-    if (
-        normalized["plan_id"] != expected_plan_id
-        or normalized["hold_id"] != expected_hold_id
-        or not isinstance(fingerprint, str)
-        or _ACTIVATION_SHA256_RE.fullmatch(fingerprint) is None
-        or fingerprint != _exact_outbox_hold_fingerprint(normalized)
-    ):
-        raise ValueError("exact_outbox_hold_fingerprint_invalid")
-    try:
-        serialized = _exact_canonical_json(normalized)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("exact_outbox_hold_audit_json_invalid") from exc
-    if len(serialized.encode("utf-8")) > EXACT_OUTBOX_HOLD_MAX_AUDIT_BYTES:
-        raise ValueError("exact_outbox_hold_audit_too_large")
     return normalized
 
 
@@ -2640,15 +1068,7 @@ class ManualRcaAdmissionResult:
         }
 
 
-ActivationEpochState = Literal[
-    "safe_off",
-    "preauthorized",
-    "bounded_active",
-    "confirmed",
-    "steady_active",
-    "aborted",
-]
-ActivationAdmissionOutcome = Literal["admit", "join", "shadow", "reject"]
+ActivationAdmissionOutcome = Literal["admit", "join"]
 
 
 @dataclass(frozen=True)
@@ -2658,25 +1078,10 @@ class ActivationAdmissionDecision:
     decision: ActivationAdmissionOutcome
     reason: str
     ledger_id: int | None = None
-    slot_kind: str = ""
-    consumed_slot: bool = False
-    legacy_unconfigured: bool = False
-
-    @property
-    def creates_execution(self) -> bool:
-        return self.decision == "admit"
-
-    @property
-    def creates_shadow(self) -> bool:
-        return self.decision == "shadow"
 
 
 class ActivationEpochError(RuntimeError):
     """The durable production activation state rejected an unsafe mutation."""
-
-
-class CapacityTransitionStateError(RuntimeError):
-    """The durable capacity latch rejected an unsafe or stale transition."""
 
 
 class ManualRcaAdmissionError(ValueError):
@@ -2695,26 +1100,8 @@ class RecordProcessingBlockedError(RuntimeError):
         super().__init__(f"durable record processing blocked: {self.event_uid}")
 
 
-class ActivationIngressDeferredError(
-    ActivationEpochError, RecordProcessingBlockedError
-):
-    """Kafka must retain this exact offset until the activation fence advances."""
-
-    def __init__(self, event_uid: str, reason_code: str):
-        self.event_uid = str(event_uid)
-        self.reason_code = str(reason_code)
-        RuntimeError.__init__(
-            self,
-            f"durable record processing blocked: {self.event_uid}: {self.reason_code}",
-        )
-
-
 class StaleOutboxLeaseError(RuntimeError):
     """An outbox mutation was attempted without the current fencing token."""
-
-
-class ShadowPromotionError(RuntimeError):
-    """A shadow event could not be promoted under the single-event policy."""
 
 
 class ControlStoreCapacityError(RuntimeError):
@@ -2762,27 +1149,6 @@ class DispatcherCircuit:
     @property
     def is_open(self) -> bool:
         return self.state == "open"
-
-
-@dataclass(frozen=True)
-class ShadowPromotionResult:
-    event_uid: str
-    outbox_id: int
-    submission_key: str
-    status: str
-    promoted: bool
-    audit_id: int
-
-
-@dataclass(frozen=True)
-class ActivationDeferralResult:
-    event_uid: str
-    epoch_id: str
-    outbox_id: int
-    submission_key: str
-    prior_status: str
-    status: str
-    audit_id: int
 
 
 class RcaControlStore:
@@ -3125,204 +1491,6 @@ class RcaControlStore:
                     value TEXT NOT NULL
                 );
 
-                CREATE TABLE IF NOT EXISTS rca_capacity_transition_state (
-                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
-                    release_id TEXT NOT NULL,
-                    bootstrap_epoch_id TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK (state IN (
-                        'BOOTSTRAP_PRODUCTION', 'STEADY_ACTIVE'
-                    )),
-                    generation INTEGER NOT NULL CHECK (generation >= 1),
-                    final_ledger_sha256 TEXT,
-                    transition_authorization_sha256 TEXT,
-                    transition_authorization_fingerprint TEXT,
-                    transition_receipt_sha256 TEXT,
-                    transition_receipt_fingerprint TEXT,
-                    commit_marker_sha256 TEXT,
-                    commit_marker_fingerprint TEXT,
-                    evidence_bundle_sha256 TEXT,
-                    evidence_bundle_fingerprint TEXT,
-                    authorization_issued_at TEXT,
-                    authorization_expires_at TEXT,
-                    receipt_created_at TEXT,
-                    marker_committed_at TEXT,
-                    bootstrap_initialized_at TEXT NOT NULL,
-                    steady_activated_at TEXT,
-                    updated_at TEXT NOT NULL,
-                    CHECK (
-                        (
-                            state = 'BOOTSTRAP_PRODUCTION'
-                            AND final_ledger_sha256 IS NULL
-                            AND transition_authorization_sha256 IS NULL
-                            AND transition_authorization_fingerprint IS NULL
-                            AND transition_receipt_sha256 IS NULL
-                            AND transition_receipt_fingerprint IS NULL
-                            AND commit_marker_sha256 IS NULL
-                            AND commit_marker_fingerprint IS NULL
-                            AND evidence_bundle_sha256 IS NULL
-                            AND evidence_bundle_fingerprint IS NULL
-                            AND authorization_issued_at IS NULL
-                            AND authorization_expires_at IS NULL
-                            AND receipt_created_at IS NULL
-                            AND marker_committed_at IS NULL
-                            AND steady_activated_at IS NULL
-                        ) OR (
-                            state = 'STEADY_ACTIVE'
-                            AND final_ledger_sha256 IS NOT NULL
-                            AND transition_authorization_sha256 IS NOT NULL
-                            AND transition_authorization_fingerprint IS NOT NULL
-                            AND transition_receipt_sha256 IS NOT NULL
-                            AND transition_receipt_fingerprint IS NOT NULL
-                            AND commit_marker_sha256 IS NOT NULL
-                            AND commit_marker_fingerprint IS NOT NULL
-                            AND evidence_bundle_sha256 IS NOT NULL
-                            AND evidence_bundle_fingerprint IS NOT NULL
-                            AND authorization_issued_at IS NOT NULL
-                            AND authorization_expires_at IS NOT NULL
-                            AND receipt_created_at IS NOT NULL
-                            AND marker_committed_at IS NOT NULL
-                            AND steady_activated_at IS NOT NULL
-                        )
-                    )
-                );
-
-                CREATE TABLE IF NOT EXISTS rca_capacity_transition_audit (
-                    audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    release_id TEXT NOT NULL,
-                    bootstrap_epoch_id TEXT NOT NULL,
-                    from_state TEXT NOT NULL CHECK (from_state IN (
-                        'UNCONFIGURED', 'BOOTSTRAP_PRODUCTION'
-                    )),
-                    to_state TEXT NOT NULL CHECK (to_state IN (
-                        'BOOTSTRAP_PRODUCTION', 'STEADY_ACTIVE'
-                    )),
-                    from_generation INTEGER NOT NULL CHECK (from_generation >= 0),
-                    to_generation INTEGER NOT NULL CHECK (to_generation >= 1),
-                    final_ledger_sha256 TEXT,
-                    transition_authorization_sha256 TEXT,
-                    transition_authorization_fingerprint TEXT,
-                    transition_receipt_sha256 TEXT,
-                    transition_receipt_fingerprint TEXT,
-                    commit_marker_sha256 TEXT,
-                    commit_marker_fingerprint TEXT,
-                    evidence_bundle_sha256 TEXT,
-                    evidence_bundle_fingerprint TEXT,
-                    authorization_issued_at TEXT,
-                    authorization_expires_at TEXT,
-                    receipt_created_at TEXT,
-                    marker_committed_at TEXT,
-                    transitioned_at TEXT NOT NULL,
-                    UNIQUE (release_id, bootstrap_epoch_id, to_generation),
-                    CHECK (
-                        (
-                            to_state = 'BOOTSTRAP_PRODUCTION'
-                            AND from_state = 'UNCONFIGURED'
-                            AND from_generation = 0
-                            AND to_generation = 1
-                            AND final_ledger_sha256 IS NULL
-                            AND transition_authorization_sha256 IS NULL
-                            AND transition_authorization_fingerprint IS NULL
-                            AND transition_receipt_sha256 IS NULL
-                            AND transition_receipt_fingerprint IS NULL
-                            AND commit_marker_sha256 IS NULL
-                            AND commit_marker_fingerprint IS NULL
-                            AND evidence_bundle_sha256 IS NULL
-                            AND evidence_bundle_fingerprint IS NULL
-                            AND authorization_issued_at IS NULL
-                            AND authorization_expires_at IS NULL
-                            AND receipt_created_at IS NULL
-                            AND marker_committed_at IS NULL
-                        ) OR (
-                            to_state = 'STEADY_ACTIVE'
-                            AND from_state = 'BOOTSTRAP_PRODUCTION'
-                            AND to_generation = from_generation + 1
-                            AND final_ledger_sha256 IS NOT NULL
-                            AND transition_authorization_sha256 IS NOT NULL
-                            AND transition_authorization_fingerprint IS NOT NULL
-                            AND transition_receipt_sha256 IS NOT NULL
-                            AND transition_receipt_fingerprint IS NOT NULL
-                            AND commit_marker_sha256 IS NOT NULL
-                            AND commit_marker_fingerprint IS NOT NULL
-                            AND evidence_bundle_sha256 IS NOT NULL
-                            AND evidence_bundle_fingerprint IS NOT NULL
-                            AND authorization_issued_at IS NOT NULL
-                            AND authorization_expires_at IS NOT NULL
-                            AND receipt_created_at IS NOT NULL
-                            AND marker_committed_at IS NOT NULL
-                        )
-                    )
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_rca_capacity_transition_audit_time
-                    ON rca_capacity_transition_audit(transitioned_at, audit_id);
-
-                CREATE TRIGGER IF NOT EXISTS trg_rca_capacity_state_no_delete
-                BEFORE DELETE ON rca_capacity_transition_state
-                BEGIN
-                    SELECT RAISE(ABORT, 'rca_capacity_state_delete_forbidden');
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS trg_rca_capacity_state_no_replace
-                BEFORE INSERT ON rca_capacity_transition_state
-                WHEN EXISTS (SELECT 1 FROM rca_capacity_transition_state)
-                BEGIN
-                    SELECT RAISE(ABORT, 'rca_capacity_state_replace_forbidden');
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS trg_rca_capacity_state_identity_immutable
-                BEFORE UPDATE ON rca_capacity_transition_state
-                WHEN NEW.release_id != OLD.release_id
-                  OR NEW.bootstrap_epoch_id != OLD.bootstrap_epoch_id
-                  OR NEW.singleton_id != OLD.singleton_id
-                BEGIN
-                    SELECT RAISE(ABORT, 'rca_capacity_state_identity_immutable');
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS trg_rca_capacity_state_bootstrap_transition
-                BEFORE UPDATE ON rca_capacity_transition_state
-                WHEN OLD.state = 'BOOTSTRAP_PRODUCTION'
-                 AND NOT (
-                    NEW.state = 'STEADY_ACTIVE'
-                    AND NEW.generation = OLD.generation + 1
-                 )
-                BEGIN
-                    SELECT RAISE(ABORT, 'rca_capacity_state_transition_invalid');
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS trg_rca_capacity_state_steady_immutable
-                BEFORE UPDATE ON rca_capacity_transition_state
-                WHEN OLD.state = 'STEADY_ACTIVE'
-                BEGIN
-                    SELECT RAISE(ABORT, 'rca_capacity_state_steady_immutable');
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS trg_rca_capacity_audit_no_update
-                BEFORE UPDATE ON rca_capacity_transition_audit
-                BEGIN
-                    SELECT RAISE(ABORT, 'rca_capacity_audit_update_forbidden');
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS trg_rca_capacity_audit_no_delete
-                BEFORE DELETE ON rca_capacity_transition_audit
-                BEGIN
-                    SELECT RAISE(ABORT, 'rca_capacity_audit_delete_forbidden');
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS trg_rca_capacity_audit_no_replace
-                BEFORE INSERT ON rca_capacity_transition_audit
-                WHEN EXISTS (
-                    SELECT 1 FROM rca_capacity_transition_audit
-                     WHERE audit_id = NEW.audit_id
-                        OR (
-                            release_id = NEW.release_id
-                            AND bootstrap_epoch_id = NEW.bootstrap_epoch_id
-                            AND to_generation = NEW.to_generation
-                        )
-                )
-                BEGIN
-                    SELECT RAISE(ABORT, 'rca_capacity_audit_replace_forbidden');
-                END;
-
                 CREATE TABLE IF NOT EXISTS rca_activation_epochs (
                     epoch_id TEXT PRIMARY KEY,
                     state TEXT NOT NULL CHECK (state IN (
@@ -3377,33 +1545,6 @@ class RcaControlStore:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_rca_single_current_activation_epoch
                     ON rca_activation_epochs(is_current) WHERE is_current = 1;
 
-                CREATE TABLE IF NOT EXISTS rca_activation_budget_slots (
-                    epoch_id TEXT NOT NULL,
-                    slot_kind TEXT NOT NULL CHECK (slot_kind IN (
-                        'kafka_success', 'manual_success',
-                        'manual_terminal_failure'
-                    )),
-                    authorized_source_kind TEXT CHECK (
-                        authorized_source_kind IN ('kafka', 'manual')
-                    ),
-                    authorized_identity_sha256 TEXT,
-                    authorized_at TEXT,
-                    authorized_operator TEXT,
-                    authorized_reason TEXT,
-                    consumed_ledger_id INTEGER UNIQUE,
-                    consumed_at TEXT,
-                    PRIMARY KEY(epoch_id, slot_kind),
-                    FOREIGN KEY(epoch_id) REFERENCES rca_activation_epochs(epoch_id),
-                    FOREIGN KEY(consumed_ledger_id)
-                        REFERENCES rca_activation_admission_ledger(ledger_id)
-                );
-
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_rca_activation_slot_identity
-                    ON rca_activation_budget_slots(
-                        epoch_id, authorized_source_kind, authorized_identity_sha256
-                    )
-                    WHERE authorized_identity_sha256 IS NOT NULL;
-
                 CREATE TABLE IF NOT EXISTS rca_activation_admission_ledger (
                     ledger_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     epoch_id TEXT NOT NULL,
@@ -3413,10 +1554,6 @@ class RcaControlStore:
                     )),
                     source_kind TEXT NOT NULL CHECK (source_kind IN ('kafka', 'manual')),
                     source_identity_sha256 TEXT NOT NULL,
-                    slot_kind TEXT CHECK (slot_kind IN (
-                        'kafka_success', 'manual_success',
-                        'manual_terminal_failure'
-                    )),
                     decision TEXT NOT NULL CHECK (
                         decision IN ('admit', 'join', 'shadow', 'reject')
                     ),
@@ -3481,7 +1618,6 @@ class RcaControlStore:
                     activation_ingress_state TEXT NOT NULL DEFAULT 'legacy_unconfigured',
                     activation_required INTEGER NOT NULL DEFAULT 0
                         CHECK (activation_required IN (0, 1)),
-                    activation_slot_kind TEXT,
                     activation_source_identity_sha256 TEXT NOT NULL DEFAULT '',
                     rearm_reason TEXT NOT NULL DEFAULT '',
                     processing_attempts INTEGER NOT NULL DEFAULT 0,
@@ -3707,7 +1843,6 @@ class RcaControlStore:
             # The source backfill below may classify post-cutoff stock rows;
             # install its durable target schema before invoking that path.
             self._create_v12_learning_lane_schema(conn)
-            self._create_v13_historical_outbox_hold_schema(conn)
             self._create_v14_terminal_rerun_delivery_authority_schema(conn)
             self._create_historical_epoch_rerun_delivery_authority_schema(conn)
             if self._learning_delivery_schema_present(conn):
@@ -3786,7 +1921,6 @@ class RcaControlStore:
             )
             self._create_v11_snapshot_schema(conn)
             self._create_v12_learning_lane_schema(conn)
-            self._create_v13_historical_outbox_hold_schema(conn)
             self._create_v14_terminal_rerun_delivery_authority_schema(conn)
             self._create_historical_epoch_rerun_delivery_authority_schema(conn)
             self._validate_structural_contract(
@@ -3892,7 +2026,7 @@ class RcaControlStore:
             conn.close()
 
     def _migrate_v12_to_v13(self) -> bool:
-        """Install the immutable historical-outbox hold and disposition schema."""
+        """Advance the legacy marker without installing retired hold schema."""
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -3910,8 +2044,6 @@ class RcaControlStore:
             if marker_value != "pnc_rca_control_store_v12":
                 raise RuntimeError("incompatible_control_store_schema:version_marker")
             self._validate_v12_learning_lane_schema(conn)
-            self._drop_v13_historical_outbox_hold_triggers(conn)
-            self._create_v13_historical_outbox_hold_schema(conn)
             self._validate_structural_contract(conn, integrity_check=True)
             updated = conn.execute(
                 "UPDATE control_meta SET value = ? "
@@ -3944,7 +2076,6 @@ class RcaControlStore:
                 return False
             if marker_value != "pnc_rca_control_store_v13":
                 raise RuntimeError("incompatible_control_store_schema:version_marker")
-            self._validate_v13_historical_outbox_hold_schema(conn)
             self._create_v14_terminal_rerun_delivery_authority_schema(conn)
             self._create_historical_epoch_rerun_delivery_authority_schema(conn)
             self._validate_structural_contract(conn, integrity_check=True)
@@ -5096,615 +3227,6 @@ class RcaControlStore:
                 )
 
     @staticmethod
-    def _v13_historical_outbox_hold_trigger_names() -> tuple[str, ...]:
-        return (
-            "trg_activation_historical_hold_no_update",
-            "trg_activation_historical_hold_no_delete",
-            "trg_activation_historical_hold_no_replace",
-            "trg_activation_historical_hold_item_no_append",
-            "trg_activation_historical_hold_item_no_update",
-            "trg_activation_historical_hold_item_no_delete",
-            "trg_activation_historical_disposition_no_update",
-            "trg_activation_historical_disposition_no_delete",
-            "trg_activation_historical_disposition_no_replace",
-            "trg_activation_historical_disposition_item_no_append",
-            "trg_activation_historical_disposition_item_no_update",
-            "trg_activation_historical_disposition_item_no_delete",
-            "trg_activation_historical_outbox_no_update",
-            "trg_activation_historical_outbox_disposition_guard",
-            "trg_activation_historical_outbox_no_delete",
-        )
-
-    @staticmethod
-    def _v13_historical_outbox_hold_schema_statements() -> tuple[str, ...]:
-        immutable_guard = " OR ".join(
-            f"NEW.{field} IS NOT OLD.{field}"
-            for field in ACTIVATION_HISTORICAL_OUTBOX_IMMUTABLE_ROW_FIELDS
-        )
-        return (
-            f"""
-            CREATE TABLE IF NOT EXISTS rca_activation_historical_outbox_holds (
-                epoch_id TEXT PRIMARY KEY,
-                schema_version TEXT NOT NULL CHECK(
-                    schema_version =
-                        '{ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION}'
-                ),
-                partition_start_fence_sha256 TEXT NOT NULL CHECK(
-                    length(partition_start_fence_sha256) = 64
-                    AND partition_start_fence_sha256 NOT GLOB '*[^0-9a-f]*'
-                ),
-                cohort_count INTEGER NOT NULL CHECK(cohort_count >= 0),
-                cohort_sha256 TEXT NOT NULL CHECK(
-                    length(cohort_sha256) = 64
-                    AND cohort_sha256 NOT GLOB '*[^0-9a-f]*'
-                ),
-                sealed_at TEXT NOT NULL CHECK(length(trim(sealed_at)) > 0),
-                FOREIGN KEY(epoch_id) REFERENCES rca_activation_epochs(epoch_id)
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS
-                rca_activation_historical_outbox_hold_items (
-                    epoch_id TEXT NOT NULL,
-                    outbox_id INTEGER NOT NULL,
-                    row_sha256 TEXT NOT NULL CHECK(
-                        length(row_sha256) = 64
-                        AND row_sha256 NOT GLOB '*[^0-9a-f]*'
-                    ),
-                    immutable_row_sha256 TEXT NOT NULL CHECK(
-                        length(immutable_row_sha256) = 64
-                        AND immutable_row_sha256 NOT GLOB '*[^0-9a-f]*'
-                    ),
-                    PRIMARY KEY(epoch_id, outbox_id),
-                    FOREIGN KEY(epoch_id)
-                        REFERENCES rca_activation_historical_outbox_holds(epoch_id),
-                    FOREIGN KEY(outbox_id) REFERENCES rca_outbox(outbox_id)
-                )
-            """,
-            f"""
-            CREATE TABLE IF NOT EXISTS
-                rca_activation_historical_outbox_dispositions (
-                    disposition_id TEXT PRIMARY KEY CHECK(
-                        disposition_id = 'rca-hold-disposition-v1-' || disposition_sha256
-                    ),
-                    epoch_id TEXT NOT NULL UNIQUE,
-                    epoch_state TEXT NOT NULL CHECK(epoch_state = 'aborted'),
-                    schema_version TEXT NOT NULL CHECK(
-                        schema_version =
-                            '{ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_SCHEMA_VERSION}'
-                    ),
-                    hold_schema_version TEXT NOT NULL CHECK(
-                        hold_schema_version =
-                            '{ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION}'
-                    ),
-                    row_schema_version TEXT NOT NULL CHECK(
-                        row_schema_version =
-                            '{ACTIVATION_HISTORICAL_OUTBOX_ROW_SCHEMA_VERSION}'
-                    ),
-                    cohort_count INTEGER NOT NULL CHECK(cohort_count >= 0),
-                    cohort_sha256 TEXT NOT NULL CHECK(
-                        length(cohort_sha256) = 64
-                        AND cohort_sha256 NOT GLOB '*[^0-9a-f]*'
-                    ),
-                    owner_authorized INTEGER NOT NULL CHECK(owner_authorized = 1),
-                    operator TEXT NOT NULL CHECK(length(trim(operator)) > 0),
-                    reason TEXT NOT NULL CHECK(length(trim(reason)) > 0),
-                    disposed_at TEXT NOT NULL CHECK(length(trim(disposed_at)) > 0),
-                    disposition_sha256 TEXT NOT NULL UNIQUE CHECK(
-                        length(disposition_sha256) = 64
-                        AND disposition_sha256 NOT GLOB '*[^0-9a-f]*'
-                    ),
-                    FOREIGN KEY(epoch_id)
-                        REFERENCES rca_activation_historical_outbox_holds(epoch_id)
-                )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS
-                rca_activation_historical_outbox_disposition_items (
-                    disposition_id TEXT NOT NULL,
-                    outbox_id INTEGER NOT NULL,
-                    row_sha256 TEXT NOT NULL CHECK(
-                        length(row_sha256) = 64
-                        AND row_sha256 NOT GLOB '*[^0-9a-f]*'
-                    ),
-                    immutable_row_sha256 TEXT NOT NULL CHECK(
-                        length(immutable_row_sha256) = 64
-                        AND immutable_row_sha256 NOT GLOB '*[^0-9a-f]*'
-                    ),
-                    PRIMARY KEY(disposition_id, outbox_id),
-                    FOREIGN KEY(disposition_id) REFERENCES
-                        rca_activation_historical_outbox_dispositions(disposition_id),
-                    FOREIGN KEY(outbox_id) REFERENCES rca_outbox(outbox_id)
-                )
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS trg_activation_historical_hold_no_update
-            BEFORE UPDATE ON rca_activation_historical_outbox_holds
-            BEGIN
-                SELECT RAISE(
-                    ABORT, 'activation_historical_hold_seal_update_forbidden'
-                );
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS trg_activation_historical_hold_no_delete
-            BEFORE DELETE ON rca_activation_historical_outbox_holds
-            BEGIN
-                SELECT RAISE(
-                    ABORT, 'activation_historical_hold_seal_delete_forbidden'
-                );
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS trg_activation_historical_hold_no_replace
-            BEFORE INSERT ON rca_activation_historical_outbox_holds
-            WHEN EXISTS (
-                SELECT 1 FROM rca_activation_historical_outbox_holds
-                 WHERE epoch_id = NEW.epoch_id
-            )
-            BEGIN
-                SELECT RAISE(
-                    ABORT, 'activation_historical_hold_seal_replace_forbidden'
-                );
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS
-                trg_activation_historical_hold_item_no_append
-            BEFORE INSERT ON rca_activation_historical_outbox_hold_items
-            WHEN (
-                SELECT COUNT(*)
-                  FROM rca_activation_historical_outbox_hold_items
-                 WHERE epoch_id = NEW.epoch_id
-            ) >= (
-                SELECT cohort_count
-                  FROM rca_activation_historical_outbox_holds
-                 WHERE epoch_id = NEW.epoch_id
-            )
-            BEGIN
-                SELECT RAISE(
-                    ABORT, 'activation_historical_hold_item_append_forbidden'
-                );
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS
-                trg_activation_historical_hold_item_no_update
-            BEFORE UPDATE ON rca_activation_historical_outbox_hold_items
-            BEGIN
-                SELECT RAISE(
-                    ABORT, 'activation_historical_hold_item_update_forbidden'
-                );
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS
-                trg_activation_historical_hold_item_no_delete
-            BEFORE DELETE ON rca_activation_historical_outbox_hold_items
-            BEGIN
-                SELECT RAISE(
-                    ABORT, 'activation_historical_hold_item_delete_forbidden'
-                );
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS
-                trg_activation_historical_disposition_no_update
-            BEFORE UPDATE ON rca_activation_historical_outbox_dispositions
-            BEGIN
-                SELECT RAISE(
-                    ABORT, 'activation_historical_disposition_update_forbidden'
-                );
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS
-                trg_activation_historical_disposition_no_delete
-            BEFORE DELETE ON rca_activation_historical_outbox_dispositions
-            BEGIN
-                SELECT RAISE(
-                    ABORT, 'activation_historical_disposition_delete_forbidden'
-                );
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS
-                trg_activation_historical_disposition_no_replace
-            BEFORE INSERT ON rca_activation_historical_outbox_dispositions
-            WHEN EXISTS (
-                SELECT 1 FROM rca_activation_historical_outbox_dispositions
-                 WHERE disposition_id = NEW.disposition_id
-                    OR epoch_id = NEW.epoch_id
-                    OR disposition_sha256 = NEW.disposition_sha256
-            )
-            BEGIN
-                SELECT RAISE(
-                    ABORT, 'activation_historical_disposition_replace_forbidden'
-                );
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS
-                trg_activation_historical_disposition_item_no_append
-            BEFORE INSERT ON rca_activation_historical_outbox_disposition_items
-            WHEN (
-                SELECT COUNT(*)
-                  FROM rca_activation_historical_outbox_disposition_items
-                 WHERE disposition_id = NEW.disposition_id
-            ) >= (
-                SELECT cohort_count
-                  FROM rca_activation_historical_outbox_dispositions
-                 WHERE disposition_id = NEW.disposition_id
-            )
-            BEGIN
-                SELECT RAISE(
-                    ABORT, 'activation_historical_disposition_item_append_forbidden'
-                );
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS
-                trg_activation_historical_disposition_item_no_update
-            BEFORE UPDATE ON rca_activation_historical_outbox_disposition_items
-            BEGIN
-                SELECT RAISE(
-                    ABORT, 'activation_historical_disposition_item_update_forbidden'
-                );
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS
-                trg_activation_historical_disposition_item_no_delete
-            BEFORE DELETE ON rca_activation_historical_outbox_disposition_items
-            BEGIN
-                SELECT RAISE(
-                    ABORT, 'activation_historical_disposition_item_delete_forbidden'
-                );
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS trg_activation_historical_outbox_no_update
-            BEFORE UPDATE ON rca_outbox
-            WHEN EXISTS (
-                SELECT 1
-                  FROM rca_activation_historical_outbox_hold_items AS held
-                 WHERE held.outbox_id = OLD.outbox_id
-                   AND NOT EXISTS (
-                       SELECT 1
-                         FROM rca_activation_historical_outbox_disposition_items AS disposed
-                        WHERE disposed.outbox_id = held.outbox_id
-                   )
-            )
-            BEGIN
-                SELECT RAISE(
-                    ABORT, 'activation_historical_outbox_update_forbidden'
-                );
-            END
-            """,
-            f"""
-            CREATE TRIGGER IF NOT EXISTS
-                trg_activation_historical_outbox_disposition_guard
-            BEFORE UPDATE ON rca_outbox
-            WHEN EXISTS (
-                SELECT 1
-                  FROM rca_activation_historical_outbox_disposition_items AS disposed
-                 WHERE disposed.outbox_id = OLD.outbox_id
-            ) AND NOT (
-                OLD.status = 'pending'
-                AND NEW.status = 'quarantined'
-                AND NEW.next_attempt_at IS NULL
-                AND NEW.lease_token IS NULL
-                AND NEW.lease_owner IS NULL
-                AND NEW.lease_expires_at IS NULL
-                AND NEW.claimed_at IS NULL
-                AND NEW.completed_at IS NULL
-                AND NEW.result_json IS NULL
-                AND NEW.quarantined_at IS NOT NULL
-                AND NEW.updated_at = NEW.quarantined_at
-                AND NEW.last_error_code =
-                    '{ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_ERROR_CODE}'
-                AND NEW.last_error_detail = 'owner_audited_disposition'
-                AND NOT ({immutable_guard})
-                AND EXISTS (
-                    SELECT 1
-                      FROM rca_activation_historical_outbox_disposition_items AS disposed
-                      JOIN rca_activation_historical_outbox_dispositions AS disposition
-                        ON disposition.disposition_id = disposed.disposition_id
-                      JOIN rca_activation_historical_outbox_hold_items AS held
-                        ON held.epoch_id = disposition.epoch_id
-                       AND held.outbox_id = disposed.outbox_id
-                       AND held.row_sha256 = disposed.row_sha256
-                       AND held.immutable_row_sha256 =
-                           disposed.immutable_row_sha256
-                     WHERE disposed.outbox_id = OLD.outbox_id
-                       AND disposition.disposed_at = NEW.quarantined_at
-                )
-            )
-            BEGIN
-                SELECT RAISE(
-                    ABORT, 'activation_historical_disposed_outbox_update_forbidden'
-                );
-            END
-            """,
-            """
-            CREATE TRIGGER IF NOT EXISTS trg_activation_historical_outbox_no_delete
-            BEFORE DELETE ON rca_outbox
-            WHEN EXISTS (
-                SELECT 1
-                  FROM rca_activation_historical_outbox_hold_items AS held
-                 WHERE held.outbox_id = OLD.outbox_id
-            )
-            BEGIN
-                SELECT RAISE(
-                    ABORT, 'activation_historical_outbox_delete_forbidden'
-                );
-            END
-            """,
-        )
-
-    @classmethod
-    def _drop_v13_historical_outbox_hold_triggers(
-        cls,
-        conn: sqlite3.Connection,
-    ) -> None:
-        for name in cls._v13_historical_outbox_hold_trigger_names():
-            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
-
-    @classmethod
-    def _create_v13_historical_outbox_hold_schema(
-        cls,
-        conn: sqlite3.Connection,
-    ) -> None:
-        """Create immutable per-epoch seals and owner-audited disposition records."""
-        for statement in cls._v13_historical_outbox_hold_schema_statements():
-            conn.execute(statement)
-
-    @classmethod
-    def _validate_v13_historical_outbox_hold_schema(
-        cls,
-        conn: sqlite3.Connection,
-    ) -> None:
-        normalize_sql = lambda value: " ".join(str(value).split()).rstrip(";")
-        statements = cls._v13_historical_outbox_hold_schema_statements()
-        expected_tables: dict[str, str] = {}
-        expected_triggers: dict[str, str] = {}
-        for statement in statements:
-            normalized = normalize_sql(statement)
-            if normalized.startswith("CREATE TABLE IF NOT EXISTS "):
-                name = normalized[len("CREATE TABLE IF NOT EXISTS ") :].split(" ", 1)[0]
-                expected_tables[name] = normalized.replace(
-                    "CREATE TABLE IF NOT EXISTS ", "CREATE TABLE ", 1
-                )
-            elif normalized.startswith("CREATE TRIGGER IF NOT EXISTS "):
-                name = normalized[len("CREATE TRIGGER IF NOT EXISTS ") :].split(" ", 1)[0]
-                expected_triggers[name] = normalized.replace(
-                    "CREATE TRIGGER IF NOT EXISTS ", "CREATE TRIGGER ", 1
-                )
-        observed_tables = {
-            str(row["name"]): normalize_sql(row["sql"] or "")
-            for row in conn.execute(
-                "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
-            if str(row["name"]) in expected_tables
-        }
-        historical_table_names = {
-            str(row["name"])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' "
-                "AND name LIKE 'rca_activation_historical_outbox_%'"
-            ).fetchall()
-        }
-        if (
-            observed_tables != expected_tables
-            or historical_table_names != set(expected_tables)
-        ):
-            raise RuntimeError(
-                "incompatible_control_store_schema:historical_outbox_hold_table_sql"
-            )
-        observed_triggers = {
-            str(row["name"]): normalize_sql(row["sql"] or "")
-            for row in conn.execute(
-                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
-            ).fetchall()
-            if str(row["name"]) in expected_triggers
-        }
-        historical_trigger_names = {
-            str(row["name"])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
-                "AND name LIKE 'trg_activation_historical_%'"
-            ).fetchall()
-        }
-        if (
-            observed_triggers != expected_triggers
-            or historical_trigger_names != set(expected_triggers)
-        ):
-            raise RuntimeError(
-                "incompatible_control_store_schema:historical_outbox_hold_trigger_sql"
-            )
-
-        orphan = conn.execute(
-            """
-            SELECT 1
-              FROM rca_activation_historical_outbox_dispositions AS disposition
-         LEFT JOIN rca_activation_historical_outbox_holds AS held
-                ON held.epoch_id = disposition.epoch_id
-             WHERE held.epoch_id IS NULL
-             LIMIT 1
-            """
-        ).fetchone()
-        if orphan is not None:
-            raise RuntimeError(
-                "incompatible_control_store_schema:historical_outbox_disposition_orphan"
-            )
-        orphan_hold_item = conn.execute(
-            """
-            SELECT 1
-              FROM rca_activation_historical_outbox_hold_items AS item
-         LEFT JOIN rca_activation_historical_outbox_holds AS held
-                ON held.epoch_id = item.epoch_id
-         LEFT JOIN rca_outbox AS outbox
-                ON outbox.outbox_id = item.outbox_id
-             WHERE held.epoch_id IS NULL OR outbox.outbox_id IS NULL
-             LIMIT 1
-            """
-        ).fetchone()
-        if orphan_hold_item is not None:
-            raise RuntimeError(
-                "incompatible_control_store_schema:historical_outbox_hold_item_orphan"
-            )
-        orphan_disposition_item = conn.execute(
-            """
-            SELECT 1
-              FROM rca_activation_historical_outbox_disposition_items AS item
-         LEFT JOIN rca_activation_historical_outbox_dispositions AS disposition
-                ON disposition.disposition_id = item.disposition_id
-         LEFT JOIN rca_outbox AS outbox
-                ON outbox.outbox_id = item.outbox_id
-             WHERE disposition.disposition_id IS NULL
-                OR outbox.outbox_id IS NULL
-             LIMIT 1
-            """
-        ).fetchone()
-        if orphan_disposition_item is not None:
-            raise RuntimeError(
-                "incompatible_control_store_schema:"
-                "historical_outbox_disposition_item_orphan"
-            )
-        for hold in conn.execute(
-            "SELECT * FROM rca_activation_historical_outbox_holds ORDER BY epoch_id"
-        ).fetchall():
-            epoch = conn.execute(
-                "SELECT state, partition_start_fence_sha256 "
-                "FROM rca_activation_epochs WHERE epoch_id = ?",
-                (hold["epoch_id"],),
-            ).fetchone()
-            if (
-                epoch is None
-                or str(hold["schema_version"])
-                != ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION
-                or str(hold["partition_start_fence_sha256"])
-                != str(epoch["partition_start_fence_sha256"])
-            ):
-                raise RuntimeError(
-                    "incompatible_control_store_schema:historical_outbox_hold_binding"
-                )
-            items = [
-                {
-                    "outbox_id": int(row["outbox_id"]),
-                    "row_sha256": str(row["row_sha256"]),
-                    "immutable_row_sha256": str(row["immutable_row_sha256"]),
-                }
-                for row in conn.execute(
-                    "SELECT outbox_id, row_sha256, immutable_row_sha256 "
-                    "FROM rca_activation_historical_outbox_hold_items "
-                    "WHERE epoch_id = ? ORDER BY outbox_id",
-                    (hold["epoch_id"],),
-                ).fetchall()
-            ]
-            if len(items) != int(hold["cohort_count"]) or _canonical_sha256(
-                items
-            ) != str(hold["cohort_sha256"]):
-                raise RuntimeError(
-                    "incompatible_control_store_schema:historical_outbox_hold_seal"
-                )
-            disposition = conn.execute(
-                "SELECT * FROM rca_activation_historical_outbox_dispositions "
-                "WHERE epoch_id = ?",
-                (hold["epoch_id"],),
-            ).fetchone()
-            if disposition is None:
-                for item in items:
-                    outbox = conn.execute(
-                        "SELECT * FROM rca_outbox WHERE outbox_id = ?",
-                        (item["outbox_id"],),
-                    ).fetchone()
-                    if (
-                        outbox is None
-                        or cls._historical_outbox_row_sha256(outbox)
-                        != item["row_sha256"]
-                        or cls._historical_outbox_immutable_row_sha256(outbox)
-                        != item["immutable_row_sha256"]
-                    ):
-                        raise RuntimeError(
-                            "incompatible_control_store_schema:"
-                            "historical_outbox_hold_row_binding"
-                        )
-                continue
-            if str(epoch["state"]) != "aborted":
-                raise RuntimeError(
-                    "incompatible_control_store_schema:"
-                    "historical_outbox_disposition_epoch_state"
-                )
-            disposed_items = [
-                {
-                    "outbox_id": int(row["outbox_id"]),
-                    "row_sha256": str(row["row_sha256"]),
-                    "immutable_row_sha256": str(row["immutable_row_sha256"]),
-                }
-                for row in conn.execute(
-                    "SELECT outbox_id, row_sha256, immutable_row_sha256 "
-                    "FROM rca_activation_historical_outbox_disposition_items "
-                    "WHERE disposition_id = ? ORDER BY outbox_id",
-                    (disposition["disposition_id"],),
-                ).fetchall()
-            ]
-            binding = cls._historical_outbox_disposition_binding(
-                epoch_id=str(disposition["epoch_id"]),
-                cohort_count=int(disposition["cohort_count"]),
-                cohort_sha256=str(disposition["cohort_sha256"]),
-                operator=str(disposition["operator"]),
-                reason=str(disposition["reason"]),
-                disposed_at=str(disposition["disposed_at"]),
-            )
-            disposition_sha256 = _canonical_sha256(binding)
-            if (
-                str(disposition["schema_version"])
-                != ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_SCHEMA_VERSION
-                or str(disposition["epoch_id"]) != str(hold["epoch_id"])
-                or str(disposition["epoch_state"]) != "aborted"
-                or str(disposition["hold_schema_version"])
-                != ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION
-                or str(disposition["row_schema_version"])
-                != ACTIVATION_HISTORICAL_OUTBOX_ROW_SCHEMA_VERSION
-                or int(disposition["cohort_count"]) != int(hold["cohort_count"])
-                or str(disposition["cohort_sha256"]) != str(hold["cohort_sha256"])
-                or int(disposition["owner_authorized"]) != 1
-                or disposed_items != items
-                or str(disposition["disposition_sha256"]) != disposition_sha256
-                or str(disposition["disposition_id"])
-                != f"rca-hold-disposition-v1-{disposition_sha256}"
-            ):
-                raise RuntimeError(
-                    "incompatible_control_store_schema:"
-                    "historical_outbox_disposition_binding"
-                )
-            for item in disposed_items:
-                outbox = conn.execute(
-                    "SELECT * FROM rca_outbox WHERE outbox_id = ?",
-                    (item["outbox_id"],),
-                ).fetchone()
-                if (
-                    outbox is None
-                    or cls._historical_outbox_immutable_row_sha256(outbox)
-                    != item["immutable_row_sha256"]
-                    or str(outbox["status"]) != "quarantined"
-                    or outbox["next_attempt_at"] is not None
-                    or str(outbox["quarantined_at"] or "")
-                    != str(disposition["disposed_at"])
-                    or str(outbox["last_error_code"] or "")
-                    != ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_ERROR_CODE
-                    or str(outbox["last_error_detail"] or "")
-                    != "owner_audited_disposition"
-                    or str(outbox["updated_at"] or "")
-                    != str(disposition["disposed_at"])
-                ):
-                    raise RuntimeError(
-                        "incompatible_control_store_schema:"
-                        "historical_outbox_disposition_row_binding"
-                    )
-
-    @staticmethod
     def _v14_terminal_rerun_delivery_authority_trigger_names() -> tuple[str, ...]:
         return (
             "trg_terminal_rerun_delivery_authority_no_update",
@@ -5981,7 +3503,7 @@ class RcaControlStore:
                    AND ledger.generation = NEW.generation
                    AND ledger.bound_at IS NOT NULL
                    AND epoch.is_current = 1
-                   AND epoch.state IN ('bounded_active', 'steady_active')
+                   AND epoch.state = 'steady_active'
             )
             BEGIN
                 SELECT RAISE(
@@ -6768,7 +4290,6 @@ class RcaControlStore:
             conn.execute("BEGIN")
             self._validate_structural_contract(conn, integrity_check=False)
             self._validate_v12_learning_lane_schema(conn)
-            self._validate_v13_historical_outbox_hold_schema(conn)
             self._validate_v14_terminal_rerun_delivery_authority_schema(conn)
             self._validate_historical_epoch_rerun_delivery_authority_schema(conn)
             conn.commit()
@@ -6801,200 +4322,6 @@ class RcaControlStore:
         return normalized
 
     @staticmethod
-    def _normalize_capacity_identity(value: str, field: str) -> str:
-        normalized = str(value or "").strip()
-        if _ACTIVATION_EPOCH_ID_RE.fullmatch(normalized) is None:
-            raise CapacityTransitionStateError(f"capacity_{field}_invalid")
-        return normalized
-
-    @staticmethod
-    def _normalize_capacity_sha256(value: str, field: str) -> str:
-        normalized = str(value or "").strip().lower()
-        if _ACTIVATION_SHA256_RE.fullmatch(normalized) is None:
-            raise CapacityTransitionStateError(f"capacity_{field}_invalid")
-        return normalized
-
-    @staticmethod
-    def _normalize_capacity_timestamp(value: str, field: str) -> str:
-        text = str(value or "").strip()
-        candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
-        try:
-            parsed = datetime.fromisoformat(candidate)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise CapacityTransitionStateError(f"capacity_{field}_invalid") from exc
-        if parsed.tzinfo is None or parsed.utcoffset() is None:
-            raise CapacityTransitionStateError(f"capacity_{field}_invalid")
-        return parsed.astimezone(timezone.utc).isoformat()
-
-    @staticmethod
-    def _capacity_transition_state_tx(
-        conn: sqlite3.Connection,
-    ) -> sqlite3.Row | None:
-        return conn.execute(
-            "SELECT * FROM rca_capacity_transition_state WHERE singleton_id = 1"
-        ).fetchone()
-
-    @staticmethod
-    def _public_capacity_transition_state(row: sqlite3.Row) -> dict[str, Any]:
-        value = dict(row)
-        value["singleton_id"] = int(value["singleton_id"])
-        value["generation"] = int(value["generation"])
-        return value
-
-    @staticmethod
-    def _capacity_transition_integrity_error_tx(conn: sqlite3.Connection) -> str:
-        capacity_rows = conn.execute(
-            "SELECT * FROM rca_capacity_transition_state"
-        ).fetchall()
-        total_audits = int(
-            conn.execute("SELECT COUNT(*) FROM rca_capacity_transition_audit").fetchone()[
-                0
-            ]
-        )
-        if len(capacity_rows) > 1:
-            return "capacity_transition_singleton"
-        if not capacity_rows:
-            return "capacity_transition_orphan_audit" if total_audits else ""
-
-        capacity_row = capacity_rows[0]
-        if int(capacity_row["singleton_id"]) != 1:
-            return "capacity_transition_singleton"
-        for field in ("release_id", "bootstrap_epoch_id"):
-            raw_identity = str(capacity_row[field] or "")
-            if (
-                raw_identity != raw_identity.strip()
-                or _ACTIVATION_EPOCH_ID_RE.fullmatch(raw_identity) is None
-            ):
-                return "capacity_transition_identity"
-
-        durable_state = str(capacity_row["state"])
-        durable_generation = int(capacity_row["generation"])
-        expected_generation = (
-            1
-            if durable_state == CAPACITY_BOOTSTRAP_PRODUCTION
-            else 2
-            if durable_state == CAPACITY_STEADY_ACTIVE
-            else -1
-        )
-        if durable_generation != expected_generation:
-            return "capacity_transition_generation"
-
-        evidence_fields = (
-            "final_ledger_sha256",
-            "transition_authorization_sha256",
-            "transition_authorization_fingerprint",
-            "transition_receipt_sha256",
-            "transition_receipt_fingerprint",
-            "commit_marker_sha256",
-            "commit_marker_fingerprint",
-            "evidence_bundle_sha256",
-            "evidence_bundle_fingerprint",
-        )
-        transition_time_fields = (
-            "authorization_issued_at",
-            "authorization_expires_at",
-            "receipt_created_at",
-            "marker_committed_at",
-        )
-
-        def strict_timestamp(value: Any) -> datetime:
-            text = str(value or "")
-            parsed = datetime.fromisoformat(text)
-            if (
-                parsed.tzinfo is None
-                or parsed.utcoffset() is None
-                or text != parsed.astimezone(timezone.utc).isoformat()
-            ):
-                raise ValueError("timestamp is not canonical UTC")
-            return parsed.astimezone(timezone.utc)
-
-        try:
-            initialized = strict_timestamp(capacity_row["bootstrap_initialized_at"])
-            updated = strict_timestamp(capacity_row["updated_at"])
-        except (TypeError, ValueError, OverflowError):
-            return "capacity_transition_time"
-        if initialized > updated:
-            return "capacity_transition_time"
-
-        audit_rows = conn.execute(
-            """
-            SELECT * FROM rca_capacity_transition_audit
-             WHERE release_id = ? AND bootstrap_epoch_id = ?
-             ORDER BY to_generation
-            """,
-            (
-                capacity_row["release_id"],
-                capacity_row["bootstrap_epoch_id"],
-            ),
-        ).fetchall()
-        if (
-            len(audit_rows) != durable_generation
-            or str(audit_rows[0]["from_state"]) != "UNCONFIGURED"
-            or str(audit_rows[0]["to_state"]) != CAPACITY_BOOTSTRAP_PRODUCTION
-            or int(audit_rows[0]["from_generation"]) != 0
-            or int(audit_rows[0]["to_generation"]) != 1
-            or any(
-                audit_rows[0][field] is not None
-                for field in evidence_fields + transition_time_fields
-            )
-            or str(audit_rows[0]["transitioned_at"])
-            != str(capacity_row["bootstrap_initialized_at"])
-        ):
-            return "capacity_transition_audit_chain"
-
-        if durable_state == CAPACITY_BOOTSTRAP_PRODUCTION:
-            if (
-                any(capacity_row[field] is not None for field in evidence_fields)
-                or any(
-                    capacity_row[field] is not None
-                    for field in transition_time_fields
-                )
-                or capacity_row["steady_activated_at"] is not None
-                or initialized != updated
-            ):
-                return "capacity_transition_bootstrap_binding"
-        else:
-            if any(
-                _ACTIVATION_SHA256_RE.fullmatch(str(capacity_row[field] or ""))
-                is None
-                for field in evidence_fields
-            ):
-                return "capacity_transition_evidence"
-            try:
-                issued = strict_timestamp(capacity_row["authorization_issued_at"])
-                expires = strict_timestamp(capacity_row["authorization_expires_at"])
-                receipt_created = strict_timestamp(capacity_row["receipt_created_at"])
-                marker_committed = strict_timestamp(capacity_row["marker_committed_at"])
-                activated = strict_timestamp(capacity_row["steady_activated_at"])
-            except (TypeError, ValueError, OverflowError):
-                return "capacity_transition_time"
-            if not (
-                initialized <= issued <= receipt_created <= marker_committed
-                <= expires
-                and marker_committed <= activated == updated
-                and issued < expires
-            ):
-                return "capacity_transition_time"
-            steady_audit = audit_rows[1]
-            if (
-                str(steady_audit["from_state"])
-                != CAPACITY_BOOTSTRAP_PRODUCTION
-                or str(steady_audit["to_state"]) != CAPACITY_STEADY_ACTIVE
-                or int(steady_audit["from_generation"]) != 1
-                or int(steady_audit["to_generation"]) != 2
-                or any(
-                    steady_audit[field] != capacity_row[field]
-                    for field in evidence_fields + transition_time_fields
-                )
-                or str(steady_audit["transitioned_at"])
-                != str(capacity_row["steady_activated_at"])
-            ):
-                return "capacity_transition_audit_binding"
-        if total_audits != durable_generation:
-            return "capacity_transition_audit_scope"
-        return ""
-
-    @staticmethod
     def _normalize_activation_db_identity(value: Mapping[str, Any]) -> str:
         if not isinstance(value, Mapping) or not value:
             raise ActivationEpochError("activation_db_logical_identity_invalid")
@@ -7005,8 +4332,10 @@ class RcaControlStore:
 
     @staticmethod
     def _normalize_partition_fence(value: Mapping[str, Any]) -> str:
-        if not isinstance(value, Mapping) or not value:
+        if not isinstance(value, Mapping):
             raise ActivationEpochError("activation_partition_fence_invalid")
+        if not value:
+            return _canonical_json({})
         normalized: dict[str, dict[str, int]] = {}
         for raw_topic, raw_partitions in value.items():
             topic = str(raw_topic or "").strip()
@@ -7084,353 +4413,8 @@ class RcaControlStore:
             normalized["issue_url"] = normalized["issue_url"].rstrip("/")
             if normalized["mode"] not in {"run_or_join", "rerun", "debug"}:
                 raise ActivationEpochError("activation_manual_mode_invalid")
-            automation_authority = value.get("automation_authority")
-            if automation_authority is not None:
-                try:
-                    normalized["automation_authority"] = (
-                        normalize_gray_sample_automation_authority(
-                            automation_authority
-                        )
-                    )
-                except ValueError as exc:
-                    raise ActivationEpochError(str(exc)) from exc
         canonical = _canonical_json(normalized)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest(), normalized
-
-    @staticmethod
-    def _historical_outbox_row_sha256(row: sqlite3.Row) -> str:
-        """Hash the stable v1 outbox projection, ignoring later additive columns."""
-        try:
-            projection = {
-                field: row[field] for field in ACTIVATION_HISTORICAL_OUTBOX_ROW_FIELDS
-            }
-        except (IndexError, KeyError) as exc:
-            raise RuntimeError(
-                "incompatible_control_store_schema:historical_outbox_row_projection"
-            ) from exc
-        return _canonical_sha256(projection)
-
-    @staticmethod
-    def _historical_outbox_immutable_row_sha256(row: sqlite3.Row) -> str:
-        """Hash the v1 identity that must survive owner-audited disposition."""
-        try:
-            projection = {
-                field: row[field]
-                for field in ACTIVATION_HISTORICAL_OUTBOX_IMMUTABLE_ROW_FIELDS
-            }
-        except (IndexError, KeyError) as exc:
-            raise RuntimeError(
-                "incompatible_control_store_schema:"
-                "historical_outbox_immutable_row_projection"
-            ) from exc
-        return _canonical_sha256(projection)
-
-    @staticmethod
-    def _historical_outbox_disposition_binding(
-        *,
-        epoch_id: str,
-        cohort_count: int,
-        cohort_sha256: str,
-        operator: str,
-        reason: str,
-        disposed_at: str,
-    ) -> dict[str, Any]:
-        return {
-            "schema_version": ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_SCHEMA_VERSION,
-            "hold_schema_version": ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION,
-            "row_schema_version": ACTIVATION_HISTORICAL_OUTBOX_ROW_SCHEMA_VERSION,
-            "epoch_id": epoch_id,
-            "epoch_state": "aborted",
-            "cohort_count": cohort_count,
-            "cohort_sha256": cohort_sha256,
-            "owner_authorized": True,
-            "operator": operator,
-            "reason": reason,
-            "disposed_at": disposed_at,
-        }
-
-    @classmethod
-    def _historical_outbox_hold_snapshot_tx(
-        cls,
-        conn: sqlite3.Connection,
-        *,
-        epoch: sqlite3.Row,
-        allow_current_epoch: bool,
-    ) -> list[dict[str, Any]]:
-        epoch_id = str(epoch["epoch_id"])
-        start_fence = json.loads(str(epoch["partition_start_fence_json"]))
-        items: list[dict[str, Any]] = []
-        for row in conn.execute(
-            "SELECT * FROM rca_outbox "
-            "WHERE status IN ('pending', 'claimed', 'shadow') ORDER BY outbox_id"
-        ).fetchall():
-            bound_epoch = row["activation_epoch_id"]
-            bound_ledger = row["activation_ledger_id"]
-            if bound_epoch is not None or bound_ledger is not None:
-                if allow_current_epoch and str(bound_epoch or "") == epoch_id:
-                    if bound_ledger is None:
-                        raise ActivationEpochError(
-                            "activation_historical_hold_current_epoch_binding_invalid"
-                        )
-                    binding = conn.execute(
-                        """
-                        SELECT ledger.decision, ledger.bound_at,
-                               trigger.state AS trigger_state
-                          FROM rca_activation_admission_ledger AS ledger
-                          JOIN business_triggers AS trigger
-                            ON trigger.activation_epoch_id = ledger.epoch_id
-                           AND trigger.activation_ledger_id = ledger.ledger_id
-                           AND trigger.business_key = ledger.business_key
-                           AND trigger.submission_key = ledger.submission_key
-                           AND trigger.generation = ledger.generation
-                         WHERE ledger.epoch_id = ? AND ledger.ledger_id = ?
-                           AND ledger.business_key = ?
-                           AND ledger.submission_key = ?
-                           AND ledger.generation = ?
-                        """,
-                        (
-                            epoch_id,
-                            bound_ledger,
-                            row["business_key"],
-                            row["submission_key"],
-                            row["generation"],
-                        ),
-                    ).fetchone()
-                    status = str(row["status"] or "")
-                    expected = {
-                        "pending": ("admit", "pending"),
-                        "claimed": ("admit", "dispatching"),
-                        "shadow": ("shadow", "shadow"),
-                    }.get(status)
-                    if (
-                        binding is None
-                        or expected is None
-                        or not str(binding["bound_at"] or "")
-                        or str(binding["decision"] or "") != expected[0]
-                        or str(binding["trigger_state"] or "") != expected[1]
-                    ):
-                        raise ActivationEpochError(
-                            "activation_historical_hold_current_epoch_binding_invalid"
-                        )
-                    continue
-                raise ActivationEpochError(
-                    "activation_historical_hold_outbox_activation_bound"
-                )
-            status = str(row["status"] or "")
-            if status == "claimed":
-                raise ActivationEpochError("activation_historical_hold_outbox_claimed")
-            if status == "shadow":
-                raise ActivationEpochError("activation_historical_hold_outbox_shadow")
-            if status != "pending":
-                raise ActivationEpochError(
-                    "activation_historical_hold_outbox_status_invalid"
-                )
-            # A retry clears the active lease but intentionally preserves
-            # claimed_at as immutable audit history. Only live lease fields
-            # make a pending historical row unsafe to seal.
-            if any(
-                row[field] is not None
-                for field in ("lease_token", "lease_owner", "lease_expires_at")
-            ):
-                raise ActivationEpochError("activation_historical_hold_outbox_leased")
-            topic = str(row["source_topic"] or "")
-            if not topic:
-                raise ActivationEpochError("activation_historical_hold_outbox_manual")
-            raw_partition = row["source_partition"]
-            raw_offset = row["source_offset"]
-            if raw_partition is None or raw_offset is None:
-                raise ActivationEpochError("activation_historical_hold_outbox_unfenced")
-            try:
-                partition_value = int(raw_partition)
-                offset = int(raw_offset)
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ActivationEpochError(
-                    "activation_historical_hold_outbox_unfenced"
-                ) from exc
-            partition = str(partition_value)
-            if (
-                partition_value < 0
-                or offset < 0
-                or topic not in start_fence
-                or partition not in start_fence[topic]
-            ):
-                raise ActivationEpochError("activation_historical_hold_outbox_unfenced")
-            if offset >= int(start_fence[topic][partition]):
-                raise ActivationEpochError(
-                    "activation_historical_hold_outbox_at_or_after_start_fence"
-                )
-            items.append({
-                "outbox_id": int(row["outbox_id"]),
-                "row_sha256": cls._historical_outbox_row_sha256(row),
-                "immutable_row_sha256": (
-                    cls._historical_outbox_immutable_row_sha256(row)
-                ),
-            })
-        return items
-
-    @classmethod
-    def _historical_outbox_hold_evidence_tx(
-        cls,
-        conn: sqlite3.Connection,
-        *,
-        epoch: sqlite3.Row,
-        allow_current_epoch: bool,
-    ) -> dict[str, Any]:
-        epoch_id = str(epoch["epoch_id"])
-        hold = conn.execute(
-            "SELECT * FROM rca_activation_historical_outbox_holds WHERE epoch_id = ?",
-            (epoch_id,),
-        ).fetchone()
-        if hold is None:
-            raise ActivationEpochError("activation_historical_hold_not_sealed")
-        if str(
-            hold["schema_version"]
-        ) != ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION or str(
-            hold["partition_start_fence_sha256"]
-        ) != str(epoch["partition_start_fence_sha256"]):
-            raise ActivationEpochError("activation_historical_hold_seal_invalid")
-        sealed_items = [
-            {
-                "outbox_id": int(row["outbox_id"]),
-                "row_sha256": str(row["row_sha256"]),
-                "immutable_row_sha256": str(row["immutable_row_sha256"]),
-            }
-            for row in conn.execute(
-                "SELECT outbox_id, row_sha256, immutable_row_sha256 "
-                "FROM rca_activation_historical_outbox_hold_items "
-                "WHERE epoch_id = ? ORDER BY outbox_id",
-                (epoch_id,),
-            ).fetchall()
-        ]
-        sealed_count = int(hold["cohort_count"])
-        sealed_sha256 = str(hold["cohort_sha256"])
-        if (
-            len(sealed_items) != sealed_count
-            or _canonical_sha256(sealed_items) != sealed_sha256
-        ):
-            raise ActivationEpochError("activation_historical_hold_seal_invalid")
-        disposition = conn.execute(
-            "SELECT disposition_id, disposition_sha256, disposed_at "
-            "FROM rca_activation_historical_outbox_dispositions WHERE epoch_id = ?",
-            (epoch_id,),
-        ).fetchone()
-        current_items = cls._historical_outbox_hold_snapshot_tx(
-            conn,
-            epoch=epoch,
-            allow_current_epoch=allow_current_epoch,
-        )
-        current_count = len(current_items)
-        current_sha256 = _canonical_sha256(current_items)
-        return {
-            "schema_version": ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION,
-            "row_schema_version": ACTIVATION_HISTORICAL_OUTBOX_ROW_SCHEMA_VERSION,
-            "epoch_id": epoch_id,
-            "partition_start_fence_sha256": str(hold["partition_start_fence_sha256"]),
-            "sealed_at": str(hold["sealed_at"]),
-            "sealed_count": sealed_count,
-            "sealed_sha256": sealed_sha256,
-            "disposed": disposition is not None,
-            "disposition_id": (
-                str(disposition["disposition_id"]) if disposition is not None else ""
-            ),
-            "disposition_sha256": (
-                str(disposition["disposition_sha256"])
-                if disposition is not None
-                else ""
-            ),
-            "disposed_at": (
-                str(disposition["disposed_at"]) if disposition is not None else ""
-            ),
-            "current_count": current_count,
-            "current_sha256": current_sha256,
-            "matches": (
-                sealed_count == current_count
-                and sealed_sha256 == current_sha256
-                and sealed_items == current_items
-            ),
-        }
-
-    @classmethod
-    def _require_historical_outbox_hold_match_tx(
-        cls,
-        conn: sqlite3.Connection,
-        *,
-        epoch: sqlite3.Row,
-        allow_current_epoch: bool = True,
-    ) -> dict[str, Any]:
-        evidence = cls._historical_outbox_hold_evidence_tx(
-            conn,
-            epoch=epoch,
-            allow_current_epoch=allow_current_epoch,
-        )
-        if evidence["disposed"]:
-            raise ActivationEpochError("activation_historical_hold_disposed")
-        if not evidence["matches"]:
-            raise ActivationEpochError("activation_historical_hold_cohort_changed")
-        return evidence
-
-    @classmethod
-    def _seal_historical_outbox_hold_tx(
-        cls,
-        conn: sqlite3.Connection,
-        *,
-        epoch: sqlite3.Row,
-        sealed_at: str,
-    ) -> dict[str, Any]:
-        epoch_id = str(epoch["epoch_id"])
-        existing = conn.execute(
-            "SELECT 1 FROM rca_activation_historical_outbox_holds WHERE epoch_id = ?",
-            (epoch_id,),
-        ).fetchone()
-        if existing is not None:
-            return cls._require_historical_outbox_hold_match_tx(
-                conn,
-                epoch=epoch,
-                allow_current_epoch=False,
-            )
-        items = cls._historical_outbox_hold_snapshot_tx(
-            conn,
-            epoch=epoch,
-            allow_current_epoch=False,
-        )
-        cohort_sha256 = _canonical_sha256(items)
-        conn.execute(
-            """
-            INSERT INTO rca_activation_historical_outbox_holds(
-                epoch_id, schema_version, partition_start_fence_sha256,
-                cohort_count, cohort_sha256, sealed_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                epoch_id,
-                ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION,
-                epoch["partition_start_fence_sha256"],
-                len(items),
-                cohort_sha256,
-                sealed_at,
-            ),
-        )
-        conn.executemany(
-            """
-            INSERT INTO rca_activation_historical_outbox_hold_items(
-                epoch_id, outbox_id, row_sha256, immutable_row_sha256
-            ) VALUES (?, ?, ?, ?)
-            """,
-            [
-                (
-                    epoch_id,
-                    item["outbox_id"],
-                    item["row_sha256"],
-                    item["immutable_row_sha256"],
-                )
-                for item in items
-            ],
-        )
-        return cls._require_historical_outbox_hold_match_tx(
-            conn,
-            epoch=epoch,
-            allow_current_epoch=False,
-        )
 
     @staticmethod
     def _current_activation_epoch_tx(conn: sqlite3.Connection) -> sqlite3.Row | None:
@@ -7497,28 +4481,6 @@ class RcaControlStore:
         from_state: str,
         to_state: str,
     ) -> dict[str, Any]:
-        slot_bindings = [
-            {
-                "authorized_identity_sha256": str(
-                    row["authorized_identity_sha256"] or ""
-                ),
-                "authorized_operator": str(row["authorized_operator"] or ""),
-                "authorized_reason": str(row["authorized_reason"] or ""),
-                "authorized_source_kind": str(row["authorized_source_kind"] or ""),
-                "consumed_ledger_id": int(row["consumed_ledger_id"] or 0),
-                "slot_kind": str(row["slot_kind"]),
-            }
-            for row in conn.execute(
-                """
-                SELECT slot_kind, authorized_source_kind,
-                       authorized_identity_sha256, authorized_operator,
-                       authorized_reason, consumed_ledger_id
-                  FROM rca_activation_budget_slots
-                 WHERE epoch_id = ? ORDER BY slot_kind
-                """,
-                (epoch["epoch_id"],),
-            ).fetchall()
-        ]
         return {
             "config_sha256": str(epoch["config_sha256"]),
             "db_logical_identity_sha256": str(
@@ -7556,7 +4518,9 @@ class RcaControlStore:
             "production_gate_receipt_sha256": str(
                 epoch["production_gate_receipt_sha256"] or ""
             ),
-            "slot_bindings_sha256": _canonical_sha256(slot_bindings),
+            # Direct-steady releases never authorize slots. Keep the empty-list
+            # digest in the fingerprint so existing direct bindings stay exact.
+            "slot_bindings_sha256": _canonical_sha256([]),
             "to_state": to_state,
         }
 
@@ -7639,177 +4603,6 @@ class RcaControlStore:
         if cursor.lastrowid is None:
             raise ActivationEpochError("activation_transition_audit_failed")
         return int(cursor.lastrowid)
-
-    def create_activation_epoch(
-        self,
-        *,
-        epoch_id: str,
-        preauthorization_fingerprint: str,
-        preauthorization_gate_receipt_sha256: str,
-        preauthorization_capsule_sha256: str,
-        config_sha256: str,
-        db_logical_identity: Mapping[str, Any],
-        partition_start_fence: Mapping[str, Any],
-        operator: str,
-        reason: str,
-        now: datetime | None = None,
-    ) -> dict[str, Any]:
-        """Create one safe-off epoch from an immutable preauthorization capsule."""
-        identity = self._normalize_activation_epoch_id(epoch_id)
-        preauthorization_hash = self._normalize_activation_sha256(
-            preauthorization_fingerprint, "preauthorization_fingerprint"
-        )
-        preauthorization_receipt_hash = self._normalize_activation_sha256(
-            preauthorization_gate_receipt_sha256,
-            "preauthorization_gate_receipt_sha256",
-        )
-        preauthorization_capsule_hash = self._normalize_activation_sha256(
-            preauthorization_capsule_sha256,
-            "preauthorization_capsule_sha256",
-        )
-        config_hash = self._normalize_activation_sha256(config_sha256, "config_sha256")
-        db_identity_json = self._normalize_activation_db_identity(db_logical_identity)
-        db_identity_sha = hashlib.sha256(db_identity_json.encode("utf-8")).hexdigest()
-        start_fence_json = self._normalize_partition_fence(partition_start_fence)
-        start_fence_sha = hashlib.sha256(start_fence_json.encode("utf-8")).hexdigest()
-        actor, justification = self._normalize_activation_audit_text(operator, reason)
-        current = _iso(now)
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            existing = self._current_activation_epoch_tx(conn)
-            if existing is not None and str(existing["epoch_id"]) == identity:
-                expected = (
-                    preauthorization_hash,
-                    preauthorization_receipt_hash,
-                    preauthorization_capsule_hash,
-                    config_hash,
-                    db_identity_sha,
-                    start_fence_sha,
-                )
-                observed = (
-                    str(existing["preauthorization_fingerprint"]),
-                    str(existing["preauthorization_gate_receipt_sha256"]),
-                    str(existing["preauthorization_capsule_sha256"]),
-                    str(existing["config_sha256"]),
-                    str(existing["db_logical_identity_sha256"]),
-                    str(existing["partition_start_fence_sha256"]),
-                )
-                if observed != expected:
-                    raise ActivationEpochError("activation_epoch_binding_conflict")
-                conn.commit()
-                return self._public_activation_epoch(existing)
-            pending_inbox = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM kafka_inbox WHERE decision = 'pending'"
-                ).fetchone()[0]
-            )
-            if pending_inbox:
-                raise ActivationEpochError("activation_pending_inbox_not_drained")
-            shadow_backlog = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM rca_outbox WHERE status = 'shadow'"
-                ).fetchone()[0]
-            )
-            if shadow_backlog:
-                raise ActivationEpochError(
-                    "activation_shadow_backlog_not_disposed"
-                )
-            predecessor_epoch_id = (
-                str(existing["epoch_id"]) if existing is not None else ""
-            )
-            bound_outbox_backlog = 0
-            if predecessor_epoch_id:
-                bound_outbox_backlog = int(
-                    conn.execute(
-                        "SELECT COUNT(*) FROM rca_outbox "
-                        "WHERE status IN ('pending', 'claimed', 'shadow') "
-                        "AND (activation_epoch_id = ? OR activation_ledger_id IN ("
-                        "SELECT ledger_id FROM rca_activation_admission_ledger "
-                        "WHERE epoch_id = ?))",
-                        (predecessor_epoch_id, predecessor_epoch_id),
-                    ).fetchone()[0]
-                )
-            if bound_outbox_backlog:
-                raise ActivationEpochError(
-                    "activation_bound_outbox_backlog_not_drained"
-                )
-            bound_delivery_backlog = (
-                self._activation_bound_delivery_backlog_tx(
-                    conn,
-                    epoch_id=predecessor_epoch_id,
-                )
-                if predecessor_epoch_id
-                else 0
-            )
-            if bound_delivery_backlog:
-                raise ActivationEpochError(
-                    "activation_bound_delivery_backlog_not_drained"
-                )
-            if existing is not None:
-                if str(existing["state"]) != "aborted":
-                    raise ActivationEpochError("activation_current_epoch_exists")
-                conn.execute(
-                    """
-                    UPDATE rca_activation_epochs
-                       SET is_current = 0, superseded_at = ?, updated_at = ?
-                     WHERE epoch_id = ? AND is_current = 1 AND state = 'aborted'
-                    """,
-                    (current, current, existing["epoch_id"]),
-                )
-            conn.execute(
-                """
-                INSERT INTO rca_activation_epochs(
-                    epoch_id, state, is_current,
-                    preauthorization_fingerprint,
-                    preauthorization_gate_receipt_sha256,
-                    preauthorization_capsule_sha256,
-                    config_sha256, db_logical_identity_json,
-                    db_logical_identity_sha256, partition_start_fence_json,
-                    partition_start_fence_sha256, created_at, updated_at
-                ) VALUES (?, 'safe_off', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    identity,
-                    preauthorization_hash,
-                    preauthorization_receipt_hash,
-                    preauthorization_capsule_hash,
-                    config_hash,
-                    db_identity_json,
-                    db_identity_sha,
-                    start_fence_json,
-                    start_fence_sha,
-                    current,
-                    current,
-                ),
-            )
-            conn.executemany(
-                """
-                INSERT INTO rca_activation_budget_slots(epoch_id, slot_kind)
-                VALUES (?, ?)
-                """,
-                [(identity, slot_kind) for slot_kind in ACTIVATION_SLOT_KINDS],
-            )
-            row = self._current_activation_epoch_tx(conn)
-            if row is None:
-                raise ActivationEpochError("activation_epoch_create_lost")
-            self._insert_activation_transition_audit_tx(
-                conn,
-                epoch=row,
-                from_state="none",
-                to_state="safe_off",
-                operator=actor,
-                reason=justification,
-                transitioned_at=current,
-            )
-            conn.commit()
-            return self._public_activation_epoch(row)
-        except Exception:
-            if conn.in_transaction:
-                conn.rollback()
-            raise
-        finally:
-            conn.close()
 
     @classmethod
     def _direct_steady_current_inflight_tx(
@@ -7911,10 +4704,12 @@ class RcaControlStore:
 
         This is a deliberately separate compatibility path for a release that
         has no bounded canary slots.  It still records the exact release,
-        config, database, and broker-fence identities and leaves the normal
+        config, database, and optional broker-fence identities and leaves the normal
         provider/write-fence checks anchored to the current epoch.  Historical
         outbox state is observation-only here; it is not a prerequisite for
-        activating a fresh current epoch.
+        activating a fresh current epoch.  An empty broker fence explicitly
+        represents a Kafka-disabled release; a later Kafka consumer still
+        fails closed when it requests a missing topic or partition fence.
         """
         identity = self._normalize_activation_epoch_id(epoch_id)
         release_hash = self._normalize_activation_sha256(
@@ -8128,536 +4923,11 @@ class RcaControlStore:
         finally:
             conn.close()
 
-    def preauthorize_activation_epoch(
-        self,
-        *,
-        epoch_id: str,
-        preproduction_fingerprint: str,
-        preproduction_gate_receipt_sha256: str,
-        preproduction_capsule_sha256: str,
-        expected_preauthorization_fingerprint: str,
-        expected_preauthorization_gate_receipt_sha256: str,
-        expected_preauthorization_capsule_sha256: str,
-        expected_config_sha256: str,
-        expected_db_logical_identity_sha256: str,
-        expected_partition_start_fence_sha256: str,
-        operator: str,
-        reason: str,
-        now: datetime | None = None,
-    ) -> dict[str, Any]:
-        """Consume one preproduction capsule and open the exact safe-off epoch."""
-        identity = self._normalize_activation_epoch_id(epoch_id)
-        preproduction_hash = self._normalize_activation_sha256(
-            preproduction_fingerprint, "preproduction_fingerprint"
-        )
-        preproduction_receipt_hash = self._normalize_activation_sha256(
-            preproduction_gate_receipt_sha256,
-            "preproduction_gate_receipt_sha256",
-        )
-        preproduction_capsule_hash = self._normalize_activation_sha256(
-            preproduction_capsule_sha256,
-            "preproduction_capsule_sha256",
-        )
-        expected_bindings = {
-            "preauthorization_fingerprint": self._normalize_activation_sha256(
-                expected_preauthorization_fingerprint,
-                "preauthorization_fingerprint",
-            ),
-            "preauthorization_gate_receipt_sha256": (
-                self._normalize_activation_sha256(
-                    expected_preauthorization_gate_receipt_sha256,
-                    "preauthorization_gate_receipt_sha256",
-                )
-            ),
-            "preauthorization_capsule_sha256": self._normalize_activation_sha256(
-                expected_preauthorization_capsule_sha256,
-                "preauthorization_capsule_sha256",
-            ),
-            "config_sha256": self._normalize_activation_sha256(
-                expected_config_sha256, "config_sha256"
-            ),
-            "db_logical_identity_sha256": self._normalize_activation_sha256(
-                expected_db_logical_identity_sha256,
-                "db_logical_identity_sha256",
-            ),
-            "partition_start_fence_sha256": self._normalize_activation_sha256(
-                expected_partition_start_fence_sha256,
-                "partition_start_fence_sha256",
-            ),
-        }
-        actor, justification = self._normalize_activation_audit_text(operator, reason)
-        current = _iso(now)
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            epoch = self._current_activation_epoch_tx(conn)
-            if epoch is None or str(epoch["epoch_id"]) != identity:
-                raise ActivationEpochError("activation_epoch_not_current")
-            if any(str(epoch[field] or "") != value for field, value in expected_bindings.items()):
-                raise ActivationEpochError(
-                    "activation_preproduction_epoch_binding_changed"
-                )
-            prior = str(epoch["state"])
-            expected_preproduction = (
-                preproduction_hash,
-                preproduction_receipt_hash,
-                preproduction_capsule_hash,
-            )
-            observed_preproduction = (
-                str(epoch["preproduction_fingerprint"] or ""),
-                str(epoch["preproduction_gate_receipt_sha256"] or ""),
-                str(epoch["preproduction_capsule_sha256"] or ""),
-            )
-            if prior == "preauthorized":
-                if observed_preproduction != expected_preproduction:
-                    raise ActivationEpochError(
-                        "activation_preproduction_binding_conflict"
-                    )
-                self._require_historical_outbox_hold_match_tx(
-                    conn,
-                    epoch=epoch,
-                )
-                conn.commit()
-                return self._public_activation_epoch(epoch)
-            if prior != "safe_off":
-                raise ActivationEpochError("activation_epoch_state_changed")
-            if observed_preproduction != ("", "", ""):
-                raise ActivationEpochError("activation_preproduction_binding_conflict")
-            pending_inbox = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM kafka_inbox WHERE decision = 'pending'"
-                ).fetchone()[0]
-            )
-            current_ledger = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM rca_activation_admission_ledger "
-                    "WHERE epoch_id = ?",
-                    (identity,),
-                ).fetchone()[0]
-            )
-            if pending_inbox:
-                raise ActivationEpochError("activation_historical_hold_pending_inbox")
-            if current_ledger:
-                raise ActivationEpochError("activation_historical_hold_current_ledger")
-            self._seal_historical_outbox_hold_tx(
-                conn,
-                epoch=epoch,
-                sealed_at=current,
-            )
-            updated = conn.execute(
-                """
-                UPDATE rca_activation_epochs
-                   SET state = 'preauthorized',
-                       preproduction_fingerprint = ?,
-                       preproduction_gate_receipt_sha256 = ?,
-                       preproduction_capsule_sha256 = ?,
-                       updated_at = ?
-                 WHERE epoch_id = ? AND is_current = 1 AND state = 'safe_off'
-                   AND preproduction_fingerprint IS NULL
-                   AND preproduction_gate_receipt_sha256 IS NULL
-                   AND preproduction_capsule_sha256 IS NULL
-                """,
-                (
-                    preproduction_hash,
-                    preproduction_receipt_hash,
-                    preproduction_capsule_hash,
-                    current,
-                    identity,
-                ),
-            )
-            if updated.rowcount != 1:
-                raise ActivationEpochError("activation_epoch_state_changed")
-            row = self._current_activation_epoch_tx(conn)
-            if row is None:
-                raise ActivationEpochError("activation_epoch_transition_lost")
-            self._insert_activation_transition_audit_tx(
-                conn,
-                epoch=row,
-                from_state="safe_off",
-                to_state="preauthorized",
-                operator=actor,
-                reason=justification,
-                transitioned_at=current,
-            )
-            conn.commit()
-            return self._public_activation_epoch(row)
-        except Exception:
-            if conn.in_transaction:
-                conn.rollback()
-            raise
-        finally:
-            conn.close()
-
     def activation_epoch(self) -> dict[str, Any] | None:
         conn = self._connect()
         try:
             row = self._current_activation_epoch_tx(conn)
             return self._public_activation_epoch(row) if row is not None else None
-        finally:
-            conn.close()
-
-    def activation_historical_outbox_hold_evidence(
-        self,
-        *,
-        epoch_id: str,
-    ) -> dict[str, Any]:
-        """Return privacy-light sealed/current cohort evidence without writing."""
-        identity = self._normalize_activation_epoch_id(epoch_id)
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN")
-            epoch = self._current_activation_epoch_tx(conn)
-            if epoch is None or str(epoch["epoch_id"]) != identity:
-                raise ActivationEpochError("activation_epoch_not_current")
-            evidence = self._historical_outbox_hold_evidence_tx(
-                conn,
-                epoch=epoch,
-                allow_current_epoch=True,
-            )
-            conn.rollback()
-            return evidence
-        except Exception:
-            if conn.in_transaction:
-                conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    @staticmethod
-    def _public_historical_outbox_disposition(row: sqlite3.Row) -> dict[str, Any]:
-        return {
-            "schema_version": str(row["schema_version"]),
-            "disposition_id": str(row["disposition_id"]),
-            "disposition_sha256": str(row["disposition_sha256"]),
-            "epoch_id": str(row["epoch_id"]),
-            "epoch_state": str(row["epoch_state"]),
-            "hold_schema_version": str(row["hold_schema_version"]),
-            "row_schema_version": str(row["row_schema_version"]),
-            "cohort_count": int(row["cohort_count"]),
-            "cohort_sha256": str(row["cohort_sha256"]),
-            "owner_authorized": bool(row["owner_authorized"]),
-            "operator": str(row["operator"]),
-            "reason": str(row["reason"]),
-            "disposed_at": str(row["disposed_at"]),
-            "outbox_status": "quarantined",
-        }
-
-    def dispose_activation_historical_outbox_hold(
-        self,
-        *,
-        epoch_id: str,
-        expected_cohort_count: int,
-        expected_cohort_sha256: str,
-        owner_authorized: bool,
-        operator: str,
-        reason: str,
-        now: datetime | None = None,
-    ) -> dict[str, Any]:
-        """Quarantine one exact aborted cohort under an immutable owner audit."""
-        identity = self._normalize_activation_epoch_id(epoch_id)
-        if (
-            isinstance(expected_cohort_count, bool)
-            or not isinstance(expected_cohort_count, int)
-            or expected_cohort_count < 0
-        ):
-            raise ActivationEpochError(
-                "activation_historical_disposition_cohort_count_invalid"
-            )
-        expected_sha256 = self._normalize_activation_sha256(
-            expected_cohort_sha256,
-            "historical_disposition_cohort_sha256",
-        )
-        if owner_authorized is not True:
-            raise ActivationEpochError(
-                "activation_historical_disposition_owner_authorization_required"
-            )
-        actor, justification = self._normalize_activation_audit_text(operator, reason)
-        disposed_at = _iso(now)
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            epoch = self._current_activation_epoch_tx(conn)
-            if epoch is None or str(epoch["epoch_id"]) != identity:
-                raise ActivationEpochError("activation_epoch_not_current")
-            if str(epoch["state"]) != "aborted":
-                raise ActivationEpochError(
-                    "activation_historical_disposition_epoch_not_aborted"
-                )
-            hold = conn.execute(
-                "SELECT * FROM rca_activation_historical_outbox_holds "
-                "WHERE epoch_id = ?",
-                (identity,),
-            ).fetchone()
-            if hold is None:
-                raise ActivationEpochError("activation_historical_hold_not_sealed")
-            if (
-                int(hold["cohort_count"]) != expected_cohort_count
-                or str(hold["cohort_sha256"]) != expected_sha256
-            ):
-                raise ActivationEpochError(
-                    "activation_historical_disposition_cohort_binding_changed"
-                )
-            existing = conn.execute(
-                "SELECT * FROM rca_activation_historical_outbox_dispositions "
-                "WHERE epoch_id = ?",
-                (identity,),
-            ).fetchone()
-            if existing is not None:
-                if (
-                    int(existing["cohort_count"]) != expected_cohort_count
-                    or str(existing["cohort_sha256"]) != expected_sha256
-                    or str(existing["operator"]) != actor
-                    or str(existing["reason"]) != justification
-                    or int(existing["owner_authorized"]) != 1
-                ):
-                    raise ActivationEpochError(
-                        "activation_historical_disposition_binding_conflict"
-                    )
-                self._validate_v13_historical_outbox_hold_schema(conn)
-                result = self._public_historical_outbox_disposition(existing)
-                conn.commit()
-                return result
-            evidence = self._require_historical_outbox_hold_match_tx(
-                conn,
-                epoch=epoch,
-                allow_current_epoch=True,
-            )
-            if (
-                int(evidence["sealed_count"]) != expected_cohort_count
-                or str(evidence["sealed_sha256"]) != expected_sha256
-            ):
-                raise ActivationEpochError(
-                    "activation_historical_disposition_cohort_binding_changed"
-                )
-            items = [
-                {
-                    "outbox_id": int(row["outbox_id"]),
-                    "row_sha256": str(row["row_sha256"]),
-                    "immutable_row_sha256": str(row["immutable_row_sha256"]),
-                }
-                for row in conn.execute(
-                    "SELECT outbox_id, row_sha256, immutable_row_sha256 "
-                    "FROM rca_activation_historical_outbox_hold_items "
-                    "WHERE epoch_id = ? ORDER BY outbox_id",
-                    (identity,),
-                ).fetchall()
-            ]
-            covered_holds = [
-                {
-                    "epoch_id": identity,
-                    "state": str(epoch["state"]),
-                    "cohort_count": int(hold["cohort_count"]),
-                    "cohort_sha256": str(hold["cohort_sha256"]),
-                }
-            ]
-            if items:
-                outbox_ids = [item["outbox_id"] for item in items]
-                placeholders = ",".join("?" for _ in outbox_ids)
-                covered_holds = [
-                    dict(row)
-                    for row in conn.execute(
-                        f"""
-                        SELECT DISTINCT referenced_epoch.epoch_id,
-                                        referenced_epoch.state,
-                                        referenced_hold.cohort_count,
-                                        referenced_hold.cohort_sha256
-                          FROM rca_activation_historical_outbox_hold_items AS held
-                          JOIN rca_activation_historical_outbox_holds
-                               AS referenced_hold
-                            ON referenced_hold.epoch_id = held.epoch_id
-                          JOIN rca_activation_epochs AS referenced_epoch
-                            ON referenced_epoch.epoch_id = held.epoch_id
-                         WHERE held.outbox_id IN ({placeholders})
-                         ORDER BY referenced_epoch.epoch_id
-                        """,
-                        tuple(outbox_ids),
-                    ).fetchall()
-                ]
-                for covered_hold in covered_holds:
-                    if str(covered_hold["state"]) != "aborted":
-                        raise ActivationEpochError(
-                            "activation_historical_disposition_active_epoch_reference"
-                        )
-                    referenced_items = [
-                        {
-                            "outbox_id": int(row["outbox_id"]),
-                            "row_sha256": str(row["row_sha256"]),
-                            "immutable_row_sha256": str(
-                                row["immutable_row_sha256"]
-                            ),
-                        }
-                        for row in conn.execute(
-                            "SELECT outbox_id, row_sha256, immutable_row_sha256 "
-                            "FROM rca_activation_historical_outbox_hold_items "
-                            "WHERE epoch_id = ? ORDER BY outbox_id",
-                            (covered_hold["epoch_id"],),
-                        ).fetchall()
-                    ]
-                    if (
-                        referenced_items != items
-                        or int(covered_hold["cohort_count"])
-                        != expected_cohort_count
-                        or str(covered_hold["cohort_sha256"]) != expected_sha256
-                    ):
-                        raise ActivationEpochError(
-                            "activation_historical_disposition_overlapping_cohort_changed"
-                        )
-            if identity not in {
-                str(covered_hold["epoch_id"]) for covered_hold in covered_holds
-            }:
-                raise ActivationEpochError(
-                    "activation_historical_disposition_current_hold_missing"
-                )
-            for covered_hold in covered_holds:
-                overlapping = conn.execute(
-                    "SELECT 1 FROM rca_activation_historical_outbox_dispositions "
-                    "WHERE epoch_id = ?",
-                    (covered_hold["epoch_id"],),
-                ).fetchone()
-                if overlapping is not None:
-                    raise ActivationEpochError(
-                        "activation_historical_disposition_overlapping_epoch_disposed"
-                    )
-            for item in items:
-                parent = conn.execute(
-                    """
-                    SELECT trigger.state
-                      FROM rca_outbox AS outbox
-                      JOIN business_triggers AS trigger
-                        ON trigger.business_key = outbox.business_key
-                       AND trigger.generation = outbox.generation
-                       AND trigger.submission_key = outbox.submission_key
-                     WHERE outbox.outbox_id = ?
-                    """,
-                    (item["outbox_id"],),
-                ).fetchone()
-                if parent is None or str(parent["state"]) != "pending":
-                    raise ActivationEpochError(
-                        "activation_historical_disposition_parent_state_invalid"
-                    )
-            disposition_id = ""
-            for covered_hold in covered_holds:
-                covered_epoch_id = str(covered_hold["epoch_id"])
-                binding = self._historical_outbox_disposition_binding(
-                    epoch_id=covered_epoch_id,
-                    cohort_count=expected_cohort_count,
-                    cohort_sha256=expected_sha256,
-                    operator=actor,
-                    reason=justification,
-                    disposed_at=disposed_at,
-                )
-                disposition_sha256 = _canonical_sha256(binding)
-                covered_disposition_id = (
-                    f"rca-hold-disposition-v1-{disposition_sha256}"
-                )
-                conn.execute(
-                    """
-                    INSERT INTO rca_activation_historical_outbox_dispositions(
-                        disposition_id, epoch_id, epoch_state, schema_version,
-                        hold_schema_version, row_schema_version,
-                        cohort_count, cohort_sha256, owner_authorized,
-                        operator, reason, disposed_at, disposition_sha256
-                    ) VALUES (?, ?, 'aborted', ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
-                    """,
-                    (
-                        covered_disposition_id,
-                        covered_epoch_id,
-                        ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_SCHEMA_VERSION,
-                        ACTIVATION_HISTORICAL_OUTBOX_HOLD_SCHEMA_VERSION,
-                        ACTIVATION_HISTORICAL_OUTBOX_ROW_SCHEMA_VERSION,
-                        expected_cohort_count,
-                        expected_sha256,
-                        actor,
-                        justification,
-                        disposed_at,
-                        disposition_sha256,
-                    ),
-                )
-                conn.executemany(
-                    """
-                    INSERT INTO rca_activation_historical_outbox_disposition_items(
-                        disposition_id, outbox_id, row_sha256,
-                        immutable_row_sha256
-                    ) VALUES (?, ?, ?, ?)
-                    """,
-                    [
-                        (
-                            covered_disposition_id,
-                            item["outbox_id"],
-                            item["row_sha256"],
-                            item["immutable_row_sha256"],
-                        )
-                        for item in items
-                    ],
-                )
-                if covered_epoch_id == identity:
-                    disposition_id = covered_disposition_id
-            if not disposition_id:
-                raise ActivationEpochError(
-                    "activation_historical_disposition_current_audit_missing"
-                )
-            for item in items:
-                updated = conn.execute(
-                    """
-                    UPDATE rca_outbox
-                       SET status = 'quarantined', next_attempt_at = NULL,
-                           quarantined_at = ?,
-                           last_error_code = ?,
-                           last_error_detail = 'owner_audited_disposition',
-                           updated_at = ?
-                     WHERE outbox_id = ? AND status = 'pending'
-                       AND activation_epoch_id IS NULL
-                       AND activation_ledger_id IS NULL
-                       AND lease_token IS NULL AND lease_owner IS NULL
-                       AND lease_expires_at IS NULL AND claimed_at IS NULL
-                       AND completed_at IS NULL AND result_json IS NULL
-                    """,
-                    (
-                        disposed_at,
-                        ACTIVATION_HISTORICAL_OUTBOX_DISPOSITION_ERROR_CODE,
-                        disposed_at,
-                        item["outbox_id"],
-                    ),
-                )
-                if updated.rowcount != 1:
-                    raise ActivationEpochError(
-                        "activation_historical_disposition_outbox_state_changed"
-                    )
-                parent_updated = conn.execute(
-                    """
-                    UPDATE business_triggers
-                       SET state = 'quarantined'
-                     WHERE business_key = (
-                               SELECT business_key FROM rca_outbox WHERE outbox_id = ?
-                           )
-                       AND generation = (
-                               SELECT generation FROM rca_outbox WHERE outbox_id = ?
-                           )
-                       AND state = 'pending'
-                    """,
-                    (item["outbox_id"], item["outbox_id"]),
-                )
-                if parent_updated.rowcount != 1:
-                    raise ActivationEpochError(
-                        "activation_historical_disposition_parent_state_changed"
-                    )
-            self._validate_v13_historical_outbox_hold_schema(conn)
-            disposition = conn.execute(
-                "SELECT * FROM rca_activation_historical_outbox_dispositions "
-                "WHERE disposition_id = ?",
-                (disposition_id,),
-            ).fetchone()
-            if disposition is None:
-                raise ActivationEpochError(
-                    "activation_historical_disposition_commit_lost"
-                )
-            result = self._public_historical_outbox_disposition(disposition)
-            conn.commit()
-            return result
-        except Exception:
-            if conn.in_transaction:
-                conn.rollback()
-            raise
         finally:
             conn.close()
 
@@ -8839,10 +5109,7 @@ class RcaControlStore:
                 raise RecordConflictError(
                     "manual_external_write_activation_ledger_missing"
                 )
-            if str(ledger["state"]) not in {
-                "bounded_active",
-                "steady_active",
-            }:
+            if str(ledger["state"]) != "steady_active":
                 raise RecordConflictError(
                     "manual_external_write_activation_epoch_not_current"
                 )
@@ -9025,7 +5292,7 @@ class RcaControlStore:
 
         This query is intentionally independent of dispatcher enable switches;
         a fence is live only while its exact admitted ledger row belongs to the
-        current bounded/steady activation epoch.
+        current steady activation epoch.
         """
         epoch_id = str(fence.get("activation_epoch_id") or "").strip()
         ledger_id = fence.get("activation_ledger_id")
@@ -9066,7 +5333,7 @@ class RcaControlStore:
             conn.close()
         if row is None or int(row["is_current"]) != 1:
             raise RecordConflictError("external_write_fence_epoch_not_current")
-        if str(row["state"]) not in {"bounded_active", "steady_active"}:
+        if str(row["state"]) != "steady_active":
             raise RecordConflictError("external_write_fence_epoch_not_current")
         if str(row["decision"]) != "admit" or not row["bound_at"]:
             raise RecordConflictError("external_write_fence_operation_denied")
@@ -9095,619 +5362,6 @@ class RcaControlStore:
             "generation": int(row["generation"]),
             **targets,
         }
-
-    def capacity_transition_state(self) -> dict[str, Any] | None:
-        """Return the durable capacity latch; derived readiness lives elsewhere."""
-
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN")
-            integrity_error = self._capacity_transition_integrity_error_tx(conn)
-            if integrity_error:
-                raise RuntimeError(
-                    f"rca_capacity_transition_integrity:{integrity_error}"
-                )
-            row = self._capacity_transition_state_tx(conn)
-            result = (
-                self._public_capacity_transition_state(row)
-                if row is not None
-                else None
-            )
-            conn.commit()
-            return result
-        except Exception:
-            if conn.in_transaction:
-                conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    def initialize_capacity_transition(
-        self,
-        *,
-        release_id: str,
-        bootstrap_epoch_id: str,
-        now: datetime | None = None,
-    ) -> dict[str, Any]:
-        """Create the explicit bootstrap latch once; missing state never auto-allows."""
-
-        release = self._normalize_capacity_identity(release_id, "release_id")
-        epoch = self._normalize_capacity_identity(
-            bootstrap_epoch_id, "bootstrap_epoch_id"
-        )
-        current = _iso(now)
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            integrity_error = self._capacity_transition_integrity_error_tx(conn)
-            if integrity_error:
-                raise CapacityTransitionStateError(
-                    f"capacity_transition_integrity_invalid:{integrity_error}"
-                )
-            existing = self._capacity_transition_state_tx(conn)
-            if existing is not None:
-                if (
-                    str(existing["release_id"]) != release
-                    or str(existing["bootstrap_epoch_id"]) != epoch
-                ):
-                    raise CapacityTransitionStateError(
-                        "capacity_transition_identity_conflict"
-                    )
-                conn.commit()
-                return self._public_capacity_transition_state(existing)
-            conn.execute(
-                """
-                INSERT INTO rca_capacity_transition_state(
-                    singleton_id, release_id, bootstrap_epoch_id, state,
-                    generation, bootstrap_initialized_at, updated_at
-                ) VALUES(1, ?, ?, 'BOOTSTRAP_PRODUCTION', 1, ?, ?)
-                """,
-                (release, epoch, current, current),
-            )
-            conn.execute(
-                """
-                INSERT INTO rca_capacity_transition_audit(
-                    release_id, bootstrap_epoch_id, from_state, to_state,
-                    from_generation, to_generation, transitioned_at
-                ) VALUES(?, ?, 'UNCONFIGURED', 'BOOTSTRAP_PRODUCTION', 0, 1, ?)
-                """,
-                (release, epoch, current),
-            )
-            row = self._capacity_transition_state_tx(conn)
-            if row is None:
-                raise CapacityTransitionStateError(
-                    "capacity_transition_initialize_lost"
-                )
-            integrity_error = self._capacity_transition_integrity_error_tx(conn)
-            if integrity_error:
-                raise CapacityTransitionStateError(
-                    f"capacity_transition_initialize_invalid:{integrity_error}"
-                )
-            conn.commit()
-            return self._public_capacity_transition_state(row)
-        except Exception:
-            if conn.in_transaction:
-                conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    def compare_and_set_capacity_steady(
-        self,
-        *,
-        expected_generation: int,
-        release_id: str,
-        bootstrap_epoch_id: str,
-        final_ledger_sha256: str,
-        transition_authorization_sha256: str,
-        transition_authorization_fingerprint: str,
-        transition_receipt_sha256: str,
-        transition_receipt_fingerprint: str,
-        commit_marker_sha256: str,
-        commit_marker_fingerprint: str,
-        evidence_bundle_sha256: str,
-        evidence_bundle_fingerprint: str,
-        authorization_issued_at: str,
-        authorization_expires_at: str,
-        receipt_created_at: str,
-        marker_committed_at: str,
-        now: datetime | None = None,
-    ) -> dict[str, Any]:
-        """Irreversibly CAS the release-bound bootstrap latch to steady."""
-
-        if (
-            isinstance(expected_generation, bool)
-            or not isinstance(expected_generation, int)
-            or expected_generation < 1
-        ):
-            raise CapacityTransitionStateError(
-                "capacity_expected_generation_invalid"
-            )
-        release = self._normalize_capacity_identity(release_id, "release_id")
-        epoch = self._normalize_capacity_identity(
-            bootstrap_epoch_id, "bootstrap_epoch_id"
-        )
-        hashes = {
-            field: self._normalize_capacity_sha256(value, field)
-            for field, value in {
-                "final_ledger_sha256": final_ledger_sha256,
-                "transition_authorization_sha256": (
-                    transition_authorization_sha256
-                ),
-                "transition_authorization_fingerprint": (
-                    transition_authorization_fingerprint
-                ),
-                "transition_receipt_sha256": transition_receipt_sha256,
-                "transition_receipt_fingerprint": (
-                    transition_receipt_fingerprint
-                ),
-                "commit_marker_sha256": commit_marker_sha256,
-                "commit_marker_fingerprint": commit_marker_fingerprint,
-                "evidence_bundle_sha256": evidence_bundle_sha256,
-                "evidence_bundle_fingerprint": evidence_bundle_fingerprint,
-            }.items()
-        }
-        timestamps = {
-            field: self._normalize_capacity_timestamp(value, field)
-            for field, value in {
-                "authorization_issued_at": authorization_issued_at,
-                "authorization_expires_at": authorization_expires_at,
-                "receipt_created_at": receipt_created_at,
-                "marker_committed_at": marker_committed_at,
-            }.items()
-        }
-        issued = datetime.fromisoformat(timestamps["authorization_issued_at"])
-        expires = datetime.fromisoformat(timestamps["authorization_expires_at"])
-        receipt_created = datetime.fromisoformat(timestamps["receipt_created_at"])
-        marker_committed = datetime.fromisoformat(timestamps["marker_committed_at"])
-        current_dt = _utc_datetime(now)
-        if not (
-            issued < expires
-            and issued <= receipt_created <= marker_committed <= expires
-            and marker_committed <= current_dt + timedelta(seconds=5)
-        ):
-            raise CapacityTransitionStateError(
-                "capacity_transition_timestamp_order_invalid"
-            )
-        current = current_dt.isoformat()
-        bindings = {**hashes, **timestamps}
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            integrity_error = self._capacity_transition_integrity_error_tx(conn)
-            if integrity_error:
-                raise CapacityTransitionStateError(
-                    f"capacity_transition_integrity_invalid:{integrity_error}"
-                )
-            existing = self._capacity_transition_state_tx(conn)
-            if existing is None:
-                raise CapacityTransitionStateError(
-                    "capacity_transition_unconfigured"
-                )
-            if (
-                str(existing["release_id"]) != release
-                or str(existing["bootstrap_epoch_id"]) != epoch
-            ):
-                raise CapacityTransitionStateError(
-                    "capacity_transition_identity_conflict"
-                )
-            existing_state = str(existing["state"])
-            if existing_state == CAPACITY_STEADY_ACTIVE:
-                if int(existing["generation"]) != expected_generation + 1:
-                    raise CapacityTransitionStateError(
-                        "capacity_transition_generation_changed"
-                    )
-                if all(existing[field] == value for field, value in bindings.items()):
-                    conn.commit()
-                    return self._public_capacity_transition_state(existing)
-                raise CapacityTransitionStateError(
-                    "capacity_transition_steady_binding_conflict"
-                )
-            if existing_state != CAPACITY_BOOTSTRAP_PRODUCTION:
-                raise CapacityTransitionStateError(
-                    "capacity_transition_state_invalid"
-                )
-            if int(existing["generation"]) != expected_generation:
-                raise CapacityTransitionStateError(
-                    "capacity_transition_generation_changed"
-                )
-            next_generation = expected_generation + 1
-            updated = conn.execute(
-                """
-                UPDATE rca_capacity_transition_state
-                   SET state = 'STEADY_ACTIVE', generation = ?,
-                       final_ledger_sha256 = ?,
-                       transition_authorization_sha256 = ?,
-                       transition_authorization_fingerprint = ?,
-                       transition_receipt_sha256 = ?,
-                       transition_receipt_fingerprint = ?,
-                       commit_marker_sha256 = ?,
-                       commit_marker_fingerprint = ?,
-                       evidence_bundle_sha256 = ?,
-                       evidence_bundle_fingerprint = ?,
-                       authorization_issued_at = ?,
-                       authorization_expires_at = ?,
-                       receipt_created_at = ?, marker_committed_at = ?,
-                       steady_activated_at = ?, updated_at = ?
-                 WHERE singleton_id = 1
-                   AND release_id = ? AND bootstrap_epoch_id = ?
-                   AND state = 'BOOTSTRAP_PRODUCTION' AND generation = ?
-                """,
-                (
-                    next_generation,
-                    hashes["final_ledger_sha256"],
-                    hashes["transition_authorization_sha256"],
-                    hashes["transition_authorization_fingerprint"],
-                    hashes["transition_receipt_sha256"],
-                    hashes["transition_receipt_fingerprint"],
-                    hashes["commit_marker_sha256"],
-                    hashes["commit_marker_fingerprint"],
-                    hashes["evidence_bundle_sha256"],
-                    hashes["evidence_bundle_fingerprint"],
-                    timestamps["authorization_issued_at"],
-                    timestamps["authorization_expires_at"],
-                    timestamps["receipt_created_at"],
-                    timestamps["marker_committed_at"],
-                    current,
-                    current,
-                    release,
-                    epoch,
-                    expected_generation,
-                ),
-            )
-            if updated.rowcount != 1:
-                raise CapacityTransitionStateError(
-                    "capacity_transition_generation_changed"
-                )
-            conn.execute(
-                """
-                INSERT INTO rca_capacity_transition_audit(
-                    release_id, bootstrap_epoch_id, from_state, to_state,
-                    from_generation, to_generation,
-                    final_ledger_sha256,
-                    transition_authorization_sha256,
-                    transition_authorization_fingerprint,
-                    transition_receipt_sha256,
-                    transition_receipt_fingerprint,
-                    commit_marker_sha256, commit_marker_fingerprint,
-                    evidence_bundle_sha256, evidence_bundle_fingerprint,
-                    authorization_issued_at, authorization_expires_at,
-                    receipt_created_at, marker_committed_at, transitioned_at
-                ) VALUES(
-                    ?, ?, 'BOOTSTRAP_PRODUCTION', 'STEADY_ACTIVE', ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-                )
-                """,
-                (
-                    release,
-                    epoch,
-                    expected_generation,
-                    next_generation,
-                    hashes["final_ledger_sha256"],
-                    hashes["transition_authorization_sha256"],
-                    hashes["transition_authorization_fingerprint"],
-                    hashes["transition_receipt_sha256"],
-                    hashes["transition_receipt_fingerprint"],
-                    hashes["commit_marker_sha256"],
-                    hashes["commit_marker_fingerprint"],
-                    hashes["evidence_bundle_sha256"],
-                    hashes["evidence_bundle_fingerprint"],
-                    timestamps["authorization_issued_at"],
-                    timestamps["authorization_expires_at"],
-                    timestamps["receipt_created_at"],
-                    timestamps["marker_committed_at"],
-                    current,
-                ),
-            )
-            row = self._capacity_transition_state_tx(conn)
-            if row is None or int(row["generation"]) != next_generation:
-                raise CapacityTransitionStateError(
-                    "capacity_transition_cas_lost"
-                )
-            integrity_error = self._capacity_transition_integrity_error_tx(conn)
-            if integrity_error:
-                raise CapacityTransitionStateError(
-                    f"capacity_transition_cas_invalid:{integrity_error}"
-                )
-            conn.commit()
-            return self._public_capacity_transition_state(row)
-        except Exception:
-            if conn.in_transaction:
-                conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    def activation_slot_authorizations(
-        self,
-        *,
-        epoch_id: str,
-    ) -> dict[str, dict[str, str | None]]:
-        """Return the immutable, payload-free slot authorization bindings."""
-        identity = self._normalize_activation_epoch_id(epoch_id)
-        conn = self._connect()
-        try:
-            epoch = self._current_activation_epoch_tx(conn)
-            if epoch is None or str(epoch["epoch_id"]) != identity:
-                raise ActivationEpochError("activation_epoch_not_current")
-            rows = conn.execute(
-                f"""
-                SELECT slot_kind, authorized_source_kind,
-                       authorized_identity_sha256
-                  FROM rca_activation_budget_slots
-                 WHERE epoch_id = ?
-                   AND slot_kind IN ({_ACTIVATION_RELEASE_SLOT_SQL})
-                 ORDER BY slot_kind
-                """,
-                (identity,),
-            ).fetchall()
-            if len(rows) != len(ACTIVATION_RELEASE_SLOT_KINDS) or {
-                str(row["slot_kind"]) for row in rows
-            } != set(ACTIVATION_RELEASE_SLOT_KINDS):
-                raise ActivationEpochError("activation_slot_set_invalid")
-            return {
-                str(row["slot_kind"]): {
-                    "source_kind": (
-                        str(row["authorized_source_kind"])
-                        if row["authorized_source_kind"] is not None
-                        else None
-                    ),
-                    "source_identity_sha256": (
-                        str(row["authorized_identity_sha256"])
-                        if row["authorized_identity_sha256"] is not None
-                        else None
-                    ),
-                }
-                for row in rows
-            }
-        finally:
-            conn.close()
-
-    def authorize_activation_slot(
-        self,
-        *,
-        epoch_id: str,
-        slot_kind: str,
-        source_kind: str,
-        source_identity: Mapping[str, Any],
-        operator: str,
-        reason: str,
-        now: datetime | None = None,
-    ) -> dict[str, Any]:
-        """Bind one bounded slot to one exact, payload-free source identity hash."""
-        identity = self._normalize_activation_epoch_id(epoch_id)
-        slot = str(slot_kind or "").strip()
-        if slot not in ACTIVATION_SLOT_KINDS:
-            raise ActivationEpochError("activation_slot_kind_invalid")
-        kind = str(source_kind or "").strip()
-        expected_kind = "kafka" if slot == "kafka_success" else "manual"
-        if kind != expected_kind:
-            raise ActivationEpochError("activation_slot_source_kind_mismatch")
-        source_sha, normalized_source = self._normalize_activation_source_identity(
-            kind, source_identity
-        )
-        actor, justification = self._normalize_activation_audit_text(operator, reason)
-        current = _iso(now)
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            epoch = self._current_activation_epoch_tx(conn)
-            if epoch is None or str(epoch["epoch_id"]) != identity:
-                raise ActivationEpochError("activation_epoch_not_current")
-            if str(epoch["state"]) != "preauthorized":
-                raise ActivationEpochError("activation_slot_authorization_closed")
-            if kind == "kafka":
-                start_fence = json.loads(str(epoch["partition_start_fence_json"]))
-                topic = str(normalized_source["topic"])
-                partition = str(normalized_source["partition"])
-                offset = int(normalized_source["offset"])
-                if topic not in start_fence or partition not in start_fence[topic]:
-                    raise ActivationEpochError("activation_kafka_partition_not_fenced")
-                if offset < int(start_fence[topic][partition]):
-                    raise ActivationEpochError("activation_kafka_before_start_fence")
-            reused = conn.execute(
-                """
-                SELECT slot_kind FROM rca_activation_budget_slots
-                 WHERE epoch_id = ? AND slot_kind != ?
-                   AND authorized_source_kind = ?
-                   AND authorized_identity_sha256 = ?
-                """,
-                (identity, slot, kind, source_sha),
-            ).fetchone()
-            if reused is not None:
-                raise ActivationEpochError("activation_slot_identity_reused")
-            row = conn.execute(
-                """
-                SELECT * FROM rca_activation_budget_slots
-                 WHERE epoch_id = ? AND slot_kind = ?
-                """,
-                (identity, slot),
-            ).fetchone()
-            if row is None:
-                raise ActivationEpochError("activation_slot_missing")
-            if row["authorized_identity_sha256"] is not None:
-                if (
-                    str(row["authorized_source_kind"]) != kind
-                    or str(row["authorized_identity_sha256"]) != source_sha
-                    or str(row["authorized_operator"] or "") != actor
-                    or str(row["authorized_reason"] or "") != justification
-                ):
-                    raise ActivationEpochError("activation_slot_identity_conflict")
-            else:
-                conn.execute(
-                    """
-                    UPDATE rca_activation_budget_slots
-                       SET authorized_source_kind = ?,
-                           authorized_identity_sha256 = ?, authorized_at = ?,
-                           authorized_operator = ?, authorized_reason = ?
-                     WHERE epoch_id = ? AND slot_kind = ?
-                       AND authorized_identity_sha256 IS NULL
-                    """,
-                    (
-                        kind,
-                        source_sha,
-                        current,
-                        actor,
-                        justification,
-                        identity,
-                        slot,
-                    ),
-                )
-            conn.commit()
-            return {
-                "epoch_id": identity,
-                "slot_kind": slot,
-                "source_kind": kind,
-                "source_identity_sha256": source_sha,
-            }
-        except Exception:
-            if conn.in_transaction:
-                conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    @staticmethod
-    def _validate_partition_end_fence(start_json: str, end_json: str) -> None:
-        start = json.loads(start_json)
-        end = json.loads(end_json)
-        if set(start) != set(end):
-            raise ActivationEpochError("activation_partition_end_fence_keys_changed")
-        for topic, start_partitions in start.items():
-            end_partitions = end.get(topic)
-            if not isinstance(end_partitions, dict) or set(start_partitions) != set(
-                end_partitions
-            ):
-                raise ActivationEpochError(
-                    "activation_partition_end_fence_keys_changed"
-                )
-            for partition, start_offset in start_partitions.items():
-                if int(end_partitions[partition]) < int(start_offset):
-                    raise ActivationEpochError(
-                        "activation_partition_end_fence_regressed"
-                    )
-
-    @staticmethod
-    def _activation_inflight_writes_tx(conn: sqlite3.Connection) -> int:
-        total = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM rca_outbox WHERE status = 'claimed'"
-            ).fetchone()[0]
-        )
-        delivery_effects = conn.execute(
-            """
-            SELECT 1 FROM sqlite_master
-             WHERE type = 'table' AND name = 'rca_delivery_effects'
-            """
-        ).fetchone()
-        if delivery_effects is not None:
-            total += int(
-                conn.execute(
-                    """
-                    SELECT COUNT(*) FROM rca_delivery_effects
-                     WHERE status = 'claimed'
-                    """
-                ).fetchone()[0]
-            )
-        return total
-
-    @staticmethod
-    def _activation_terminal_execution_complete_tx(
-        conn: sqlite3.Connection,
-        *,
-        business_key: str,
-        submission_key: str,
-        generation: int,
-    ) -> bool:
-        """Require one durable terminal settlement, public or intentionally silent."""
-        required_tables = {
-            "rca_execution_watch",
-            "rca_delivery_jobs",
-            "rca_delivery_effects",
-            "rca_delivery_subscriptions",
-            "rca_failure_routes",
-        }
-        present = {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            ).fetchall()
-        }
-        if not required_tables.issubset(present):
-            return False
-        watch = conn.execute(
-            """
-            SELECT w.state, w.task_id, w.terminal_at, w.delivery_id,
-                   w.last_error_code, w.last_status_json,
-                   j.status AS job_status,
-                   j.delivery_id AS job_delivery_id, j.outcome AS job_outcome,
-                   j.terminal_state,
-                   j.terminal_error_code
-              FROM rca_execution_watch AS w
-              LEFT JOIN rca_delivery_jobs AS j
-                ON j.delivery_id = w.delivery_id
-             WHERE w.submission_key = ?
-               AND w.business_key = ?
-               AND w.generation = ?
-            """,
-            (submission_key, business_key, generation),
-        ).fetchone()
-        if watch is None:
-            return False
-        public_delivery_complete = not (
-            str(watch["state"] or "") != "delivery_created"
-            or watch["task_id"] is not None
-            or not str(watch["terminal_at"] or "")
-            or not str(watch["last_error_code"] or "")
-            or not str(watch["delivery_id"] or "")
-            or str(watch["job_status"] or "") != "delivered"
-            or str(watch["job_outcome"] or "")
-            not in {"terminal_failed", "quarantined"}
-            or not str(watch["terminal_state"] or "")
-            or not str(watch["terminal_error_code"] or "")
-            or str(watch["delivery_id"] or "")
-            != str(watch["job_delivery_id"] or "")
-        )
-        if not public_delivery_complete:
-            return RcaControlStore._activation_silent_terminal_complete_tx(
-                conn,
-                business_key=business_key,
-                submission_key=submission_key,
-                generation=generation,
-                watch=watch,
-            )
-        effects = conn.execute(
-            """
-            SELECT s.effect_kind, s.required, s.status AS subscription_status,
-                   s.delivery_id AS subscription_delivery_id,
-                   s.effect_key AS subscription_effect_key,
-                   e.status AS effect_status, e.outcome AS effect_outcome,
-                   e.completed_at
-              FROM rca_delivery_subscriptions AS s
-              LEFT JOIN rca_delivery_effects AS e
-                ON e.effect_key = s.effect_key
-             WHERE s.business_key = ?
-               AND s.generation = ?
-               AND s.required = 1
-            ORDER BY s.effect_kind
-            """,
-            (business_key, generation),
-        ).fetchall()
-        if len(effects) != 2 or {
-            str(row["effect_kind"] or "") for row in effects
-        } != {"feishu_issue_comment", "feishu_thread_reply"}:
-            return False
-        delivery_id = str(watch["delivery_id"])
-        return all(
-            int(row["required"] or 0) == 1
-            and str(row["subscription_status"] or "") == "materialized"
-            and str(row["subscription_delivery_id"] or "") == delivery_id
-            and str(row["subscription_effect_key"] or "")
-            and str(row["effect_status"] or "") == "succeeded"
-            and str(row["effect_outcome"] or "") == str(watch["job_outcome"])
-            and bool(str(row["completed_at"] or ""))
-            for row in effects
-        )
 
     @staticmethod
     def _activation_silent_terminal_complete_tx(
@@ -9744,7 +5398,7 @@ class RcaControlStore:
             or _canonical_json(status) != status_raw
             or status.get("external_writes") is not False
             or status.get("terminal_delivery_policy")
-            != _ACTIVATION_SILENT_TERMINAL_POLICY
+            != _SILENT_TERMINAL_POLICY
         ):
             return False
         taxonomy = status.get("failure_taxonomy")
@@ -9781,7 +5435,7 @@ class RcaControlStore:
             not (known_terminal or taxonomy_gap_terminal)
             or str(taxonomy.get("terminal_error_code") or "") != error_code
             or (route_kind, lane)
-            not in _ACTIVATION_SILENT_TERMINAL_ROUTE_LANES
+            not in _SILENT_TERMINAL_ROUTE_LANES
             or not isinstance(durable_route, dict)
             or not isinstance(fallback, dict)
         ):
@@ -10077,773 +5731,6 @@ class RcaControlStore:
             )
             for row in effects
         )
-
-    @classmethod
-    def _activation_bound_delivery_backlog_tx(
-        cls,
-        conn: sqlite3.Connection,
-        *,
-        epoch_id: str,
-    ) -> int:
-        rows = conn.execute(
-            """
-            SELECT business_key, submission_key, generation
-             FROM rca_outbox
-             WHERE status IN ('completed', 'quarantined')
-               AND (activation_epoch_id = ? OR activation_ledger_id IN (
-                    SELECT ledger_id FROM rca_activation_admission_ledger
-                     WHERE epoch_id = ?))
-               AND last_error_code != 'activation_epoch_deferred'
-            """,
-            (epoch_id, epoch_id),
-        ).fetchall()
-        return sum(
-            not cls._activation_delivery_execution_complete_tx(
-                conn,
-                business_key=str(row["business_key"] or ""),
-                submission_key=str(row["submission_key"] or ""),
-                generation=int(row["generation"] or 0),
-            )
-            for row in rows
-        )
-
-    @classmethod
-    def _activation_completed_bound_slot_count_tx(
-        cls,
-        conn: sqlite3.Connection,
-        *,
-        epoch_id: str,
-    ) -> int:
-        bound_slots = conn.execute(
-            f"""
-            SELECT s.slot_kind, al.business_key, al.submission_key,
-                   al.generation, o.status AS outbox_status
-              FROM rca_activation_budget_slots AS s
-              JOIN rca_activation_admission_ledger AS al
-                ON al.epoch_id = s.epoch_id
-               AND al.ledger_id = s.consumed_ledger_id
-               AND al.slot_kind = s.slot_kind
-               AND al.source_identity_sha256 = s.authorized_identity_sha256
-               AND al.decision = 'admit'
-               AND al.bound_at IS NOT NULL
-              JOIN business_triggers AS t
-                ON t.activation_epoch_id = al.epoch_id
-               AND t.activation_ledger_id = al.ledger_id
-               AND t.business_key = al.business_key
-               AND t.submission_key = al.submission_key
-               AND t.generation = al.generation
-              JOIN rca_outbox AS o
-                ON o.activation_epoch_id = al.epoch_id
-               AND o.activation_ledger_id = al.ledger_id
-               AND o.business_key = al.business_key
-               AND o.submission_key = al.submission_key
-               AND o.generation = al.generation
-             WHERE s.epoch_id = ?
-               AND s.slot_kind IN ({_ACTIVATION_RELEASE_SLOT_SQL})
-            """,
-            (epoch_id,),
-        ).fetchall()
-        completed = 0
-        for slot in bound_slots:
-            slot_kind = str(slot["slot_kind"] or "")
-            is_complete = (
-                cls._activation_terminal_execution_complete_tx(
-                    conn,
-                    business_key=str(slot["business_key"] or ""),
-                    submission_key=str(slot["submission_key"] or ""),
-                    generation=int(slot["generation"] or 0),
-                )
-                if slot_kind == "manual_terminal_failure"
-                else str(slot["outbox_status"] or "") == "completed"
-            )
-            if is_complete:
-                completed += 1
-        return completed
-
-    @classmethod
-    def _validate_consumed_activation_executions_tx(
-        cls,
-        conn: sqlite3.Connection,
-        *,
-        epoch: sqlite3.Row,
-        end_fence_json: str,
-    ) -> str:
-        epoch_id = str(epoch["epoch_id"])
-        historical_hold = cls._require_historical_outbox_hold_match_tx(
-            conn,
-            epoch=epoch,
-        )
-        rows = conn.execute(
-            f"""
-            SELECT s.slot_kind, s.authorized_identity_sha256,
-                   s.consumed_ledger_id, s.consumed_at,
-                   al.ledger_id, al.epoch_id AS ledger_epoch_id,
-                   al.source_identity_sha256, al.slot_kind AS ledger_slot_kind,
-                   al.decision, al.bound_at, al.business_key,
-                   al.submission_key, al.generation,
-                   t.activation_epoch_id AS trigger_epoch_id,
-                   t.activation_ledger_id AS trigger_ledger_id,
-                   o.activation_epoch_id AS outbox_epoch_id,
-                   o.activation_ledger_id AS outbox_ledger_id,
-                   o.status AS outbox_status
-             FROM rca_activation_budget_slots AS s
-         LEFT JOIN rca_activation_admission_ledger AS al
-                ON al.ledger_id = s.consumed_ledger_id
-               AND al.epoch_id = s.epoch_id
-         LEFT JOIN business_triggers AS t
-                ON t.business_key = al.business_key
-               AND t.submission_key = al.submission_key
-               AND t.generation = al.generation
-         LEFT JOIN rca_outbox AS o
-                ON o.business_key = al.business_key
-               AND o.submission_key = al.submission_key
-               AND o.generation = al.generation
-             WHERE s.epoch_id = ?
-               AND s.slot_kind IN ({_ACTIVATION_RELEASE_SLOT_SQL})
-             ORDER BY s.slot_kind
-            """,
-            (epoch_id,),
-        ).fetchall()
-        if len(rows) != len(ACTIVATION_RELEASE_SLOT_KINDS):
-            raise ActivationEpochError("activation_bounded_execution_unbound")
-        for row in rows:
-            ledger_id = int(row["ledger_id"] or 0)
-            if (
-                row["consumed_ledger_id"] is None
-                or not str(row["consumed_at"] or "")
-                or ledger_id != int(row["consumed_ledger_id"] or 0)
-                or str(row["ledger_epoch_id"] or "") != epoch_id
-                or str(row["ledger_slot_kind"] or "") != str(row["slot_kind"])
-                or str(row["decision"] or "") != "admit"
-                or not str(row["bound_at"] or "")
-                or str(row["source_identity_sha256"] or "")
-                != str(row["authorized_identity_sha256"] or "")
-                or str(row["trigger_epoch_id"] or "") != epoch_id
-                or int(row["trigger_ledger_id"] or 0) != ledger_id
-                or str(row["outbox_epoch_id"] or "") != epoch_id
-                or int(row["outbox_ledger_id"] or 0) != ledger_id
-                or (
-                    str(row["slot_kind"] or "") == "manual_terminal_failure"
-                    and not cls._activation_terminal_execution_complete_tx(
-                        conn,
-                        business_key=str(row["business_key"] or ""),
-                        submission_key=str(row["submission_key"] or ""),
-                        generation=int(row["generation"] or 0),
-                    )
-                )
-                or (
-                    str(row["slot_kind"] or "") != "manual_terminal_failure"
-                    and str(row["outbox_status"] or "") != "completed"
-                )
-            ):
-                raise ActivationEpochError("activation_bounded_execution_unbound")
-        start_fence = json.loads(str(epoch["partition_start_fence_json"]))
-        unexpected_admissions = int(
-            conn.execute(
-                """
-                SELECT COUNT(*) FROM rca_activation_admission_ledger
-                 WHERE epoch_id = ? AND decision IN ('admit', 'join')
-                   AND ledger_id NOT IN (
-                       SELECT consumed_ledger_id
-                         FROM rca_activation_budget_slots
-                        WHERE epoch_id = ? AND consumed_ledger_id IS NOT NULL
-                   )
-                """,
-                (epoch_id, epoch_id),
-            ).fetchone()[0]
-        )
-        admitted_ledgers = int(
-            conn.execute(
-                """
-                SELECT COUNT(*) FROM rca_activation_admission_ledger
-                 WHERE epoch_id = ? AND decision = 'admit'
-                """,
-                (epoch_id,),
-            ).fetchone()[0]
-        )
-        unbound_ledger = int(
-            conn.execute(
-                """
-                SELECT COUNT(*)
-                  FROM rca_activation_admission_ledger AS al
-                 WHERE al.epoch_id = ?
-                   AND al.decision IN ('admit', 'shadow')
-                   AND (
-                       al.bound_at IS NULL
-                    OR NOT EXISTS (
-                        SELECT 1 FROM business_triggers AS t
-                         WHERE t.activation_epoch_id = al.epoch_id
-                           AND t.activation_ledger_id = al.ledger_id
-                           AND t.business_key = al.business_key
-                           AND t.submission_key = al.submission_key
-                           AND t.generation = al.generation
-                    )
-                    OR NOT EXISTS (
-                        SELECT 1 FROM rca_outbox AS o
-                         WHERE o.activation_epoch_id = al.epoch_id
-                           AND o.activation_ledger_id = al.ledger_id
-                           AND o.business_key = al.business_key
-                           AND o.submission_key = al.submission_key
-                           AND o.generation = al.generation
-                    )
-                   )
-                """,
-                (epoch_id,),
-            ).fetchone()[0]
-        )
-        historical_blocked = int(
-            conn.execute(
-                """
-                SELECT COUNT(*) FROM rca_outbox AS o
-                 WHERE o.status IN ('pending', 'claimed')
-                   AND NOT EXISTS (
-                       SELECT 1
-                         FROM rca_activation_historical_outbox_hold_items AS held
-                        WHERE held.epoch_id = ?
-                          AND held.outbox_id = o.outbox_id
-                   )
-                   AND (
-                       o.activation_epoch_id IS NULL
-                       OR o.activation_epoch_id != ?
-                       OR o.activation_ledger_id IS NULL
-                       OR NOT EXISTS (
-                           SELECT 1
-                             FROM rca_activation_admission_ledger AS al
-                            WHERE al.ledger_id = o.activation_ledger_id
-                              AND al.epoch_id = o.activation_epoch_id
-                              AND al.decision = 'admit'
-                       )
-                   )
-                """,
-                (epoch_id, epoch_id),
-            ).fetchone()[0]
-        )
-        historical_held = int(
-            conn.execute(
-                """
-                SELECT COUNT(*) FROM rca_outbox AS o
-                 WHERE o.status = 'shadow'
-                   AND (
-                       o.activation_epoch_id IS NULL
-                       OR o.activation_epoch_id != ?
-                   )
-                """,
-                (epoch_id,),
-            ).fetchone()[0]
-        )
-        unadjudicated_shadow = int(
-            conn.execute(
-                """
-                SELECT COUNT(*) FROM rca_outbox AS o
-                 WHERE o.status = 'shadow'
-                   AND (
-                       o.activation_ledger_id IS NULL
-                       OR NOT EXISTS (
-                           SELECT 1
-                             FROM rca_activation_admission_ledger AS al
-                            WHERE al.ledger_id = o.activation_ledger_id
-                              AND al.epoch_id = o.activation_epoch_id
-                              AND al.business_key = o.business_key
-                              AND al.submission_key = o.submission_key
-                              AND al.generation = o.generation
-                       )
-                   )
-                """
-            ).fetchone()[0]
-        )
-        if (
-            admitted_ledgers != len(ACTIVATION_RELEASE_SLOT_KINDS)
-            or unexpected_admissions
-        ):
-            raise ActivationEpochError("activation_unexpected_admission")
-        if unbound_ledger:
-            raise ActivationEpochError("activation_bounded_execution_unbound")
-        if historical_blocked or historical_held:
-            raise ActivationEpochError("activation_historical_backlog_not_drained")
-        if unadjudicated_shadow:
-            raise ActivationEpochError("activation_shadow_binding_invalid")
-        bindings = {
-            str(row["slot_kind"]): {
-                "business_key": str(row["business_key"] or ""),
-                "submission_key": str(row["submission_key"] or ""),
-                "generation": int(row["generation"] or 0),
-                "ledger_id": int(row["ledger_id"]),
-                "source_identity_sha256": str(
-                    row["source_identity_sha256"]
-                ),
-            }
-            for row in rows
-        }
-        release_binding = {
-            "epoch_id": epoch_id,
-            "state": "bounded_active",
-            "preauthorization_fingerprint": str(epoch["preauthorization_fingerprint"]),
-            "preauthorization_gate_receipt_sha256": str(
-                epoch["preauthorization_gate_receipt_sha256"]
-            ),
-            "preauthorization_capsule_sha256": str(
-                epoch["preauthorization_capsule_sha256"]
-            ),
-            "preproduction_fingerprint": str(epoch["preproduction_fingerprint"]),
-            "preproduction_gate_receipt_sha256": str(
-                epoch["preproduction_gate_receipt_sha256"]
-            ),
-            "preproduction_capsule_sha256": str(epoch["preproduction_capsule_sha256"]),
-            "config_sha256": str(epoch["config_sha256"]),
-            "db_logical_identity_sha256": str(epoch["db_logical_identity_sha256"]),
-            "bounded_activated_at": str(epoch["bounded_activated_at"]),
-            "partition_start_fence_sha256": str(epoch["partition_start_fence_sha256"]),
-            "partition_start_fence": start_fence,
-            "kafka_proof": {
-                "mode": ACTIVATION_KAFKA_PROOF_MODE,
-                "preauthorization_gate_receipt_sha256": str(
-                    epoch["preauthorization_gate_receipt_sha256"]
-                ),
-                "partition_start_fence_sha256": str(
-                    epoch["partition_start_fence_sha256"]
-                ),
-                "partition_end_fence_sha256": hashlib.sha256(
-                    end_fence_json.encode("utf-8")
-                ).hexdigest(),
-            },
-            "slot_bindings": bindings,
-            "unexpected_admissions": 0,
-            "historical_blocked": 0,
-            "historical_held": 0,
-            "historical_hold_count": historical_hold["sealed_count"],
-            "historical_hold_sha256": historical_hold["sealed_sha256"],
-            "historical_hold_row_schema_version": historical_hold[
-                "row_schema_version"
-            ],
-            "pending_inbox": 0,
-            "unbound_ledger": 0,
-            "inflight_writes": 0,
-        }
-        return _canonical_sha256(release_binding)
-
-    @staticmethod
-    def _validate_current_activation_shadows_tx(
-        conn: sqlite3.Connection,
-        *,
-        epoch: sqlite3.Row,
-        end_fence_json: str,
-    ) -> None:
-        epoch_id = str(epoch["epoch_id"])
-        start_fence = json.loads(str(epoch["partition_start_fence_json"]))
-        end_fence = json.loads(end_fence_json)
-        rows = conn.execute(
-            """
-            SELECT o.activation_ledger_id, o.business_key, o.submission_key,
-                   o.generation, o.source_topic, o.source_partition,
-                   o.source_offset, al.ledger_id, al.decision, al.bound_at
-              FROM rca_outbox AS o
-         LEFT JOIN rca_activation_admission_ledger AS al
-                ON al.epoch_id = o.activation_epoch_id
-               AND al.ledger_id = o.activation_ledger_id
-               AND al.business_key = o.business_key
-               AND al.submission_key = o.submission_key
-               AND al.generation = o.generation
-             WHERE o.activation_epoch_id = ? AND o.status = 'shadow'
-            """,
-            (epoch_id,),
-        ).fetchall()
-        for row in rows:
-            if (
-                row["activation_ledger_id"] is None
-                or row["ledger_id"] is None
-                or str(row["decision"] or "") != "shadow"
-                or not str(row["bound_at"] or "")
-                or row["source_partition"] is None
-                or row["source_offset"] is None
-            ):
-                raise ActivationEpochError("activation_shadow_binding_invalid")
-            topic = str(row["source_topic"] or "")
-            partition = str(row["source_partition"])
-            offset = int(row["source_offset"])
-            if (
-                topic not in start_fence
-                or partition not in start_fence[topic]
-                or topic not in end_fence
-                or partition not in end_fence[topic]
-                or offset < int(start_fence[topic][partition])
-                or offset >= int(end_fence[topic][partition])
-            ):
-                raise ActivationEpochError("activation_shadow_outside_end_fence")
-
-    def activation_release_binding_sha256(
-        self,
-        *,
-        epoch_id: str,
-        partition_end_fence: Mapping[str, Any],
-    ) -> str:
-        """Return the exact bounded release binding from one read snapshot."""
-        identity = self._normalize_activation_epoch_id(epoch_id)
-        end_fence_json = self._normalize_partition_fence(partition_end_fence)
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN")
-            epoch = self._current_activation_epoch_tx(conn)
-            if epoch is None or str(epoch["epoch_id"]) != identity:
-                raise ActivationEpochError("activation_epoch_not_current")
-            if str(epoch["state"]) not in {"bounded_active", "confirmed"}:
-                raise ActivationEpochError("activation_epoch_state_changed")
-            if int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM kafka_inbox WHERE decision = 'pending'"
-                ).fetchone()[0]
-            ):
-                raise ActivationEpochError("activation_pending_inbox_not_drained")
-            if self._activation_inflight_writes_tx(conn):
-                raise ActivationEpochError("activation_inflight_writes_not_drained")
-            self._validate_partition_end_fence(
-                str(epoch["partition_start_fence_json"]), end_fence_json
-            )
-            result = self._validate_consumed_activation_executions_tx(
-                conn,
-                epoch=epoch,
-                end_fence_json=end_fence_json,
-            )
-            conn.rollback()
-            return result
-        except Exception:
-            if conn.in_transaction:
-                conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    def transition_activation_epoch(
-        self,
-        *,
-        epoch_id: str,
-        target_state: ActivationEpochState,
-        expected_state: ActivationEpochState | None = None,
-        partition_end_fence: Mapping[str, Any] | None = None,
-        production_fingerprint: str = "",
-        production_gate_receipt_sha256: str = "",
-        expected_config_sha256: str = "",
-        expected_db_logical_identity_sha256: str = "",
-        expected_partition_start_fence_sha256: str = "",
-        expected_release_binding_sha256: str = "",
-        operator: str,
-        reason: str,
-        now: datetime | None = None,
-    ) -> dict[str, Any]:
-        """Advance one current epoch through the fail-closed release state machine."""
-        identity = self._normalize_activation_epoch_id(epoch_id)
-        target = str(target_state or "").strip()
-        if target not in ACTIVATION_EPOCH_STATES:
-            raise ActivationEpochError("activation_target_state_invalid")
-        if target == "preauthorized":
-            raise ActivationEpochError(
-                "activation_preproduction_capsule_required"
-            )
-        expected = str(expected_state or "").strip()
-        if expected and expected not in ACTIVATION_EPOCH_STATES:
-            raise ActivationEpochError("activation_expected_state_invalid")
-        actor, justification = self._normalize_activation_audit_text(operator, reason)
-        end_fence_json = (
-            self._normalize_partition_fence(partition_end_fence)
-            if partition_end_fence is not None
-            else None
-        )
-        production_hash = str(production_fingerprint or "").strip().lower()
-        receipt_hash = str(production_gate_receipt_sha256 or "").strip().lower()
-        expected_confirmation_bindings = {
-            "config_sha256": str(expected_config_sha256 or "").strip().lower(),
-            "db_logical_identity_sha256": str(
-                expected_db_logical_identity_sha256 or ""
-            )
-            .strip()
-            .lower(),
-            "partition_start_fence_sha256": str(
-                expected_partition_start_fence_sha256 or ""
-            )
-            .strip()
-            .lower(),
-            "release_binding_sha256": str(
-                expected_release_binding_sha256 or ""
-            )
-            .strip()
-            .lower(),
-        }
-        for field, value in tuple(expected_confirmation_bindings.items()):
-            if value:
-                expected_confirmation_bindings[field] = (
-                    self._normalize_activation_sha256(value, field)
-                )
-        if any(expected_confirmation_bindings.values()) and target != "confirmed":
-            raise ActivationEpochError(
-                "activation_confirmation_binding_only_allowed_on_confirm"
-            )
-        if target == "confirmed" and not all(
-            expected_confirmation_bindings.values()
-        ):
-            raise ActivationEpochError(
-                "activation_confirmation_preconditions_required"
-            )
-        if target == "confirmed":
-            production_hash = self._normalize_activation_sha256(
-                production_hash, "production_fingerprint"
-            )
-            receipt_hash = self._normalize_activation_sha256(
-                receipt_hash, "production_gate_receipt_sha256"
-            )
-        elif production_hash or receipt_hash:
-            raise ActivationEpochError(
-                "activation_production_binding_only_allowed_on_confirm"
-            )
-        current = _iso(now)
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            epoch = self._current_activation_epoch_tx(conn)
-            if epoch is None or str(epoch["epoch_id"]) != identity:
-                raise ActivationEpochError("activation_epoch_not_current")
-            for field, value in expected_confirmation_bindings.items():
-                if field == "release_binding_sha256":
-                    continue
-                if value and str(epoch[field] or "") != value:
-                    raise ActivationEpochError(
-                        "activation_confirmation_epoch_binding_changed"
-                    )
-            prior = str(epoch["state"])
-            if expected and prior != expected:
-                raise ActivationEpochError("activation_epoch_state_changed")
-            if prior == target:
-                if target in {"bounded_active", "steady_active"}:
-                    self._require_historical_outbox_hold_match_tx(
-                        conn,
-                        epoch=epoch,
-                    )
-                if target == "confirmed":
-                    if end_fence_json is None:
-                        raise ActivationEpochError(
-                            "activation_partition_end_fence_required"
-                        )
-                    observed_sha = str(epoch["partition_end_fence_sha256"] or "")
-                    expected_sha = hashlib.sha256(
-                        end_fence_json.encode("utf-8")
-                    ).hexdigest()
-                    if (
-                        observed_sha != expected_sha
-                        or str(epoch["production_fingerprint"] or "")
-                        != production_hash
-                        or str(epoch["production_gate_receipt_sha256"] or "")
-                        != receipt_hash
-                    ):
-                        raise ActivationEpochError(
-                            "activation_confirmation_binding_conflict"
-                        )
-                    release_binding_sha256 = (
-                        self._validate_consumed_activation_executions_tx(
-                            conn,
-                            epoch=epoch,
-                            end_fence_json=end_fence_json,
-                        )
-                    )
-                    if (
-                        release_binding_sha256
-                        != expected_confirmation_bindings["release_binding_sha256"]
-                    ):
-                        raise ActivationEpochError(
-                            "activation_confirmation_release_binding_changed"
-                        )
-                conn.commit()
-                return self._public_activation_epoch(epoch)
-            pending_inbox = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM kafka_inbox WHERE decision = 'pending'"
-                ).fetchone()[0]
-            )
-            if pending_inbox:
-                raise ActivationEpochError("activation_pending_inbox_not_drained")
-            if target in {"confirmed", "steady_active", "aborted"}:
-                if self._activation_inflight_writes_tx(conn):
-                    raise ActivationEpochError("activation_inflight_writes_not_drained")
-            allowed = {
-                "safe_off": {"aborted"},
-                "preauthorized": {"bounded_active", "aborted"},
-                "bounded_active": {"confirmed", "aborted"},
-                "confirmed": {"steady_active", "aborted"},
-                "steady_active": {"aborted"},
-                "aborted": set(),
-            }
-            if target not in allowed[prior]:
-                raise ActivationEpochError("activation_state_transition_invalid")
-            fields = ["state = ?", "updated_at = ?"]
-            parameters: list[Any] = [target, current]
-            if target == "bounded_active":
-                self._require_historical_outbox_hold_match_tx(
-                    conn,
-                    epoch=epoch,
-                )
-                if any(
-                    not str(epoch[field] or "")
-                    for field in (
-                        "preproduction_fingerprint",
-                        "preproduction_gate_receipt_sha256",
-                        "preproduction_capsule_sha256",
-                    )
-                ):
-                    raise ActivationEpochError(
-                        "activation_preproduction_binding_missing"
-                    )
-                authorized = int(
-                    conn.execute(
-                        f"""
-                        SELECT COUNT(*) FROM rca_activation_budget_slots
-                         WHERE epoch_id = ?
-                           AND slot_kind IN ({_ACTIVATION_RELEASE_SLOT_SQL})
-                           AND authorized_source_kind IS NOT NULL
-                           AND authorized_identity_sha256 IS NOT NULL
-                        """,
-                        (identity,),
-                    ).fetchone()[0]
-                )
-                optional_mutated = int(
-                    conn.execute(
-                        f"""
-                        SELECT COUNT(*) FROM rca_activation_budget_slots
-                         WHERE epoch_id = ?
-                           AND slot_kind NOT IN ({_ACTIVATION_RELEASE_SLOT_SQL})
-                           AND (
-                               authorized_source_kind IS NOT NULL
-                            OR authorized_identity_sha256 IS NOT NULL
-                            OR consumed_ledger_id IS NOT NULL
-                           )
-                        """,
-                        (identity,),
-                    ).fetchone()[0]
-                )
-                if optional_mutated:
-                    raise ActivationEpochError(
-                        "activation_nonrelease_slot_mutated"
-                    )
-                if authorized != len(ACTIVATION_RELEASE_SLOT_KINDS):
-                    raise ActivationEpochError("activation_slots_not_preauthorized")
-                fields.append("bounded_activated_at = ?")
-                parameters.append(current)
-            elif target == "confirmed":
-                consumed = int(
-                    conn.execute(
-                        f"""
-                        SELECT COUNT(*) FROM rca_activation_budget_slots
-                         WHERE epoch_id = ?
-                           AND slot_kind IN ({_ACTIVATION_RELEASE_SLOT_SQL})
-                           AND consumed_ledger_id IS NOT NULL
-                        """,
-                        (identity,),
-                    ).fetchone()[0]
-                )
-                if consumed != len(ACTIVATION_RELEASE_SLOT_KINDS):
-                    raise ActivationEpochError("activation_bounded_budget_incomplete")
-                if end_fence_json is None:
-                    raise ActivationEpochError("activation_partition_end_fence_required")
-                self._validate_partition_end_fence(
-                    str(epoch["partition_start_fence_json"]), end_fence_json
-                )
-                release_binding_sha256 = (
-                    self._validate_consumed_activation_executions_tx(
-                    conn,
-                    epoch=epoch,
-                    end_fence_json=end_fence_json,
-                )
-                )
-                if release_binding_sha256 != expected_confirmation_bindings[
-                    "release_binding_sha256"
-                ]:
-                    raise ActivationEpochError(
-                        "activation_confirmation_release_binding_changed"
-                    )
-                self._validate_current_activation_shadows_tx(
-                    conn,
-                    epoch=epoch,
-                    end_fence_json=end_fence_json,
-                )
-                end_sha = hashlib.sha256(end_fence_json.encode("utf-8")).hexdigest()
-                fields.extend(
-                    [
-                        "partition_end_fence_json = ?",
-                        "partition_end_fence_sha256 = ?",
-                        "production_fingerprint = ?",
-                        "production_gate_receipt_sha256 = ?",
-                        "confirmed_at = ?",
-                    ]
-                )
-                parameters.extend(
-                    [
-                        end_fence_json,
-                        end_sha,
-                        production_hash,
-                        receipt_hash,
-                        current,
-                    ]
-                )
-            elif target == "steady_active":
-                self._require_historical_outbox_hold_match_tx(
-                    conn,
-                    epoch=epoch,
-                )
-                if (
-                    not str(epoch["production_fingerprint"] or "")
-                    or not str(epoch["production_gate_receipt_sha256"] or "")
-                    or not str(epoch["partition_end_fence_sha256"] or "")
-                ):
-                    raise ActivationEpochError(
-                        "activation_production_confirmation_missing"
-                    )
-                shadow_backlog = int(
-                    conn.execute(
-                        "SELECT COUNT(*) FROM rca_outbox WHERE status = 'shadow'"
-                    ).fetchone()[0]
-                )
-                if shadow_backlog:
-                    raise ActivationEpochError(
-                        "activation_shadow_backlog_not_drained"
-                    )
-                fields.append("steady_activated_at = ?")
-                parameters.append(current)
-            elif target == "aborted":
-                fields.append("aborted_at = ?")
-                parameters.append(current)
-            parameters.extend([identity, prior])
-            updated = conn.execute(
-                f"""
-                UPDATE rca_activation_epochs SET {', '.join(fields)}
-                 WHERE epoch_id = ? AND is_current = 1 AND state = ?
-                """,
-                parameters,
-            )
-            if updated.rowcount != 1:
-                raise ActivationEpochError("activation_epoch_state_changed")
-            row = self._current_activation_epoch_tx(conn)
-            if row is None:
-                raise ActivationEpochError("activation_epoch_transition_lost")
-            self._insert_activation_transition_audit_tx(
-                conn,
-                epoch=row,
-                from_state=prior,
-                to_state=target,
-                operator=actor,
-                reason=justification,
-                transitioned_at=current,
-            )
-            conn.commit()
-            return self._public_activation_epoch(row)
-        except Exception:
-            if conn.in_transaction:
-                conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    @staticmethod
-    def _activation_held_outcome(entrypoint: str, state: str) -> tuple[str, str]:
-        if entrypoint == "kafka_ingest" and state != "aborted":
-            return "shadow", f"activation_epoch_held_{state}"
-        return "reject", f"activation_epoch_rejected_{state}"
-
     @staticmethod
     def _activation_admission_key(
         *,
@@ -10872,7 +5759,6 @@ class RcaControlStore:
         entrypoint: str,
         source_kind: str,
         source_identity_sha256: str,
-        slot_kind: str,
         decision: str,
         reason: str,
         business_key: str,
@@ -10892,10 +5778,10 @@ class RcaControlStore:
                 """
                 INSERT INTO rca_activation_admission_ledger(
                     epoch_id, admission_key, entrypoint, source_kind,
-                    source_identity_sha256, slot_kind, decision, reason,
+                    source_identity_sha256, decision, reason,
                     business_key, submission_key, generation,
                     first_adjudicated_at, last_adjudicated_at, admitted_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     epoch_id,
@@ -10903,7 +5789,6 @@ class RcaControlStore:
                     entrypoint,
                     source_kind,
                     source_identity_sha256,
-                    slot_kind or None,
                     decision,
                     reason,
                     business_key,
@@ -10948,7 +5833,7 @@ class RcaControlStore:
         conn.execute(
             """
             UPDATE rca_activation_admission_ledger
-               SET entrypoint = ?, slot_kind = ?, decision = ?, reason = ?,
+               SET entrypoint = ?, decision = ?, reason = ?,
                    adjudication_count = adjudication_count + 1,
                    last_adjudicated_at = ?,
                    admitted_at = CASE WHEN ? = 'admit' THEN ? ELSE admitted_at END
@@ -10956,7 +5841,6 @@ class RcaControlStore:
             """,
             (
                 entrypoint,
-                slot_kind or None,
                 decision,
                 reason,
                 current,
@@ -10979,20 +5863,10 @@ class RcaControlStore:
         submission_key: str,
         generation: int,
         new_execution: bool,
-        requested_slot_kind: str = "",
-        activation_required: bool = False,
         ingress_epoch_id: str | None = None,
-        ingress_state: str | None = None,
         now: datetime | None = None,
     ) -> ActivationAdmissionDecision:
-        """Adjudicate and consume inside the caller's ``BEGIN IMMEDIATE``.
-
-        The caller must create or mutate the generation and outbox before the
-        same transaction commits, then call ``bind_activation_admission_tx``.
-        A committed ledger reservation is intentionally never returned after a
-        process crash; an exact retry reuses the same ledger id without another
-        slot consumption.
-        """
+        """Admit or join one execution under the exact current steady epoch."""
         if not conn.in_transaction:
             raise ActivationEpochError("activation_transaction_required")
         point = str(entrypoint or "").strip()
@@ -11002,12 +5876,17 @@ class RcaControlStore:
         expected_kind = "manual" if point == "manual_admit" else "kafka"
         if kind != expected_kind:
             raise ActivationEpochError("activation_entrypoint_source_mismatch")
-        source_sha, normalized_source = cls._normalize_activation_source_identity(
+        source_sha, _normalized_source = cls._normalize_activation_source_identity(
             kind, source_identity
         )
         business = str(business_key or "").strip()
         submission = str(submission_key or "").strip()
-        if not business or not submission or len(business) > 500 or len(submission) > 500:
+        if (
+            not business
+            or not submission
+            or len(business) > 500
+            or len(submission) > 500
+        ):
             raise ActivationEpochError("activation_execution_identity_invalid")
         if isinstance(generation, bool):
             raise ActivationEpochError("activation_generation_invalid")
@@ -11017,36 +5896,16 @@ class RcaControlStore:
             raise ActivationEpochError("activation_generation_invalid") from exc
         if generation_number < 1:
             raise ActivationEpochError("activation_generation_invalid")
-        if not isinstance(new_execution, bool) or not isinstance(
-            activation_required, bool
-        ):
+        if not isinstance(new_execution, bool):
             raise ActivationEpochError("activation_adjudication_flag_invalid")
-        slot_kind = str(requested_slot_kind or "").strip()
-        if slot_kind and slot_kind not in ACTIVATION_SLOT_KINDS:
-            raise ActivationEpochError("activation_slot_kind_invalid")
-        current = _iso(now)
-        epoch = cls._current_activation_epoch_tx(conn)
-        if epoch is None:
-            if not activation_required and ingress_epoch_id is None:
-                return ActivationAdmissionDecision(
-                    epoch_id="",
-                    epoch_state="legacy_unconfigured",
-                    decision="admit",
-                    reason="activation_legacy_unconfigured",
-                    legacy_unconfigured=True,
-                )
-            decision, reason = cls._activation_held_outcome(point, "unconfigured")
-            return ActivationAdmissionDecision(
-                epoch_id="",
-                epoch_state="unconfigured",
-                decision=decision,  # type: ignore[arg-type]
-                reason=reason,
-            )
 
+        epoch = cls._current_activation_epoch_tx(conn)
+        if epoch is None or str(epoch["state"] or "") != "steady_active":
+            raise ActivationEpochError("activation_steady_epoch_required")
         epoch_id = str(epoch["epoch_id"])
-        state = str(epoch["state"])
         if ingress_epoch_id is not None and str(ingress_epoch_id) != epoch_id:
             raise ActivationEpochError("activation_ingress_epoch_changed")
+
         admission_key = cls._activation_admission_key(
             source_kind=kind,
             source_identity_sha256=source_sha,
@@ -11054,252 +5913,21 @@ class RcaControlStore:
             submission_key=submission,
             generation=generation_number,
         )
-        captured_state = str(ingress_state or "").strip()
-        if (
-            point == "kafka_ingest"
-            and captured_state
-            and captured_state != "legacy_unconfigured"
-            and captured_state != state
-        ):
-            raise ActivationEpochError("activation_ingress_state_changed")
-        if point == "kafka_ingest" and captured_state in {
-            "safe_off",
-            "preauthorized",
-            "confirmed",
-            "aborted",
-        }:
-            held_decision, held_reason = cls._activation_held_outcome(
-                point, f"ingress_{captured_state}"
-            )
-            ledger_id, prior = cls._write_activation_ledger_tx(
-                conn,
-                epoch_id=epoch_id,
-                admission_key=admission_key,
-                entrypoint=point,
-                source_kind=kind,
-                source_identity_sha256=source_sha,
-                slot_kind=slot_kind,
-                decision=held_decision,
-                reason=held_reason,
-                business_key=business,
-                submission_key=submission,
-                generation=generation_number,
-                current=current,
-            )
-            if prior == "admit":
-                held_decision = "admit"
-                held_reason = "activation_admission_idempotent"
-            return ActivationAdmissionDecision(
-                epoch_id=epoch_id,
-                epoch_state=state,
-                decision=held_decision,  # type: ignore[arg-type]
-                reason=held_reason,
-                ledger_id=ledger_id,
-                slot_kind=slot_kind,
-            )
         existing_trigger = conn.execute(
             """
-            SELECT business_key, generation, source_event_id,
-                   activation_epoch_id, activation_ledger_id
-              FROM business_triggers WHERE submission_key = ?
+            SELECT business_key, generation
+              FROM business_triggers
+             WHERE submission_key = ?
             """,
             (submission,),
         ).fetchone()
+        current = _iso(now)
         if existing_trigger is not None:
             if (
                 str(existing_trigger["business_key"]) != business
                 or int(existing_trigger["generation"]) != generation_number
             ):
                 raise ActivationEpochError("activation_join_identity_conflict")
-            prior_admission = conn.execute(
-                """
-                SELECT al.ledger_id, al.slot_kind
-                  FROM rca_activation_admission_ledger AS al
-                  JOIN rca_outbox AS o
-                    ON o.activation_epoch_id = al.epoch_id
-                   AND o.activation_ledger_id = al.ledger_id
-                   AND o.business_key = al.business_key
-                   AND o.submission_key = al.submission_key
-                   AND o.generation = al.generation
-                  JOIN rca_activation_budget_slots AS abs
-                    ON abs.epoch_id = al.epoch_id
-                   AND abs.consumed_ledger_id = al.ledger_id
-                 WHERE al.epoch_id = ? AND al.admission_key = ?
-                   AND al.decision = 'admit' AND al.bound_at IS NOT NULL
-                """,
-                (epoch_id, admission_key),
-            ).fetchone()
-            if point == "shadow_promotion" and state == "confirmed":
-                if slot_kind:
-                    raise ActivationEpochError(
-                        "activation_confirmed_reconciliation_slot_forbidden"
-                    )
-                start_fence = json.loads(str(epoch["partition_start_fence_json"]))
-                end_fence = json.loads(str(epoch["partition_end_fence_json"] or "{}"))
-                topic = str(normalized_source["topic"])
-                partition = str(normalized_source["partition"])
-                offset = int(normalized_source["offset"])
-                if (
-                    topic not in start_fence
-                    or partition not in start_fence[topic]
-                    or topic not in end_fence
-                    or partition not in end_fence[topic]
-                    or offset < int(start_fence[topic][partition])
-                    or offset >= int(end_fence[topic][partition])
-                ):
-                    raise ActivationEpochError(
-                        "activation_confirmed_shadow_outside_fence"
-                    )
-                reconciliation = conn.execute(
-                    """
-                    SELECT al.ledger_id, al.decision, al.bound_at,
-                           o.status AS outbox_status
-                      FROM rca_activation_admission_ledger AS al
-                      JOIN rca_outbox AS o
-                        ON o.activation_epoch_id = al.epoch_id
-                       AND o.activation_ledger_id = al.ledger_id
-                       AND o.business_key = al.business_key
-                       AND o.submission_key = al.submission_key
-                       AND o.generation = al.generation
-                     WHERE al.epoch_id = ? AND al.admission_key = ?
-                       AND al.source_kind = 'kafka'
-                       AND al.source_identity_sha256 = ?
-                       AND al.business_key = ? AND al.submission_key = ?
-                       AND al.generation = ? AND al.decision = 'shadow'
-                       AND al.bound_at IS NOT NULL AND o.status = 'shadow'
-                    """,
-                    (
-                        epoch_id,
-                        admission_key,
-                        source_sha,
-                        business,
-                        submission,
-                        generation_number,
-                    ),
-                ).fetchone()
-                if (
-                    reconciliation is None
-                    or str(existing_trigger["source_event_id"] or "")
-                    != str(normalized_source["event_uid"])
-                    or str(existing_trigger["activation_epoch_id"] or "") != epoch_id
-                    or int(existing_trigger["activation_ledger_id"] or 0)
-                    != int(reconciliation["ledger_id"])
-                ):
-                    raise ActivationEpochError(
-                        "activation_confirmed_shadow_reconciliation_invalid"
-                    )
-                ledger_id, prior = cls._write_activation_ledger_tx(
-                    conn,
-                    epoch_id=epoch_id,
-                    admission_key=admission_key,
-                    entrypoint=point,
-                    source_kind=kind,
-                    source_identity_sha256=source_sha,
-                    slot_kind="",
-                    decision="admit",
-                    reason="activation_confirmed_shadow_reconciliation",
-                    business_key=business,
-                    submission_key=submission,
-                    generation=generation_number,
-                    current=current,
-                )
-                if prior != "shadow" or ledger_id != int(reconciliation["ledger_id"]):
-                    raise ActivationEpochError(
-                        "activation_confirmed_shadow_reconciliation_lost"
-                    )
-                return ActivationAdmissionDecision(
-                    epoch_id=epoch_id,
-                    epoch_state=state,
-                    decision="admit",
-                    reason="activation_confirmed_shadow_reconciliation",
-                    ledger_id=ledger_id,
-                )
-            if point == "manual_admit" and prior_admission is not None:
-                conn.execute(
-                    """
-                    UPDATE rca_activation_admission_ledger
-                       SET adjudication_count = adjudication_count + 1,
-                           last_adjudicated_at = ?
-                     WHERE ledger_id = ?
-                    """,
-                    (current, prior_admission["ledger_id"]),
-                )
-                return ActivationAdmissionDecision(
-                    epoch_id=epoch_id,
-                    epoch_state=state,
-                    decision="join",
-                    reason="activation_admission_idempotent",
-                    ledger_id=int(prior_admission["ledger_id"]),
-                    slot_kind=str(prior_admission["slot_kind"] or ""),
-                )
-            exact_kafka_replay = (
-                point == "kafka_ingest"
-                and str(existing_trigger["source_event_id"] or "")
-                == str(normalized_source["event_uid"])
-            )
-            steady_join = state == "steady_active" and point in {
-                "kafka_ingest",
-                "manual_admit",
-            }
-            if point != "shadow_promotion" and (exact_kafka_replay or steady_join):
-                ledger_id, _prior = cls._write_activation_ledger_tx(
-                    conn,
-                    epoch_id=epoch_id,
-                    admission_key=admission_key,
-                    entrypoint=point,
-                    source_kind=kind,
-                    source_identity_sha256=source_sha,
-                    slot_kind="",
-                    decision="join",
-                    reason="activation_existing_generation_join",
-                    business_key=business,
-                    submission_key=submission,
-                    generation=generation_number,
-                    current=current,
-                )
-                return ActivationAdmissionDecision(
-                    epoch_id=epoch_id,
-                    epoch_state=state,
-                    decision="join",
-                    reason="activation_existing_generation_join",
-                    ledger_id=ledger_id,
-                )
-            if point != "shadow_promotion":
-                rejection_reason = (
-                    f"activation_epoch_rejected_{state}"
-                    if state in {
-                        "safe_off",
-                        "preauthorized",
-                        "confirmed",
-                        "aborted",
-                    }
-                    else "activation_existing_generation_not_eligible"
-                )
-                ledger_id, _prior = cls._write_activation_ledger_tx(
-                    conn,
-                    epoch_id=epoch_id,
-                    admission_key=admission_key,
-                    entrypoint=point,
-                    source_kind=kind,
-                    source_identity_sha256=source_sha,
-                    slot_kind=slot_kind,
-                    decision="reject",
-                    reason=rejection_reason,
-                    business_key=business,
-                    submission_key=submission,
-                    generation=generation_number,
-                    current=current,
-                )
-                return ActivationAdmissionDecision(
-                    epoch_id=epoch_id,
-                    epoch_state=state,
-                    decision="reject",
-                    reason=rejection_reason,
-                    ledger_id=ledger_id,
-                    slot_kind=slot_kind,
-                )
-        if not new_execution:
-            decision, reason = "reject", "activation_join_target_missing"
             ledger_id, _prior = cls._write_activation_ledger_tx(
                 conn,
                 epoch_id=epoch_id,
@@ -11307,9 +5935,8 @@ class RcaControlStore:
                 entrypoint=point,
                 source_kind=kind,
                 source_identity_sha256=source_sha,
-                slot_kind=slot_kind,
-                decision=decision,
-                reason=reason,
+                decision="join",
+                reason="activation_existing_generation_join",
                 business_key=business,
                 submission_key=submission,
                 generation=generation_number,
@@ -11317,160 +5944,14 @@ class RcaControlStore:
             )
             return ActivationAdmissionDecision(
                 epoch_id=epoch_id,
-                epoch_state=state,
-                decision="reject",
-                reason=reason,
-                ledger_id=ledger_id,
-                slot_kind=slot_kind,
-            )
-
-        def held(reason_code: str) -> ActivationAdmissionDecision:
-            outcome, _state_reason = cls._activation_held_outcome(point, state)
-            ledger_id, prior = cls._write_activation_ledger_tx(
-                conn,
-                epoch_id=epoch_id,
-                admission_key=admission_key,
-                entrypoint=point,
-                source_kind=kind,
-                source_identity_sha256=source_sha,
-                slot_kind=slot_kind,
-                decision=outcome,
-                reason=reason_code,
-                business_key=business,
-                submission_key=submission,
-                generation=generation_number,
-                current=current,
-            )
-            if prior == "admit":
-                return ActivationAdmissionDecision(
-                    epoch_id=epoch_id,
-                    epoch_state=state,
-                    decision="admit",
-                    reason="activation_admission_idempotent",
-                    ledger_id=ledger_id,
-                    slot_kind=slot_kind,
-                )
-            return ActivationAdmissionDecision(
-                epoch_id=epoch_id,
-                epoch_state=state,
-                decision=outcome,  # type: ignore[arg-type]
-                reason=reason_code,
-                ledger_id=ledger_id,
-                slot_kind=slot_kind,
-            )
-
-        if state != "bounded_active" and state != "steady_active":
-            _outcome, held_reason = cls._activation_held_outcome(point, state)
-            return held(held_reason)
-        if state == "steady_active":
-            ledger_id, prior = cls._write_activation_ledger_tx(
-                conn,
-                epoch_id=epoch_id,
-                admission_key=admission_key,
-                entrypoint=point,
-                source_kind=kind,
-                source_identity_sha256=source_sha,
-                slot_kind="",
-                decision="admit",
-                reason="activation_steady_active",
-                business_key=business,
-                submission_key=submission,
-                generation=generation_number,
-                current=current,
-            )
-            return ActivationAdmissionDecision(
-                epoch_id=epoch_id,
-                epoch_state=state,
-                decision="admit",
-                reason=(
-                    "activation_admission_idempotent"
-                    if prior == "admit"
-                    else "activation_steady_active"
-                ),
+                epoch_state="steady_active",
+                decision="join",
+                reason="activation_existing_generation_join",
                 ledger_id=ledger_id,
             )
+        if not new_execution:
+            raise ActivationEpochError("activation_join_target_missing")
 
-        if not slot_kind and kind == "manual":
-            matching_slots = conn.execute(
-                """
-                SELECT slot_kind FROM rca_activation_budget_slots
-                 WHERE epoch_id = ? AND authorized_source_kind = ?
-                   AND authorized_identity_sha256 = ?
-                 ORDER BY slot_kind
-                """,
-                (epoch_id, kind, source_sha),
-            ).fetchall()
-            if len(matching_slots) > 1:
-                return held("activation_bounded_slot_ambiguous")
-            if len(matching_slots) == 1:
-                slot_kind = str(matching_slots[0]["slot_kind"])
-        if not slot_kind:
-            return held("activation_bounded_slot_required")
-        slot = conn.execute(
-            """
-            SELECT * FROM rca_activation_budget_slots
-             WHERE epoch_id = ? AND slot_kind = ?
-            """,
-            (epoch_id, slot_kind),
-        ).fetchone()
-        if slot is None:
-            raise ActivationEpochError("activation_slot_missing")
-        if (
-            str(slot["authorized_source_kind"] or "") != kind
-            or str(slot["authorized_identity_sha256"] or "") != source_sha
-        ):
-            return held("activation_bounded_identity_not_authorized")
-        if kind == "kafka":
-            start_fence = json.loads(str(epoch["partition_start_fence_json"]))
-            topic = str(normalized_source["topic"])
-            partition = str(normalized_source["partition"])
-            offset = int(normalized_source["offset"])
-            if topic not in start_fence or partition not in start_fence[topic]:
-                return held("activation_kafka_partition_not_fenced")
-            if offset < int(start_fence[topic][partition]):
-                return held("activation_kafka_before_start_fence")
-            if epoch["partition_end_fence_json"] is not None:
-                end_fence = json.loads(str(epoch["partition_end_fence_json"]))
-                if offset >= int(end_fence[topic][partition]):
-                    return held("activation_kafka_at_or_after_end_fence")
-        consumed_ledger_id = slot["consumed_ledger_id"]
-        existing_ledger = conn.execute(
-            """
-            SELECT ledger_id, decision FROM rca_activation_admission_ledger
-             WHERE epoch_id = ? AND admission_key = ?
-            """,
-            (epoch_id, admission_key),
-        ).fetchone()
-        if consumed_ledger_id is not None:
-            if (
-                existing_ledger is not None
-                and int(consumed_ledger_id) == int(existing_ledger["ledger_id"])
-                and str(existing_ledger["decision"]) == "admit"
-            ):
-                ledger_id, _prior = cls._write_activation_ledger_tx(
-                    conn,
-                    epoch_id=epoch_id,
-                    admission_key=admission_key,
-                    entrypoint=point,
-                    source_kind=kind,
-                    source_identity_sha256=source_sha,
-                    slot_kind=slot_kind,
-                    decision="admit",
-                    reason="activation_admission_idempotent",
-                    business_key=business,
-                    submission_key=submission,
-                    generation=generation_number,
-                    current=current,
-                )
-                return ActivationAdmissionDecision(
-                    epoch_id=epoch_id,
-                    epoch_state=state,
-                    decision="admit",
-                    reason="activation_admission_idempotent",
-                    ledger_id=ledger_id,
-                    slot_kind=slot_kind,
-                )
-            return held("activation_bounded_slot_consumed")
         ledger_id, prior = cls._write_activation_ledger_tx(
             conn,
             epoch_id=epoch_id,
@@ -11478,39 +5959,23 @@ class RcaControlStore:
             entrypoint=point,
             source_kind=kind,
             source_identity_sha256=source_sha,
-            slot_kind=slot_kind,
             decision="admit",
-            reason="activation_bounded_slot_consumed",
+            reason="activation_steady_active",
             business_key=business,
             submission_key=submission,
             generation=generation_number,
             current=current,
         )
-        consumed = conn.execute(
-            """
-            UPDATE rca_activation_budget_slots
-               SET consumed_ledger_id = ?, consumed_at = ?
-             WHERE epoch_id = ? AND slot_kind = ?
-               AND consumed_ledger_id IS NULL
-               AND authorized_source_kind = ?
-               AND authorized_identity_sha256 = ?
-            """,
-            (ledger_id, current, epoch_id, slot_kind, kind, source_sha),
-        )
-        if consumed.rowcount != 1:
-            raise ActivationEpochError("activation_slot_consume_lost")
         return ActivationAdmissionDecision(
             epoch_id=epoch_id,
-            epoch_state=state,
+            epoch_state="steady_active",
             decision="admit",
             reason=(
                 "activation_admission_idempotent"
                 if prior == "admit"
-                else "activation_bounded_slot_consumed"
+                else "activation_steady_active"
             ),
             ledger_id=ledger_id,
-            slot_kind=slot_kind,
-            consumed_slot=prior != "admit",
         )
 
     @staticmethod
@@ -11526,9 +5991,7 @@ class RcaControlStore:
         """Bind a newly created execution to its adjudication before commit."""
         if not conn.in_transaction:
             raise ActivationEpochError("activation_transaction_required")
-        if decision.legacy_unconfigured:
-            return
-        if decision.decision not in {"admit", "shadow"}:
+        if decision.decision != "admit":
             raise ActivationEpochError("activation_noncreating_decision_cannot_bind")
         if not decision.epoch_id or decision.ledger_id is None:
             raise ActivationEpochError("activation_binding_identity_missing")
@@ -11553,9 +6016,19 @@ class RcaControlStore:
         )
         if (
             observed != expected_identity
-            or str(ledger["decision"]) != decision.decision
+            or str(ledger["decision"]) != "admit"
         ):
             raise ActivationEpochError("activation_binding_ledger_conflict")
+        epoch = conn.execute(
+            "SELECT state, is_current FROM rca_activation_epochs WHERE epoch_id = ?",
+            (decision.epoch_id,),
+        ).fetchone()
+        if (
+            epoch is None
+            or str(epoch["state"] or "") != "steady_active"
+            or int(epoch["is_current"] or 0) != 1
+        ):
+            raise ActivationEpochError("activation_steady_epoch_required")
         execution_key = (
             str(business_key),
             int(generation),
@@ -13289,7 +7762,6 @@ class RcaControlStore:
                 "TEXT NOT NULL DEFAULT 'legacy_unconfigured'"
             ),
             "activation_required": "INTEGER NOT NULL DEFAULT 0",
-            "activation_slot_kind": "TEXT",
             "activation_source_identity_sha256": "TEXT NOT NULL DEFAULT ''",
             "rearm_reason": "TEXT NOT NULL DEFAULT ''",
             "processing_attempts": "INTEGER NOT NULL DEFAULT 0",
@@ -13362,20 +7834,6 @@ class RcaControlStore:
             for name, declaration in additions.items():
                 if name not in existing:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
-        if RcaControlStore._table_exists(conn, "rca_activation_budget_slots"):
-            slot_columns = {
-                str(row["name"])
-                for row in conn.execute(
-                    "PRAGMA table_info(rca_activation_budget_slots)"
-                ).fetchall()
-            }
-            for name in ("authorized_operator", "authorized_reason"):
-                if name not in slot_columns:
-                    conn.execute(
-                        "ALTER TABLE rca_activation_budget_slots "
-                        f"ADD COLUMN {name} TEXT"
-                    )
-
     @staticmethod
     def _validate_v11_snapshot_schema(conn: sqlite3.Connection) -> None:
         normalize_sql = lambda value: " ".join(str(value).split()).rstrip(";")
@@ -14097,24 +8555,6 @@ class RcaControlStore:
             CONTROL_STORE_SCHEMA_VERSION,
         } or v12_tables_present:
             RcaControlStore._validate_v12_learning_lane_schema(conn)
-        v13_tables_present = any(
-            RcaControlStore._table_exists(conn, table)
-            for table in (
-                "rca_activation_historical_outbox_holds",
-                "rca_activation_historical_outbox_hold_items",
-                "rca_activation_historical_outbox_dispositions",
-                "rca_activation_historical_outbox_disposition_items",
-            )
-        )
-        if (
-            marker_value
-            in {
-                "pnc_rca_control_store_v13",
-                CONTROL_STORE_SCHEMA_VERSION,
-            }
-            or v13_tables_present
-        ):
-            RcaControlStore._validate_v13_historical_outbox_hold_schema(conn)
         v14_table_present = RcaControlStore._table_exists(
             conn, "rca_terminal_rerun_delivery_authorities"
         )
@@ -14165,32 +8605,12 @@ class RcaControlStore:
                 raise RuntimeError(
                     f"incompatible_control_store_schema:{table}_foreign_keys"
                 )
-        slot_groups = foreign_key_groups("rca_activation_budget_slots")
-        required_slot_foreign_keys = {
-            ("rca_activation_epochs", "epoch_id", "epoch_id"),
-            (
-                "rca_activation_admission_ledger",
-                "consumed_ledger_id",
-                "ledger_id",
-            ),
-        }
-        observed_slot_foreign_keys = {
-            (parent, source, target)
-            for (_identifier, parent), pairs in slot_groups.items()
-            for source, target in pairs
-        }
-        if not required_slot_foreign_keys.issubset(observed_slot_foreign_keys):
-            raise RuntimeError(
-                "incompatible_control_store_schema:activation_slot_foreign_keys"
-            )
         required_indexes = {
             "idx_business_triggers_issue_scope",
             "idx_rca_manual_operator_rate",
             "idx_rca_single_current_activation_epoch",
-            "idx_rca_activation_slot_identity",
             "idx_rca_activation_ledger_submission",
             "idx_rca_activation_transition_epoch",
-            "idx_rca_capacity_transition_audit_time",
             "idx_outbox_activation_claim",
             "idx_outbox_source_status",
             "idx_trigger_bindings_generation",
@@ -14204,42 +8624,11 @@ class RcaControlStore:
         }
         if not required_indexes.issubset(present_indexes):
             raise RuntimeError("incompatible_control_store_schema:required_indexes")
-        slot_identity_index = next(
-            (
-                row
-                for row in conn.execute(
-                    "PRAGMA index_list(rca_activation_budget_slots)"
-                ).fetchall()
-                if str(row["name"]) == "idx_rca_activation_slot_identity"
-            ),
-            None,
-        )
-        slot_identity_columns = [
-            str(row["name"])
-            for row in conn.execute(
-                "PRAGMA index_info(idx_rca_activation_slot_identity)"
-            ).fetchall()
-        ]
-        if (
-            slot_identity_index is None
-            or int(slot_identity_index["unique"]) != 1
-            or int(slot_identity_index["partial"]) != 1
-            or slot_identity_columns
-            != [
-                "epoch_id",
-                "authorized_source_kind",
-                "authorized_identity_sha256",
-            ]
-        ):
-            raise RuntimeError(
-                "incompatible_control_store_schema:activation_slot_identity_index"
-            )
         required_activation_columns = {
             "kafka_inbox": {
                 "activation_epoch_id",
                 "activation_ingress_state",
                 "activation_required",
-                "activation_slot_kind",
                 "activation_source_identity_sha256",
                 "submit_enabled_requested",
             },
@@ -14255,17 +8644,6 @@ class RcaControlStore:
                 "production_fingerprint",
                 "production_gate_receipt_sha256",
             },
-            "rca_activation_budget_slots": {
-                "epoch_id",
-                "slot_kind",
-                "authorized_source_kind",
-                "authorized_identity_sha256",
-                "authorized_at",
-                "authorized_operator",
-                "authorized_reason",
-                "consumed_ledger_id",
-                "consumed_at",
-            },
         }
         for table, required_columns in required_activation_columns.items():
             present_columns = {
@@ -14278,11 +8656,8 @@ class RcaControlStore:
                 )
         required_activation_tables = {
             "rca_activation_epochs",
-            "rca_activation_budget_slots",
             "rca_activation_admission_ledger",
             "rca_activation_transition_audit",
-            "rca_capacity_transition_state",
-            "rca_capacity_transition_audit",
         }
         present_tables = {
             str(row["name"])
@@ -14292,199 +8667,6 @@ class RcaControlStore:
         }
         if not required_activation_tables.issubset(present_tables):
             raise RuntimeError("incompatible_control_store_schema:activation_tables")
-        required_capacity_columns = {
-            "singleton_id",
-            "release_id",
-            "bootstrap_epoch_id",
-            "state",
-            "generation",
-            "final_ledger_sha256",
-            "transition_authorization_sha256",
-            "transition_authorization_fingerprint",
-            "transition_receipt_sha256",
-            "transition_receipt_fingerprint",
-            "commit_marker_sha256",
-            "commit_marker_fingerprint",
-            "evidence_bundle_sha256",
-            "evidence_bundle_fingerprint",
-            "authorization_issued_at",
-            "authorization_expires_at",
-            "receipt_created_at",
-            "marker_committed_at",
-            "bootstrap_initialized_at",
-            "steady_activated_at",
-            "updated_at",
-        }
-        observed_capacity_columns = {
-            str(row["name"])
-            for row in conn.execute(
-                "PRAGMA table_info(rca_capacity_transition_state)"
-            ).fetchall()
-        }
-        if observed_capacity_columns != required_capacity_columns:
-            raise RuntimeError(
-                "incompatible_control_store_schema:capacity_transition_columns"
-            )
-        required_capacity_audit_columns = {
-            "audit_id",
-            "release_id",
-            "bootstrap_epoch_id",
-            "from_state",
-            "to_state",
-            "from_generation",
-            "to_generation",
-            "final_ledger_sha256",
-            "transition_authorization_sha256",
-            "transition_authorization_fingerprint",
-            "transition_receipt_sha256",
-            "transition_receipt_fingerprint",
-            "commit_marker_sha256",
-            "commit_marker_fingerprint",
-            "evidence_bundle_sha256",
-            "evidence_bundle_fingerprint",
-            "authorization_issued_at",
-            "authorization_expires_at",
-            "receipt_created_at",
-            "marker_committed_at",
-            "transitioned_at",
-        }
-        observed_capacity_audit_columns = {
-            str(row["name"])
-            for row in conn.execute(
-                "PRAGMA table_info(rca_capacity_transition_audit)"
-            ).fetchall()
-        }
-        if observed_capacity_audit_columns != required_capacity_audit_columns:
-            raise RuntimeError(
-                "incompatible_control_store_schema:capacity_transition_audit_columns"
-            )
-        required_capacity_triggers = {
-            "trg_rca_capacity_state_no_delete",
-            "trg_rca_capacity_state_no_replace",
-            "trg_rca_capacity_state_identity_immutable",
-            "trg_rca_capacity_state_bootstrap_transition",
-            "trg_rca_capacity_state_steady_immutable",
-            "trg_rca_capacity_audit_no_update",
-            "trg_rca_capacity_audit_no_delete",
-            "trg_rca_capacity_audit_no_replace",
-        }
-        observed_capacity_triggers = {
-            str(row["name"]): str(row["sql"] or "")
-            for row in conn.execute(
-                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger'"
-            ).fetchall()
-        }
-        if not required_capacity_triggers.issubset(observed_capacity_triggers):
-            raise RuntimeError(
-                "incompatible_control_store_schema:capacity_transition_triggers"
-            )
-        normalize_sql = lambda value: " ".join(str(value).split()).rstrip(";")
-        expected_capacity_trigger_sql = {
-            "trg_rca_capacity_state_no_delete": """
-                CREATE TRIGGER trg_rca_capacity_state_no_delete
-                BEFORE DELETE ON rca_capacity_transition_state
-                BEGIN
-                    SELECT RAISE(ABORT, 'rca_capacity_state_delete_forbidden');
-                END
-            """,
-            "trg_rca_capacity_state_no_replace": """
-                CREATE TRIGGER trg_rca_capacity_state_no_replace
-                BEFORE INSERT ON rca_capacity_transition_state
-                WHEN EXISTS (SELECT 1 FROM rca_capacity_transition_state)
-                BEGIN
-                    SELECT RAISE(ABORT, 'rca_capacity_state_replace_forbidden');
-                END
-            """,
-            "trg_rca_capacity_state_identity_immutable": """
-                CREATE TRIGGER trg_rca_capacity_state_identity_immutable
-                BEFORE UPDATE ON rca_capacity_transition_state
-                WHEN NEW.release_id != OLD.release_id
-                  OR NEW.bootstrap_epoch_id != OLD.bootstrap_epoch_id
-                  OR NEW.singleton_id != OLD.singleton_id
-                BEGIN
-                    SELECT RAISE(ABORT, 'rca_capacity_state_identity_immutable');
-                END
-            """,
-            "trg_rca_capacity_state_bootstrap_transition": """
-                CREATE TRIGGER trg_rca_capacity_state_bootstrap_transition
-                BEFORE UPDATE ON rca_capacity_transition_state
-                WHEN OLD.state = 'BOOTSTRAP_PRODUCTION'
-                 AND NOT (
-                    NEW.state = 'STEADY_ACTIVE'
-                    AND NEW.generation = OLD.generation + 1
-                 )
-                BEGIN
-                    SELECT RAISE(ABORT, 'rca_capacity_state_transition_invalid');
-                END
-            """,
-            "trg_rca_capacity_state_steady_immutable": """
-                CREATE TRIGGER trg_rca_capacity_state_steady_immutable
-                BEFORE UPDATE ON rca_capacity_transition_state
-                WHEN OLD.state = 'STEADY_ACTIVE'
-                BEGIN
-                    SELECT RAISE(ABORT, 'rca_capacity_state_steady_immutable');
-                END
-            """,
-            "trg_rca_capacity_audit_no_update": """
-                CREATE TRIGGER trg_rca_capacity_audit_no_update
-                BEFORE UPDATE ON rca_capacity_transition_audit
-                BEGIN
-                    SELECT RAISE(ABORT, 'rca_capacity_audit_update_forbidden');
-                END
-            """,
-            "trg_rca_capacity_audit_no_delete": """
-                CREATE TRIGGER trg_rca_capacity_audit_no_delete
-                BEFORE DELETE ON rca_capacity_transition_audit
-                BEGIN
-                    SELECT RAISE(ABORT, 'rca_capacity_audit_delete_forbidden');
-                END
-            """,
-            "trg_rca_capacity_audit_no_replace": """
-                CREATE TRIGGER trg_rca_capacity_audit_no_replace
-                BEFORE INSERT ON rca_capacity_transition_audit
-                WHEN EXISTS (
-                    SELECT 1 FROM rca_capacity_transition_audit
-                     WHERE audit_id = NEW.audit_id
-                        OR (
-                            release_id = NEW.release_id
-                            AND bootstrap_epoch_id = NEW.bootstrap_epoch_id
-                            AND to_generation = NEW.to_generation
-                        )
-                )
-                BEGIN
-                    SELECT RAISE(ABORT, 'rca_capacity_audit_replace_forbidden');
-                END
-            """,
-        }
-        if any(
-            normalize_sql(observed_capacity_triggers[name])
-            != normalize_sql(expected_capacity_trigger_sql[name])
-            for name in required_capacity_triggers
-        ):
-            raise RuntimeError(
-                "incompatible_control_store_schema:capacity_transition_trigger_sql"
-            )
-        capacity_integrity_error = (
-            RcaControlStore._capacity_transition_integrity_error_tx(conn)
-        )
-        if capacity_integrity_error:
-            raise RuntimeError(
-                f"incompatible_control_store_schema:{capacity_integrity_error}"
-            )
-        dangling_slot = conn.execute(
-            """
-            SELECT 1 FROM rca_activation_budget_slots AS s
-         LEFT JOIN rca_activation_admission_ledger AS al
-                ON al.ledger_id = s.consumed_ledger_id
-               AND al.epoch_id = s.epoch_id
-             WHERE s.consumed_ledger_id IS NOT NULL AND al.ledger_id IS NULL
-             LIMIT 1
-            """
-        ).fetchone()
-        if dangling_slot is not None:
-            raise RuntimeError(
-                "incompatible_control_store_schema:activation_slot_binding"
-            )
         for table in ("business_triggers", "rca_outbox"):
             invalid_binding = conn.execute(
                 f"""
@@ -14940,6 +9122,14 @@ class RcaControlStore:
             expected_ticket_title_sha256=expected_ticket_title_sha256,
             expected_policy_sha256s=policy_pins,
         )
+        if (
+            core.execution_admission["state"] != "steady_active"
+            or core.execution_admission["decision"] != "admit"
+            or core.execution_admission["legacy_unconfigured"]
+            or not core.execution_admission["activation_epoch_id"]
+            or core.execution_admission["activation_ledger_id"] is None
+        ):
+            raise RecordConflictError("w3_snapshot_steady_activation_required")
         envelope = validate_snapshot_source_envelope(
             source_envelope,
             expected_snapshot=core,
@@ -15234,14 +9424,9 @@ class RcaControlStore:
                     generation=int(core.resolved_admission["generation"]),
                 )
                 expected_entrypoint = (
-                    "shadow_promotion"
-                    if core.execution_admission["reason"]
-                    == "activation_confirmed_shadow_reconciliation"
-                    else (
-                        "manual_admit"
-                        if activation_source_kind == "manual"
-                        else "kafka_ingest"
-                    )
+                    "manual_admit"
+                    if activation_source_kind == "manual"
+                    else "kafka_ingest"
                 )
                 durable_execution = conn.execute(
                     """
@@ -15371,7 +9556,7 @@ class RcaControlStore:
                 f"w3_snapshot_authority_integrity_conflict:{exc}"
             ) from exc
 
-    def persist_w3_admission_shadow_tx(
+    def persist_w3_admission_snapshot_tx(
         self,
         conn: sqlite3.Connection,
         *,
@@ -15383,16 +9568,13 @@ class RcaControlStore:
         activation_decision: ActivationAdmissionDecision | None,
         manual_ingress_authority: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Project and persist one legacy admission through the W3 shadow oracle."""
+        """Project and persist one steady-admitted W3 execution snapshot."""
         from gateway.pnc_rca_admission import validate_rca_trigger_context
         from gateway.pnc_rca_snapshot import (
             build_admission_snapshot,
             build_canonical_rca_request,
             build_snapshot_source_envelope,
             build_source_authority_receipt,
-            compare_snapshot_shadow,
-            compose_snapshot_projection,
-            legacy_semantic_projection,
             validate_admission_snapshot,
         )
 
@@ -15606,45 +9788,30 @@ class RcaControlStore:
             )
             execution_admission = dict(snapshot.execution_admission)
             if (
-                execution_admission["decision"] == "shadow"
-                and str(binding["outbox_status"]) == "pending"
+                execution_admission["state"] != "steady_active"
+                or execution_admission["decision"] != "admit"
+                or execution_admission["legacy_unconfigured"]
             ):
-                raise RecordConflictError("w3_snapshot_promotion_lineage_required")
+                raise RecordConflictError("w3_snapshot_steady_activation_required")
         else:
             if binding_action == "join":
                 raise RecordConflictError("w3_snapshot_creator_missing")
-            if activation_decision is None or activation_decision.legacy_unconfigured:
-                shadow_observation = str(binding["outbox_status"]) == "shadow"
-                execution_admission = (
-                    {
-                        "activation_epoch_id": "",
-                        "activation_ledger_id": None,
-                        "decision": "shadow",
-                        "reason": "activation_epoch_held_unconfigured",
-                        "state": "unconfigured",
-                        "legacy_unconfigured": False,
-                    }
-                    if shadow_observation
-                    else {
-                        "activation_epoch_id": "",
-                        "activation_ledger_id": None,
-                        "decision": "admit",
-                        "reason": "activation_legacy_unconfigured",
-                        "state": "legacy_unconfigured",
-                        "legacy_unconfigured": True,
-                    }
-                )
-            else:
-                if activation_decision.decision not in {"admit", "shadow"}:
-                    raise RecordConflictError("w3_snapshot_activation_decision_invalid")
-                execution_admission = {
-                    "activation_epoch_id": activation_decision.epoch_id,
-                    "activation_ledger_id": activation_decision.ledger_id,
-                    "decision": activation_decision.decision,
-                    "reason": activation_decision.reason,
-                    "state": activation_decision.epoch_state,
-                    "legacy_unconfigured": False,
-                }
+            if (
+                activation_decision is None
+                or activation_decision.decision != "admit"
+                or activation_decision.epoch_state != "steady_active"
+                or activation_decision.ledger_id is None
+                or not activation_decision.epoch_id
+            ):
+                raise RecordConflictError("w3_snapshot_steady_activation_required")
+            execution_admission = {
+                "activation_epoch_id": activation_decision.epoch_id,
+                "activation_ledger_id": activation_decision.ledger_id,
+                "decision": "admit",
+                "reason": activation_decision.reason,
+                "state": "steady_active",
+                "legacy_unconfigured": False,
+            }
             if legacy_admission.generation > 1:
                 if (
                     source_kind != "feishu_group_manual"
@@ -15686,8 +9853,6 @@ class RcaControlStore:
                 expected_ticket_title_sha256=expected_title_sha256,
                 expected_policy_sha256s=policy_sha256s,
             )
-
-        legacy_snapshot_sha256 = snapshot.snapshot_sha256
 
         # W5 issues the one external-write fence only after W3 has produced an
         # admitted snapshot and the activation ledger binding is durable in this
@@ -15774,11 +9939,7 @@ class RcaControlStore:
                     ) from exc
 
         ingress_decision = {
-            "requested_mode": (
-                "pending"
-                if snapshot.execution_admission["decision"] == "admit"
-                else "shadow"
-            ),
+            "requested_mode": "pending",
             "binding_action": binding_action,
             "decision": str(snapshot.execution_admission["decision"]),
             "authorization_evidence_sha256": authorization_evidence_sha256,
@@ -15810,79 +9971,6 @@ class RcaControlStore:
             expected_snapshot_sha256=snapshot.snapshot_sha256,
             expected_source_authority=source_authority,
         )
-        legacy_projection = legacy_semantic_projection(
-            admission=legacy_admission,
-            trigger_context=context,
-            creation_policy=policies["creation_policy"],
-            business_profile=policies["business_profile"],
-            execution_policy=policies["execution_policy"],
-            publication_policy=policies["publication_policy"],
-            correction_lineage_policy=policies["correction_lineage_policy"],
-            execution_admission=execution_admission,
-            source_id=str(source_id),
-            source_metadata=source_metadata,
-            anchor=anchor,
-            ingress_decision=ingress_decision,
-            expected_authorization_evidence_sha256=(
-                authorization_evidence_sha256
-            ),
-            generation_reason=(
-                "explicit_user_rerun"
-                if legacy_admission.generation > 1
-                else "initial"
-            ),
-            generation_authorization_evidence_sha256=generation_evidence,
-            expected_generation_authorization_evidence_sha256=(
-                generation_evidence
-            ),
-            expected_ticket_title_sha256=expected_title_sha256,
-            expected_source_payload_sha256=str(source["payload_sha256"]),
-            expected_policy_sha256s=policy_sha256s,
-            expected_source_authority=source_authority,
-        )
-        candidate_projection = compose_snapshot_projection(
-            snapshot,
-            envelope,
-            expected_authorization_evidence_sha256=(
-                authorization_evidence_sha256
-            ),
-            expected_generation_authorization_evidence_sha256=(
-                generation_evidence
-            ),
-            expected_ticket_title_sha256=expected_title_sha256,
-            expected_source_payload_sha256=str(source["payload_sha256"]),
-            expected_policy_sha256s=policy_sha256s,
-            expected_snapshot_sha256=snapshot.snapshot_sha256,
-            expected_source_authority=source_authority,
-        )
-        comparison = compare_snapshot_shadow(
-            legacy_projection,
-            candidate_projection,
-            expected_legacy_authorization_evidence_sha256=(
-                authorization_evidence_sha256
-            ),
-            expected_candidate_authorization_evidence_sha256=(
-                authorization_evidence_sha256
-            ),
-            expected_legacy_generation_authorization_evidence_sha256=(
-                generation_evidence
-            ),
-            expected_candidate_generation_authorization_evidence_sha256=(
-                generation_evidence
-            ),
-            expected_legacy_ticket_title_sha256=expected_title_sha256,
-            expected_candidate_ticket_title_sha256=expected_title_sha256,
-            expected_legacy_source_payload_sha256=str(source["payload_sha256"]),
-            expected_candidate_source_payload_sha256=str(source["payload_sha256"]),
-            expected_legacy_policy_sha256s=policy_sha256s,
-            expected_candidate_policy_sha256s=policy_sha256s,
-            expected_legacy_snapshot_sha256=legacy_snapshot_sha256,
-            expected_candidate_snapshot_sha256=snapshot.snapshot_sha256,
-            expected_legacy_source_authority=source_authority,
-            expected_candidate_source_authority=source_authority,
-        )
-        if comparison["outcome"] != "match":
-            raise RecordConflictError("w3_snapshot_shadow_mismatch")
         persisted = self.persist_admission_snapshot_source_tx(
             conn,
             snapshot=snapshot,
@@ -15905,7 +9993,6 @@ class RcaControlStore:
             "ticket_authority_sha256": ticket_receipt[
                 "ticket_authority_sha256"
             ],
-            "shadow_comparison": comparison,
         }
 
     def persist_raw(
@@ -15915,15 +10002,11 @@ class RcaControlStore:
         policy: WorkflowEventPolicy,
         submit_enabled: bool = False,
         activation_required: bool = False,
-        activation_slot_kind: str = "",
     ) -> RawPersistResult:
         """Durably persist raw bytes plus their immutable processing policy."""
         if not isinstance(activation_required, bool):
             raise ActivationEpochError("activation_adjudication_flag_invalid")
-        slot_kind = str(activation_slot_kind or "").strip()
-        if slot_kind and slot_kind not in ACTIVATION_SLOT_KINDS:
-            raise ActivationEpochError("activation_slot_kind_invalid")
-        source_sha, normalized_source = self._normalize_activation_source_identity(
+        source_sha, _normalized_source = self._normalize_activation_source_identity(
             "kafka", {"event_uid": record.event_uid}
         )
         raw = _bytes(record.value)
@@ -15934,82 +10017,22 @@ class RcaControlStore:
             conn.execute("BEGIN IMMEDIATE")
             current = _now_iso()
             epoch = self._current_activation_epoch_tx(conn)
-            activation_epoch_id = str(epoch["epoch_id"]) if epoch is not None else None
-            activation_ingress_state = (
-                str(epoch["state"]) if epoch is not None else "legacy_unconfigured"
-            )
-            activation_enforced = activation_required or epoch is not None
-            if activation_enforced and (
-                epoch is None
-                or not submit_enabled
-                or activation_ingress_state
-                in {"safe_off", "preauthorized", "aborted"}
-            ):
-                raise ActivationIngressDeferredError(
-                    record.event_uid, "activation_ingress_unavailable"
-                )
-            if submit_enabled and activation_ingress_state == "confirmed":
-                start_fence = json.loads(str(epoch["partition_start_fence_json"]))
-                end_fence = json.loads(str(epoch["partition_end_fence_json"] or "{}"))
-                topic = str(normalized_source["topic"])
-                partition = str(normalized_source["partition"])
-                offset = int(normalized_source["offset"])
-                if (
-                    topic not in start_fence
-                    or partition not in start_fence[topic]
-                    or topic not in end_fence
-                    or partition not in end_fence[topic]
-                    or offset < int(start_fence[topic][partition])
-                    or offset >= int(end_fence[topic][partition])
-                ):
-                    raise ActivationIngressDeferredError(
-                        record.event_uid,
-                        "activation_confirmed_ingress_deferred",
-                    )
+            activation_epoch_id: str | None = None
+            activation_ingress_state = "shadow"
+            if submit_enabled:
+                if epoch is None or str(epoch["state"] or "") != "steady_active":
+                    raise ActivationEpochError("activation_steady_epoch_required")
+                activation_epoch_id = str(epoch["epoch_id"])
+                activation_ingress_state = "steady_active"
+            effective_activation_required = submit_enabled
             submission_mode = "pending" if submit_enabled else "shadow"
-            if submit_enabled and epoch is not None:
-                if str(epoch["state"]) == "steady_active":
-                    submission_mode = "pending"
-                elif str(epoch["state"]) == "bounded_active" and slot_kind:
-                    slot = conn.execute(
-                        """
-                        SELECT authorized_source_kind, authorized_identity_sha256,
-                               consumed_ledger_id
-                          FROM rca_activation_budget_slots
-                         WHERE epoch_id = ? AND slot_kind = ?
-                        """,
-                        (activation_epoch_id, slot_kind),
-                    ).fetchone()
-                    start_fence = json.loads(
-                        str(epoch["partition_start_fence_json"])
-                    )
-                    topic = str(normalized_source["topic"])
-                    partition = str(normalized_source["partition"])
-                    offset = int(normalized_source["offset"])
-                    exact_slot = (
-                        slot is not None
-                        and str(slot["authorized_source_kind"] or "") == "kafka"
-                        and str(slot["authorized_identity_sha256"] or "") == source_sha
-                        and slot["consumed_ledger_id"] is None
-                    )
-                    in_fence = (
-                        topic in start_fence
-                        and partition in start_fence[topic]
-                        and offset >= int(start_fence[topic][partition])
-                    )
-                    submission_mode = "pending" if exact_slot and in_fence else "shadow"
-                else:
-                    submission_mode = "shadow"
-            elif submit_enabled and activation_required:
-                submission_mode = "shadow"
             self._register_policy_snapshot_tx(conn, policy, current)
             existing = conn.execute(
                 """
                 SELECT raw_sha256, policy_json, creation_rule_version,
                        submission_mode, submit_enabled_requested,
                        activation_epoch_id, activation_ingress_state,
-                       activation_required, activation_slot_kind,
-                       activation_source_identity_sha256
+                       activation_required, activation_source_identity_sha256
                   FROM kafka_inbox WHERE event_uid = ?
                 """,
                 (record.event_uid,),
@@ -16023,14 +10046,12 @@ class RcaControlStore:
                     str(existing["policy_json"]),
                     str(existing["creation_rule_version"]),
                     int(existing["activation_required"]),
-                    str(existing["activation_slot_kind"] or ""),
                     str(existing["activation_source_identity_sha256"] or ""),
                 )
                 requested_intent = (
                     policy_json,
                     policy.policy_version,
-                    int(activation_required),
-                    slot_kind,
+                    int(effective_activation_required),
                     source_sha,
                 )
                 if immutable_intent != requested_intent:
@@ -16040,13 +10061,7 @@ class RcaControlStore:
                 submit_intent_changed = int(
                     existing["submit_enabled_requested"]
                 ) != int(bool(submit_enabled))
-                legacy_lineage = (
-                    existing["activation_epoch_id"] is None
-                    and str(existing["activation_ingress_state"])
-                    == "legacy_unconfigured"
-                    and int(existing["activation_required"]) == 0
-                )
-                if submit_intent_changed and not legacy_lineage:
+                if submit_intent_changed:
                     raise RecordConflictError(
                         f"Kafka coordinate {record.event_uid} changed submission intent"
                     )
@@ -16062,9 +10077,8 @@ class RcaControlStore:
                     creation_rule_version, submission_mode,
                     submit_enabled_requested, received_at,
                     activation_epoch_id, activation_ingress_state,
-                    activation_required, activation_slot_kind,
-                    activation_source_identity_sha256
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    activation_required, activation_source_identity_sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.event_uid,
@@ -16084,8 +10098,7 @@ class RcaControlStore:
                     current,
                     activation_epoch_id,
                     activation_ingress_state,
-                    int(activation_required),
-                    slot_kind or None,
+                    int(effective_activation_required),
                     source_sha,
                 ),
             )
@@ -16124,14 +10137,9 @@ class RcaControlStore:
         conn: sqlite3.Connection,
         *,
         outbox_high_watermark: int,
-        activation_required: bool,
     ) -> None:
         activation_predicate, activation_parameters = (
-            cls._activation_claim_predicate_tx(
-                conn,
-                activation_required=activation_required,
-                historical_submission_allowlist=(),
-            )
+            cls._activation_claim_predicate_tx(conn)
         )
         backlog = int(
             conn.execute(
@@ -16497,122 +10505,6 @@ class RcaControlStore:
         return True
 
     @classmethod
-    def _manual_shadow_promote_tx(
-        cls,
-        conn: sqlite3.Connection,
-        *,
-        row: sqlite3.Row,
-        request: ManualRcaTriggerRequest,
-        current: str,
-    ) -> bool:
-        """Promote one unsubmitted Kafka shadow without changing its lineage."""
-        if str(row["outbox_status"] or "") != "shadow":
-            return False
-        if str(row["state"] or "") != "shadow":
-            raise ManualRcaAdmissionError("manual_shadow_state_inconsistent")
-        if conn.execute(
-            """
-            SELECT 1 FROM rca_admission_snapshots
-             WHERE business_key = ? AND generation = ?
-            """,
-            (row["business_key"], row["generation"]),
-        ).fetchone() is not None:
-            raise ManualRcaAdmissionError(
-                "w3_snapshot_promotion_lineage_required"
-            )
-        event_uid = str(row["source_event_id"] or "").strip()
-        if not event_uid:
-            raise ManualRcaAdmissionError("manual_shadow_source_missing")
-        if (
-            int(row["attempt"] or 0) != 0
-            or row["completed_at"] is not None
-            or row["result_json"] is not None
-            or row["quarantined_at"] is not None
-            or str(row["last_error_code"] or "")
-            or any(
-                row[name] is not None
-                for name in ("lease_token", "lease_owner", "lease_expires_at")
-            )
-        ):
-            raise ManualRcaAdmissionError("manual_shadow_already_submitted")
-        inbox = conn.execute(
-            """
-            SELECT decision, submission_mode, business_key, submission_key, generation
-              FROM kafka_inbox WHERE event_uid = ?
-            """,
-            (event_uid,),
-        ).fetchone()
-        if (
-            inbox is None
-            or str(inbox["decision"] or "") != "accepted"
-            or str(inbox["submission_mode"] or "") != "shadow"
-            or str(inbox["business_key"] or "") != str(row["business_key"])
-            or str(inbox["submission_key"] or "") != str(row["submission_key"])
-            or int(inbox["generation"] or 0) != int(row["generation"])
-        ):
-            raise ManualRcaAdmissionError("manual_shadow_inbox_inconsistent")
-
-        inbox_update = conn.execute(
-            """
-            UPDATE kafka_inbox SET submission_mode = 'pending'
-             WHERE event_uid = ? AND decision = 'accepted'
-               AND submission_mode = 'shadow' AND business_key = ?
-               AND submission_key = ? AND generation = ?
-            """,
-            (
-                event_uid,
-                row["business_key"],
-                row["submission_key"],
-                row["generation"],
-            ),
-        )
-        outbox_update = conn.execute(
-            """
-            UPDATE rca_outbox
-               SET status = 'pending', next_attempt_at = ?, updated_at = ?
-             WHERE outbox_id = ? AND status = 'shadow' AND attempt = 0
-               AND completed_at IS NULL AND result_json IS NULL
-               AND quarantined_at IS NULL AND last_error_code = ''
-               AND lease_token IS NULL AND lease_owner IS NULL
-               AND lease_expires_at IS NULL
-            """,
-            (current, current, row["outbox_id"]),
-        )
-        trigger_update = conn.execute(
-            """
-            UPDATE business_triggers SET state = 'pending'
-             WHERE business_key = ? AND generation = ? AND state = 'shadow'
-               AND submission_key = ? AND source_event_id = ?
-            """,
-            (
-                row["business_key"],
-                row["generation"],
-                row["submission_key"],
-                event_uid,
-            ),
-        )
-        if (
-            inbox_update.rowcount != 1
-            or outbox_update.rowcount != 1
-            or trigger_update.rowcount != 1
-        ):
-            raise RuntimeError("manual_shadow_promotion_lost_atomic_guard")
-        cls._insert_promotion_audit(
-            conn,
-            event_uid=event_uid,
-            outbox_id=int(row["outbox_id"]),
-            submission_key=str(row["submission_key"]),
-            operator=f"manual:{request.requester_id}",
-            reason=f"manual_{request.mode}",
-            outcome=MANUAL_SHADOW_PROMOTED_REASON,
-            from_status="shadow",
-            to_status="pending",
-            detail="authorized manual trigger promoted exact unsubmitted shadow",
-            created_at=current,
-        )
-        return True
-
-    @classmethod
     def _execution_watch_exists_tx(
         cls, conn: sqlite3.Connection, submission_key: str
     ) -> bool:
@@ -16875,15 +10767,6 @@ class RcaControlStore:
             terminal_generation = int(terminal["watch_generation"] or 0)
         except (TypeError, ValueError, OverflowError):
             return False
-        if cls._pre_w3_no_write_rerun_eligible_tx(
-            conn,
-            row=row,
-            terminal=terminal,
-            business_key=business_key,
-            generation=generation,
-            terminal_generation=terminal_generation,
-        ):
-            return True
         silent_error_code = str(terminal["last_error_code"] or "")
         if (
             str(terminal["state"] or "") != "terminal_failed"
@@ -17068,112 +10951,6 @@ class RcaControlStore:
         return True
 
     @classmethod
-    def _pre_w3_no_write_rerun_eligible_tx(
-        cls,
-        conn: sqlite3.Connection,
-        *,
-        row: sqlite3.Row,
-        terminal: sqlite3.Row,
-        business_key: str,
-        generation: int,
-        terminal_generation: int,
-    ) -> bool:
-        """Accept only a settled pre-W3 preread quarantine with no write path."""
-        if (
-            str(row["state"] or "") != "quarantined"
-            or str(terminal["state"] or "") != "quarantined"
-            or str(terminal["watch_business_key"] or "") != business_key
-            or terminal_generation != generation
-            or terminal["task_id"] is not None
-            or terminal["delivery_id"] is not None
-            or not str(terminal["terminal_at"] or "").strip()
-            or str(terminal["last_error_code"] or "")
-            != "w3_execution_snapshot_missing"
-            or not str(terminal["last_error_detail"] or "").strip()
-            or str(terminal["outbox_status"] or "") != "quarantined"
-            or int(terminal["outbox_attempt"] or 0) < 1
-            or terminal["outbox_next_attempt_at"] is not None
-            or not str(terminal["outbox_claimed_at"] or "").strip()
-            or terminal["outbox_completed_at"] is not None
-            or not str(terminal["outbox_quarantined_at"] or "").strip()
-            or terminal["outbox_result_json"] is not None
-            or str(terminal["outbox_error_code"] or "")
-            not in PRE_W3_NO_WRITE_RERUN_OUTBOX_ERROR_CODES
-            or not str(terminal["outbox_error_detail"] or "").strip()
-            or str(terminal["terminal_at"])
-            != str(terminal["outbox_quarantined_at"])
-            or any(
-                terminal[name] is not None
-                for name in (
-                    "lease_token",
-                    "lease_owner",
-                    "lease_expires_at",
-                    "outbox_lease_token",
-                    "outbox_lease_owner",
-                    "outbox_lease_expires_at",
-                )
-            )
-        ):
-            return False
-        try:
-            status = json.loads(str(terminal["last_status_json"] or ""))
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return False
-        if not isinstance(status, Mapping) or (
-            status.get("success") is not False
-            or status.get("state") != "quarantined"
-            or status.get("error_code") != "w3_execution_snapshot_missing"
-            or status.get("external_writes") is not False
-            or status.get("terminal_delivery_policy")
-            != "silent_internal_alert_only"
-        ):
-            return False
-        if conn.execute(
-            "SELECT 1 FROM rca_admission_snapshots "
-            "WHERE business_key = ? AND generation = ? LIMIT 1",
-            (business_key, generation),
-        ).fetchone() is not None:
-            return False
-        if conn.execute(
-            "SELECT 1 FROM rca_delivery_jobs "
-            "WHERE business_key = ? AND generation = ? LIMIT 1",
-            (business_key, generation),
-        ).fetchone() is not None:
-            return False
-        if conn.execute(
-            "SELECT 1 FROM rca_delivery_effects AS effect "
-            "JOIN rca_delivery_jobs AS job ON job.delivery_id = effect.delivery_id "
-            "WHERE job.business_key = ? AND job.generation = ? LIMIT 1",
-            (business_key, generation),
-        ).fetchone() is not None:
-            return False
-        if conn.execute(
-            "SELECT 1 FROM rca_delivery_attempts AS attempt "
-            "JOIN rca_delivery_effects AS effect "
-            "ON effect.effect_key = attempt.effect_key "
-            "JOIN rca_delivery_jobs AS job ON job.delivery_id = effect.delivery_id "
-            "WHERE job.business_key = ? AND job.generation = ? LIMIT 1",
-            (business_key, generation),
-        ).fetchone() is not None:
-            return False
-        subscriptions = conn.execute(
-            """
-            SELECT required, status, delivery_id, effect_key, reason
-              FROM rca_delivery_subscriptions
-             WHERE business_key = ? AND generation = ?
-            """,
-            (business_key, generation),
-        ).fetchall()
-        required = [item for item in subscriptions if int(item["required"] or 0) == 1]
-        return bool(required) and all(
-            str(item["status"] or "") == "quarantined"
-            and item["delivery_id"] is None
-            and item["effect_key"] is None
-            and str(item["reason"] or "") == "w3_execution_snapshot_missing"
-            for item in subscriptions
-        )
-
-    @classmethod
     def _terminal_duplicate_retrigger_eligible_tx(
         cls,
         conn: sqlite3.Connection,
@@ -17250,8 +11027,6 @@ class RcaControlStore:
         active_policy: WorkflowEventPolicy | Mapping[str, Any] | None = None,
         outbox_high_watermark: int = DEFAULT_OUTBOX_HIGH_WATERMARK,
         activation_required: bool = False,
-        activation_slot_kind: str = "",
-        automation_authority: Mapping[str, Any] | None = None,
         user_rerun_authority: Mapping[str, Any] | None = None,
         historical_epoch_rerun_authority: Mapping[str, Any] | None = None,
         batch_terminal_rerun_authority: Mapping[str, Any] | None = None,
@@ -17266,10 +11041,6 @@ class RcaControlStore:
         issue_only_operator = manual.platform == "operator"
         if not isinstance(activation_required, bool):
             raise ManualRcaAdmissionError("manual_activation_required_invalid")
-        activation_slot = str(activation_slot_kind or "").strip()
-        if activation_slot and activation_slot not in ACTIVATION_SLOT_KINDS:
-            raise ManualRcaAdmissionError("manual_activation_slot_invalid")
-        gray_sample_authority: dict[str, str] | None = None
         normalized_user_rerun: dict[str, str] | None = None
         normalized_historical_epoch_rerun: dict[str, Any] | None = None
         normalized_batch_rerun: dict[str, Any] | None = None
@@ -17371,10 +11142,8 @@ class RcaControlStore:
                 or manual.mode != "rerun"
                 or operator_authorized is not True
                 or user_rerun_authority is not None
-                or automation_authority is not None
                 or batch_terminal_rerun_authority is not None
                 or silent_terminal_rerun_authority is not None
-                or activation_slot
                 or snapshot_authority is not None
                 or snapshot_ticket_authority is not None
                 or snapshot_manual_ingress_authority is not None
@@ -17437,9 +11206,7 @@ class RcaControlStore:
                 or manual.mode != "rerun"
                 or operator_authorized is not True
                 or user_rerun_authority is not None
-                or automation_authority is not None
                 or historical_epoch_rerun_authority is not None
-                or activation_slot
                 or snapshot_authority is not None
                 or snapshot_ticket_authority is not None
                 or snapshot_manual_ingress_authority is not None
@@ -17500,9 +11267,7 @@ class RcaControlStore:
                 or manual.mode != "rerun"
                 or operator_authorized is not True
                 or user_rerun_authority is not None
-                or automation_authority is not None
                 or historical_epoch_rerun_authority is not None
-                or activation_slot
                 or snapshot_authority is not None
                 or snapshot_ticket_authority is not None
                 or snapshot_manual_ingress_authority is not None
@@ -17515,36 +11280,6 @@ class RcaControlStore:
                     "batch_terminal_rerun_authority_invalid"
                 )
             normalized_batch_rerun = expected_batch_rerun
-        if automation_authority is not None:
-            try:
-                gray_sample_authority = normalize_gray_sample_automation_authority(
-                    automation_authority
-                )
-            except ValueError as exc:
-                raise ManualRcaAdmissionError(str(exc)) from exc
-            if (
-                manual.platform != "operator"
-                or manual.mode != "rerun"
-                or manual.requester_id != GRAY_SAMPLE_REQUESTER_ID
-                or activation_required is not True
-                or activation_slot
-                or operator_authorized is not True
-                or snapshot_authority is not None
-                or snapshot_ticket_authority is not None
-                or snapshot_manual_ingress_authority is not None
-                or historical_epoch_rerun_authority is not None
-            ):
-                raise ManualRcaAdmissionError("gray_sample_automation_contract_invalid")
-            sample_id = gray_sample_authority["sample_id"]
-            if (
-                manual.issue_url != gray_sample_issue_url(sample_id)
-                or manual.reason != build_gray_sample_reason(gray_sample_authority)
-                or manual.message_id
-                != build_gray_sample_message_id(gray_sample_authority)
-            ):
-                raise ManualRcaAdmissionError(
-                    "gray_sample_automation_binding_mismatch"
-                )
         allowed = {str(item or "").strip() for item in allowed_chat_ids}
         if not submit_enabled:
             raise ManualRcaAdmissionError("manual_intake_disabled")
@@ -17622,8 +11357,6 @@ class RcaControlStore:
         except (TypeError, ValueError, KeyError) as exc:
             raise ManualRcaAdmissionError(str(exc)) from exc
         source_payload = manual.to_dict()
-        if gray_sample_authority is not None:
-            source_payload["automation_authority"] = gray_sample_authority
         if normalized_user_rerun is not None:
             source_payload["user_rerun_authority"] = normalized_user_rerun
         if normalized_historical_epoch_rerun is not None:
@@ -17653,10 +11386,6 @@ class RcaControlStore:
         if issue_only_operator:
             activation_source_identity.update(
                 {"chat_id": "operator", "thread_id": "operator:issue-only"}
-            )
-        if gray_sample_authority is not None:
-            activation_source_identity["automation_authority"] = (
-                gray_sample_authority
             )
         current = _iso(now)
         conn = self._connect()
@@ -17693,6 +11422,10 @@ class RcaControlStore:
                 ).fetchone()
                 if binding is None:
                     raise ManualRcaAdmissionError("manual_source_binding_missing")
+                if str(binding["outbox_status"] or "") == "shadow":
+                    raise ManualRcaAdmissionError(
+                        "manual_historical_shadow_not_executable"
+                    )
                 replay_activation = self.adjudicate_activation_tx(
                     conn,
                     entrypoint="manual_admit",
@@ -17702,48 +11435,13 @@ class RcaControlStore:
                     submission_key=str(binding["submission_key"]),
                     generation=int(binding["generation"]),
                     new_execution=False,
-                    requested_slot_kind=activation_slot,
-                    activation_required=activation_required,
                     now=now,
                 )
                 if replay_activation.decision not in {"admit", "join"}:
                     raise ManualRcaAdmissionError(replay_activation.reason)
-                w3_shadow_observation = bool(
-                    w3_authority is not None
-                    and manual.mode == "run_or_join"
-                    and str(binding["outbox_status"] or "") == "shadow"
-                )
-                if (
-                    str(binding["outbox_status"] or "") == "shadow"
-                    and not w3_shadow_observation
-                ):
-                    self._assert_manual_storage_capacity()
-                    self._assert_manual_dispatch_capacity_tx(
-                        conn,
-                        outbox_high_watermark=high_watermark,
-                        activation_required=activation_required,
-                    )
-                shadow_promoted = (
-                    False
-                    if w3_shadow_observation
-                    else self._manual_shadow_promote_tx(
-                        conn,
-                        row=binding,
-                        request=manual,
-                        current=current,
-                    )
-                )
                 replay_outcome = str(existing_source["outcome"] or "joined")
                 replay_state = str(binding["state"])
                 replay_reason = "idempotent_source_replay"
-                if shadow_promoted:
-                    replay_outcome = "rearmed"
-                    replay_state = "pending"
-                    replay_reason = MANUAL_SHADOW_PROMOTED_REASON
-                    conn.execute(
-                        "UPDATE rca_trigger_sources SET outcome = ? WHERE source_id = ?",
-                        (replay_outcome, source_id),
-                    )
                 replay_generation = int(binding["generation"])
                 replay_admission_for_lane = build_rca_admission(
                     project_key=str(binding["project_key"]),
@@ -17922,7 +11620,7 @@ class RcaControlStore:
                         issue_url=manual.issue_url,
                         title=str(w3_ticket_authority["ticket"]["title"]),
                     )
-                    self.persist_w3_admission_shadow_tx(
+                    self.persist_w3_admission_snapshot_tx(
                         conn,
                         admission=replay_admission,
                         trigger_context=replay_context,
@@ -17999,8 +11697,7 @@ class RcaControlStore:
                     )
 
             if (
-                gray_sample_authority is None
-                and operator_requested
+                operator_requested
                 and not issue_only_operator
                 and normalized_user_rerun is None
             ):
@@ -18061,12 +11758,6 @@ class RcaControlStore:
                 work_item_type_key=work_item_type_key,
                 work_item_id=work_item_id,
             )
-            if gray_sample_authority is not None and (
-                latest is None or not self._execution_terminal_tx(conn, latest)
-            ):
-                raise ManualRcaAdmissionError(
-                    "gray_sample_terminal_generation_required"
-                )
             if normalized_user_rerun is not None:
                 if latest is None:
                     raise ManualRcaAdmissionError(
@@ -18308,13 +11999,11 @@ class RcaControlStore:
             created = False
             rearmed = False
             rearm_reason = ""
-            needs_shadow_promotion = False
             needs_input_rearm = False
             if latest is None:
                 self._assert_manual_dispatch_capacity_tx(
                     conn,
                     outbox_high_watermark=high_watermark,
-                    activation_required=activation_required,
                 )
                 admission = base_admission
                 outcome = "created"
@@ -18322,7 +12011,6 @@ class RcaControlStore:
                 self._assert_manual_dispatch_capacity_tx(
                     conn,
                     outbox_high_watermark=high_watermark,
-                    activation_required=activation_required,
                 )
                 admission = build_rca_admission(
                     project_key=str(latest["project_key"]),
@@ -18334,28 +12022,10 @@ class RcaControlStore:
                     generation=int(latest["generation"]) + 1,
                 )
                 outcome = "created"
-            elif (
-                str(latest["outbox_status"] or "") == "shadow"
-                and w3_authority is not None
-                and manual.mode == "run_or_join"
-            ):
-                admission = existing_admission(
-                    generation=int(latest["generation"])
-                )
-                outcome = "joined"
             elif str(latest["outbox_status"] or "") == "shadow":
-                self._assert_manual_dispatch_capacity_tx(
-                    conn,
-                    outbox_high_watermark=high_watermark,
-                    activation_required=activation_required,
+                raise ManualRcaAdmissionError(
+                    "manual_historical_shadow_not_executable"
                 )
-                admission = existing_admission(
-                    generation=int(latest["generation"])
-                )
-                outcome = "rearmed"
-                rearmed = True
-                rearm_reason = MANUAL_SHADOW_PROMOTED_REASON
-                needs_shadow_promotion = True
             elif self._manual_input_wait_rearm_eligible(
                 latest
             ) and not self._execution_watch_exists_tx(
@@ -18364,7 +12034,6 @@ class RcaControlStore:
                 self._assert_manual_dispatch_capacity_tx(
                     conn,
                     outbox_high_watermark=high_watermark,
-                    activation_required=activation_required,
                 )
                 admission = existing_admission(
                     generation=int(latest["generation"])
@@ -18381,14 +12050,13 @@ class RcaControlStore:
                 if (
                     manual.platform != "feishu"
                     or manual.mode != "rerun"
-                ) and gray_sample_authority is None and normalized_silent_rerun is None and normalized_batch_rerun is None:
+                ) and normalized_silent_rerun is None and normalized_batch_rerun is None:
                     raise ManualRcaAdmissionError(
                         "manual_generation_requires_explicit_user_rerun"
                     )
                 self._assert_manual_dispatch_capacity_tx(
                     conn,
                     outbox_high_watermark=high_watermark,
-                    activation_required=activation_required,
                 )
                 admission = build_rca_admission(
                     project_key=str(latest["project_key"]),
@@ -18418,20 +12086,10 @@ class RcaControlStore:
                 submission_key=admission.submission_key,
                 generation=admission.generation,
                 new_execution=creates_generation,
-                requested_slot_kind=activation_slot,
-                activation_required=activation_required,
                 now=now,
             )
             if activation_decision.decision not in {"admit", "join"}:
                 raise ManualRcaAdmissionError(activation_decision.reason)
-            if needs_shadow_promotion:
-                if latest is None or not self._manual_shadow_promote_tx(
-                    conn,
-                    row=latest,
-                    request=manual,
-                    current=current,
-                ):
-                    raise RuntimeError("manual_shadow_promotion_not_applied")
             if needs_input_rearm:
                 if latest is None or not self._manual_input_wait_rearm_tx(
                     conn, row=latest, current=current
@@ -18532,7 +12190,6 @@ class RcaControlStore:
                 created = True
                 if (
                     activation_decision.decision == "admit"
-                    and not activation_decision.legacy_unconfigured
                     and activation_decision.ledger_id is not None
                 ):
                     self.bind_activation_admission_tx(
@@ -18692,7 +12349,7 @@ class RcaControlStore:
                 )
             )
             if w3_authority is not None:
-                self.persist_w3_admission_shadow_tx(
+                self.persist_w3_admission_snapshot_tx(
                     conn,
                     admission=admission,
                     trigger_context=trigger_context,
@@ -19194,31 +12851,10 @@ class RcaControlStore:
                                 submission_key=submission_key,
                                 generation=generation,
                                 new_execution=creates_generation,
-                                requested_slot_kind=str(
-                                    row["activation_slot_kind"] or ""
-                                ),
-                                activation_required=bool(
-                                    row["activation_required"]
-                                ),
                                 ingress_epoch_id=captured_epoch,
-                                ingress_state=str(
-                                    row["activation_ingress_state"] or ""
-                                ),
                                 now=now_dt,
                             )
-                            if activation_decision.decision == "reject":
-                                decision = "filtered"
-                                reason = activation_decision.reason
-                                admission = None
-                                business_key = ""
-                                generation = 0
-                                submission_key = ""
-                                kafka_source_id = ""
-                                creates_generation = False
-                            elif activation_decision.decision == "shadow":
-                                effective_submission_mode = "shadow"
-                                reason = activation_decision.reason
-                            elif activation_decision.decision == "admit":
+                            if activation_decision.decision == "admit":
                                 effective_submission_mode = "pending"
                         kafka_source_id = self._ensure_kafka_source_tx(
                             conn,
@@ -19324,8 +12960,7 @@ class RcaControlStore:
                                 reason = INPUT_WAIT_TERMINAL_NEW_GENERATION_REASON
                         if (
                             activation_decision is not None
-                            and activation_decision.decision in {"admit", "shadow"}
-                            and not activation_decision.legacy_unconfigured
+                            and activation_decision.decision == "admit"
                             and activation_decision.ledger_id is not None
                         ):
                             self.bind_activation_admission_tx(
@@ -19403,7 +13038,10 @@ class RcaControlStore:
                             subscription_key=issue_subscription_key,
                             current=now,
                         )
-                        if snapshot_authority is not None:
+                        if (
+                            snapshot_authority is not None
+                            and activation_decision is not None
+                        ):
                             snapshot_context = build_rca_trigger_context(
                                 source_kind="kafka_workflow_event",
                                 project_key=normalized.project_key,
@@ -19414,7 +13052,7 @@ class RcaControlStore:
                                 issue_url=normalized.issue_url,
                                 title=normalized.title,
                             )
-                            self.persist_w3_admission_shadow_tx(
+                            self.persist_w3_admission_snapshot_tx(
                                 conn,
                                 admission=admission,
                                 trigger_context=snapshot_context,
@@ -19525,7 +13163,6 @@ class RcaControlStore:
         policy: WorkflowEventPolicy,
         submit_enabled: bool = False,
         activation_required: bool = False,
-        activation_slot_kind: str = "",
         runtime_identity: Mapping[str, Any] | None = None,
         after_raw_persisted: Callable[[RawPersistResult], None] | None = None,
         snapshot_authority: Any = None,
@@ -19536,7 +13173,6 @@ class RcaControlStore:
             policy=policy,
             submit_enabled=submit_enabled,
             activation_required=activation_required,
-            activation_slot_kind=activation_slot_kind,
         )
         if after_raw_persisted is not None:
             after_raw_persisted(raw_result)
@@ -19707,11 +13343,7 @@ class RcaControlStore:
         conn = self._connect()
         try:
             row = self._current_activation_epoch_tx(conn)
-            if row is None or str(row["state"]) not in {
-                "bounded_active",
-                "confirmed",
-                "steady_active",
-            }:
+            if row is None or str(row["state"]) != "steady_active":
                 return {}
             try:
                 start_fence = json.loads(str(row["partition_start_fence_json"]))
@@ -19812,532 +13444,6 @@ class RcaControlStore:
             for event_uid in self.pending_event_uids(limit=limit)
         ]
 
-    def promote_shadow_event(
-        self,
-        event_uid: str,
-        *,
-        operator: str,
-        reason: str,
-        expected_activation_epoch_id: str = "",
-        activation_required: bool = False,
-        activation_slot_kind: str = "",
-        now: datetime | None = None,
-    ) -> ShadowPromotionResult:
-        """Promote exactly one accepted shadow event for an audited canary.
-
-        This API deliberately accepts one exact transport identity and has no
-        list, prefix, policy, or wildcard mode. Repeating a successful promotion
-        is idempotent and creates a second audit entry without mutating state.
-        """
-        event_id = str(event_uid or "").strip()
-        actor = str(operator or "").strip()
-        justification = str(reason or "").strip()
-        if not event_id or "\n" in event_id or "\r" in event_id:
-            raise ValueError("event_uid must be one exact non-empty identity")
-        if not actor:
-            raise ValueError("operator must not be empty")
-        if not justification:
-            raise ValueError("reason must not be empty")
-        if len(event_id) > 500 or len(actor) > 200 or len(justification) > 1000:
-            raise ValueError("promotion audit fields exceed their size limits")
-        if not isinstance(activation_required, bool):
-            raise ActivationEpochError("activation_adjudication_flag_invalid")
-        expected_epoch_id = str(expected_activation_epoch_id or "").strip()
-        if expected_epoch_id:
-            expected_epoch_id = self._normalize_activation_epoch_id(expected_epoch_id)
-        activation_slot = str(activation_slot_kind or "").strip()
-        if activation_slot and activation_slot not in ACTIVATION_SLOT_KINDS:
-            raise ActivationEpochError("activation_slot_kind_invalid")
-        current = _iso(now)
-        conn = self._connect()
-        denied: tuple[str, int, str, str] | None = None
-        result: ShadowPromotionResult | None = None
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            epoch = self._current_activation_epoch_tx(conn)
-            if expected_epoch_id and (
-                epoch is None or str(epoch["epoch_id"]) != expected_epoch_id
-            ):
-                raise ActivationEpochError("activation_epoch_not_current")
-            row = conn.execute(
-                """
-                SELECT i.event_uid, i.decision, i.submission_mode,
-                       o.outbox_id, o.submission_key, o.status AS outbox_status,
-                       o.business_key, o.generation, o.activation_epoch_id,
-                       o.activation_ledger_id,
-                       EXISTS (
-                           SELECT 1 FROM rca_admission_snapshots AS snapshot
-                            WHERE snapshot.business_key = o.business_key
-                              AND snapshot.generation = o.generation
-                       ) AS has_w3_snapshot,
-                       t.state AS trigger_state
-                  FROM kafka_inbox AS i
-             LEFT JOIN rca_outbox AS o ON o.source_event_id = i.event_uid
-             LEFT JOIN business_triggers AS t
-                    ON t.business_key = o.business_key
-                   AND t.generation = o.generation
-                 WHERE i.event_uid = ?
-                """,
-                (event_id,),
-            ).fetchone()
-            if row is None:
-                denied = ("event_not_found", 0, "", "")
-            elif row["decision"] != "accepted":
-                denied = (
-                    "event_not_accepted",
-                    int(row["outbox_id"] or 0),
-                    str(row["submission_key"] or ""),
-                    str(row["outbox_status"] or row["submission_mode"] or ""),
-                )
-            elif row["outbox_id"] is None:
-                denied = ("accepted_event_missing_outbox", 0, "", "")
-            elif row["submission_mode"] == "shadow":
-                if row["outbox_status"] != "shadow" or row["trigger_state"] != "shadow":
-                    denied = (
-                        "shadow_state_inconsistent_or_completed",
-                        int(row["outbox_id"]),
-                        str(row["submission_key"]),
-                        str(row["outbox_status"] or ""),
-                    )
-                elif int(row["has_w3_snapshot"] or 0) == 1:
-                    denied = (
-                        "w3_snapshot_promotion_lineage_required",
-                        int(row["outbox_id"]),
-                        str(row["submission_key"]),
-                        str(row["outbox_status"] or ""),
-                    )
-                else:
-                    if epoch is not None and (
-                        str(row["activation_epoch_id"] or "")
-                        != str(epoch["epoch_id"])
-                        or row["activation_ledger_id"] is None
-                    ):
-                        denied = (
-                            "activation_shadow_epoch_mismatch",
-                            int(row["outbox_id"]),
-                            str(row["submission_key"]),
-                            str(row["outbox_status"] or ""),
-                        )
-                    else:
-                        activation_decision = self.adjudicate_activation_tx(
-                            conn,
-                            entrypoint="shadow_promotion",
-                            source_kind="kafka",
-                            source_identity={"event_uid": event_id},
-                            business_key=str(row["business_key"]),
-                            submission_key=str(row["submission_key"]),
-                            generation=int(row["generation"]),
-                            new_execution=True,
-                            requested_slot_kind=activation_slot,
-                            activation_required=activation_required,
-                            now=now,
-                        )
-                        if activation_decision.decision != "admit":
-                            denied = (
-                                activation_decision.reason,
-                                int(row["outbox_id"]),
-                                str(row["submission_key"]),
-                                str(row["outbox_status"] or ""),
-                            )
-                        elif epoch is not None and (
-                            activation_decision.ledger_id
-                            != int(row["activation_ledger_id"])
-                            or activation_decision.epoch_id != str(epoch["epoch_id"])
-                        ):
-                            raise ActivationEpochError(
-                                "activation_shadow_ledger_mismatch"
-                            )
-                    if denied is not None:
-                        pass
-                    else:
-                        inbox_update = conn.execute(
-                            """
-                            UPDATE kafka_inbox SET submission_mode = 'pending'
-                             WHERE event_uid = ? AND decision = 'accepted'
-                               AND submission_mode = 'shadow'
-                            """,
-                            (event_id,),
-                        )
-                        outbox_update = conn.execute(
-                            """
-                            UPDATE rca_outbox SET status = 'pending', updated_at = ?
-                             WHERE outbox_id = ? AND status = 'shadow'
-                            """,
-                            (current, row["outbox_id"]),
-                        )
-                        trigger_update = conn.execute(
-                            """
-                            UPDATE business_triggers SET state = 'pending'
-                             WHERE business_key = ? AND generation = ?
-                               AND state = 'shadow'
-                            """,
-                            (row["business_key"], row["generation"]),
-                        )
-                        if (
-                            inbox_update.rowcount != 1
-                            or outbox_update.rowcount != 1
-                            or trigger_update.rowcount != 1
-                        ):
-                            raise RuntimeError(
-                                "shadow promotion lost its atomic state guard"
-                            )
-                        audit_id = self._insert_promotion_audit(
-                            conn,
-                            event_uid=event_id,
-                            outbox_id=int(row["outbox_id"]),
-                            submission_key=str(row["submission_key"]),
-                            operator=actor,
-                            reason=justification,
-                            outcome="promoted",
-                            from_status="shadow",
-                            to_status="pending",
-                            detail="single accepted shadow event promoted for canary",
-                            created_at=current,
-                        )
-                        result = ShadowPromotionResult(
-                            event_uid=event_id,
-                            outbox_id=int(row["outbox_id"]),
-                            submission_key=str(row["submission_key"]),
-                            status="pending",
-                            promoted=True,
-                            audit_id=audit_id,
-                        )
-            else:
-                prior = conn.execute(
-                    """
-                    SELECT audit_id FROM rca_shadow_promotion_audit
-                     WHERE event_uid = ? AND outcome = 'promoted'
-                     ORDER BY audit_id LIMIT 1
-                    """,
-                    (event_id,),
-                ).fetchone()
-                if prior is None:
-                    denied = (
-                        "event_was_not_promoted_from_shadow",
-                        int(row["outbox_id"]),
-                        str(row["submission_key"]),
-                        str(row["outbox_status"] or ""),
-                    )
-                else:
-                    if epoch is not None:
-                        eligible = conn.execute(
-                            """
-                            SELECT al.bound_at, al.reason,
-                                   EXISTS (
-                                       SELECT 1
-                                         FROM rca_activation_budget_slots AS abs
-                                        WHERE abs.epoch_id = al.epoch_id
-                                          AND abs.consumed_ledger_id = al.ledger_id
-                                          AND abs.slot_kind = 'kafka_success'
-                                   ) AS is_kafka_canary
-                              FROM rca_activation_admission_ledger AS al
-                             WHERE al.ledger_id = ? AND al.epoch_id = ?
-                               AND al.decision = 'admit'
-                               AND al.business_key = ?
-                               AND al.submission_key = ?
-                               AND al.generation = ?
-                            """,
-                            (
-                                row["activation_ledger_id"],
-                                epoch["epoch_id"],
-                                row["business_key"],
-                                row["submission_key"],
-                                row["generation"],
-                            ),
-                        ).fetchone()
-                        epoch_state = str(epoch["state"])
-                        replay_allowed = bool(
-                            eligible is not None
-                            and str(eligible["bound_at"] or "")
-                            and (
-                                epoch_state == "steady_active"
-                                or (
-                                    epoch_state == "bounded_active"
-                                    and int(eligible["is_kafka_canary"] or 0) == 1
-                                )
-                                or (
-                                    epoch_state == "confirmed"
-                                    and (
-                                        int(eligible["is_kafka_canary"] or 0) == 1
-                                        or str(eligible["reason"] or "")
-                                        == "activation_confirmed_shadow_reconciliation"
-                                    )
-                                )
-                            )
-                        )
-                        if (
-                            str(row["activation_epoch_id"] or "")
-                            != str(epoch["epoch_id"])
-                            or not replay_allowed
-                        ):
-                            denied = (
-                                "activation_promotion_replay_not_eligible",
-                                int(row["outbox_id"]),
-                                str(row["submission_key"]),
-                                str(row["outbox_status"] or ""),
-                            )
-                    elif activation_required:
-                        denied = (
-                            "activation_epoch_rejected_unconfigured",
-                            int(row["outbox_id"]),
-                            str(row["submission_key"]),
-                            str(row["outbox_status"] or ""),
-                        )
-                    if denied is not None:
-                        pass
-                    else:
-                        audit_id = self._insert_promotion_audit(
-                            conn,
-                            event_uid=event_id,
-                            outbox_id=int(row["outbox_id"]),
-                            submission_key=str(row["submission_key"]),
-                            operator=actor,
-                            reason=justification,
-                            outcome="already_promoted",
-                            from_status=str(row["outbox_status"] or ""),
-                            to_status=str(row["outbox_status"] or ""),
-                            detail="idempotent repeat of an audited promotion",
-                            created_at=current,
-                        )
-                        result = ShadowPromotionResult(
-                            event_uid=event_id,
-                            outbox_id=int(row["outbox_id"]),
-                            submission_key=str(row["submission_key"]),
-                            status=str(row["outbox_status"] or ""),
-                            promoted=False,
-                            audit_id=audit_id,
-                        )
-
-            if denied is not None:
-                code, outbox_id, submission_key, from_status = denied
-                self._insert_promotion_audit(
-                    conn,
-                    event_uid=event_id,
-                    outbox_id=outbox_id or None,
-                    submission_key=submission_key,
-                    operator=actor,
-                    reason=justification,
-                    outcome="denied",
-                    from_status=from_status,
-                    to_status=from_status,
-                    detail=code,
-                    created_at=current,
-                )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-        if denied is not None:
-            raise ShadowPromotionError(
-                f"shadow promotion denied for {event_id}: {denied[0]}"
-            )
-        if result is None:
-            raise RuntimeError("shadow promotion produced no result")
-        return result
-
-    def defer_activation_event(
-        self,
-        event_uid: str,
-        *,
-        expected_activation_epoch_id: str,
-        operator: str,
-        reason: str,
-        now: datetime | None = None,
-    ) -> ActivationDeferralResult:
-        """Quarantine one exact unexecuted activation item with an immutable audit trail.
-
-        The identity may be a Kafka ``event_uid`` or a Feishu manual
-        ``message_id``. Both paths resolve one already-bound row and share the
-        same transaction and audit disposition; no broad source lookup is
-        permitted.
-        """
-        event_id = str(event_uid or "").strip()
-        if not event_id or "\n" in event_id or "\r" in event_id or len(event_id) > 500:
-            raise ActivationEpochError("activation_deferred_event_uid_invalid")
-        epoch_id = self._normalize_activation_epoch_id(expected_activation_epoch_id)
-        actor, justification = self._normalize_activation_audit_text(operator, reason)
-        current = _iso(now)
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            epoch = self._current_activation_epoch_tx(conn)
-            if epoch is None or str(epoch["epoch_id"]) != epoch_id:
-                raise ActivationEpochError("activation_epoch_not_current")
-            if str(epoch["state"]) == "steady_active":
-                raise ActivationEpochError("activation_deferral_closed")
-            row = conn.execute(
-                """
-                SELECT *
-                  FROM (
-                    SELECT 'kafka' AS bound_source_kind,
-                           i.decision AS inbox_decision,
-                           NULL AS source_kind, NULL AS source_outcome,
-                           o.outbox_id, o.business_key, o.submission_key,
-                           o.generation, o.status AS outbox_status,
-                           o.last_error_code, o.activation_epoch_id,
-                           o.activation_ledger_id, t.state AS trigger_state,
-                           al.decision AS ledger_decision, al.bound_at
-                      FROM kafka_inbox AS i
-                      JOIN rca_outbox AS o ON o.source_event_id = i.event_uid
-                      JOIN business_triggers AS t
-                        ON t.business_key = o.business_key
-                       AND t.submission_key = o.submission_key
-                       AND t.generation = o.generation
-                      JOIN rca_activation_admission_ledger AS al
-                        ON al.epoch_id = o.activation_epoch_id
-                       AND al.ledger_id = o.activation_ledger_id
-                       AND al.business_key = o.business_key
-                       AND al.submission_key = o.submission_key
-                       AND al.generation = o.generation
-                     WHERE i.event_uid = ?
-                    UNION ALL
-                    SELECT 'manual' AS bound_source_kind,
-                           NULL AS inbox_decision,
-                           s.source_kind, s.outcome AS source_outcome,
-                           o.outbox_id, o.business_key, o.submission_key,
-                           o.generation, o.status AS outbox_status,
-                           o.last_error_code, o.activation_epoch_id,
-                           o.activation_ledger_id, t.state AS trigger_state,
-                           al.decision AS ledger_decision, al.bound_at
-                      FROM rca_trigger_sources AS s
-                      JOIN rca_trigger_bindings AS b
-                        ON b.source_id = s.source_id AND b.role = 'origin'
-                      JOIN business_triggers AS t
-                        ON t.business_key = b.business_key
-                       AND t.generation = b.generation
-                      JOIN rca_outbox AS o
-                        ON o.business_key = b.business_key
-                       AND o.generation = b.generation
-                       AND o.submission_key = t.submission_key
-                      JOIN rca_activation_admission_ledger AS al
-                        ON al.epoch_id = o.activation_epoch_id
-                       AND al.ledger_id = o.activation_ledger_id
-                       AND al.business_key = o.business_key
-                       AND al.submission_key = o.submission_key
-                       AND al.generation = o.generation
-                     WHERE s.source_kind = 'feishu_group_manual'
-                       AND s.source_dedupe_key = 'feishu:' || s.message_id
-                       AND s.message_id = ?
-                  )
-                 LIMIT 1
-                """,
-                (event_id, event_id),
-            ).fetchone()
-            if row is None:
-                raise ActivationEpochError("activation_deferred_event_not_bound")
-            bound_source_kind = str(row["bound_source_kind"] or "")
-            if bound_source_kind == "kafka":
-                source_binding_valid = str(row["inbox_decision"]) == "accepted"
-            elif bound_source_kind == "manual":
-                source_binding_valid = (
-                    str(row["source_kind"] or "") == "feishu_group_manual"
-                    and str(row["source_outcome"] or "") in {"created", "joined"}
-                )
-            else:
-                source_binding_valid = False
-            if (
-                not source_binding_valid
-                or str(row["activation_epoch_id"] or "") != epoch_id
-                or row["activation_ledger_id"] is None
-                or not str(row["bound_at"] or "")
-            ):
-                raise ActivationEpochError("activation_deferred_binding_invalid")
-            prior_status = str(row["outbox_status"] or "")
-            ledger_decision = str(row["ledger_decision"] or "")
-            already_deferred = (
-                prior_status == "quarantined"
-                and str(row["last_error_code"] or "")
-                == "activation_epoch_deferred"
-                and str(row["trigger_state"] or "") == "quarantined"
-            )
-            if not already_deferred and (
-                prior_status not in {"shadow", "pending"}
-                or (prior_status == "shadow" and ledger_decision != "shadow")
-                or (prior_status == "pending" and ledger_decision != "admit")
-                or str(row["trigger_state"] or "") != prior_status
-            ):
-                raise ActivationEpochError("activation_deferred_state_invalid")
-            invalid_subscription = conn.execute(
-                """
-                SELECT 1 FROM rca_delivery_subscriptions
-                 WHERE business_key = ? AND generation = ?
-                   AND status NOT IN ('pending', 'quarantined')
-                 LIMIT 1
-                """,
-                (row["business_key"], row["generation"]),
-            ).fetchone()
-            if invalid_subscription is not None:
-                raise ActivationEpochError(
-                    "activation_deferred_delivery_already_materialized"
-                )
-            if not already_deferred:
-                outbox_update = conn.execute(
-                    """
-                    UPDATE rca_outbox
-                       SET status = 'quarantined', quarantined_at = ?,
-                           next_attempt_at = NULL, lease_token = NULL,
-                           lease_owner = NULL, lease_expires_at = NULL,
-                           last_error_code = 'activation_epoch_deferred',
-                           last_error_detail = 'exact operator-reviewed activation deferral',
-                           updated_at = ?
-                     WHERE outbox_id = ? AND status IN ('shadow', 'pending')
-                    """,
-                    (current, current, row["outbox_id"]),
-                )
-                trigger_update = conn.execute(
-                    """
-                    UPDATE business_triggers SET state = 'quarantined'
-                     WHERE business_key = ? AND generation = ? AND state = ?
-                    """,
-                    (
-                        row["business_key"],
-                        row["generation"],
-                        prior_status,
-                    ),
-                )
-                if outbox_update.rowcount != 1 or trigger_update.rowcount != 1:
-                    raise ActivationEpochError("activation_deferred_state_changed")
-                conn.execute(
-                    """
-                    UPDATE rca_delivery_subscriptions
-                       SET status = 'quarantined',
-                           reason = 'activation_epoch_deferred', updated_at = ?
-                     WHERE business_key = ? AND generation = ? AND status = 'pending'
-                    """,
-                    (current, row["business_key"], row["generation"]),
-                )
-            audit_id = self._insert_promotion_audit(
-                conn,
-                event_uid=event_id,
-                outbox_id=int(row["outbox_id"]),
-                submission_key=str(row["submission_key"]),
-                operator=actor,
-                reason=justification,
-                outcome="already_deferred" if already_deferred else "deferred",
-                from_status=prior_status,
-                to_status="quarantined",
-                detail="exact activation item deferred for reviewed manual recovery",
-                created_at=current,
-            )
-            conn.commit()
-            return ActivationDeferralResult(
-                event_uid=event_id,
-                epoch_id=epoch_id,
-                outbox_id=int(row["outbox_id"]),
-                submission_key=str(row["submission_key"]),
-                prior_status=prior_status,
-                status="quarantined",
-                audit_id=audit_id,
-            )
-        except Exception:
-            if conn.in_transaction:
-                conn.rollback()
-            raise
-        finally:
-            conn.close()
-
     @staticmethod
     def _insert_promotion_audit(
         conn: sqlite3.Connection,
@@ -20382,26 +13488,12 @@ class RcaControlStore:
         cls,
         conn: sqlite3.Connection,
         *,
-        activation_required: bool,
-        historical_submission_allowlist: Iterable[str],
         alias: str = "o",
     ) -> tuple[str, tuple[Any, ...]]:
-        if not isinstance(activation_required, bool):
-            raise ActivationEpochError("activation_adjudication_flag_invalid")
-        allowlist = tuple(
-            dict.fromkeys(
-                str(item or "").strip() for item in historical_submission_allowlist
-            )
-        )
-        if any(not item or len(item) > 500 for item in allowlist) or len(allowlist) > 100:
-            raise ActivationEpochError("activation_historical_allowlist_invalid")
         epoch = cls._current_activation_epoch_tx(conn)
-        if epoch is None:
-            return ("0", ()) if activation_required else ("1", ())
-        epoch_id = str(epoch["epoch_id"])
-        state = str(epoch["state"])
-        if state not in {"bounded_active", "steady_active"}:
+        if epoch is None or str(epoch["state"] or "") != "steady_active":
             return "0", ()
+        epoch_id = str(epoch["epoch_id"])
         ledger_match = f"""
             {alias}.activation_epoch_id = ?
             AND {alias}.activation_ledger_id IS NOT NULL
@@ -20410,34 +13502,21 @@ class RcaControlStore:
                  WHERE al.ledger_id = {alias}.activation_ledger_id
                    AND al.epoch_id = {alias}.activation_epoch_id
                    AND al.decision = 'admit'
+                   AND al.bound_at IS NOT NULL
                    AND al.business_key = {alias}.business_key
                    AND al.submission_key = {alias}.submission_key
                    AND al.generation = {alias}.generation
             )
-        """
-        parameters: list[Any] = [epoch_id]
-        if state == "bounded_active":
-            ledger_match += f"""
-                AND EXISTS (
-                    SELECT 1 FROM rca_activation_budget_slots AS abs
-                     WHERE abs.epoch_id = {alias}.activation_epoch_id
-                       AND abs.consumed_ledger_id = {alias}.activation_ledger_id
-                )
-            """
-        elif allowlist:
-            placeholders = ",".join("?" for _ in allowlist)
-            ledger_match = (
-                f"(({ledger_match}) OR ("
-                f"{alias}.activation_epoch_id IS NULL "
-                f"AND {alias}.activation_ledger_id IS NULL "
-                f"AND {alias}.submission_key IN ({placeholders}) "
-                "AND NOT EXISTS ("
-                "SELECT 1 "
-                "FROM rca_activation_historical_outbox_hold_items AS held "
-                f"WHERE held.outbox_id = {alias}.outbox_id)))"
+            AND EXISTS (
+                SELECT 1 FROM business_triggers AS bt
+                 WHERE bt.activation_epoch_id = {alias}.activation_epoch_id
+                   AND bt.activation_ledger_id = {alias}.activation_ledger_id
+                   AND bt.business_key = {alias}.business_key
+                   AND bt.submission_key = {alias}.submission_key
+                   AND bt.generation = {alias}.generation
             )
-            parameters.extend(allowlist)
-        return f"({ledger_match})", tuple(parameters)
+        """
+        return f"({ledger_match})", (epoch_id,)
 
     def claim_outbox(
         self,
@@ -20445,8 +13524,6 @@ class RcaControlStore:
         lease_owner: str,
         lease_seconds: int = 180,
         max_age_seconds: int = 86_400,
-        activation_required: bool = False,
-        historical_submission_allowlist: Iterable[str] = (),
         now: datetime | None = None,
     ) -> OutboxClaim | None:
         """Atomically claim one due pending row or recover one expired lease.
@@ -20472,11 +13549,7 @@ class RcaControlStore:
         try:
             conn.execute("BEGIN IMMEDIATE")
             activation_predicate, activation_parameters = (
-                self._activation_claim_predicate_tx(
-                    conn,
-                    activation_required=activation_required,
-                    historical_submission_allowlist=historical_submission_allowlist,
-                )
+                self._activation_claim_predicate_tx(conn)
             )
             expired_rows = conn.execute(
                 f"""
@@ -20684,8 +13757,6 @@ class RcaControlStore:
         lease_token: str,
         lease_owner: str,
         lease_seconds: int,
-        activation_required: bool = False,
-        historical_submission_allowlist: Iterable[str] = (),
         now: datetime | None = None,
     ) -> str:
         """Extend a live lease only while its activation binding remains eligible."""
@@ -20701,12 +13772,7 @@ class RcaControlStore:
         try:
             conn.execute("BEGIN IMMEDIATE")
             activation_predicate, activation_parameters = (
-                self._activation_claim_predicate_tx(
-                    conn,
-                    activation_required=activation_required,
-                    historical_submission_allowlist=historical_submission_allowlist,
-                    alias="o",
-                )
+                self._activation_claim_predicate_tx(conn, alias="o")
             )
             updated = conn.execute(
                 f"""
@@ -21034,8 +14100,6 @@ class RcaControlStore:
         self,
         *,
         limit: int = 20,
-        activation_required: bool = False,
-        historical_submission_allowlist: Iterable[str] = (),
         now: datetime | None = None,
     ) -> list[dict[str, Any]]:
         """Read due rows without claiming or mutating them (used by dry-run)."""
@@ -21045,11 +14109,7 @@ class RcaControlStore:
         conn = self._connect()
         try:
             activation_predicate, activation_parameters = (
-                self._activation_claim_predicate_tx(
-                    conn,
-                    activation_required=activation_required,
-                    historical_submission_allowlist=historical_submission_allowlist,
-                )
+                self._activation_claim_predicate_tx(conn)
             )
             rows = conn.execute(
                 f"""
@@ -21073,1276 +14133,6 @@ class RcaControlStore:
                 (*activation_parameters, current, current, limit),
             ).fetchall()
             return [dict(row) for row in rows]
-        finally:
-            conn.close()
-
-    @staticmethod
-    def _exact_outbox_row_binding(row: sqlite3.Row) -> dict[str, Any]:
-        """Return the small stable row binding used by the operator CAS."""
-        projection = {
-            field: row[field] for field in ACTIVATION_HISTORICAL_OUTBOX_ROW_FIELDS
-        }
-        return {
-            "schema_version": EXACT_OUTBOX_HOLD_ROW_SCHEMA_VERSION,
-            "outbox_id": int(row["outbox_id"]),
-            "submission_key": str(row["submission_key"] or ""),
-            "business_key": str(row["business_key"] or ""),
-            "generation": int(row["generation"]),
-            "status": str(row["status"] or ""),
-            "attempt": int(row["attempt"]),
-            "fence": int(row["fence"]),
-            "next_attempt_at": (
-                str(row["next_attempt_at"])
-                if row["next_attempt_at"] is not None
-                else None
-            ),
-            "retry_window_started_at": (
-                str(row["retry_window_started_at"])
-                if row["retry_window_started_at"] is not None
-                else None
-            ),
-            "lease_token": row["lease_token"],
-            "lease_owner": row["lease_owner"],
-            "lease_expires_at": row["lease_expires_at"],
-            "claimed_at": row["claimed_at"],
-            "completed_at": row["completed_at"],
-            "quarantined_at": row["quarantined_at"],
-            "result_json": row["result_json"],
-            "created_at": str(row["created_at"] or ""),
-            "updated_at": str(row["updated_at"] or ""),
-            "activation_epoch_id": row["activation_epoch_id"],
-            "activation_ledger_id": row["activation_ledger_id"],
-            "row_sha256": _exact_canonical_sha256(projection),
-            "_row_projection": projection,
-        }
-
-    @staticmethod
-    def _exact_bound_file_bytes(
-        path: str | Path,
-    ) -> tuple[str, bytes, os.stat_result]:
-        lexical = Path(path).expanduser().absolute()
-        try:
-            lexical_stat = lexical.lstat()
-        except OSError as exc:
-            raise RuntimeError("exact_outbox_hold_bound_file_missing") from exc
-        if (
-            stat.S_ISLNK(lexical_stat.st_mode)
-            or not stat.S_ISREG(lexical_stat.st_mode)
-            or lexical_stat.st_nlink != 1
-            or lexical_stat.st_uid != os.getuid()
-            or stat.S_IMODE(lexical_stat.st_mode) & 0o022
-        ):
-            raise RuntimeError("exact_outbox_hold_bound_file_invalid")
-        descriptor = os.open(
-            lexical,
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
-        try:
-            before = os.fstat(descriptor)
-            if (before.st_dev, before.st_ino) != (
-                lexical_stat.st_dev,
-                lexical_stat.st_ino,
-            ):
-                raise RuntimeError("exact_outbox_hold_bound_file_changed")
-            digest = hashlib.sha256()
-            chunks: list[bytes] = []
-            while True:
-                chunk = os.read(descriptor, 1024 * 1024)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                digest.update(chunk)
-            after = os.fstat(descriptor)
-            if (
-                before.st_dev,
-                before.st_ino,
-                before.st_size,
-                before.st_mtime_ns,
-            ) != (
-                after.st_dev,
-                after.st_ino,
-                after.st_size,
-                after.st_mtime_ns,
-            ):
-                raise RuntimeError("exact_outbox_hold_bound_file_changed")
-            return digest.hexdigest(), b"".join(chunks), before
-        finally:
-            os.close(descriptor)
-
-    @staticmethod
-    def _exact_bound_file_sha256(path: str | Path) -> str:
-        digest, _raw, _identity = RcaControlStore._exact_bound_file_bytes(path)
-        return digest
-
-    @staticmethod
-    def _exact_logical_source_identity(identity: Mapping[str, Any]) -> dict[str, Any]:
-        logical = dict(identity.get("logical_db_identity") or {})
-        wal = dict(logical.get("wal") or {})
-        if wal.get("present") is True and int(wal.get("size", 0)) == 0:
-            wal = {"present": False}
-        logical["wal"] = wal
-        return {
-            "path": identity.get("path"),
-            "logical_db_identity": logical,
-        }
-
-    @staticmethod
-    def _exact_destination_parent_live(payload: Mapping[str, Any]) -> None:
-        path = Path(str(payload["destination_path"])).expanduser().absolute()
-        parent = path.parent
-        try:
-            observed = parent.lstat()
-        except OSError as exc:
-            raise RuntimeError("exact_outbox_hold_destination_parent_invalid") from exc
-        binding = payload["destination_binding"]
-        if (
-            stat.S_ISLNK(observed.st_mode)
-            or not stat.S_ISDIR(observed.st_mode)
-            or observed.st_uid != os.getuid()
-            or stat.S_IMODE(observed.st_mode) & 0o022
-            or observed.st_dev != int(binding["parent_device"])
-            or observed.st_ino != int(binding["parent_inode"])
-            or Path(os.path.realpath(parent)) != parent
-        ):
-            raise RuntimeError("exact_outbox_hold_destination_parent_changed")
-
-    @staticmethod
-    def _exact_resident_census_live(payload: Mapping[str, Any]) -> None:
-        census = payload["resident_census"]
-        uid = str(os.getuid())
-        expected_labels = list(EXACT_OUTBOX_RUNTIME_PLIST_LABELS)
-        try:
-            observed_at = datetime.fromisoformat(
-                str(census["observed_at"]).replace("Z", "+00:00")
-            )
-            recorded_at = datetime.fromisoformat(
-                str(payload["recorded_at"]).replace("Z", "+00:00")
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError("exact_outbox_hold_resident_census_invalid") from exc
-        if (
-            observed_at.tzinfo is None
-            or observed_at.utcoffset() != timedelta(0)
-            or recorded_at.tzinfo is None
-            or recorded_at.utcoffset() != timedelta(0)
-        ):
-            raise RuntimeError("exact_outbox_hold_resident_census_invalid")
-        current = datetime.now(timezone.utc)
-        age = (current - observed_at.astimezone(timezone.utc)).total_seconds()
-        if (
-            observed_at.astimezone(timezone.utc)
-            < recorded_at.astimezone(timezone.utc)
-            or age > EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS
-            or age < -EXACT_OUTBOX_HOLD_MAX_FUTURE_SKEW_SECONDS
-        ):
-            raise RuntimeError("exact_outbox_hold_resident_census_invalid")
-        live_env_path = Path(
-            str(payload["active_release_binding"]["live_env_path"])
-        ).expanduser().absolute()
-        canonical_binding_path = (
-            live_env_path.parent
-            / "runtime"
-            / "pnc_agent"
-            / "feishu_issue_kafka_rca"
-            / "active-release-binding.json"
-        )
-        census_binding_path = Path(
-            str(census["active_release_binding_path"])
-        ).expanduser().absolute()
-        if (
-            census_binding_path != canonical_binding_path
-            or str(census_binding_path)
-            != str(payload["active_release_binding"]["path"])
-        ):
-            raise RuntimeError("exact_outbox_hold_resident_census_invalid")
-        if census.get("forbidden_labels") != expected_labels:
-            raise RuntimeError("exact_outbox_hold_resident_census_invalid")
-        observations = census.get("observations")
-        if not isinstance(observations, list) or len(observations) != len(expected_labels):
-            raise RuntimeError("exact_outbox_hold_resident_census_invalid")
-        for expected_label, expected in zip(expected_labels, observations, strict=True):
-            try:
-                result = subprocess.run(
-                    ["launchctl", "print", f"gui/{uid}/{expected_label}"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                    timeout=3,
-                )
-            except (OSError, subprocess.SubprocessError) as exc:
-                raise RuntimeError("exact_outbox_hold_resident_census_unavailable") from exc
-            combined = (result.stdout or "") + (result.stderr or "")
-            unloaded_proven = bool(
-                result.returncode == 113
-                and re.fullmatch(
-                    rf"Bad request\.\nCould not find service \"{re.escape(expected_label)}\" in domain for user gui: {re.escape(uid)}\n?",
-                    combined,
-                )
-            )
-            if result.returncode == 0 or not unloaded_proven:
-                raise RuntimeError("exact_outbox_hold_forbidden_resident_loaded")
-            observed_sha = hashlib.sha256(combined.encode("utf-8")).hexdigest()
-            if (
-                not isinstance(expected, Mapping)
-                or expected.get("label") != expected_label
-                or expected.get("returncode") != result.returncode
-                or expected.get("unloaded_proven") is not True
-                or expected.get("output_sha256") != observed_sha
-            ):
-                raise RuntimeError("exact_outbox_hold_resident_census_changed")
-
-    def _validate_exact_hold_external_bindings(
-        self,
-        payload: Mapping[str, Any],
-        *,
-        include_control_db_identity: bool = True,
-    ) -> None:
-        self._exact_destination_parent_live(payload)
-        self._exact_resident_census_live(payload)
-        config_binding = payload["config_binding"]
-        if (
-            config_binding.get("control_db_path")
-            != str(self.db_path.expanduser().absolute())
-            or config_binding.get("delivery_db_path")
-            != config_binding.get("control_db_path")
-        ):
-            raise RuntimeError("exact_outbox_hold_config_changed")
-        live_path = Path(str(payload["active_release_binding"]["live_env_path"])).expanduser().absolute()
-        hermes_home = live_path.parent
-        canonical_db_path = (
-            hermes_home
-            / "runtime"
-            / "pnc_agent"
-            / "feishu_issue_kafka_rca"
-            / "control.sqlite3"
-        )
-        canonical_binding_path = self.db_path.expanduser().absolute().parent / "active-release-binding.json"
-        if (
-            self.db_path.expanduser().absolute() != canonical_db_path
-            or Path(str(payload["active_release_binding"]["path"])).expanduser().absolute()
-            != canonical_binding_path
-            or live_path != hermes_home / ".env"
-        ):
-            raise RuntimeError("exact_outbox_hold_config_changed")
-        if (
-            config_binding.get("active_release_binding_path")
-            != payload["active_release_binding"]["path"]
-            or config_binding.get("live_env_path")
-            != payload["active_release_binding"]["live_env_path"]
-            or config_binding.get("activation_required") is not True
-        ):
-            raise RuntimeError("exact_outbox_hold_config_changed")
-        try:
-            from scripts.pnc_rca_outbox_dispatcher import (
-                DispatcherConfig,
-                _exact_outbox_canonical_env_config,
-            )
-
-            canonical_config = _exact_outbox_canonical_env_config(
-                payload["active_release_binding"]["live_env_path"]
-            )
-            process_config = DispatcherConfig.from_env()
-            canonical_config_binding = canonical_config.public_dict()
-            live_config_binding = process_config.public_dict()
-        except Exception as exc:
-            raise RuntimeError("exact_outbox_hold_config_unavailable") from exc
-        if (
-            canonical_config_binding != dict(config_binding)
-            or live_config_binding != dict(config_binding)
-        ):
-            raise RuntimeError("exact_outbox_hold_config_changed")
-        expected_max_age = canonical_config.max_age_seconds
-        if (
-            config_binding.get("max_age_seconds") != expected_max_age
-            or payload.get("max_age_seconds") != expected_max_age
-            or config_binding.get("release_id")
-            != payload["active_release_binding"].get("release_id")
-            or config_binding.get("bootstrap_epoch_id")
-            != payload["active_release_binding"].get("bootstrap_epoch_id")
-            or config_binding.get("allow_download") is not False
-            or config_binding.get("allow_feishu_writeback") is not False
-            or config_binding.get("data_access_mode") != "remote_read"
-        ):
-            raise RuntimeError("exact_outbox_hold_config_changed")
-        if include_control_db_identity:
-            snapshot_store = RcaControlStore(
-                self.db_path,
-                require_current=True,
-                read_only=True,
-            )
-            current_identity = snapshot_store.control_db_source_snapshot_identity()
-            if self._exact_logical_source_identity(current_identity) != self._exact_logical_source_identity(
-                payload["control_db_identity"]
-            ):
-                raise RuntimeError("exact_outbox_hold_control_db_provenance_changed")
-        binding = payload["active_release_binding"]
-        active_digest, raw_binding, _active_identity = self._exact_bound_file_bytes(
-            binding["path"]
-        )
-        if active_digest != binding["raw_sha256"]:
-            raise RuntimeError("exact_outbox_hold_active_binding_changed")
-        live_env_digest = self._exact_bound_file_sha256(binding["live_env_path"])
-        if (
-            live_env_digest != binding["live_env_sha256"]
-            or live_env_digest != binding["candidate_env_sha256"]
-        ):
-            raise RuntimeError("exact_outbox_hold_live_env_changed")
-        try:
-            parsed_binding = json.loads(
-                raw_binding.decode("utf-8"),
-                parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
-            )
-        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise RuntimeError("exact_outbox_hold_active_binding_changed") from exc
-        if not isinstance(parsed_binding, Mapping):
-            raise RuntimeError("exact_outbox_hold_active_binding_changed")
-        try:
-            from gateway.pnc_rca_prod_bootstrap import load_active_release_binding
-
-            live_binding = load_active_release_binding(
-                path=Path(binding["path"]),
-                live_env_path=Path(binding["live_env_path"]),
-                expected_release_id=str(config_binding["release_id"]),
-                expected_epoch_id=str(config_binding["bootstrap_epoch_id"]),
-            )
-        except Exception as exc:
-            raise RuntimeError("exact_outbox_hold_active_binding_changed") from exc
-        live_binding_projection = {
-            "sha256": str(live_binding["binding_receipt_sha256"]),
-            "release_id": str(live_binding["release_id"]),
-            "authority_sha256": str(live_binding["authority_sha256"]),
-            "authority_epoch_id": str(live_binding["authority_epoch_id"]),
-            "bootstrap_epoch_id": str(live_binding["bootstrap_epoch_id"]),
-            "release_bom_sha256": str(live_binding["release_bom_sha256"]),
-            "candidate_env_sha256": str(live_binding["candidate_env_sha256"]),
-            "authorization_fingerprint": str(
-                live_binding["authorization_fingerprint"]
-            ),
-            "authorization_receipt_sha256": str(
-                live_binding["authorization_receipt_sha256"]
-            ),
-            "approval_evidence_sha256": str(
-                live_binding["approval_evidence_sha256"]
-            ),
-        }
-        if (
-            any(binding.get(key) != value for key, value in live_binding_projection.items())
-            or self._exact_bound_file_sha256(binding["path"]) != active_digest
-        ):
-            raise RuntimeError("exact_outbox_hold_active_binding_changed")
-        provenance = payload["tool_provenance"]
-        for key, value in provenance.items():
-            if not key.endswith("_path"):
-                continue
-            digest_key = key.removesuffix("_path") + "_sha256"
-            if digest_key not in provenance:
-                raise RuntimeError("exact_outbox_hold_tool_provenance_invalid")
-            if self._exact_bound_file_sha256(value) != provenance[digest_key]:
-                raise RuntimeError("exact_outbox_hold_tool_provenance_changed")
-        entrypoint = Path(provenance["entrypoint_path"]).expanduser().absolute()
-        control_source = Path(provenance["control_store_path"]).expanduser().absolute()
-        bootstrap_source = Path(provenance["bootstrap_path"]).expanduser().absolute()
-        module_source = Path(__file__).expanduser().absolute()
-        module_root = module_source.parent.parent
-        if (
-            Path(os.path.realpath(module_source)) != module_source
-            or Path(os.path.realpath(entrypoint)) != entrypoint
-            or Path(os.path.realpath(control_source)) != control_source
-            or Path(os.path.realpath(bootstrap_source)) != bootstrap_source
-            or entrypoint != module_root / "scripts" / "pnc_rca_outbox_dispatcher.py"
-            or control_source != module_source
-            or bootstrap_source != module_root / "gateway" / "pnc_rca_prod_bootstrap.py"
-        ):
-            raise RuntimeError("exact_outbox_hold_tool_provenance_invalid")
-        tool_root = module_root
-        tool_head = subprocess.run(
-            ["git", "-C", str(tool_root), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-        tool_tree = subprocess.run(
-            ["git", "-C", str(tool_root), "rev-parse", "HEAD^{tree}"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-        tool_status = subprocess.run(
-            ["git", "-C", str(tool_root), "status", "--porcelain", "--untracked-files=all"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-        )
-        if (
-            tool_head.returncode != 0
-            or tool_tree.returncode != 0
-            or tool_status.returncode != 0
-            or tool_head.stdout.strip() != provenance["git_head"]
-            or tool_tree.stdout.strip() != provenance["git_tree"]
-            or tool_status.stdout.strip()
-            or provenance.get("git_status_returncode") != 0
-            or provenance.get("git_clean") is not True
-        ):
-            raise RuntimeError("exact_outbox_hold_tool_provenance_changed")
-        runtime = provenance["runtime_provenance"]
-        runtime_files = [
-            runtime["manifest"],
-            *runtime["plists"],
-            runtime["stable_target_registry"],
-            runtime["launcher_source"],
-            runtime["installed_launcher"],
-            *runtime["runtime_scripts"],
-        ]
-        runtime_raw: dict[str, bytes] = {}
-        try:
-            for file_binding in runtime_files:
-                if (
-                    not isinstance(file_binding, Mapping)
-                    or file_binding.get("present") is not True
-                ):
-                    raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
-                digest, raw, identity = self._exact_bound_file_bytes(
-                    file_binding["path"]
-                )
-                if (
-                    digest != file_binding["sha256"]
-                    or identity.st_size != int(file_binding["size"])
-                    or stat.S_IMODE(identity.st_mode) != int(file_binding["mode"])
-                    or identity.st_uid != int(file_binding["uid"])
-                    or identity.st_nlink != int(file_binding["nlink"])
-                ):
-                    raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
-                runtime_raw[
-                    str(Path(file_binding["path"]).expanduser().absolute())
-                ] = raw
-        except Exception as exc:
-            if isinstance(exc, RuntimeError) and str(exc) == (
-                "exact_outbox_hold_runtime_provenance_changed"
-            ):
-                raise
-            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed") from exc
-        manifest_path = Path(runtime["manifest"]["path"]).expanduser().absolute()
-        hermes_home = Path(
-            payload["active_release_binding"]["live_env_path"]
-        ).expanduser().absolute().parent
-        if (
-            manifest_path != hermes_home / "runtime" / "LIVE_MANIFEST.json"
-            or Path(os.path.realpath(manifest_path)) != manifest_path
-        ):
-            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
-        try:
-            manifest = json.loads(
-                runtime_raw[str(manifest_path)].decode("utf-8"),
-                parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
-            )
-        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed") from exc
-        release_binding = manifest.get("gateway_release_binding") if isinstance(manifest, Mapping) else None
-        capacity = release_binding.get("capacity_admission") if isinstance(release_binding, Mapping) else None
-        if (
-            not isinstance(manifest, Mapping)
-            or manifest.get("runtime_root") != runtime["manifest_runtime_root"]
-            or manifest.get("runtime_venv") != runtime["runtime_venv"]
-            or manifest.get("runtime_python") != runtime["runtime_python"]
-            or manifest.get("runtime_release_target") != runtime["manifest_runtime_release_target"]
-            or manifest.get("gateway_release_target") != runtime["manifest_gateway_release_target"]
-            or not isinstance(release_binding, Mapping)
-            or release_binding.get("commit") != runtime["manifest_commit"]
-            or release_binding.get("tree") != runtime["manifest_tree"]
-            or not isinstance(capacity, Mapping)
-            or capacity.get("release_bom_sha256") != runtime["release_bom_sha256"]
-            or payload["active_release_binding"].get("release_bom_sha256")
-            != runtime["release_bom_sha256"]
-        ):
-            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
-        runtime_root = Path(runtime["manifest_runtime_root"]).expanduser().absolute()
-        if (
-            runtime_root != Path(runtime["manifest_runtime_root"])
-            or Path(os.path.realpath(runtime_root)) != runtime_root
-            or runtime_root.parent
-            != hermes_home / "runtime" / "releases"
-        ):
-            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
-        try:
-            runtime_root_stat = runtime_root.lstat()
-        except OSError as exc:
-            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed") from exc
-        if (
-            stat.S_ISLNK(runtime_root_stat.st_mode)
-            or not stat.S_ISDIR(runtime_root_stat.st_mode)
-            or runtime_root_stat.st_uid != os.getuid()
-            or stat.S_IMODE(runtime_root_stat.st_mode) & 0o022
-        ):
-            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
-        try:
-            from scripts.pnc_live_exec import (
-                SERVICE_TARGETS,
-                _stable_target_registry,
-                resolve_active_runtime,
-            )
-
-            resolved = resolve_active_runtime(
-                manifest_path=manifest_path,
-                hermes_home=hermes_home,
-                service_label="local.pnc.rca-outbox-dispatcher",
-            )
-        except Exception as exc:
-            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed") from exc
-        if (
-            resolved.get("manifest_sha256") != runtime["manifest"]["sha256"]
-            or resolved.get("runtime_root") != str(runtime_root)
-            or resolved.get("runtime_venv") != runtime["runtime_venv"]
-            or resolved.get("runtime_python") != runtime["runtime_python"]
-            or resolved.get("runtime_commit") != runtime["runtime_git_head"]
-            or resolved.get("runtime_tree") != runtime["runtime_git_tree"]
-        ):
-            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
-
-        expected_script_paths: list[Path] = []
-        for label in EXACT_OUTBOX_RUNTIME_PLIST_LABELS:
-            target_kind, relative_target = SERVICE_TARGETS[label]
-            if target_kind != "runtime_script":
-                raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
-            expected_script_paths.append((runtime_root / relative_target).absolute())
-        actual_script_paths = [
-            Path(item["path"]).expanduser().absolute()
-            for item in runtime["runtime_scripts"]
-        ]
-        if actual_script_paths != expected_script_paths or any(
-            Path(os.path.realpath(path)) != path for path in actual_script_paths
-        ):
-            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
-
-        launcher_source_path = runtime_root / "scripts" / "pnc_live_exec.py"
-        installed_launcher_path = (
-            hermes_home / "runtime" / "governance-tools" / "pnc_live_exec.py"
-        )
-        if (
-            Path(runtime["launcher_source"]["path"]) != launcher_source_path
-            or Path(runtime["installed_launcher"]["path"])
-            != installed_launcher_path
-            or Path(os.path.realpath(launcher_source_path))
-            != launcher_source_path
-            or Path(os.path.realpath(installed_launcher_path))
-            != installed_launcher_path
-            or runtime_raw[str(launcher_source_path)]
-            != runtime_raw[str(installed_launcher_path)]
-            or runtime["launcher_source"]["sha256"]
-            != runtime["installed_launcher"]["sha256"]
-            or runtime["launcher_source"]["size"]
-            != runtime["installed_launcher"]["size"]
-        ):
-            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
-        expected_plist_prefix = Path.home() / "Library" / "LaunchAgents"
-        expected_plist_paths = [
-            expected_plist_prefix / f"{label}.plist"
-            for label in EXACT_OUTBOX_RUNTIME_PLIST_LABELS
-        ]
-        actual_plist_paths = [
-            Path(item["path"]).expanduser().absolute() for item in runtime["plists"]
-        ]
-        if actual_plist_paths != expected_plist_paths:
-            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
-        for label, item in zip(EXACT_OUTBOX_RUNTIME_PLIST_LABELS, runtime["plists"], strict=True):
-            plist_path = Path(item["path"])
-            source_plist_path = runtime_root / f"{label}.plist"
-            observed = plist_path.lstat()
-            _source_digest, source_raw, _source_identity = (
-                self._exact_bound_file_bytes(source_plist_path)
-            )
-            if (
-                Path(os.path.realpath(plist_path)) != plist_path
-                or Path(os.path.realpath(source_plist_path))
-                != source_plist_path
-                or runtime_raw[str(plist_path)] != source_raw
-            ):
-                raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
-            if (
-                observed.st_uid != int(item["uid"])
-                or observed.st_nlink != int(item["nlink"])
-                or stat.S_IMODE(observed.st_mode) != int(item["mode"])
-            ):
-                raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
-            try:
-                from scripts.pnc_rca_release_transaction import _validate_plist
-
-                _validate_plist(
-                    runtime_raw[str(plist_path)],
-                    label=label,
-                    hermes_home=hermes_home,
-                )
-            except Exception as exc:
-                raise RuntimeError("exact_outbox_hold_runtime_provenance_changed") from exc
-        registry_path = Path(runtime["stable_target_registry"]["path"]).expanduser().absolute()
-        if (
-            registry_path
-            != runtime_root / "gateway" / "assets" / "pnc_stable_target_registry_v1.json"
-            or Path(os.path.realpath(registry_path)) != registry_path
-        ):
-            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed")
-        try:
-            registered_targets = _stable_target_registry(runtime_root)
-            for label, (target_kind, relative_target) in SERVICE_TARGETS.items():
-                if target_kind not in {"governance_tool", "runtime_file"}:
-                    continue
-                target_base = (
-                    hermes_home / "runtime" / "governance-tools"
-                    if target_kind == "governance_tool"
-                    else hermes_home / "runtime"
-                )
-                target_path = (target_base / relative_target).absolute()
-                expected = registered_targets[label]
-                digest, raw, _identity = self._exact_bound_file_bytes(target_path)
-                if (
-                    Path(os.path.realpath(target_path)) != target_path
-                    or len(raw) != expected["size"]
-                    or digest != expected["sha256"]
-                ):
-                    raise RuntimeError("exact_outbox_hold_runtime_target_changed")
-        except Exception as exc:
-            if isinstance(exc, RuntimeError) and str(exc) == "exact_outbox_hold_runtime_target_changed":
-                raise
-            raise RuntimeError("exact_outbox_hold_runtime_provenance_changed") from exc
-
-    @staticmethod
-    def _exact_hold_freshness(
-        payload: Mapping[str, Any], fresh_now: datetime
-    ) -> tuple[datetime, datetime, int]:
-        try:
-            recorded = datetime.fromisoformat(
-                str(payload["recorded_at"]).replace("Z", "+00:00")
-            )
-            horizon = payload["retry_horizon"]
-            expires = datetime.fromisoformat(
-                str(horizon["expires_at"]).replace("Z", "+00:00")
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError("exact_outbox_hold_retry_horizon_invalid") from exc
-        if recorded.tzinfo is None or expires.tzinfo is None:
-            raise RuntimeError("exact_outbox_hold_retry_horizon_invalid")
-        fresh = _utc_datetime(fresh_now)
-        age = (fresh - _utc_datetime(recorded)).total_seconds()
-        if age < -5 or age > EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS:
-            raise RuntimeError("exact_outbox_hold_recorded_at_stale")
-        remaining = (_utc_datetime(expires) - fresh).total_seconds()
-        if remaining < EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS:
-            raise RuntimeError("exact_outbox_hold_retry_horizon_headroom_insufficient")
-        return recorded, expires, int(remaining)
-
-    @staticmethod
-    def _exact_hold_with_apply_observation(
-        payload: Mapping[str, Any], fresh_now: datetime, remaining: int
-    ) -> dict[str, Any]:
-        effective = dict(payload)
-        horizon = dict(payload["retry_horizon"])
-        horizon["apply_observed_at"] = _iso(fresh_now)
-        horizon["apply_remaining_seconds"] = int(remaining)
-        effective["retry_horizon"] = horizon
-        effective["receipt_fingerprint"] = _exact_outbox_hold_fingerprint(effective)
-        return _validate_exact_outbox_hold_audit(effective)
-
-    @staticmethod
-    def _exact_outbox_queue_sha256(entries: Iterable[Mapping[str, Any]]) -> str:
-        return _exact_canonical_sha256(
-            [
-                {
-                    "outbox_id": int(item["outbox_id"]),
-                    "row_sha256": str(item["row_sha256"]),
-                }
-                for item in entries
-            ]
-        )
-
-    @classmethod
-    def _exact_outbox_activation_binding_tx(
-        cls, conn: sqlite3.Connection
-    ) -> dict[str, Any]:
-        current_rows = conn.execute(
-            "SELECT * FROM rca_activation_epochs WHERE is_current = 1"
-        ).fetchall()
-        if len(current_rows) > 1:
-            raise RuntimeError("exact_outbox_hold_activation_not_unique")
-        epoch = current_rows[0] if current_rows else None
-        if epoch is None:
-            value: dict[str, Any] = {"configured": False, "epoch_id": ""}
-        else:
-            db_identity_json = str(epoch["db_logical_identity_json"])
-            try:
-                db_identity = json.loads(
-                    db_identity_json,
-                    parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
-                )
-            except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise RuntimeError(
-                    "exact_outbox_hold_activation_db_binding_invalid"
-                ) from exc
-            if (
-                not isinstance(db_identity, Mapping)
-                or _exact_canonical_json(db_identity) != db_identity_json
-                or hashlib.sha256(db_identity_json.encode("utf-8")).hexdigest()
-                != str(epoch["db_logical_identity_sha256"])
-            ):
-                raise RuntimeError("exact_outbox_hold_activation_db_binding_invalid")
-            value = {
-                "configured": True,
-                "epoch_id": str(epoch["epoch_id"]),
-                "state": str(epoch["state"]),
-                "is_current": int(epoch["is_current"]),
-                "config_sha256": str(epoch["config_sha256"]),
-                "db_logical_identity_sha256": str(
-                    epoch["db_logical_identity_sha256"]
-                ),
-                "db_logical_identity": dict(db_identity),
-                "preproduction_fingerprint": str(
-                    epoch["preproduction_fingerprint"] or ""
-                ),
-                "preproduction_gate_receipt_sha256": str(
-                    epoch["preproduction_gate_receipt_sha256"] or ""
-                ),
-                "production_fingerprint": str(epoch["production_fingerprint"] or ""),
-                "production_gate_receipt_sha256": str(
-                    epoch["production_gate_receipt_sha256"] or ""
-                ),
-            }
-        value["sha256"] = _exact_canonical_sha256(
-            {key: item for key, item in value.items() if key != "sha256"}
-        )
-        return value
-
-    @classmethod
-    def _exact_outbox_hold_role_binding_tx(
-        cls,
-        conn: sqlite3.Connection,
-        *,
-        row: Mapping[str, Any],
-        epoch_id: str,
-        expected_slot_kind: str,
-    ) -> None:
-        """Bind each hold row to its exact consumed manual activation slot."""
-        binding = conn.execute(
-            """
-            SELECT s.slot_kind, s.authorized_source_kind,
-                   s.authorized_identity_sha256, s.consumed_ledger_id,
-                   s.consumed_at, al.ledger_id, al.epoch_id AS ledger_epoch_id,
-                   al.entrypoint, al.source_kind, al.source_identity_sha256,
-                   al.slot_kind AS ledger_slot_kind, al.decision, al.bound_at,
-                   al.business_key, al.submission_key, al.generation,
-                   t.activation_epoch_id AS trigger_epoch_id,
-                   t.activation_ledger_id AS trigger_ledger_id
-              FROM rca_activation_budget_slots AS s
-              JOIN rca_activation_admission_ledger AS al
-                ON al.epoch_id = s.epoch_id
-               AND al.ledger_id = s.consumed_ledger_id
-              JOIN business_triggers AS t
-                ON t.activation_epoch_id = al.epoch_id
-               AND t.activation_ledger_id = al.ledger_id
-               AND t.business_key = al.business_key
-               AND t.submission_key = al.submission_key
-               AND t.generation = al.generation
-             WHERE s.epoch_id = ?
-               AND s.slot_kind = ?
-               AND s.consumed_ledger_id = ?
-               AND t.business_key = ?
-               AND t.submission_key = ?
-               AND t.generation = ?
-            """,
-            (
-                str(epoch_id),
-                str(expected_slot_kind),
-                row["activation_ledger_id"],
-                row["business_key"],
-                row["submission_key"],
-                row["generation"],
-            ),
-        ).fetchone()
-        if (
-            binding is None
-            or str(binding["slot_kind"] or "") != expected_slot_kind
-            or str(binding["authorized_source_kind"] or "") != "manual"
-            or not str(binding["authorized_identity_sha256"] or "")
-            or binding["consumed_ledger_id"] is None
-            or not str(binding["consumed_at"] or "")
-            or int(binding["ledger_id"] or 0)
-            != int(binding["consumed_ledger_id"] or 0)
-            or str(binding["ledger_epoch_id"] or "") != str(epoch_id)
-            or str(binding["entrypoint"] or "") != "manual_admit"
-            or str(binding["source_kind"] or "") != "manual"
-            or str(binding["source_identity_sha256"] or "")
-            != str(binding["authorized_identity_sha256"] or "")
-            or str(binding["ledger_slot_kind"] or "") != expected_slot_kind
-            or str(binding["decision"] or "") != "admit"
-            or not str(binding["bound_at"] or "")
-            or str(binding["business_key"] or "") != str(row["business_key"])
-            or str(binding["submission_key"] or "")
-            != str(row["submission_key"])
-            or int(binding["generation"] or 0) != int(row["generation"])
-            or str(binding["trigger_epoch_id"] or "") != str(epoch_id)
-            or int(binding["trigger_ledger_id"] or 0)
-            != int(binding["ledger_id"] or 0)
-        ):
-            raise RuntimeError("exact_outbox_hold_activation_role_binding_invalid")
-
-    @classmethod
-    def _exact_outbox_hold_snapshot_tx(
-        cls,
-        conn: sqlite3.Connection,
-        *,
-        target_outbox_id: int,
-        predecessor_outbox_id: int,
-        activation_required: bool,
-        max_age_seconds: int,
-        now: datetime,
-        require_exact_queue: bool = True,
-        include_private_projection: bool = False,
-    ) -> dict[str, Any]:
-        if isinstance(target_outbox_id, bool) or int(target_outbox_id) < 1:
-            raise ValueError("exact_outbox_hold_target_id_invalid")
-        if isinstance(predecessor_outbox_id, bool) or int(predecessor_outbox_id) < 1:
-            raise ValueError("exact_outbox_hold_predecessor_id_invalid")
-        if int(target_outbox_id) == int(predecessor_outbox_id):
-            raise ValueError("exact_outbox_hold_identity_invalid")
-        if not isinstance(max_age_seconds, int) or isinstance(max_age_seconds, bool):
-            raise ValueError("exact_outbox_hold_max_age_invalid")
-        if max_age_seconds < 1:
-            raise ValueError("exact_outbox_hold_max_age_invalid")
-        current = _utc_datetime(now)
-        current_iso = _iso(current)
-        cutoff_iso = _iso(current - timedelta(seconds=max_age_seconds))
-        predicate, parameters = cls._activation_claim_predicate_tx(
-            conn,
-            activation_required=activation_required,
-            historical_submission_allowlist=(),
-        )
-        target = conn.execute(
-            "SELECT * FROM rca_outbox WHERE outbox_id = ?",
-            (int(target_outbox_id),),
-        ).fetchone()
-        predecessor = conn.execute(
-            "SELECT * FROM rca_outbox WHERE outbox_id = ?",
-            (int(predecessor_outbox_id),),
-        ).fetchone()
-        if target is None:
-            raise RuntimeError("exact_outbox_hold_target_missing")
-        if predecessor is None:
-            raise RuntimeError("exact_outbox_hold_predecessor_missing")
-        for row in (target, predecessor):
-            for field in ("created_at", "retry_window_started_at"):
-                raw_timestamp = row[field]
-                if raw_timestamp is None:
-                    if field == "created_at":
-                        raise RuntimeError("exact_outbox_hold_retry_window_invalid")
-                    continue
-                try:
-                    parsed_timestamp = datetime.fromisoformat(
-                        str(raw_timestamp).replace("Z", "+00:00")
-                    )
-                except (TypeError, ValueError) as exc:
-                    raise RuntimeError(
-                        "exact_outbox_hold_retry_window_invalid"
-                    ) from exc
-                if (
-                    parsed_timestamp.tzinfo is None
-                    or parsed_timestamp.utcoffset() != timedelta(0)
-                    or _utc_datetime(parsed_timestamp) > current
-                ):
-                    raise RuntimeError("exact_outbox_hold_retry_window_invalid")
-        rows = conn.execute(
-            f"""
-            SELECT o.*
-              FROM rca_outbox AS o
-             WHERE ({predicate})
-               AND COALESCE(o.retry_window_started_at, o.created_at) > ?
-               AND (
-                    (o.status = 'pending'
-                     AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?))
-                    OR (o.status = 'claimed'
-                        AND o.lease_expires_at IS NOT NULL
-                        AND o.lease_expires_at <= ?)
-               )
-             ORDER BY o.outbox_id
-            """,
-            (*parameters, cutoff_iso, current_iso, current_iso),
-        ).fetchall()
-        bindings = [cls._exact_outbox_row_binding(row) for row in rows]
-        queue_entries = [
-            {"outbox_id": item["outbox_id"], "row_sha256": item["row_sha256"]}
-            for item in bindings
-        ]
-        queue_ids = [int(item["outbox_id"]) for item in queue_entries]
-        expected_ids = sorted(
-            [int(predecessor_outbox_id), int(target_outbox_id)]
-        )
-        if require_exact_queue and queue_ids != expected_ids:
-            raise RuntimeError(
-                "exact_outbox_hold_eligible_queue_changed:"
-                f"observed={queue_ids}:expected={expected_ids}"
-            )
-        target_binding = cls._exact_outbox_row_binding(target)
-        predecessor_binding = cls._exact_outbox_row_binding(predecessor)
-        active_activation = cls._exact_outbox_activation_binding_tx(conn)
-        if (
-            activation_required is not True
-            or active_activation.get("configured") is not True
-            or active_activation.get("state") != "bounded_active"
-        ):
-            raise RuntimeError("exact_outbox_hold_bounded_activation_required")
-        epoch_id = str(active_activation.get("epoch_id") or "")
-        cls._exact_outbox_hold_role_binding_tx(
-            conn,
-            row=predecessor,
-            epoch_id=epoch_id,
-            expected_slot_kind="manual_success",
-        )
-        cls._exact_outbox_hold_role_binding_tx(
-            conn,
-            row=target,
-            epoch_id=epoch_id,
-            expected_slot_kind="manual_terminal_failure",
-        )
-        for role, binding in (
-            ("target", target_binding),
-            ("predecessor", predecessor_binding),
-        ):
-            if (
-                binding["status"] != "pending"
-                or binding["attempt"] != 0
-                or binding["fence"] != 0
-                or (
-                    binding["next_attempt_at"] is not None
-                    and (require_exact_queue or role == "predecessor")
-                )
-                or any(
-                    binding[field] is not None
-                    for field in (
-                        "lease_token",
-                        "lease_owner",
-                        "lease_expires_at",
-                        "claimed_at",
-                        "completed_at",
-                        "quarantined_at",
-                        "result_json",
-                    )
-                )
-            ):
-                raise RuntimeError(f"exact_outbox_hold_{role}_baseline_invalid")
-        target_anchor = target["retry_window_started_at"] or target["created_at"]
-        try:
-            target_anchor_dt = _utc_datetime(
-                datetime.fromisoformat(str(target_anchor).replace("Z", "+00:00"))
-            )
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("exact_outbox_hold_retry_window_invalid") from exc
-        expires_at = target_anchor_dt + timedelta(seconds=max_age_seconds)
-        remaining = (expires_at - current).total_seconds()
-        if remaining <= 0:
-            raise RuntimeError("exact_outbox_hold_retry_horizon_expired")
-        snapshot = {
-            "schema_version": EXACT_OUTBOX_HOLD_SNAPSHOT_SCHEMA_VERSION,
-            "observed_at": current_iso,
-            "target_outbox_id": int(target_outbox_id),
-            "predecessor_outbox_id": int(predecessor_outbox_id),
-            "activation_required": activation_required,
-            "max_age_seconds": max_age_seconds,
-            "active_activation": active_activation,
-            "target": target_binding,
-            "predecessor": predecessor_binding,
-            "eligible_queue": {
-                "outbox_ids": queue_ids,
-                "entries": queue_entries,
-                "sha256": cls._exact_outbox_queue_sha256(queue_entries),
-            },
-            "retry_horizon": {
-                "target_outbox_id": int(target_outbox_id),
-                "anchor": str(target_anchor),
-                "expires_at": _iso(expires_at),
-                "cutoff_at": cutoff_iso,
-                "remaining_seconds": remaining,
-            },
-        }
-        if not include_private_projection:
-            snapshot["target"].pop("_row_projection", None)
-            snapshot["predecessor"].pop("_row_projection", None)
-        return snapshot
-
-    def exact_outbox_hold_snapshot(
-        self,
-        *,
-        target_outbox_id: int,
-        predecessor_outbox_id: int,
-        activation_required: bool = True,
-        max_age_seconds: int = 86_400,
-        now: datetime | None = None,
-    ) -> dict[str, Any]:
-        """Read the exact bounded queue without taking a write lock."""
-        conn = self._connect()
-        try:
-            return self._exact_outbox_hold_snapshot_tx(
-                conn,
-                target_outbox_id=target_outbox_id,
-                predecessor_outbox_id=predecessor_outbox_id,
-                activation_required=activation_required,
-                max_age_seconds=max_age_seconds,
-                now=_utc_datetime(now),
-            )
-        finally:
-            conn.close()
-
-    def _exact_outbox_hold_private_snapshot(
-        self,
-        *,
-        target_outbox_id: int,
-        predecessor_outbox_id: int,
-        activation_required: bool,
-        max_age_seconds: int,
-        now: datetime,
-    ) -> dict[str, Any]:
-        conn = self._connect()
-        try:
-            return self._exact_outbox_hold_snapshot_tx(
-                conn,
-                target_outbox_id=target_outbox_id,
-                predecessor_outbox_id=predecessor_outbox_id,
-                activation_required=activation_required,
-                max_age_seconds=max_age_seconds,
-                now=now,
-                include_private_projection=True,
-            )
-        finally:
-            conn.close()
-
-    def hold_exact_outbox_with_audit(
-        self,
-        *,
-        audit: Mapping[str, Any],
-        now: datetime | None = None,
-    ) -> dict[str, Any]:
-        """CAS-hold exactly one pending outbox row and durably audit it."""
-        if self.read_only:
-            raise RuntimeError("exact_outbox_hold_mutation_requires_read_write_store")
-        payload = _validate_exact_outbox_hold_audit(audit)
-        # The caller's timestamp is only an audit anchor.  Fresh wall-clock
-        # reads govern admission and are repeated after taking the write lock.
-        fresh_before = _utc_datetime()
-        self._exact_hold_freshness(payload, fresh_before)
-        current = str(payload["recorded_at"])
-        try:
-            db_identity = self.db_path.expanduser().absolute().lstat()
-        except OSError as exc:
-            raise RuntimeError("exact_outbox_hold_control_db_missing") from exc
-        recorded_identity = payload["control_db_identity"]
-        if (
-            recorded_identity.get("path") != str(self.db_path.expanduser().absolute())
-            or int(recorded_identity.get("device")) != int(db_identity.st_dev)
-            or int(recorded_identity.get("inode")) != int(db_identity.st_ino)
-        ):
-            raise RuntimeError("exact_outbox_hold_control_db_changed")
-        self._validate_exact_hold_external_bindings(payload)
-        meta_key = f"{EXACT_OUTBOX_HOLD_META_PREFIX}{payload['hold_id']}"
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            fresh_inside = _utc_datetime()
-            self._exact_hold_freshness(payload, fresh_inside)
-            self._validate_exact_hold_external_bindings(payload)
-            changes_before = conn.total_changes
-            existing = conn.execute(
-                "SELECT value FROM control_meta WHERE key = ?", (meta_key,)
-            ).fetchone()
-            if existing is not None:
-                if str(existing["value"]) == _exact_canonical_json(payload):
-                    raise RuntimeError("exact_outbox_hold_already_applied")
-                raise RuntimeError("exact_outbox_hold_audit_key_conflict")
-            snapshot = self._exact_outbox_hold_snapshot_tx(
-                conn,
-                target_outbox_id=int(payload["target_outbox_id"]),
-                predecessor_outbox_id=int(payload["predecessor_outbox_id"]),
-                activation_required=bool(payload["activation_required"]),
-                max_age_seconds=int(payload["max_age_seconds"]),
-                now=fresh_inside,
-            )
-            target = snapshot["target"]
-            predecessor = snapshot["predecessor"]
-            payload_horizon = payload["retry_horizon"]
-            snapshot_horizon = snapshot["retry_horizon"]
-            actual_remaining = snapshot_horizon["remaining_seconds"]
-            if (
-                payload_horizon["target_outbox_id"]
-                != snapshot_horizon["target_outbox_id"]
-                or payload_horizon["anchor"] != snapshot_horizon["anchor"]
-                or payload_horizon["expires_at"]
-                != snapshot_horizon["expires_at"]
-                or isinstance(actual_remaining, bool)
-                or not isinstance(actual_remaining, (int, float))
-                or actual_remaining < EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS
-            ):
-                raise RuntimeError("exact_outbox_hold_retry_horizon_changed")
-            remaining_inside = int(actual_remaining)
-            if (
-                dict(target) != dict(payload["target_before"])
-                or dict(predecessor) != dict(payload["predecessor"])
-                or snapshot["eligible_queue"]["sha256"]
-                != payload["eligible_queue_before"]["sha256"]
-                or dict(snapshot["active_activation"])
-                != dict(payload["active_activation"])
-                or snapshot["active_activation"].get("configured") is not True
-                or snapshot["active_activation"].get("state") != "bounded_active"
-                or target["status"] != "pending"
-                or target["attempt"] != 0
-                or target["fence"] != 0
-                or target["next_attempt_at"] is not None
-                or any(
-                    target[field] is not None
-                    for field in (
-                        "lease_token",
-                        "lease_owner",
-                        "lease_expires_at",
-                        "claimed_at",
-                        "completed_at",
-                        "quarantined_at",
-                        "result_json",
-                    )
-                )
-            ):
-                raise RuntimeError("exact_outbox_hold_target_changed")
-            if (
-                predecessor["status"] != "pending"
-                or predecessor["attempt"] != 0
-                or predecessor["fence"] != 0
-                or predecessor["next_attempt_at"] is not None
-                or any(
-                    predecessor[field] is not None
-                    for field in (
-                        "lease_token",
-                        "lease_owner",
-                        "lease_expires_at",
-                        "claimed_at",
-                        "completed_at",
-                        "quarantined_at",
-                        "result_json",
-                    )
-                )
-            ):
-                raise RuntimeError("exact_outbox_hold_predecessor_not_pending")
-            effective_payload = self._exact_hold_with_apply_observation(
-                payload, fresh_inside, remaining_inside
-            )
-            conn.execute(
-                "INSERT INTO control_meta(key, value) VALUES(?, ?)",
-                (meta_key, _exact_canonical_json(effective_payload)),
-            )
-            updated = conn.execute(
-                """
-                UPDATE rca_outbox
-                   SET next_attempt_at = ?, updated_at = ?
-                 WHERE outbox_id = ? AND status = 'pending'
-                   AND attempt = 0 AND fence = ?
-                   AND submission_key = ? AND business_key = ? AND generation = ?
-                   AND next_attempt_at IS ? AND updated_at = ?
-                   AND lease_token IS NULL AND lease_owner IS NULL
-                   AND lease_expires_at IS NULL AND claimed_at IS NULL
-                   AND completed_at IS NULL AND quarantined_at IS NULL
-                   AND result_json IS NULL
-                """,
-                (
-                    EXACT_OUTBOX_HOLD_UNTIL,
-                    current,
-                    int(payload["target_outbox_id"]),
-                    int(target["fence"]),
-                    target["submission_key"],
-                    target["business_key"],
-                    int(target["generation"]),
-                    target["next_attempt_at"],
-                    target["updated_at"],
-                ),
-            )
-            if updated.rowcount != 1:
-                raise RuntimeError("exact_outbox_hold_target_cas_lost")
-            held = conn.execute(
-                "SELECT * FROM rca_outbox WHERE outbox_id = ?",
-                (int(payload["target_outbox_id"]),),
-            ).fetchone()
-            if held is None:
-                raise RuntimeError("exact_outbox_hold_post_row_missing")
-            held_binding = self._exact_outbox_row_binding(held)
-            public_held_binding = {
-                key: item
-                for key, item in held_binding.items()
-                if not key.startswith("_")
-            }
-            if (
-                public_held_binding != dict(payload["target_after"])
-                or public_held_binding["next_attempt_at"] != EXACT_OUTBOX_HOLD_UNTIL
-                or public_held_binding["updated_at"] != current
-            ):
-                raise RuntimeError("exact_outbox_hold_post_row_changed")
-            after_snapshot = self._exact_outbox_hold_snapshot_tx(
-                conn,
-                target_outbox_id=int(payload["target_outbox_id"]),
-                predecessor_outbox_id=int(payload["predecessor_outbox_id"]),
-                activation_required=bool(payload["activation_required"]),
-                max_age_seconds=int(payload["max_age_seconds"]),
-                now=fresh_inside,
-                require_exact_queue=False,
-            )
-            if (
-                after_snapshot["eligible_queue"]["outbox_ids"]
-                != [int(payload["predecessor_outbox_id"])]
-                or after_snapshot["eligible_queue"]["sha256"]
-                != payload["eligible_queue_after"]["sha256"]
-                or conn.total_changes - changes_before != 2
-            ):
-                raise RuntimeError("exact_outbox_hold_effect_delta_changed")
-            self._validate_exact_hold_external_bindings(
-                effective_payload,
-                include_control_db_identity=False,
-            )
-            self._exact_hold_freshness(payload, _utc_datetime())
-            conn.commit()
-            return dict(effective_payload)
-        except Exception:
-            if conn.in_transaction:
-                conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    def exact_outbox_hold_audit(self, hold_id: str) -> dict[str, Any] | None:
-        normalized = str(hold_id or "").strip()
-        if not normalized:
-            raise ValueError("exact_outbox_hold_id_invalid")
-        conn = self._connect()
-        try:
-            row = conn.execute(
-                "SELECT value FROM control_meta WHERE key = ?",
-                (f"{EXACT_OUTBOX_HOLD_META_PREFIX}{normalized}",),
-            ).fetchone()
-            if row is None:
-                return None
-            raw = str(row["value"])
-            try:
-                value = json.loads(raw, parse_constant=lambda _v: (_ for _ in ()).throw(ValueError()))
-            except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise RuntimeError("exact_outbox_hold_audit_invalid") from exc
-            value = _validate_exact_outbox_hold_audit(value)
-            if (
-                value["hold_id"] != normalized
-                or _exact_canonical_json(value) != raw
-            ):
-                raise RuntimeError("exact_outbox_hold_audit_tampered")
-            identity = value["control_db_identity"]
-            observed = self.db_path.expanduser().absolute().lstat()
-            if (
-                identity.get("path") != str(self.db_path.expanduser().absolute())
-                or int(identity.get("device")) != int(observed.st_dev)
-                or int(identity.get("inode")) != int(observed.st_ino)
-            ):
-                raise RuntimeError("exact_outbox_hold_control_db_changed")
-            return value
         finally:
             conn.close()
 
@@ -22695,11 +14485,8 @@ class RcaControlStore:
             "rca_trigger_delivery_bindings",
             "rca_host_runtime_transitions",
             "rca_activation_epochs",
-            "rca_activation_budget_slots",
             "rca_activation_admission_ledger",
             "rca_activation_transition_audit",
-            "rca_capacity_transition_state",
-            "rca_capacity_transition_audit",
             "rca_canonical_requests",
             "rca_admission_snapshots",
             "rca_source_authority_receipts",
@@ -22707,10 +14494,6 @@ class RcaControlStore:
             "rca_learning_lane_cohorts",
             "rca_learning_lane_stock_items",
             "rca_learning_lane_admissions",
-            "rca_activation_historical_outbox_holds",
-            "rca_activation_historical_outbox_hold_items",
-            "rca_activation_historical_outbox_dispositions",
-            "rca_activation_historical_outbox_disposition_items",
             "rca_terminal_rerun_delivery_authorities",
             "rca_historical_epoch_rerun_delivery_authorities",
         }
@@ -22724,130 +14507,23 @@ class RcaControlStore:
             conn.close()
 
     def dispatch_backlog_count(self) -> int:
-        """Count only work that can pressure the external submission path."""
-        conn = self._connect()
-        try:
-            return int(
-                conn.execute(
-                    """
-                    SELECT COUNT(*) FROM rca_outbox
-                     WHERE status IN ('pending', 'claimed')
-                       AND NOT EXISTS (
-                           SELECT 1
-                             FROM rca_activation_historical_outbox_hold_items AS held
-                            WHERE held.outbox_id = rca_outbox.outbox_id
-                       )
-                    """
-                ).fetchone()[0]
-            )
-        finally:
-            conn.close()
-
-    def activation_ingress_freeze_readiness(self) -> dict[str, Any]:
-        """Read only the bounded-ingress fence fields needed by the Kafka loop."""
+        """Count current steady work that can pressure submission."""
         conn = self._connect()
         try:
             conn.execute("BEGIN")
-            epoch = self._current_activation_epoch_tx(conn)
-            epoch_id = str(epoch["epoch_id"]) if epoch is not None else ""
-            state = str(epoch["state"]) if epoch is not None else "unconfigured"
-            consumed_slot_count = 0
-            completed_bound_slot_count = 0
-            pending_inbox = 0
-            unbound_ledger = 0
-            inflight_writes = 0
-            reason = (
-                "activation_epoch_unconfigured"
-                if epoch is None
-                else "activation_epoch_not_bounded"
+            predicate, parameters = self._activation_claim_predicate_tx(conn)
+            count = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*) FROM rca_outbox AS o
+                     WHERE o.status IN ('pending', 'claimed')
+                       AND ({predicate})
+                    """,
+                    parameters,
+                ).fetchone()[0]
             )
-
-            # The full health snapshot scans retention and capacity state. Kafka
-            # needs the narrower execution proof only during the short bounded
-            # window; steady-state polls stay an indexed epoch lookup.
-            if state == "bounded_active":
-                consumed_slot_count = int(
-                    conn.execute(
-                        f"""
-                        SELECT COUNT(*) FROM rca_activation_budget_slots
-                         WHERE epoch_id = ?
-                           AND slot_kind IN ({_ACTIVATION_RELEASE_SLOT_SQL})
-                           AND consumed_ledger_id IS NOT NULL
-                        """,
-                        (epoch_id,),
-                    ).fetchone()[0]
-                )
-                completed_bound_slot_count = (
-                    self._activation_completed_bound_slot_count_tx(
-                        conn,
-                        epoch_id=epoch_id,
-                    )
-                )
-                pending_inbox = int(
-                    conn.execute(
-                        "SELECT COUNT(*) FROM kafka_inbox WHERE decision = 'pending'"
-                    ).fetchone()[0]
-                )
-                unbound_ledger = int(
-                    conn.execute(
-                        """
-                        SELECT COUNT(*)
-                          FROM rca_activation_admission_ledger AS al
-                         WHERE al.epoch_id = ?
-                           AND al.decision IN ('admit', 'shadow')
-                           AND (
-                               al.bound_at IS NULL
-                            OR NOT EXISTS (
-                                SELECT 1 FROM business_triggers AS t
-                                 WHERE t.activation_epoch_id = al.epoch_id
-                                   AND t.activation_ledger_id = al.ledger_id
-                                   AND t.business_key = al.business_key
-                                   AND t.submission_key = al.submission_key
-                                   AND t.generation = al.generation
-                            )
-                            OR NOT EXISTS (
-                                SELECT 1 FROM rca_outbox AS o
-                                 WHERE o.activation_epoch_id = al.epoch_id
-                                   AND o.activation_ledger_id = al.ledger_id
-                                   AND o.business_key = al.business_key
-                                   AND o.submission_key = al.submission_key
-                                   AND o.generation = al.generation
-                            )
-                           )
-                        """,
-                        (epoch_id,),
-                    ).fetchone()[0]
-                )
-                inflight_writes = self._activation_inflight_writes_tx(conn)
-                if consumed_slot_count != len(ACTIVATION_RELEASE_SLOT_KINDS):
-                    reason = "activation_slots_incomplete"
-                elif completed_bound_slot_count != len(
-                    ACTIVATION_RELEASE_SLOT_KINDS
-                ):
-                    reason = "activation_canary_executions_incomplete"
-                elif pending_inbox:
-                    reason = "activation_pending_inbox_not_drained"
-                elif unbound_ledger:
-                    reason = "activation_unbound_ledger"
-                elif inflight_writes:
-                    reason = "activation_inflight_writes_not_drained"
-                else:
-                    reason = "ready"
-
-            result = {
-                "epoch_id": epoch_id,
-                "state": state,
-                "ready": reason == "ready",
-                "reason": reason,
-                "required_slot_count": len(ACTIVATION_RELEASE_SLOT_KINDS),
-                "consumed_slot_count": consumed_slot_count,
-                "completed_bound_slot_count": completed_bound_slot_count,
-                "pending_inbox": pending_inbox,
-                "unbound_ledger": unbound_ledger,
-                "inflight_writes": inflight_writes,
-            }
             conn.commit()
-            return result
+            return count
         except Exception:
             if conn.in_transaction:
                 conn.rollback()
@@ -22860,6 +14536,10 @@ class RcaControlStore:
         try:
             conn.execute("BEGIN")
             snapshot_at = _now_iso()
+            current_epoch = self._current_activation_epoch_tx(conn)
+            activation_predicate, activation_parameters = (
+                self._activation_claim_predicate_tx(conn)
+            )
             inbox = {
                 row["decision"]: int(row["count"])
                 for row in conn.execute(
@@ -22876,19 +14556,32 @@ class RcaControlStore:
                 "SELECT MIN(received_at) FROM kafka_inbox WHERE decision = 'pending'"
             ).fetchone()[0]
             oldest_dispatchable = conn.execute(
-                """
-                SELECT MIN(COALESCE(retry_window_started_at, created_at))
-                  FROM rca_outbox
-                 WHERE status IN ('pending', 'claimed')
-                """
+                f"""
+                SELECT MIN(COALESCE(o.retry_window_started_at, o.created_at))
+                  FROM rca_outbox AS o
+                 WHERE o.status IN ('pending', 'claimed')
+                   AND ({activation_predicate})
+                """,
+                activation_parameters,
             ).fetchone()[0]
             expired_leases = int(
                 conn.execute(
-                    """
-                    SELECT COUNT(*) FROM rca_outbox
-                     WHERE status = 'claimed' AND lease_expires_at <= ?
+                    f"""
+                    SELECT COUNT(*) FROM rca_outbox AS o
+                     WHERE o.status = 'claimed' AND o.lease_expires_at <= ?
+                       AND ({activation_predicate})
                     """,
-                    (_now_iso(),),
+                    (snapshot_at, *activation_parameters),
+                ).fetchone()[0]
+            )
+            dispatchable_backlog = int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*) FROM rca_outbox AS o
+                     WHERE o.status IN ('pending', 'claimed')
+                       AND ({activation_predicate})
+                    """,
+                    activation_parameters,
                 ).fetchone()[0]
             )
             circuit_row = conn.execute(
@@ -22897,15 +14590,6 @@ class RcaControlStore:
                   FROM rca_dispatcher_circuit WHERE circuit_name = 'submission'
                 """
             ).fetchone()
-            promotion_counts = {
-                row["outcome"]: int(row["count"])
-                for row in conn.execute(
-                    """
-                    SELECT outcome, COUNT(*) AS count
-                      FROM rca_shadow_promotion_audit GROUP BY outcome
-                    """
-                ).fetchall()
-            }
             rearm_count = int(
                 conn.execute("SELECT COUNT(*) FROM rca_outbox_rearm_audit").fetchone()[0]
             )
@@ -22928,74 +14612,19 @@ class RcaControlStore:
                     "SELECT COUNT(*) FROM kafka_inbox WHERE raw_pruned_at IS NOT NULL"
                 ).fetchone()[0]
             )
-            current_epoch = self._current_activation_epoch_tx(conn)
-            capacity_transition_row = self._capacity_transition_state_tx(conn)
-            capacity_transition_audit_count = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM rca_capacity_transition_audit"
-                ).fetchone()[0]
-            )
-            capacity_transition_integrity_error = (
-                self._capacity_transition_integrity_error_tx(conn)
-            )
-            capacity_transition_integrity_ok = not bool(
-                capacity_transition_integrity_error
-            )
-            activation_slots = {
-                slot_kind: {"authorized": False, "consumed": False}
-                for slot_kind in ACTIVATION_SLOT_KINDS
-            }
             activation_ledger = {
                 "admit": 0,
                 "join": 0,
                 "shadow": 0,
                 "reject": 0,
             }
-            activation_backlog = {
-                "current_admitted": 0,
-                "current_held": 0,
-                "unadjudicated_shadow": 0,
-                "historical_blocked": 0,
-                "historical_held": 0,
-                "deferred_quarantined": 0,
-                "pending_inbox": int(inbox.get("pending", 0)),
-                "unbound_ledger": 0,
-                "historical_unbound_ledger": 0,
-            }
+            pending_inbox = 0
+            unbound_admissions = 0
             activation_current = None
-            bounded_canaries_completed_count = 0
-            historical_hold_count = 0
             if current_epoch is not None:
                 epoch_id = str(current_epoch["epoch_id"])
                 activation_current = self._public_activation_epoch(current_epoch)
-                historical_hold = conn.execute(
-                    "SELECT cohort_count "
-                    "FROM rca_activation_historical_outbox_holds "
-                    "WHERE epoch_id = ? AND NOT EXISTS ("
-                    "SELECT 1 FROM rca_activation_historical_outbox_dispositions "
-                    "WHERE epoch_id = ?)",
-                    (epoch_id, epoch_id),
-                ).fetchone()
-                historical_hold_count = (
-                    int(historical_hold["cohort_count"])
-                    if historical_hold is not None
-                    else 0
-                )
-                for slot_row in conn.execute(
-                    """
-                    SELECT slot_kind, authorized_identity_sha256,
-                           consumed_ledger_id
-                      FROM rca_activation_budget_slots WHERE epoch_id = ?
-                    """,
-                    (epoch_id,),
-                ).fetchall():
-                    activation_slots[str(slot_row["slot_kind"])] = {
-                        "authorized": bool(
-                            str(slot_row["authorized_identity_sha256"] or "")
-                        ),
-                        "consumed": slot_row["consumed_ledger_id"] is not None,
-                    }
-                for ledger_row in conn.execute(
+                for row in conn.execute(
                     """
                     SELECT decision, COUNT(*) AS count
                       FROM rca_activation_admission_ledger
@@ -23003,231 +14632,48 @@ class RcaControlStore:
                     """,
                     (epoch_id,),
                 ).fetchall():
-                    activation_ledger[str(ledger_row["decision"])] = int(
-                        ledger_row["count"]
-                    )
-                bounded_canaries_completed_count = (
-                    self._activation_completed_bound_slot_count_tx(
-                        conn,
-                        epoch_id=epoch_id,
-                    )
-                )
-                activation_backlog["current_admitted"] = int(
+                    activation_ledger[str(row["decision"])] = int(row["count"])
+                pending_inbox = int(
                     conn.execute(
                         """
-                        SELECT COUNT(*) FROM rca_outbox AS o
-                         WHERE o.activation_epoch_id = ?
-                           AND o.status IN ('pending', 'claimed')
-                           AND EXISTS (
-                               SELECT 1
-                                 FROM rca_activation_admission_ledger AS al
-                                WHERE al.ledger_id = o.activation_ledger_id
-                                  AND al.epoch_id = o.activation_epoch_id
-                                  AND al.decision = 'admit'
-                                  AND al.business_key = o.business_key
-                                  AND al.submission_key = o.submission_key
-                                  AND al.generation = o.generation
+                        SELECT COUNT(*) FROM kafka_inbox
+                         WHERE decision = 'pending' AND activation_epoch_id = ?
+                        """,
+                        (epoch_id,),
+                    ).fetchone()[0]
+                )
+                unbound_admissions = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*)
+                          FROM rca_activation_admission_ledger AS al
+                         WHERE al.epoch_id = ? AND al.decision = 'admit'
+                           AND (
+                               al.bound_at IS NULL
+                            OR NOT EXISTS (
+                                SELECT 1 FROM business_triggers AS bt
+                                 WHERE bt.activation_epoch_id = al.epoch_id
+                                   AND bt.activation_ledger_id = al.ledger_id
+                                   AND bt.business_key = al.business_key
+                                   AND bt.submission_key = al.submission_key
+                                   AND bt.generation = al.generation
+                            )
+                            OR NOT EXISTS (
+                                SELECT 1 FROM rca_outbox AS o
+                                 WHERE o.activation_epoch_id = al.epoch_id
+                                   AND o.activation_ledger_id = al.ledger_id
+                                   AND o.business_key = al.business_key
+                                   AND o.submission_key = al.submission_key
+                                   AND o.generation = al.generation
+                            )
                            )
                         """,
                         (epoch_id,),
                     ).fetchone()[0]
                 )
-                activation_backlog["current_held"] = int(
-                    conn.execute(
-                        """
-                        SELECT COUNT(*) FROM rca_outbox AS o
-                         WHERE o.activation_epoch_id = ? AND o.status = 'shadow'
-                           AND EXISTS (
-                               SELECT 1
-                                 FROM rca_activation_admission_ledger AS al
-                                WHERE al.ledger_id = o.activation_ledger_id
-                                  AND al.epoch_id = o.activation_epoch_id
-                                  AND al.decision IN ('shadow', 'reject')
-                           )
-                        """,
-                        (epoch_id,),
-                    ).fetchone()[0]
-                )
-                activation_backlog["historical_blocked"] = int(
-                    conn.execute(
-                        """
-                        SELECT COUNT(*) FROM rca_outbox AS o
-                         WHERE o.status IN ('pending', 'claimed')
-                           AND NOT EXISTS (
-                               SELECT 1
-                                 FROM rca_activation_historical_outbox_hold_items AS held
-                                WHERE held.epoch_id = ?
-                                  AND held.outbox_id = o.outbox_id
-                           )
-                           AND (
-                               o.activation_epoch_id IS NULL
-                               OR o.activation_epoch_id != ?
-                               OR o.activation_ledger_id IS NULL
-                               OR NOT EXISTS (
-                                   SELECT 1
-                                     FROM rca_activation_admission_ledger AS al
-                                    WHERE al.ledger_id = o.activation_ledger_id
-                                      AND al.epoch_id = o.activation_epoch_id
-                                      AND al.decision = 'admit'
-                               )
-                           )
-                        """,
-                        (epoch_id, epoch_id),
-                    ).fetchone()[0]
-                )
-                activation_backlog["historical_held"] = (
-                    int(
-                        conn.execute(
-                            """
-                        SELECT COUNT(*) FROM rca_outbox AS o
-                         WHERE o.status = 'shadow'
-                           AND (
-                               o.activation_epoch_id IS NULL
-                               OR o.activation_epoch_id != ?
-                           )
-                        """,
-                            (epoch_id,),
-                        ).fetchone()[0]
-                    )
-                    + historical_hold_count
-                )
-            else:
-                activation_backlog["historical_blocked"] = int(
-                    conn.execute(
-                        """
-                        SELECT COUNT(*) FROM rca_outbox
-                         WHERE status IN ('pending', 'claimed')
-                        """
-                    ).fetchone()[0]
-                )
-                activation_backlog["historical_held"] = int(
-                    conn.execute(
-                        "SELECT COUNT(*) FROM rca_outbox WHERE status = 'shadow'"
-                    ).fetchone()[0]
-                )
-            activation_backlog["unadjudicated_shadow"] = int(
-                conn.execute(
-                    """
-                    SELECT COUNT(*) FROM rca_outbox AS o
-                     WHERE o.status = 'shadow'
-                       AND (
-                           o.activation_ledger_id IS NULL
-                           OR NOT EXISTS (
-                               SELECT 1
-                                 FROM rca_activation_admission_ledger AS al
-                                WHERE al.ledger_id = o.activation_ledger_id
-                                  AND al.epoch_id = o.activation_epoch_id
-                                  AND al.business_key = o.business_key
-                                  AND al.submission_key = o.submission_key
-                                  AND al.generation = o.generation
-                           )
-                       )
-                    """
-                ).fetchone()[0]
-            )
-            activation_backlog["deferred_quarantined"] = int(
-                conn.execute(
-                    """
-                    SELECT COUNT(*) FROM rca_outbox
-                     WHERE status = 'quarantined'
-                       AND last_error_code = 'activation_epoch_deferred'
-                    """
-                ).fetchone()[0]
-            )
-            def unbound_ledger_count(
-                epoch_predicate: str, parameters: tuple[Any, ...]
-            ) -> int:
-                return int(
-                    conn.execute(
-                        f"""
-                    SELECT COUNT(*)
-                      FROM rca_activation_admission_ledger AS al
-                     WHERE {epoch_predicate}
-                       AND al.decision IN ('admit', 'shadow')
-                       AND (
-                           al.bound_at IS NULL
-                        OR NOT EXISTS (
-                            SELECT 1 FROM business_triggers AS t
-                             WHERE t.activation_epoch_id = al.epoch_id
-                               AND t.activation_ledger_id = al.ledger_id
-                               AND t.business_key = al.business_key
-                               AND t.submission_key = al.submission_key
-                               AND t.generation = al.generation
-                        )
-                        OR NOT EXISTS (
-                            SELECT 1 FROM rca_outbox AS o
-                             WHERE o.activation_epoch_id = al.epoch_id
-                               AND o.activation_ledger_id = al.ledger_id
-                               AND o.business_key = al.business_key
-                               AND o.submission_key = al.submission_key
-                               AND o.generation = al.generation
-                        )
-                       )
-                        """,
-                        parameters,
-                    ).fetchone()[0]
-                )
-
-            if current_epoch is not None:
-                current_epoch_id = str(current_epoch["epoch_id"])
-                activation_backlog["unbound_ledger"] = unbound_ledger_count(
-                    "al.epoch_id = ?", (current_epoch_id,)
-                )
-                activation_backlog["historical_unbound_ledger"] = (
-                    unbound_ledger_count(
-                        "al.epoch_id != ?", (current_epoch_id,)
-                    )
-                )
-            else:
-                activation_backlog["historical_unbound_ledger"] = (
-                    unbound_ledger_count("1", ())
-                )
-            consumed_slot_count = sum(
-                1
-                for slot_kind, slot in activation_slots.items()
-                if slot_kind in ACTIVATION_RELEASE_SLOT_KINDS and slot["consumed"]
-            )
-            inflight_writes = self._activation_inflight_writes_tx(conn)
-            freeze_state = (
-                str(current_epoch["state"])
-                if current_epoch is not None
-                else "unconfigured"
-            )
-            freeze_reason = "ready"
-            if current_epoch is None:
-                freeze_reason = "activation_epoch_unconfigured"
-            elif freeze_state != "bounded_active":
-                freeze_reason = "activation_epoch_not_bounded"
-            elif consumed_slot_count != len(ACTIVATION_RELEASE_SLOT_KINDS):
-                freeze_reason = "activation_slots_incomplete"
-            elif bounded_canaries_completed_count != len(
-                ACTIVATION_RELEASE_SLOT_KINDS
-            ):
-                freeze_reason = "activation_canary_executions_incomplete"
-            elif activation_backlog["pending_inbox"]:
-                freeze_reason = "activation_pending_inbox_not_drained"
-            elif activation_backlog["unbound_ledger"]:
-                freeze_reason = "activation_unbound_ledger"
-            elif inflight_writes:
-                freeze_reason = "activation_inflight_writes_not_drained"
-            ingress_freeze_readiness = {
-                "epoch_id": (
-                    str(current_epoch["epoch_id"])
-                    if current_epoch is not None
-                    else ""
-                ),
-                "state": freeze_state,
-                "ready": freeze_reason == "ready",
-                "reason": freeze_reason,
-                "required_slot_count": len(ACTIVATION_RELEASE_SLOT_KINDS),
-                "consumed_slot_count": consumed_slot_count,
-                "completed_bound_slot_count": bounded_canaries_completed_count,
-                "pending_inbox": activation_backlog["pending_inbox"],
-                "unbound_ledger": activation_backlog["unbound_ledger"],
-                "inflight_writes": inflight_writes,
-            }
             sqlite_data_version = int(conn.execute("PRAGMA data_version").fetchone()[0])
             conn.commit()
+
             db_files = {
                 "main": self.db_path,
                 "wal": Path(f"{self.db_path}-wal"),
@@ -23250,12 +14696,12 @@ class RcaControlStore:
                 "error": "",
             }
             try:
-                stat = os.statvfs(self.db_path.parent)
+                statvfs = os.statvfs(self.db_path.parent)
                 filesystem.update(
                     {
-                        "total_bytes": int(stat.f_blocks * stat.f_frsize),
-                        "free_bytes": int(stat.f_bfree * stat.f_frsize),
-                        "available_bytes": int(stat.f_bavail * stat.f_frsize),
+                        "total_bytes": int(statvfs.f_blocks * statvfs.f_frsize),
+                        "free_bytes": int(statvfs.f_bfree * statvfs.f_frsize),
+                        "available_bytes": int(statvfs.f_bavail * statvfs.f_frsize),
                     }
                 )
             except OSError as exc:
@@ -23266,7 +14712,7 @@ class RcaControlStore:
                 and filesystem["available_bytes"] >= CONTROL_DB_MIN_AVAILABLE_BYTES
             )
             return {
-                "ok": capacity_ok and capacity_transition_integrity_ok,
+                "ok": capacity_ok,
                 "schema_version": CONTROL_STORE_SCHEMA_VERSION,
                 "db_path": str(self.db_path),
                 "snapshot_at": snapshot_at,
@@ -23277,7 +14723,6 @@ class RcaControlStore:
                 "oldest_dispatchable_created_at": oldest_dispatchable,
                 "expired_outbox_leases": expired_leases,
                 "dispatcher_circuit": dict(circuit_row) if circuit_row else None,
-                "shadow_promotions": promotion_counts,
                 "input_wait_rearms": rearm_count,
                 "replay_raw_retention_days": REPLAY_RAW_RETENTION.days,
                 "replay_raw_retained_count": int(replay_raw["count"]),
@@ -23287,59 +14732,17 @@ class RcaControlStore:
                 "processed_raw_retained_bytes": int(processed_raw["bytes"]),
                 "raw_pruned_count": pruned_raw_count,
                 "activation": {
+                    "mode": "steady_only",
                     "configured": current_epoch is not None,
-                    "bounded_canaries_completed": (
-                        bounded_canaries_completed_count
-                        == len(ACTIVATION_RELEASE_SLOT_KINDS)
-                    ),
-                    "bounded_canaries_completed_count": (
-                        bounded_canaries_completed_count
-                    ),
-                    "ingress_freeze_readiness": ingress_freeze_readiness,
                     "production_active": bool(
                         current_epoch is not None
                         and str(current_epoch["state"]) == "steady_active"
                     ),
                     "current_epoch": activation_current,
-                    "slots": activation_slots,
                     "ledger": activation_ledger,
-                    "backlog": activation_backlog,
-                },
-                "capacity_transition": {
-                    "configured": capacity_transition_row is not None,
-                    "durable_capacity_mode": (
-                        "blocked"
-                        if not capacity_transition_integrity_ok
-                        else (
-                            "steady"
-                            if capacity_transition_row is not None
-                            and str(capacity_transition_row["state"])
-                            == CAPACITY_STEADY_ACTIVE
-                            else "bootstrap"
-                            if capacity_transition_row is not None
-                            else None
-                        )
-                    ),
-                    "generation": (
-                        int(capacity_transition_row["generation"])
-                        if capacity_transition_row is not None
-                        else None
-                    ),
-                    "irreversible": bool(
-                        capacity_transition_row is not None
-                        and str(capacity_transition_row["state"])
-                        == CAPACITY_STEADY_ACTIVE
-                    ),
-                    "state": (
-                        self._public_capacity_transition_state(
-                            capacity_transition_row
-                        )
-                        if capacity_transition_row is not None
-                        else None
-                    ),
-                    "audit_count": capacity_transition_audit_count,
-                    "integrity_ok": capacity_transition_integrity_ok,
-                    "integrity_error": capacity_transition_integrity_error,
+                    "dispatchable_backlog": dispatchable_backlog,
+                    "pending_inbox": pending_inbox,
+                    "unbound_admissions": unbound_admissions,
                 },
                 "db_size_bytes": sum(db_file_sizes.values()),
                 "db_file_sizes": db_file_sizes,

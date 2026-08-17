@@ -10,18 +10,35 @@ from gateway.pnc_rca_delivery_store import ExecutionWatchClaim
 from scripts import pnc_rca_delivery_collector as collector
 from scripts import pnc_rca_outbox_dispatcher as outbox_dispatcher
 from tests.gateway.test_pnc_rca_control_store import (
+    TOPIC,
     _policy,
     _record,
     _terminalize_input_wait,
     _value,
 )
+from tests.gateway.test_pnc_rca_w3_snapshot import _runtime_authority
 
 
 def test_kafka_terminal_rerun_contract_crosses_control_outbox_and_collector(
     tmp_path,
 ):
     store = RcaControlStore(tmp_path / "control.sqlite3")
-    first = store.ingest_record(_record(10), policy=_policy(), submit_enabled=True)
+    epoch = store.activate_direct_steady_epoch(
+        epoch_id="rca-kafka-retrigger-contract-steady",
+        release_fingerprint="1" * 64,
+        release_binding_sha256="2" * 64,
+        config_sha256="3" * 64,
+        db_logical_identity={"database": "kafka-retrigger-contract"},
+        partition_start_fence={TOPIC: {"2": 0}},
+        operator="integration-test",
+        reason="activate steady-only Kafka retrigger contract",
+    )
+    first = store.ingest_record(
+        _record(10),
+        policy=_policy(),
+        submit_enabled=True,
+        snapshot_authority=_runtime_authority(),
+    )
     _terminalize_input_wait(store, first.submission_key)
     second = store.ingest_record(
         _record(11, value=_value(updated_at=1783659999999)),
@@ -33,6 +50,21 @@ def test_kafka_terminal_rerun_contract_crosses_control_outbox_and_collector(
     outbox = next(
         row for row in store.list_rows("rca_outbox") if row["generation"] == 2
     )
+    trigger = next(
+        row
+        for row in store.list_rows("business_triggers")
+        if row["generation"] == 2
+    )
+    ledger = next(
+        row
+        for row in store.list_rows("rca_activation_admission_ledger")
+        if row["generation"] == 2 and row["decision"] == "admit"
+    )
+    assert ledger["bound_at"] is not None
+    assert outbox["activation_epoch_id"] == epoch["epoch_id"]
+    assert outbox["activation_ledger_id"] == ledger["ledger_id"]
+    assert trigger["activation_epoch_id"] == epoch["epoch_id"]
+    assert trigger["activation_ledger_id"] == ledger["ledger_id"]
     claim = store.claim_outbox(
         lease_owner="kafka-rerun-contract",
         now=datetime.fromisoformat(outbox["retry_window_started_at"])

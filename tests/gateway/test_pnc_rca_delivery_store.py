@@ -10,17 +10,19 @@ import sqlite3
 
 import pytest
 
-from gateway import pnc_rca_delivery_quarantine_baseline as quarantine_baseline
 from gateway.pnc_rca_control_store import (
     MANUAL_TRIGGER_SCHEMA_VERSION,
     ActivationEpochError,
     KafkaRecord,
     ManualRcaTriggerRequest,
     RcaControlStore,
+    build_historical_epoch_rerun_authority,
 )
 from gateway.pnc_rca_delivery_contract import (
     DELIVERY_EFFECT_KIND,
     DELIVERY_EFFECT_SCHEMA_VERSION,
+    RCA_REPORT_FIELD_KEY,
+    RCA_RESULT_FIELD_KEY,
     VerifiedDelivery,
     compute_delivery_effect_key,
     compute_delivery_effect_payload_sha256,
@@ -36,16 +38,11 @@ from gateway.pnc_rca_delivery_store import (
     OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE,
     OUTBOX_QUARANTINED_TERMINAL_STATE,
     PERMANENT_FAILURE_CIRCUIT_THRESHOLD,
-    PRE_W3_EFFECT_DISPOSITION_COMMAND,
-    PRE_W3_EFFECT_DISPOSITION_SCHEMA_VERSION,
     DeliveryRecordConflictError,
     RcaDeliveryStore,
     StaleDeliveryEffectLeaseError,
     StaleDeliveryWatchLeaseError,
     _terminal_rerun_payload_identity_matches,
-    _pre_w3_disposition_sha256,
-    _pre_w3_effect_disposition_after,
-    _pre_w3_effect_disposition_fingerprint,
 )
 from gateway.pnc_rca_kafka_contract import WorkflowEventPolicy, WorkflowTransition
 from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path, foxglove_url
@@ -202,12 +199,27 @@ def _control(
     completed: bool = True,
     offset: int = 10,
     issue_id: int = 7041712812,
+    db_path=None,
 ):
-    control = RcaControlStore(tmp_path / "control.sqlite3")
+    db_path = db_path or (tmp_path / "control.sqlite3")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    control = RcaControlStore(db_path)
+    control.activate_direct_steady_epoch(
+        epoch_id="delivery-epoch-1",
+        release_fingerprint="a" * 64,
+        release_binding_sha256="b" * 64,
+        config_sha256="c" * 64,
+        db_logical_identity={"database": "delivery-test"},
+        partition_start_fence={TOPIC: {"2": 0}},
+        operator="delivery-test",
+        reason="activate steady delivery test runtime",
+        now=NOW,
+    )
     result = control.ingest_record(
         _record(offset=offset, issue_id=issue_id),
         policy=_policy(),
         submit_enabled=True,
+        activation_required=True,
     )
     if completed:
         claim = control.claim_outbox(lease_owner="submission-worker", now=NOW)
@@ -227,149 +239,76 @@ def _control(
     return control, result
 
 
+def _activate_direct_steady(
+    control,
+    *,
+    epoch_id="delivery-epoch-1",
+    start_offset=0,
+    now=NOW,
+):
+    return control.activate_direct_steady_epoch(
+        epoch_id=epoch_id,
+        release_fingerprint="a" * 64,
+        release_binding_sha256="b" * 64,
+        config_sha256="c" * 64,
+        db_logical_identity={"database": "delivery-test"},
+        partition_start_fence={TOPIC: {"2": start_offset}},
+        operator="delivery-test",
+        reason="activate direct steady delivery test runtime",
+        now=now,
+    )
+
+
 def _bind_activation_execution(
     control,
     result,
     *,
     epoch_id="delivery-epoch-1",
     state="steady_active",
-    slot_kind="kafka_success",
-    start_offset=0,
 ):
-    created = control.create_activation_epoch(
-        epoch_id=epoch_id,
-        preauthorization_fingerprint="a" * 64,
-        preauthorization_gate_receipt_sha256="c" * 64,
-        preauthorization_capsule_sha256="d" * 64,
-        config_sha256="b" * 64,
-        db_logical_identity={"database": "delivery-test"},
-        partition_start_fence={TOPIC: {"2": start_offset}},
-        operator="delivery-test",
-        reason="delivery_activation_test",
-        now=NOW,
-    )
-    if created["state"] == "safe_off":
-        control.preauthorize_activation_epoch(
-            epoch_id=epoch_id,
-            preproduction_fingerprint="e" * 64,
-            preproduction_gate_receipt_sha256="f" * 64,
-            preproduction_capsule_sha256="1" * 64,
-            expected_preauthorization_fingerprint="a" * 64,
-            expected_preauthorization_gate_receipt_sha256="c" * 64,
-            expected_preauthorization_capsule_sha256="d" * 64,
-            expected_config_sha256=created["config_sha256"],
-            expected_db_logical_identity_sha256=created["db_logical_identity_sha256"],
-            expected_partition_start_fence_sha256=created[
-                "partition_start_fence_sha256"
-            ],
-            operator="delivery-test",
-            reason="bind exact preproduction capsule for delivery activation test",
-            now=NOW,
-        )
-    current = NOW.isoformat()
-    with sqlite3.connect(control.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_activation_epochs "
-            "SET state = ?, updated_at = ?, production_fingerprint = ?, "
-            "production_gate_receipt_sha256 = ? "
-            "WHERE epoch_id = ? AND is_current = 1",
-            (
-                state,
-                current,
-                "2" * 64 if state == "steady_active" else None,
-                "3" * 64 if state == "steady_active" else None,
-                epoch_id,
-            ),
-        )
-        cursor = conn.execute(
-            """
-            INSERT INTO rca_activation_admission_ledger(
-                epoch_id, admission_key, entrypoint, source_kind,
-                source_identity_sha256, slot_kind, decision, reason,
-                business_key, submission_key, generation,
-                first_adjudicated_at, last_adjudicated_at,
-                admitted_at, bound_at
-            ) VALUES (?, ?, 'kafka_ingest', 'kafka', ?, ?, 'admit',
-                      'delivery_test_exact_admit', ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                epoch_id,
-                f"delivery-test:{result.submission_key}",
-                "c" * 64,
-                slot_kind,
-                result.business_key,
-                result.submission_key,
-                result.generation,
-                current,
-                current,
-                current,
-                current,
-            ),
-        )
-        ledger_id = int(cursor.lastrowid)
-        conn.execute(
-            "UPDATE business_triggers SET activation_epoch_id = ?, "
-            "activation_ledger_id = ? WHERE submission_key = ?",
-            (epoch_id, ledger_id, result.submission_key),
-        )
-        conn.execute(
-            "UPDATE rca_outbox SET activation_epoch_id = ?, "
-            "activation_ledger_id = ? WHERE submission_key = ?",
-            (epoch_id, ledger_id, result.submission_key),
-        )
-        if state == "bounded_active":
-            conn.execute(
-                "UPDATE rca_activation_budget_slots "
-                "SET authorized_source_kind = 'kafka', "
-                "authorized_identity_sha256 = ?, authorized_at = ?, "
-                "consumed_ledger_id = ?, consumed_at = ? "
-                "WHERE epoch_id = ? AND slot_kind = ?",
-                ("c" * 64, current, ledger_id, current, epoch_id, slot_kind),
+    current_epoch = control.activation_epoch()
+    assert current_epoch is not None
+    assert current_epoch["epoch_id"] == epoch_id
+    [bound] = [
+        row
+        for row in control.list_rows("rca_outbox")
+        if row["submission_key"] == result.submission_key
+    ]
+    assert bound["activation_epoch_id"] == epoch_id
+    assert bound["activation_ledger_id"] is not None
+    if state != "steady_active":
+        with sqlite3.connect(control.db_path) as conn:
+            updated = conn.execute(
+                "UPDATE rca_activation_epochs "
+                "SET state = ?, updated_at = ?, production_fingerprint = NULL, "
+                "production_gate_receipt_sha256 = NULL "
+                "WHERE epoch_id = ? AND is_current = 1",
+                (state, NOW.isoformat(), epoch_id),
             )
-    return ledger_id
+        assert updated.rowcount == 1
+    return int(bound["activation_ledger_id"])
 
 
 def _switch_activation_epoch(control, *, old_epoch, new_epoch):
     with sqlite3.connect(control.db_path) as conn:
-        conn.execute(
+        updated = conn.execute(
             "UPDATE rca_activation_epochs SET state = 'aborted', is_current = 0, "
             "aborted_at = ?, superseded_at = ?, updated_at = ? "
             "WHERE epoch_id = ? AND is_current = 1",
             (NOW.isoformat(), NOW.isoformat(), NOW.isoformat(), old_epoch),
         )
-    created = control.create_activation_epoch(
+    assert updated.rowcount == 1
+    return control.activate_direct_steady_epoch(
         epoch_id=new_epoch,
-        preauthorization_fingerprint="d" * 64,
-        preauthorization_gate_receipt_sha256="f" * 64,
-        preauthorization_capsule_sha256="1" * 64,
-        config_sha256="e" * 64,
+        release_fingerprint="d" * 64,
+        release_binding_sha256="e" * 64,
+        config_sha256="f" * 64,
         db_logical_identity={"database": "delivery-test"},
         partition_start_fence={TOPIC: {"2": 11}},
         operator="delivery-test",
-        reason="delivery_activation_switch_test",
+        reason="simulate a direct steady delivery epoch switch",
         now=NOW + timedelta(seconds=1),
     )
-    control.preauthorize_activation_epoch(
-        epoch_id=new_epoch,
-        preproduction_fingerprint="2" * 64,
-        preproduction_gate_receipt_sha256="3" * 64,
-        preproduction_capsule_sha256="4" * 64,
-        expected_preauthorization_fingerprint="d" * 64,
-        expected_preauthorization_gate_receipt_sha256="f" * 64,
-        expected_preauthorization_capsule_sha256="1" * 64,
-        expected_config_sha256=created["config_sha256"],
-        expected_db_logical_identity_sha256=created["db_logical_identity_sha256"],
-        expected_partition_start_fence_sha256=created["partition_start_fence_sha256"],
-        operator="delivery-test",
-        reason="bind exact preproduction capsule for delivery epoch switch",
-        now=NOW + timedelta(seconds=1),
-    )
-    with sqlite3.connect(control.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_activation_epochs SET state = 'confirmed' "
-            "WHERE epoch_id = ? AND is_current = 1",
-            (new_epoch,),
-        )
 
 
 def _quarantine_submission(control, *, error_code="internal_submit_failure"):
@@ -419,6 +358,7 @@ def _delivery(claim):
     report_url = "http://192.168.26.174:18081/rca/index.html"
     viz_mcap_vm = canonical_viz_mcap_path(claim.submission_key)
     rendered_foxglove_url = foxglove_url(viz_mcap_vm)
+    result_field_value = "归因结论：未发现已知异常模式\n责任模块：待确认"
     semantic = {
         "schema_version": DELIVERY_EFFECT_SCHEMA_VERSION,
         "delivery_id": delivery_id,
@@ -435,6 +375,17 @@ def _delivery(claim):
         "report_status": "html_delivery_ready",
         "requires_human_review": True,
         "conclusion": "本单未能定向\n仅供参考，待确认\n未发现已知异常模式",
+        "result_field_value": result_field_value,
+        "field_updates": [
+            {
+                "field_key": RCA_RESULT_FIELD_KEY,
+                "field_value": result_field_value,
+            },
+            {
+                "field_key": RCA_REPORT_FIELD_KEY,
+                "field_value": report_url,
+            },
+        ],
     }
     semantic_sha = compute_delivery_effect_payload_sha256(
         semantic, DELIVERY_EFFECT_KIND
@@ -492,6 +443,491 @@ def _claimed_effect(tmp_path):
     effect = store.claim_due_effect(lease_owner="dispatcher", now=NOW)
     assert effect is not None
     return store, effect
+
+
+def _canonical_canary(tmp_path, *, owner_authorized=True):
+    batch_id = "canary-r15aw-7041712812-20260817"
+    issue_id = "7041712812"
+    epoch_id = "delivery-test-steady"
+    current = NOW
+    control = RcaControlStore(tmp_path / "control.sqlite3")
+    authority = None
+    if owner_authorized:
+        prior_epoch_id = "delivery-test-prior-steady"
+        control.activate_direct_steady_epoch(
+            epoch_id=prior_epoch_id,
+            release_fingerprint="a" * 64,
+            release_binding_sha256="b" * 64,
+            config_sha256="c" * 64,
+            db_logical_identity={"database": "canonical-canary-prior-test"},
+            partition_start_fence={TOPIC: {"2": 0}},
+            operator="delivery-test",
+            reason="activate prior canonical canary test runtime",
+            now=NOW,
+        )
+        prior = control.admit_manual_trigger(
+            ManualRcaTriggerRequest(
+                schema_version=MANUAL_TRIGGER_SCHEMA_VERSION,
+                issue_url=(
+                    "https://project.feishu.cn/g1q3/issue/detail/7041712812"
+                ),
+                mode="rerun",
+                reason="seed historical canonical canary generation",
+                platform="operator",
+                chat_id="",
+                thread_id="",
+                message_id=f"historical-seed-{issue_id}",
+                requester_id="automation:rca-batch-rerun",
+            ),
+            allowed_chat_ids=set(),
+            submit_enabled=True,
+            operator_authorized=True,
+            activation_required=True,
+            active_policy=_policy(),
+            now=NOW,
+        )
+        [prior_trigger] = [
+            row
+            for row in control.list_rows("business_triggers")
+            if row["submission_key"] == prior.submission_key
+        ]
+        _switch_activation_epoch(
+            control, old_epoch=prior_epoch_id, new_epoch=epoch_id
+        )
+        current = NOW + timedelta(seconds=2)
+        authority = build_historical_epoch_rerun_authority(
+            batch_id=batch_id,
+            queue_sha256="1" * 64,
+            issue_id=issue_id,
+            prior_submission_key=prior.submission_key,
+            prior_generation=prior.generation,
+            prior_activation_epoch_id=prior_epoch_id,
+            prior_activation_ledger_id=int(prior_trigger["activation_ledger_id"]),
+            target_activation_epoch_id=epoch_id,
+            owner_receipt_path=str(tmp_path / "canonical-canary-owner-receipt.json"),
+            owner_receipt_sha256="2" * 64,
+            requester_id="automation:rca-batch-rerun",
+            reason=f"production_gray_batch:{batch_id}",
+        )
+    else:
+        control.activate_direct_steady_epoch(
+            epoch_id=epoch_id,
+            release_fingerprint="a" * 64,
+            release_binding_sha256="b" * 64,
+            config_sha256="c" * 64,
+            db_logical_identity={"database": "canonical-canary-test"},
+            partition_start_fence={TOPIC: {"2": 0}},
+            operator="delivery-test",
+            reason="activate canonical canary test runtime",
+            now=NOW,
+        )
+    admitted = control.admit_manual_trigger(
+        ManualRcaTriggerRequest(
+            schema_version=MANUAL_TRIGGER_SCHEMA_VERSION,
+            issue_url=(
+                "https://project.feishu.cn/g1q3/issue/detail/7041712812"
+            ),
+            mode="rerun",
+            reason=f"production_gray_batch:{batch_id}",
+            platform="operator",
+            chat_id="",
+            thread_id="",
+            message_id=f"{batch_id}-{issue_id}-try-1",
+            requester_id="automation:rca-batch-rerun",
+        ),
+        allowed_chat_ids=set(),
+        submit_enabled=True,
+        operator_authorized=True,
+        activation_required=True,
+        active_policy=_policy(),
+        historical_epoch_rerun_authority=authority,
+        now=current,
+    )
+    outbox = control.claim_outbox(lease_owner="submission-worker", now=current)
+    assert outbox is not None
+    control.complete_outbox(
+        outbox_id=outbox.outbox_id,
+        lease_token=outbox.lease_token,
+        result={
+            "success": True,
+            "submission_key": admitted.submission_key,
+            "task_id": admitted.submission_key,
+            "task_state": "submitted",
+            "deduped": False,
+        },
+        now=current,
+    )
+    store = RcaDeliveryStore(control.db_path)
+    assert store.backfill_completed_submissions(
+        now=current, activation_required=True
+    ) == 1
+    watch = store.claim_due_watch(
+        lease_owner="collector", now=current, activation_required=True
+    )
+    assert watch is not None
+    execution_identity = {
+        "schema_version": "pnc_rca_execution_identity_readback_v1",
+        "source": "host_collector_canonical_vm_receipts_v1",
+        "release_id": "rca-r15aw-20260817",
+        "activation_epoch_id": epoch_id,
+        "release_fingerprint_sha256": "d" * 64,
+        "release_note_sha256": "e" * 64,
+        "task_id": admitted.submission_key,
+        "submission_key": admitted.submission_key,
+        "worker": {"commit": "1" * 40},
+        "pipeline": {"commit": "2" * 40},
+        "report_service": {"manifest_sha256": "3" * 64},
+        "delivery_manifest": {"sha256": "4" * 64},
+    }
+    store.create_delivery(
+        claim=watch,
+        delivery=_delivery(watch),
+        status={
+            "success": True,
+            "state": "completed",
+            "execution_identity_readback": execution_identity,
+        },
+        now=current,
+        activation_required=True,
+    )
+    effect = store.claim_due_effect(
+        lease_owner="dispatcher", now=current, activation_required=True
+    )
+    assert effect is not None
+    remote_id = "oc_canonical_canary_comment"
+    content = str(effect.payload["comment_content"])
+    observation = _delivery_observation(
+        effect,
+        remote_receipt_id=remote_id,
+        release_id=execution_identity["release_id"],
+        delivered_at=current.isoformat(),
+    )
+    store.complete_effect(
+        claim=effect,
+        outcome="ack",
+        remote_id=remote_id,
+        receipt={
+            "remote_id": remote_id,
+            "marker": effect.payload["marker"],
+            "source": "read_after_write",
+            "recovery_write_count": 0,
+            "confirmed_content_sha256": hashlib.sha256(
+                content.encode("utf-8")
+            ).hexdigest(),
+            "confirmed_report_url": effect.report_url,
+            "confirmed_field_keys": ["field_9193cb", "field_8c912e"],
+        },
+        observation=observation,
+        now=current,
+    )
+    [intent] = store.list_pending_delivery_observations()
+    assert store.mark_delivery_observation_appended(
+        observation_id=intent.observation_id,
+        payload_sha256=intent.payload_sha256,
+        now=current + timedelta(seconds=1),
+    )
+    return {
+        "db_path": control.db_path,
+        "batch_id": batch_id,
+        "issue_id": issue_id,
+        "submission_key": admitted.submission_key,
+        "generation": admitted.generation,
+        "epoch_id": epoch_id,
+        "execution_identity": execution_identity,
+        "remote_id": remote_id,
+    }
+
+
+def _canonical_canary_readback(data):
+    store = RcaDeliveryStore(
+        data["db_path"],
+        read_only=True,
+        require_current=True,
+        ensure_current_rows=False,
+    )
+    return store.canonical_canary_readback(
+        batch_id=data["batch_id"],
+        issue_id=data["issue_id"],
+        submission_key=data["submission_key"],
+        activation_epoch_id=data["epoch_id"],
+    )
+
+
+def test_canonical_canary_readback_projects_settled_db_evidence(tmp_path):
+    data = _canonical_canary(tmp_path)
+
+    readback = _canonical_canary_readback(data)
+
+    assert data["generation"] == 2
+    assert readback["batch_id"] == data["batch_id"]
+    assert readback["activation_epoch_id"] == data["epoch_id"]
+    assert readback["transport"] == {
+        "status": "pass",
+        "official_comment_id": data["remote_id"],
+        "official_field_keys": ["field_8c912e", "field_9193cb"],
+        "official_readback_source": "read_after_write",
+    }
+    assert readback["execution_identity_readback"] == data["execution_identity"]
+    assert readback["required_effects"][0]["write_phase"] == "settled"
+
+
+def test_canonical_canary_readback_rejects_generation_one(tmp_path):
+    data = _canonical_canary(tmp_path, owner_authorized=False)
+
+    assert data["generation"] == 1
+    with pytest.raises(
+        DeliveryRecordConflictError,
+        match="canonical_canary_readback_invalid:rerun_authority_missing",
+    ):
+        _canonical_canary_readback(data)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "missing_observation",
+        "extra_required_effect",
+        "wrong_epoch",
+        "job_not_delivered",
+        "effect_not_succeeded",
+        "wrong_source",
+        "wrong_fields",
+        "wrong_remote_id",
+        "effect_target",
+        "effect_payload_hash",
+        "payload_effect_key",
+        "missing_field_update_with_rebound_identity",
+        "observation_content_hash",
+        "execution_identity_mismatch",
+    ],
+)
+def test_canonical_canary_readback_fails_closed_on_db_drift(tmp_path, case):
+    data = _canonical_canary(tmp_path)
+    if case == "wrong_epoch":
+        data["epoch_id"] = "delivery-other-steady"
+    else:
+        with sqlite3.connect(data["db_path"]) as conn:
+            conn.row_factory = sqlite3.Row
+            if case == "missing_observation":
+                conn.execute("DELETE FROM rca_delivery_observation_outbox")
+            elif case == "extra_required_effect":
+                conn.execute(
+                    """
+                    INSERT INTO rca_delivery_effects(
+                        effect_key, delivery_id, effect_kind, required,
+                        target_key, payload_json, payload_sha256, status,
+                        write_phase, completed_at, created_at, updated_at
+                    )
+                    SELECT ?, delivery_id, 'feishu_field_update', 1,
+                           target_key || ':extra', '{}', ?, 'succeeded',
+                           'settled', completed_at, created_at, updated_at
+                      FROM rca_delivery_effects LIMIT 1
+                    """,
+                    ("f" * 64, "f" * 64),
+                )
+            elif case == "job_not_delivered":
+                conn.execute("UPDATE rca_delivery_jobs SET status = 'ready'")
+            elif case == "effect_not_succeeded":
+                conn.execute(
+                    "UPDATE rca_delivery_effects SET status = 'retry_wait'"
+                )
+            elif case in {"wrong_source", "wrong_fields"}:
+                row = conn.execute(
+                    "SELECT remote_receipt_json FROM rca_delivery_effects"
+                ).fetchone()
+                receipt = json.loads(row["remote_receipt_json"])
+                if case == "wrong_source":
+                    receipt["source"] = "write_response"
+                else:
+                    receipt["confirmed_field_keys"] = ["field_8c912e"]
+                conn.execute(
+                    "UPDATE rca_delivery_effects SET remote_receipt_json = ?",
+                    (
+                        json.dumps(
+                            receipt,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+            elif case == "wrong_remote_id":
+                conn.execute(
+                    "UPDATE rca_delivery_attempts SET remote_id = 'oc_other' "
+                    "WHERE outcome IN ('ack', 'reconciled')"
+                )
+            elif case == "effect_target":
+                conn.execute(
+                    "UPDATE rca_delivery_effects SET target_key = 'feishu_project:other'"
+                )
+            elif case == "effect_payload_hash":
+                conn.execute(
+                    "UPDATE rca_delivery_effects SET payload_sha256 = ?",
+                    ("f" * 64,),
+                )
+            elif case == "payload_effect_key":
+                row = conn.execute(
+                    "SELECT payload_json FROM rca_delivery_effects"
+                ).fetchone()
+                payload = json.loads(row["payload_json"])
+                payload["effect_key"] = "g1q3-rca-effect-v1-" + "f" * 64
+                conn.execute(
+                    "UPDATE rca_delivery_effects SET payload_json = ?",
+                    (
+                        json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+            elif case == "missing_field_update_with_rebound_identity":
+                row = conn.execute(
+                    """
+                    SELECT e.effect_key, e.payload_json, e.remote_receipt_json,
+                           j.delivery_id, j.target_key, j.artifact_set_id
+                      FROM rca_delivery_effects AS e
+                      JOIN rca_delivery_jobs AS j ON j.delivery_id = e.delivery_id
+                    """
+                ).fetchone()
+                old_effect_key = str(row["effect_key"])
+                payload = json.loads(row["payload_json"])
+                payload["field_updates"] = [payload["field_updates"][0]]
+                semantic_sha = compute_delivery_effect_payload_sha256(
+                    payload, DELIVERY_EFFECT_KIND
+                )
+                effect_key = compute_delivery_effect_key(
+                    delivery_id=str(row["delivery_id"]),
+                    effect_kind=DELIVERY_EFFECT_KIND,
+                    target_key=str(row["target_key"]),
+                    semantic_payload_sha256=semantic_sha,
+                )
+                old_marker = str(payload["marker"])
+                marker = delivery_effect_marker(
+                    effect_key, str(row["artifact_set_id"])
+                )
+                payload.update(
+                    {
+                        "effect_key": effect_key,
+                        "semantic_payload_sha256": semantic_sha,
+                        "marker": marker,
+                        "comment_content": str(payload["comment_content"]).replace(
+                            old_marker, marker
+                        ),
+                    }
+                )
+                receipt = json.loads(row["remote_receipt_json"])
+                receipt["marker"] = marker
+                receipt["confirmed_content_sha256"] = hashlib.sha256(
+                    payload["comment_content"].encode("utf-8")
+                ).hexdigest()
+                observation_row = conn.execute(
+                    "SELECT payload_json FROM rca_delivery_observation_outbox"
+                ).fetchone()
+                observation = json.loads(observation_row["payload_json"])
+                observation["outcome_content_sha256"] = receipt[
+                    "confirmed_content_sha256"
+                ]
+                observation["observation_id"] = delivery_observation_id(observation)
+                observation_raw = json.dumps(
+                    observation,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                conn.execute(
+                    "UPDATE rca_delivery_attempts SET effect_key = ? "
+                    "WHERE effect_key = ?",
+                    (effect_key, old_effect_key),
+                )
+                conn.execute(
+                    """
+                    UPDATE rca_delivery_observation_outbox
+                       SET effect_key = ?, observation_id = ?, payload_json = ?,
+                           payload_sha256 = ?
+                     WHERE effect_key = ?
+                    """,
+                    (
+                        effect_key,
+                        observation["observation_id"],
+                        observation_raw,
+                        hashlib.sha256(observation_raw.encode("utf-8")).hexdigest(),
+                        old_effect_key,
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE rca_delivery_effects
+                       SET effect_key = ?, payload_json = ?, payload_sha256 = ?,
+                           remote_receipt_json = ?
+                     WHERE effect_key = ?
+                    """,
+                    (
+                        effect_key,
+                        json.dumps(
+                            payload,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        semantic_sha,
+                        json.dumps(
+                            receipt,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        old_effect_key,
+                    ),
+                )
+            elif case == "observation_content_hash":
+                row = conn.execute(
+                    "SELECT payload_json FROM rca_delivery_observation_outbox"
+                ).fetchone()
+                observation = json.loads(row["payload_json"])
+                observation["outcome_content_sha256"] = "f" * 64
+                observation["observation_id"] = delivery_observation_id(observation)
+                observation_raw = json.dumps(
+                    observation,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                conn.execute(
+                    """
+                    UPDATE rca_delivery_observation_outbox
+                       SET observation_id = ?, payload_json = ?, payload_sha256 = ?
+                    """,
+                    (
+                        observation["observation_id"],
+                        observation_raw,
+                        hashlib.sha256(observation_raw.encode("utf-8")).hexdigest(),
+                    ),
+                )
+            else:
+                row = conn.execute(
+                    "SELECT last_status_json FROM rca_execution_watch"
+                ).fetchone()
+                status = json.loads(row["last_status_json"])
+                status["execution_identity_readback"]["release_id"] = "rca-other"
+                conn.execute(
+                    "UPDATE rca_execution_watch SET last_status_json = ?",
+                    (
+                        json.dumps(
+                            status,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+
+    with pytest.raises(
+        (DeliveryRecordConflictError, ValueError),
+        match="canonical_canary_readback_(invalid|identity_invalid)",
+    ):
+        _canonical_canary_readback(data)
 
 
 def _insert_job_outcomes(store, rows):
@@ -1275,11 +1711,14 @@ def test_effect_claim_fails_closed_on_invalid_business_acceptance_timestamp(
     before_effects = store.list_rows("rca_delivery_effects")
     before_attempts = store.list_rows("rca_delivery_attempts")
 
-    with pytest.raises(
-        DeliveryRecordConflictError,
-        match="delivery_business_acceptance_timestamp_invalid",
-    ):
-        store.claim_due_effect(lease_owner="dispatcher", now=NOW)
+    if corruption == "missing":
+        assert store.claim_due_effect(lease_owner="dispatcher", now=NOW) is None
+    else:
+        with pytest.raises(
+            DeliveryRecordConflictError,
+            match="delivery_business_acceptance_timestamp_invalid",
+        ):
+            store.claim_due_effect(lease_owner="dispatcher", now=NOW)
 
     assert store.list_rows("rca_delivery_effects") == before_effects
     assert store.list_rows("rca_delivery_attempts") == before_attempts
@@ -1689,58 +2128,6 @@ def test_only_completed_submission_outbox_rows_are_backfilled(tmp_path):
     assert watch["task_id"] == claim.submission_key
 
 
-def test_quarantined_kafka_outbox_backfills_public_issue_terminal_atomically(
-    tmp_path,
-):
-    control, result = _control(tmp_path, completed=False)
-    _quarantine_submission(
-        control,
-        error_code="private_submit_error_with_sensitive_context",
-    )
-    store = RcaDeliveryStore(tmp_path / "control.sqlite3")
-
-    before = store.backpressure_snapshot(now=NOW + timedelta(seconds=2))
-    assert before.untracked_completed_submissions == 1
-    assert before.unresolved_work == 1
-    assert store.backfill_completed_submissions(now=NOW + timedelta(seconds=2)) == 1
-    assert store.backfill_completed_submissions(now=NOW + timedelta(seconds=3)) == 0
-
-    [watch] = store.list_rows("rca_execution_watch")
-    [job] = store.list_rows("rca_delivery_jobs")
-    [effect] = store.list_rows("rca_delivery_effects")
-    [subscription] = store.list_rows("rca_delivery_subscriptions")
-    assert watch["submission_key"] == result.submission_key
-    assert watch["task_id"] is None
-    assert watch["state"] == "delivery_created"
-    assert watch["last_error_code"] == "private_submit_error_with_sensitive_context"
-    assert "SECRET-MUST-NOT-LEAK" in watch["last_error_detail"]
-    assert job["outcome"] == "quarantined"
-    assert job["terminal_state"] == OUTBOX_QUARANTINED_TERMINAL_STATE
-    assert job["terminal_error_code"] == OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE
-    assert job["report_url"] == ""
-    assert json.loads(job["artifacts_json"]) == []
-    assert effect["effect_kind"] == "feishu_issue_comment"
-    assert effect["required"] == 1
-    payload = json.loads(effect["payload_json"])
-    assert payload["error_code"] == OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE
-    assert "private_submit_error" not in effect["payload_json"]
-    assert "SECRET-MUST-NOT-LEAK" not in effect["payload_json"]
-    assert subscription["effect_kind"] == "feishu_issue_comment"
-    assert subscription["status"] == "materialized"
-    assert subscription["effect_key"] == effect["effect_key"]
-    assert all(
-        item["state"] == "closed"
-        for item in store.health(now=NOW + timedelta(seconds=2))[
-            "delivery_dispatcher_circuits"
-        ].values()
-    )
-    assert store.permanent_failure_circuit_state()["consecutive_failures"] == 0
-    after = store.backpressure_snapshot(now=NOW + timedelta(seconds=3))
-    assert after.untracked_completed_submissions == 0
-    assert after.unresolved_effects == 1
-    assert after.unresolved_work == 1
-
-
 def test_current_epoch_pre_w3_quarantine_backfill_is_silent_and_idempotent(
     tmp_path,
 ):
@@ -1784,12 +2171,16 @@ def test_current_epoch_pre_w3_quarantine_backfill_is_silent_and_idempotent(
     )
 
 
-def _current_epoch_valid_w3_quarantined_control(tmp_path):
-    from tests.gateway.test_pnc_rca_control_store import _create_activation_epoch
+def _current_epoch_valid_w3_quarantined_control(
+    tmp_path,
+    *,
+    error_code="internal_submit_failure",
+    error_detail="private submit failure",
+):
     from tests.gateway.test_pnc_rca_w3_snapshot import _admit_manual_w3
 
     control = RcaControlStore(tmp_path / "control.sqlite3")
-    epoch = _create_activation_epoch(control)
+    epoch = _activate_direct_steady(control)
     current = datetime.now(timezone.utc)
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
@@ -1810,11 +2201,47 @@ def _current_epoch_valid_w3_quarantined_control(tmp_path):
     control.quarantine_outbox(
         outbox_id=claim.outbox_id,
         lease_token=claim.lease_token,
-        error_code="internal_submit_failure",
-        error_detail="private submit failure",
+        error_code=error_code,
+        error_detail=error_detail,
         now=current + timedelta(seconds=2),
     )
     return control, current, snapshot
+
+
+def test_quarantined_kafka_outbox_backfills_public_issue_terminal_atomically(
+    tmp_path,
+):
+    control, current, _snapshot = _current_epoch_valid_w3_quarantined_control(
+        tmp_path,
+        error_code="private_submit_error_with_sensitive_context",
+        error_detail="internal bearer SECRET-MUST-NOT-LEAK",
+    )
+    store = RcaDeliveryStore(control.db_path)
+
+    before = store.backpressure_snapshot(now=current + timedelta(seconds=3))
+    assert before.untracked_completed_submissions == 1
+    assert store.backfill_completed_submissions(
+        now=current + timedelta(seconds=3), activation_required=True
+    ) == 1
+    assert store.backfill_completed_submissions(
+        now=current + timedelta(seconds=4), activation_required=True
+    ) == 0
+
+    [watch] = store.list_rows("rca_execution_watch")
+    [job] = store.list_rows("rca_delivery_jobs")
+    effects = store.list_rows("rca_delivery_effects")
+    assert watch["state"] == "delivery_created"
+    assert watch["last_error_code"] == "private_submit_error_with_sensitive_context"
+    assert "SECRET-MUST-NOT-LEAK" in watch["last_error_detail"]
+    assert job["outcome"] == "quarantined"
+    assert job["terminal_state"] == OUTBOX_QUARANTINED_TERMINAL_STATE
+    assert job["terminal_error_code"] == OUTBOX_QUARANTINED_PUBLIC_ERROR_CODE
+    issue_effects = [
+        row for row in effects if row["effect_kind"] == "feishu_issue_comment"
+    ]
+    assert len(issue_effects) == 1
+    assert "private_submit_error" not in issue_effects[0]["payload_json"]
+    assert "SECRET-MUST-NOT-LEAK" not in issue_effects[0]["payload_json"]
 
 
 def test_current_epoch_valid_w3_quarantine_keeps_fenced_terminal_effect(tmp_path):
@@ -1855,10 +2282,8 @@ def test_current_epoch_unsupported_profile_stays_silent_at_outbox(
     tmp_path,
     profile_error_code,
 ):
-    from tests.gateway.test_pnc_rca_control_store import _create_activation_epoch
-
     control = RcaControlStore(tmp_path / "control.sqlite3")
-    epoch = _create_activation_epoch(control, start_offset=20)
+    epoch = _activate_direct_steady(control, start_offset=20)
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
             "UPDATE rca_activation_epochs SET state='steady_active' "
@@ -1871,7 +2296,6 @@ def test_current_epoch_unsupported_profile_stays_silent_at_outbox(
         policy=policy,
         submit_enabled=True,
         activation_required=True,
-        activation_slot_kind="kafka_success",
     )
     assert result.decision == "accepted"
     assert control.list_rows("rca_admission_snapshots") == []
@@ -1889,14 +2313,6 @@ def test_current_epoch_unsupported_profile_stays_silent_at_outbox(
     )
 
     store = RcaDeliveryStore(control.db_path)
-    conn = store._connect()
-    try:
-        quarantine_snapshot_before = quarantine_baseline.quarantine_snapshot(conn)
-        quarantine_events_before = (
-            quarantine_baseline._quarantine_event_projection(conn)
-        )
-    finally:
-        conn.close()
     assert (
         store.backfill_completed_submissions(
             now=NOW + timedelta(seconds=2),
@@ -1917,18 +2333,6 @@ def test_current_epoch_unsupported_profile_stays_silent_at_outbox(
     assert {row["reason"] for row in subscriptions} == {profile_error_code}
     assert all(row["delivery_id"] is None for row in subscriptions)
     assert all(row["effect_key"] is None for row in subscriptions)
-    conn = store._connect()
-    try:
-        assert (
-            quarantine_baseline.quarantine_snapshot(conn)
-            == quarantine_snapshot_before
-        )
-        assert (
-            quarantine_baseline._quarantine_event_projection(conn)
-            == quarantine_events_before
-        )
-    finally:
-        conn.close()
 
 
 def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_path, monkeypatch):
@@ -1937,11 +2341,11 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
         build_profile_terminal_provider_claim,
     )
     from gateway.pnc_rca_write_fence import ExternalWriteFenceError
-    from tests.gateway.test_pnc_rca_control_store import _create_activation_epoch
-
     provider_now = datetime.now(timezone.utc)
     control = RcaControlStore(tmp_path / "control.sqlite3")
-    epoch = _create_activation_epoch(control, start_offset=20)
+    epoch = _activate_direct_steady(
+        control, start_offset=20, now=provider_now
+    )
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
             "UPDATE rca_activation_epochs SET state='steady_active' "
@@ -1954,7 +2358,6 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
         policy=policy,
         submit_enabled=True,
         activation_required=True,
-        activation_slot_kind="kafka_success",
     )
     assert result.decision == "accepted"
     outbox = control.claim_outbox(
@@ -2175,13 +2578,12 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
 
 def test_current_epoch_adapter_pending_terminal_without_w3_is_public(tmp_path):
     from tests.gateway.test_pnc_rca_control_store import (
-        _create_activation_epoch,
         _profile_snapshot_policy,
         _profile_snapshot_record,
     )
 
     control = RcaControlStore(tmp_path / "control.sqlite3")
-    epoch = _create_activation_epoch(control, start_offset=21)
+    epoch = _activate_direct_steady(control, start_offset=21)
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
             "UPDATE rca_activation_epochs SET state='steady_active' "
@@ -2193,7 +2595,6 @@ def test_current_epoch_adapter_pending_terminal_without_w3_is_public(tmp_path):
         policy=_profile_snapshot_policy(),
         submit_enabled=True,
         activation_required=True,
-        activation_slot_kind="kafka_success",
     )
     assert result.decision == "accepted"
     claim = control.claim_outbox(
@@ -2232,13 +2633,12 @@ def test_forged_profile_terminal_observation_is_silent_and_settled(
     tamper_kind,
 ):
     from tests.gateway.test_pnc_rca_control_store import (
-        _create_activation_epoch,
         _profile_snapshot_policy,
         _profile_snapshot_record,
     )
 
     control = RcaControlStore(tmp_path / "control.sqlite3")
-    epoch = _create_activation_epoch(control, start_offset=22)
+    epoch = _activate_direct_steady(control, start_offset=22)
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
             "UPDATE rca_activation_epochs SET state='steady_active' "
@@ -2250,7 +2650,6 @@ def test_forged_profile_terminal_observation_is_silent_and_settled(
         policy=_profile_snapshot_policy(),
         submit_enabled=True,
         activation_required=True,
-        activation_slot_kind="kafka_success",
     )
     assert result.decision == "accepted"
     claim = control.claim_outbox(
@@ -2309,13 +2708,12 @@ def test_forged_profile_terminal_observation_is_silent_and_settled(
 
 def test_invalid_profile_terminal_binding_is_silent_and_settled(tmp_path):
     from tests.gateway.test_pnc_rca_control_store import (
-        _create_activation_epoch,
         _profile_snapshot_policy,
         _profile_snapshot_record,
     )
 
     control = RcaControlStore(tmp_path / "control.sqlite3")
-    epoch = _create_activation_epoch(control, start_offset=22)
+    epoch = _activate_direct_steady(control, start_offset=22)
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
             "UPDATE rca_activation_epochs SET state='steady_active' "
@@ -2327,7 +2725,6 @@ def test_invalid_profile_terminal_binding_is_silent_and_settled(tmp_path):
         policy=_profile_snapshot_policy(),
         submit_enabled=True,
         activation_required=True,
-        activation_slot_kind="kafka_success",
     )
     assert result.decision == "accepted"
     claim = control.claim_outbox(
@@ -2357,90 +2754,6 @@ def test_invalid_profile_terminal_binding_is_silent_and_settled(tmp_path):
         row["status"] for row in store.list_rows("rca_delivery_subscriptions")
     } == {"quarantined"}
 
-    control.transition_activation_epoch(
-        epoch_id=epoch["epoch_id"],
-        expected_state="steady_active",
-        target_state="aborted",
-        operator="delivery-test",
-        reason="prove silent invalid terminal is fully settled before replacement",
-    )
-    replacement = _create_activation_epoch(
-        control,
-        epoch_id="rca-release-after-silent-terminal",
-        start_offset=23,
-        preauthorize=False,
-    )
-    assert replacement["state"] == "safe_off"
-
-
-def test_silent_terminal_without_required_subscriptions_blocks_replacement(
-    tmp_path,
-):
-    from tests.gateway.test_pnc_rca_control_store import (
-        _create_activation_epoch,
-        _profile_snapshot_policy,
-        _profile_snapshot_record,
-    )
-
-    control = RcaControlStore(tmp_path / "control.sqlite3")
-    epoch = _create_activation_epoch(control, start_offset=23)
-    with sqlite3.connect(control.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_activation_epochs SET state='steady_active' "
-            "WHERE epoch_id=? AND is_current=1",
-            (epoch["epoch_id"],),
-        )
-    result = control.ingest_record(
-        _profile_snapshot_record(23, "6841983153"),
-        policy=_profile_snapshot_policy(),
-        submit_enabled=True,
-        activation_required=True,
-        activation_slot_kind="kafka_success",
-    )
-    assert result.decision == "accepted"
-    claim = control.claim_outbox(
-        lease_owner="profile-terminal-missing-subscription-test",
-        now=NOW,
-    )
-    assert claim is not None
-    control.quarantine_outbox(
-        outbox_id=claim.outbox_id,
-        lease_token=claim.lease_token,
-        error_code="business_profile_adapter_not_ready",
-        error_detail="injected mismatched terminal code",
-        now=NOW + timedelta(seconds=1),
-    )
-    store = RcaDeliveryStore(control.db_path)
-    assert store.backfill_completed_submissions(
-        now=NOW + timedelta(seconds=2),
-        activation_required=True,
-    ) == 1
-    with sqlite3.connect(control.db_path) as conn:
-        conn.execute(
-            "DELETE FROM rca_delivery_subscriptions "
-            "WHERE business_key=? AND generation=?",
-            (result.business_key, result.generation),
-        )
-
-    control.transition_activation_epoch(
-        epoch_id=epoch["epoch_id"],
-        expected_state="steady_active",
-        target_state="aborted",
-        operator="delivery-test",
-        reason="prove missing subscription cannot be mistaken for settlement",
-        now=NOW + timedelta(seconds=3),
-    )
-    with pytest.raises(
-        ActivationEpochError,
-        match="activation_bound_delivery_backlog_not_drained",
-    ):
-        _create_activation_epoch(
-            control,
-            epoch_id="rca-release-after-missing-subscriptions",
-            start_offset=24,
-            preauthorize=False,
-        )
-
 
 def test_current_epoch_w3_validator_runtime_error_rolls_back_backfill(
     tmp_path, monkeypatch
@@ -2469,402 +2782,6 @@ def test_current_epoch_w3_validator_runtime_error_rolls_back_backfill(
     assert backpressure.untracked_completed_submissions == 1
     assert backpressure.unresolved_effects == 0
     assert backpressure.unresolved_work == 1
-
-
-def _legacy_pre_w3_pending_effects(tmp_path, *, count=2):
-    results = []
-    control = None
-    for index in range(count):
-        control, result = _control(
-            tmp_path,
-            completed=False,
-            offset=40 + index,
-            issue_id=7041712900 + index,
-        )
-        _quarantine_submission(control)
-        results.append(result)
-    assert control is not None
-    store = RcaDeliveryStore(control.db_path)
-    assert store.backfill_completed_submissions(now=NOW + timedelta(seconds=2)) == count
-    for result in results:
-        _bind_activation_execution(control, result, state="steady_active")
-    with sqlite3.connect(control.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_activation_epochs SET production_fingerprint = ?, "
-            "production_gate_receipt_sha256 = ? WHERE is_current = 1",
-            ("2" * 64, "3" * 64),
-        )
-    store.open_delivery_dispatcher_circuit(
-        reason_code="delivery_permanent_failure_streak_exceeded",
-        reason_detail="pre-W3 fixture circuit",
-        now=NOW + timedelta(seconds=3),
-    )
-    keys = sorted(
-        row["effect_key"] for row in store.list_rows("rca_delivery_effects")
-    )
-    assert len(keys) == count
-    return control, store, keys
-
-
-def _pre_w3_disposition_audit(store, snapshot, tmp_path, *, now):
-    observed = store.db_path.absolute().lstat()
-    receipt_path = (tmp_path / "pre-w3-disposition.json").absolute()
-    parent = receipt_path.parent.lstat()
-    tool_provenance = {
-        "entrypoint_path": str((tmp_path / "dispatcher.py").absolute()),
-        "entrypoint_sha256": "a" * 64,
-        "delivery_store_path": str((tmp_path / "delivery-store.py").absolute()),
-        "delivery_store_sha256": "b" * 64,
-        "receipt_helper_path": str((tmp_path / "receipt-helper.py").absolute()),
-        "receipt_helper_sha256": "c" * 64,
-        "control_store_path": str((tmp_path / "control-store.py").absolute()),
-        "control_store_sha256": "d" * 64,
-        "bootstrap_path": str((tmp_path / "bootstrap.py").absolute()),
-        "bootstrap_sha256": "e" * 64,
-    }
-    plan_id = _pre_w3_disposition_sha256({
-        "before": snapshot["snapshot_sha256"],
-        "destination": str(receipt_path),
-    })
-    disposition_id = _pre_w3_disposition_sha256({"plan_id": plan_id})
-    after = _pre_w3_effect_disposition_after(
-        snapshot,
-        disposition_id=disposition_id,
-        recorded_at=now.isoformat(),
-    )
-    count = len(snapshot["effect_keys"])
-    audit = {
-        "schema_version": PRE_W3_EFFECT_DISPOSITION_SCHEMA_VERSION,
-        "command": PRE_W3_EFFECT_DISPOSITION_COMMAND,
-        "disposition_id": disposition_id,
-        "plan_id": plan_id,
-        "recorded_at": now.isoformat(),
-        "operator": "test-operator",
-        "reason": "dispose exact pre-W3 effects without provider calls",
-        "effect_kind": DELIVERY_EFFECT_KIND,
-        "effect_keys": snapshot["effect_keys"],
-        "effect_set_sha256": snapshot["effect_set_sha256"],
-        "before_snapshot_sha256": snapshot["snapshot_sha256"],
-        "control_db_identity": {
-            "path": str(store.db_path.absolute()),
-            "device": int(observed.st_dev),
-            "inode": int(observed.st_ino),
-            "size": int(observed.st_size),
-            "mtime_ns": int(observed.st_mtime_ns),
-        },
-        "destination_binding": {
-            "path_sha256": hashlib.sha256(
-                str(receipt_path).encode("utf-8")
-            ).hexdigest(),
-            "parent_device": int(parent.st_dev),
-            "parent_inode": int(parent.st_ino),
-        },
-        "backup_binding": {
-            "path": str((tmp_path / "control.before.sqlite3").absolute()),
-            "sha256": "4" * 64,
-            "size_bytes": 4096,
-            "device": 10,
-            "inode": 11,
-            "mtime_ns": 12,
-            "source_path": str(store.db_path.absolute()),
-            "source_sha256": "4" * 64,
-            "source_device": int(observed.st_dev),
-            "source_inode": int(observed.st_ino),
-            "source_size_bytes": int(observed.st_size),
-            "source_mtime_ns": int(observed.st_mtime_ns),
-            "journal_mode": "delete",
-            "quick_check": "ok",
-            "foreign_key_check": "ok",
-            "snapshot_sha256": snapshot["snapshot_sha256"],
-            "effect_set_sha256": snapshot["effect_set_sha256"],
-            "logical_digest_sha256": snapshot["control_db_logical_digest"][
-                "sha256"
-            ],
-        },
-        "active_release_binding": {
-            "path": str((tmp_path / "active-release-binding.json").absolute()),
-            "sha256": "5" * 64,
-            "release_id": "rca-test-release",
-            "bootstrap_epoch_id": "rca-bootstrap-test",
-            "candidate_env_sha256": "6" * 64,
-            "live_env_sha256": "7" * 64,
-            "live_env_matches_candidate": False,
-        },
-        "config_binding_sha256": "8" * 64,
-        "tool_provenance": tool_provenance,
-        "tool_provenance_sha256": _pre_w3_disposition_sha256(tool_provenance),
-        "before": snapshot,
-        "after": after,
-        "effect_delta": {
-            "external_effects_triggered": False,
-            "provider_calls": 0,
-            "control_meta_inserted": 1,
-            "attempt_audits_inserted": count,
-            "effects_updated": count,
-            "jobs_updated": count,
-            "quarantine_audits_inserted": 2 * count,
-            "total_database_rows": 1 + (5 * count),
-        },
-        "external_writes_performed": False,
-        "provider_calls_performed": 0,
-    }
-    audit["receipt_fingerprint"] = _pre_w3_effect_disposition_fingerprint(audit)
-    return audit
-
-
-def test_exact_pre_w3_disposition_is_audited_atomic_and_idempotent(tmp_path):
-    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path)
-    circuit_before = store.delivery_dispatcher_circuit_reset_state()
-    snapshot = store.pre_w3_effect_disposition_snapshot(effect_keys=reversed(keys))
-    audit = _pre_w3_disposition_audit(
-        store,
-        snapshot,
-        tmp_path,
-        now=NOW + timedelta(seconds=4),
-    )
-
-    applied_audit, applied = store.quarantine_pre_w3_effects_with_audit(
-        audit=audit,
-        now=NOW + timedelta(seconds=4),
-    )
-
-    assert applied is True
-    assert applied_audit == audit
-    effects = store.list_rows("rca_delivery_effects")
-    assert [row["effect_key"] for row in effects] != []
-    assert {row["status"] for row in effects} == {"quarantined"}
-    assert {row["write_phase"] for row in effects} == {"settled"}
-    assert {row["attempt"] for row in effects} == {0}
-    assert {row["fence"] for row in effects} == {0}
-    assert all(row["remote_receipt_json"] is None for row in effects)
-    assert {row["status"] for row in store.list_rows("rca_delivery_jobs")} == {
-        "quarantined"
-    }
-    attempts = store.list_rows("rca_delivery_attempts")
-    assert len(attempts) == len(keys)
-    assert {row["outcome"] for row in attempts} == {"quarantined"}
-    assert all(row["request_id"].startswith("pre-w3-disposition:") for row in attempts)
-    assert not any(row["outcome"] == "started" for row in attempts)
-    assert store.delivery_dispatcher_circuit_reset_state() == circuit_before
-    assert store.pre_w3_effect_disposition_audit(audit["disposition_id"]) == audit
-    with sqlite3.connect(store.db_path) as conn:
-        conn.row_factory = sqlite3.Row
-        quarantine_audit = [
-            dict(row)
-            for row in conn.execute(
-                "SELECT * FROM rca_delivery_quarantine_mutation_audit "
-                "ORDER BY audit_id"
-            ).fetchall()
-        ]
-    assert len(quarantine_audit) == 2 * len(keys)
-    assert {row["entity_kind"] for row in quarantine_audit} == {"effect", "job"}
-
-    before_counts = {"rca_delivery_attempts": len(attempts)}
-    before_counts["rca_delivery_quarantine_mutation_audit"] = len(quarantine_audit)
-    repeated, repeated_applied = store.quarantine_pre_w3_effects_with_audit(
-        audit=audit,
-        now=NOW + timedelta(seconds=4),
-    )
-    assert repeated == audit
-    assert repeated_applied is False
-    with sqlite3.connect(store.db_path) as conn:
-        audit_count = conn.execute(
-            "SELECT COUNT(*) FROM rca_delivery_quarantine_mutation_audit"
-        ).fetchone()[0]
-    assert before_counts == {
-        "rca_delivery_attempts": len(store.list_rows("rca_delivery_attempts")),
-        "rca_delivery_quarantine_mutation_audit": audit_count,
-    }
-
-
-def test_exact_pre_w3_disposition_rolls_back_every_row_on_mid_batch_failure(
-    tmp_path, monkeypatch
-):
-    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path)
-    snapshot = store.pre_w3_effect_disposition_snapshot(effect_keys=keys)
-    audit = _pre_w3_disposition_audit(
-        store,
-        snapshot,
-        tmp_path,
-        now=NOW + timedelta(seconds=4),
-    )
-    original = store._aggregate_job_status
-    calls = 0
-
-    def fail_second(conn, delivery_id, current):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise RuntimeError("injected_pre_w3_batch_failure")
-        return original(conn, delivery_id, current)
-
-    monkeypatch.setattr(store, "_aggregate_job_status", fail_second)
-    with pytest.raises(RuntimeError, match="injected_pre_w3_batch_failure"):
-        store.quarantine_pre_w3_effects_with_audit(
-            audit=audit,
-            now=NOW + timedelta(seconds=4),
-        )
-
-    assert {row["status"] for row in store.list_rows("rca_delivery_effects")} == {
-        "pending"
-    }
-    assert {row["status"] for row in store.list_rows("rca_delivery_jobs")} == {
-        "ready"
-    }
-    assert store.list_rows("rca_delivery_attempts") == []
-    with sqlite3.connect(store.db_path) as conn:
-        assert conn.execute(
-            "SELECT COUNT(*) FROM rca_delivery_quarantine_mutation_audit"
-        ).fetchone()[0] == 0
-    assert store.pre_w3_effect_disposition_audit(audit["disposition_id"]) is None
-
-
-def test_exact_pre_w3_disposition_rejects_row_drift_before_mutation(tmp_path):
-    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
-    snapshot = store.pre_w3_effect_disposition_snapshot(effect_keys=keys)
-    audit = _pre_w3_disposition_audit(
-        store,
-        snapshot,
-        tmp_path,
-        now=NOW + timedelta(seconds=4),
-    )
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_delivery_effects SET last_error_detail = 'drifted' "
-            "WHERE effect_key = ?",
-            (keys[0],),
-        )
-
-    with pytest.raises(
-        DeliveryRecordConflictError,
-        match="effect_not_eligible|before_changed|logical_state_changed",
-    ):
-        store.quarantine_pre_w3_effects_with_audit(
-            audit=audit,
-            now=NOW + timedelta(seconds=4),
-        )
-    assert store.list_rows("rca_delivery_attempts") == []
-    assert store.pre_w3_effect_disposition_audit(audit["disposition_id"]) is None
-
-
-def test_manual_quarantined_backfill_rolls_back_then_materializes_issue_and_topic(
-    tmp_path, monkeypatch
-):
-    control, _result = _control(tmp_path, completed=False)
-    control.admit_manual_trigger(
-        _manual_request("om_manual_origin"),
-        allowed_chat_ids={"oc_group123"},
-        submit_enabled=True,
-    )
-    _quarantine_submission(control)
-    store = RcaDeliveryStore(tmp_path / "control.sqlite3")
-    original = store._materialize_delivery_subscriptions_in_transaction
-
-    def crash(*_args, **_kwargs):
-        raise RuntimeError("simulated quarantined backfill crash")
-
-    monkeypatch.setattr(
-        store, "_materialize_delivery_subscriptions_in_transaction", crash
-    )
-    with pytest.raises(RuntimeError, match="simulated quarantined backfill crash"):
-        store.backfill_completed_submissions(now=NOW + timedelta(seconds=2))
-    assert store.list_rows("rca_execution_watch") == []
-    assert store.list_rows("rca_delivery_jobs") == []
-    assert store.list_rows("rca_delivery_effects") == []
-    assert {row["status"] for row in store.list_rows("rca_delivery_subscriptions")} == {
-        "pending"
-    }
-
-    monkeypatch.setattr(
-        store, "_materialize_delivery_subscriptions_in_transaction", original
-    )
-    assert store.backfill_completed_submissions(now=NOW + timedelta(seconds=3)) == 1
-    assert store.backfill_completed_submissions(now=NOW + timedelta(seconds=4)) == 0
-    effects = store.list_rows("rca_delivery_effects")
-    assert {row["effect_kind"] for row in effects} == {
-        "feishu_issue_comment",
-        "feishu_thread_reply",
-    }
-    assert {row["status"] for row in effects} == {"pending"}
-    assert {row["status"] for row in store.list_rows("rca_delivery_subscriptions")} == {
-        "materialized"
-    }
-    assert all("SECRET-MUST-NOT-LEAK" not in row["payload_json"] for row in effects)
-
-
-def test_quarantined_manual_rerun_waits_for_all_required_effects_to_settle(
-    tmp_path,
-):
-    control, _result = _control(tmp_path, completed=False)
-    control.admit_manual_trigger(
-        _manual_request("om_settlement_origin"),
-        allowed_chat_ids={"oc_group123"},
-        submit_enabled=True,
-    )
-    _quarantine_submission(control)
-    store = RcaDeliveryStore(tmp_path / "control.sqlite3")
-    assert store.backfill_completed_submissions(now=NOW + timedelta(seconds=2)) == 1
-
-    pending = control.admit_manual_trigger(
-        _manual_request(
-            "om_pending_rerun", mode="rerun", thread_root="om_pending_rerun_root"
-        ),
-        allowed_chat_ids={"oc_group123"},
-        submit_enabled=True,
-        operator_authorized=True,
-        operator_rate_limit=10,
-    )
-    assert pending.generation == 1
-    store.materialize_pending_subscriptions(now=NOW + timedelta(seconds=3))
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute("UPDATE rca_delivery_effects SET status = 'succeeded'")
-        conn.execute(
-            "UPDATE rca_delivery_effects SET status = 'uncertain' "
-            "WHERE effect_kind = 'feishu_thread_reply' AND rowid = ("
-            "SELECT MIN(rowid) FROM rca_delivery_effects "
-            "WHERE effect_kind = 'feishu_thread_reply')"
-        )
-        conn.execute("UPDATE rca_delivery_jobs SET status = 'ready'")
-
-    uncertain = control.admit_manual_trigger(
-        _manual_request(
-            "om_uncertain_debug", mode="debug", thread_root="om_uncertain_debug_root"
-        ),
-        allowed_chat_ids={"oc_group123"},
-        submit_enabled=True,
-        operator_authorized=True,
-        operator_rate_limit=10,
-    )
-    assert uncertain.generation == 1
-    store.materialize_pending_subscriptions(now=NOW + timedelta(seconds=4))
-    conn = store._connect()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute("UPDATE rca_delivery_effects SET status = 'succeeded'")
-        [delivery_id] = [
-            row["delivery_id"] for row in store.list_rows("rca_delivery_jobs")
-        ]
-        store._aggregate_job_status(
-            conn,
-            delivery_id,
-            (NOW + timedelta(seconds=5)).isoformat(),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    settled = control.admit_manual_trigger(
-        _manual_request(
-            "om_settled_rerun", mode="rerun", thread_root="om_settled_rerun_root"
-        ),
-        allowed_chat_ids={"oc_group123"},
-        submit_enabled=True,
-        operator_authorized=True,
-        operator_rate_limit=10,
-    )
-    assert settled.outcome == "created"
-    assert settled.generation == 2
-    assert len(control.list_rows("rca_outbox")) == 2
 
 
 def test_v4_watch_schema_migrates_task_id_to_nullable(tmp_path):
@@ -2987,7 +2904,6 @@ def test_delivery_health_keeps_historical_quarantine_diagnostic_only(tmp_path):
         "quarantined_jobs",
         "quarantined_effects",
         "quarantined_subscriptions",
-        "quarantine_baseline_invalid",
     } & health["production_blockers"].keys()
     assert health["business_ready"] is True
 
@@ -3015,7 +2931,7 @@ def test_activation_health_does_not_block_on_historical_uncertain_effect(tmp_pat
         conn.execute("UPDATE rca_delivery_effects SET status = 'uncertain'")
 
     legacy_health = store.health(now=NOW)
-    assert legacy_health["activation"]["required"] is False
+    assert legacy_health["activation"]["required"] is True
     assert legacy_health["business_blockers"]["uncertain_effects"] == 1
     assert legacy_health["business_ready"] is False
 
@@ -3881,73 +3797,44 @@ def test_forged_activation_deferred_error_does_not_suppress_backfill(tmp_path):
 
     assert store.backfill_completed_submissions(now=NOW) == 1
     assert len(store.list_rows("rca_execution_watch")) == 1
-    assert len(store.list_rows("rca_delivery_jobs")) == 1
-    assert len(store.list_rows("rca_delivery_effects")) == 1
+    assert store.list_rows("rca_delivery_jobs") == []
+    assert store.list_rows("rca_delivery_effects") == []
 
 
 def test_audited_activation_deferral_is_never_backfilled_into_delivery(tmp_path):
     control, result = _control(tmp_path, completed=False)
-    control.create_activation_epoch(
-        epoch_id="delivery-epoch-1",
-        preauthorization_fingerprint="a" * 64,
-        preauthorization_gate_receipt_sha256="b" * 64,
-        preauthorization_capsule_sha256="c" * 64,
-        config_sha256="d" * 64,
-        db_logical_identity={"database": "delivery-test"},
-        partition_start_fence={TOPIC: {"2": 11}},
-        operator="delivery-test",
-        reason="create exact deferral fixture",
-        now=NOW,
-    )
     with sqlite3.connect(control.db_path) as conn:
-        ledger = conn.execute(
+        row = conn.execute(
             """
-            INSERT INTO rca_activation_admission_ledger(
-                epoch_id, admission_key, entrypoint, source_kind,
-                source_identity_sha256, slot_kind, decision, reason,
-                business_key, submission_key, generation,
-                first_adjudicated_at, last_adjudicated_at,
-                admitted_at, bound_at
-            ) VALUES (
-                'delivery-epoch-1', 'exact-kafka-deferral',
-                'kafka_ingest', 'kafka', ?, 'kafka_success', 'admit',
-                'exact_test_admit', ?, ?, ?, ?, ?, ?, ?
-            )
+            SELECT outbox_id, source_event_id, activation_epoch_id,
+                   activation_ledger_id
+              FROM rca_outbox
+             WHERE submission_key = ?
             """,
-            (
-                "e" * 64,
-                result.business_key,
-                result.submission_key,
-                result.generation,
-                NOW.isoformat(),
-                NOW.isoformat(),
-                NOW.isoformat(),
-                NOW.isoformat(),
-            ),
-        )
-        assert ledger.lastrowid is not None
+            (result.submission_key,),
+        ).fetchone()
+        assert row is not None
+        assert row[2] == "delivery-epoch-1"
+        assert row[3] is not None
         conn.execute(
-            "UPDATE business_triggers SET activation_epoch_id=?, "
-            "activation_ledger_id=? WHERE submission_key=?",
-            ("delivery-epoch-1", ledger.lastrowid, result.submission_key),
+            "UPDATE rca_outbox SET status = 'quarantined', quarantined_at = ?, "
+            "last_error_code = 'activation_epoch_deferred', "
+            "last_error_detail = 'exact operator-reviewed activation deferral', "
+            "updated_at = ? WHERE outbox_id = ?",
+            (NOW.isoformat(), NOW.isoformat(), row[0]),
         )
         conn.execute(
-            "UPDATE rca_outbox SET activation_epoch_id=?, "
-            "activation_ledger_id=? WHERE submission_key=?",
-            ("delivery-epoch-1", ledger.lastrowid, result.submission_key),
+            """
+            INSERT INTO rca_shadow_promotion_audit(
+                event_uid, outbox_id, submission_key, operator, reason,
+                outcome, from_status, to_status, detail, created_at
+            ) VALUES (?, ?, ?, 'delivery-test',
+                      'exact audited deferral must remain local-only',
+                      'deferred', 'pending', 'quarantined',
+                      'exact activation item deferred for reviewed manual recovery', ?)
+            """,
+            (str(row[1]), int(row[0]), result.submission_key, NOW.isoformat()),
         )
-    with sqlite3.connect(control.db_path) as conn:
-        source_event_id = str(
-            conn.execute("SELECT source_event_id FROM rca_outbox").fetchone()[0]
-        )
-    assert source_event_id
-    control.defer_activation_event(
-        source_event_id,
-        expected_activation_epoch_id="delivery-epoch-1",
-        operator="delivery-test",
-        reason="exact audited deferral must remain local-only",
-        now=NOW + timedelta(seconds=1),
-    )
     store = RcaDeliveryStore(control.db_path)
 
     assert store.backfill_completed_submissions(now=NOW + timedelta(seconds=2)) == 0
@@ -3956,12 +3843,12 @@ def test_audited_activation_deferral_is_never_backfilled_into_delivery(tmp_path)
     assert store.list_rows("rca_delivery_effects") == []
 
 
-def test_legacy_flag_bypasses_only_when_no_current_epoch_exists(tmp_path):
+def test_activation_is_required_even_when_caller_uses_legacy_flag(tmp_path):
     _control(tmp_path)
     store = RcaDeliveryStore(tmp_path / "control.sqlite3")
 
     assert store.backfill_completed_submissions(now=NOW) == 1
-    assert store.health(now=NOW)["activation"]["required"] is False
+    assert store.health(now=NOW)["activation"]["required"] is True
 
 
 def test_confirmed_epoch_keeps_delivery_held_until_steady_active(tmp_path):
@@ -3975,57 +3862,6 @@ def test_confirmed_epoch_keeps_delivery_held_until_steady_active(tmp_path):
     assert activation["processing_enabled"] is False
     assert activation["eligible_counts"]["completed_submissions"] == 0
     assert activation["held_current_counts"]["completed_submissions"] == 1
-
-
-def test_bounded_activation_allows_exact_execution_and_reuses_one_budget_slot(
-    tmp_path,
-):
-    control, result = _control(tmp_path)
-    ledger_id = _bind_activation_execution(control, result, state="bounded_active")
-    store = RcaDeliveryStore(control.db_path)
-    assert store.backfill_completed_submissions(now=NOW, activation_required=True) == 1
-    claim = store.claim_due_watch(
-        lease_owner="activation-collector",
-        now=NOW,
-        activation_required=True,
-    )
-    assert claim is not None
-    _install_subscription_table(store)
-    _insert_subscription(store, claim, effect_kind="feishu_thread_reply")
-    store.create_delivery(
-        claim=claim,
-        delivery=_delivery(claim),
-        status={"success": True, "state": "completed"},
-        now=NOW,
-        activation_required=True,
-    )
-
-    first = store.claim_due_effect(
-        lease_owner="activation-dispatcher-1",
-        now=NOW,
-        activation_required=True,
-    )
-    second = store.claim_due_effect(
-        lease_owner="activation-dispatcher-2",
-        now=NOW,
-        activation_required=True,
-    )
-    assert first is not None and second is not None
-    assert {first.effect_kind, second.effect_kind} == {
-        "feishu_issue_comment",
-        "feishu_thread_reply",
-    }
-    with sqlite3.connect(control.db_path) as conn:
-        consumed = conn.execute(
-            "SELECT consumed_ledger_id FROM rca_activation_budget_slots "
-            "WHERE epoch_id = 'delivery-epoch-1' "
-            "AND slot_kind = 'kafka_success'"
-        ).fetchone()[0]
-        ledger_count = conn.execute(
-            "SELECT COUNT(*) FROM rca_activation_admission_ledger"
-        ).fetchone()[0]
-    assert consumed == ledger_id
-    assert ledger_count == 1
 
 
 def test_fully_settled_issue_only_delivery_allows_activation_replacement(tmp_path):
@@ -4060,27 +3896,29 @@ def test_fully_settled_issue_only_delivery_allows_activation_replacement(tmp_pat
     )
     assert store.list_rows("rca_delivery_jobs")[0]["status"] == "delivered"
 
-    control.transition_activation_epoch(
-        epoch_id="delivery-epoch-1",
-        expected_state="steady_active",
-        target_state="aborted",
-        operator="delivery-test",
-        reason="replace only after the issue-only effect is settled",
-        now=NOW + timedelta(seconds=3),
-    )
-    replacement = control.create_activation_epoch(
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    assert predecessor["epoch_id"] == "delivery-epoch-1"
+    assert predecessor["state"] == "steady_active"
+    assert predecessor["inflight"]["total"] == 0
+    replacement = control.activate_direct_steady_epoch(
         epoch_id="delivery-epoch-issue-only-successor",
-        preauthorization_fingerprint="7" * 64,
-        preauthorization_gate_receipt_sha256="8" * 64,
-        preauthorization_capsule_sha256="9" * 64,
+        release_fingerprint="7" * 64,
+        release_binding_sha256="8" * 64,
         config_sha256="a" * 64,
         db_logical_identity={"database": "delivery-test"},
         partition_start_fence={TOPIC: {"2": 11}},
         operator="delivery-test",
         reason="issue-only delivery settlement permits replacement",
+        expected_predecessor_epoch_id=predecessor["epoch_id"],
+        expected_predecessor_state=predecessor["state"],
+        expected_predecessor_binding_fingerprint=predecessor[
+            "binding_fingerprint"
+        ],
         now=NOW + timedelta(seconds=4),
     )
-    assert replacement["state"] == "safe_off"
+    assert replacement["state"] == "steady_active"
+    assert control.activation_epoch()["epoch_id"] == replacement["epoch_id"]
 
 
 def _claimed_activation_effect(tmp_path):
@@ -4371,7 +4209,7 @@ def test_activation_backpressure_fails_closed_without_activation_schema(tmp_path
     _bind_activation_execution(control, result, state="steady_active")
     store = RcaDeliveryStore(control.db_path)
     with sqlite3.connect(control.db_path) as conn:
-        conn.execute("DROP TABLE rca_activation_budget_slots")
+        conn.execute("DROP TABLE rca_activation_admission_ledger")
 
     with pytest.raises(RuntimeError, match="delivery_activation_schema_unavailable"):
         store.backpressure_snapshot(now=NOW)
@@ -4403,119 +4241,3 @@ def test_activation_required_concurrent_backfill_and_claim_are_exactly_once(
     with ThreadPoolExecutor(max_workers=2) as pool:
         claims = list(pool.map(claim, range(2)))
     assert sum(item is not None for item in claims) == 1
-
-
-def test_capacity_sample_candidates_are_bounded_read_only_snapshots(tmp_path):
-    _control(tmp_path)
-    store = RcaDeliveryStore(tmp_path / "control.sqlite3")
-    assert store.backfill_completed_submissions(now=NOW) == 1
-    watch = store.claim_due_watch(lease_owner="collector", now=NOW)
-    assert watch is not None
-    store.create_delivery(
-        claim=watch,
-        delivery=_delivery(watch),
-        status={
-            "success": True,
-            "state": "completed",
-            "meta": {"rca_prod_attempt_id": "attempt-bootstrap-1"},
-        },
-        now=NOW,
-    )
-    effect = store.claim_due_effect(
-        lease_owner="dispatcher", now=NOW + timedelta(seconds=1)
-    )
-    assert effect is not None
-    store.complete_effect(
-        claim=effect,
-        outcome="ack",
-        remote_id="comment-1",
-        receipt={"remote_id": "comment-1", "request_id": effect.request_id},
-        observation=_delivery_observation(
-            effect, remote_receipt_id="comment-1"
-        ),
-        now=NOW + timedelta(seconds=2),
-    )
-
-    assert (
-        store.capacity_sample_candidates(
-            activated_at=NOW - timedelta(seconds=1), limit=1
-        )
-        == []
-    )
-    with sqlite3.connect(store.db_path) as conn:
-        row = conn.execute(
-            "SELECT last_status_json FROM rca_execution_watch WHERE task_id = ?",
-            (watch.task_id,),
-        ).fetchone()
-        assert row is not None
-        status = json.loads(row[0])
-        status["meta"]["rca_prod_capacity_sample_eligible"] = True
-        conn.execute(
-            "UPDATE rca_execution_watch SET last_status_json = ? WHERE task_id = ?",
-            (
-                json.dumps(status, sort_keys=True, separators=(",", ":")),
-                watch.task_id,
-            ),
-        )
-
-    snapshots = store.capacity_sample_candidates(
-        activated_at=NOW - timedelta(seconds=1), limit=1
-    )
-    assert len(snapshots) == 1
-    snapshot = snapshots[0]
-    assert snapshot.payload["task_id"] == watch.task_id
-    assert snapshot.payload["attempt_id"] == "attempt-bootstrap-1"
-    assert snapshot.payload["source_kind"] == "kafka_workflow_event"
-    assert snapshot.payload["job"]["status"] == "delivered"
-    assert snapshot.payload["effects"][0]["status"] == "succeeded"
-    assert snapshot.payload["effects"][0]["remote_id"] == "comment-1"
-    assert snapshot.payload["effects"][0]["remote_receipt"] == {
-        "remote_id": "comment-1",
-        "request_id": effect.request_id,
-    }
-    assert (
-        snapshot.snapshot_sha256
-        == hashlib.sha256(
-            json.dumps(
-                snapshot.payload,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
-    )
-    assert (
-        store.capacity_sample_candidates(
-            activated_at=NOW - timedelta(seconds=1),
-            limit=1,
-            excluded_task_attempts={(watch.task_id, "attempt-bootstrap-1")},
-        )
-        == []
-    )
-
-
-def test_capacity_sample_candidates_ignore_pre_activation_and_failures(tmp_path):
-    _control(tmp_path)
-    store = RcaDeliveryStore(tmp_path / "control.sqlite3")
-    store.backfill_completed_submissions(now=NOW)
-    watch = store.claim_due_watch(lease_owner="collector", now=NOW)
-    assert watch is not None
-    store.create_delivery(
-        claim=watch,
-        delivery=_delivery(watch),
-        status={
-            "success": True,
-            "state": "completed",
-            "meta": {
-                "rca_prod_attempt_id": "attempt-bootstrap-1",
-                "rca_prod_capacity_sample_eligible": True,
-            },
-        },
-        now=NOW,
-    )
-    assert (
-        store.capacity_sample_candidates(
-            activated_at=NOW + timedelta(seconds=1), limit=1
-        )
-        == []
-    )

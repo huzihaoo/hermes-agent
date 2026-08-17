@@ -4975,7 +4975,7 @@ def _relay_live_fence_binding(fence: Mapping[str, Any]) -> dict[str, Any]:
         conn.close()
     if row is None or int(row["is_current"]) != 1:
         raise ExternalWriteFenceError("external_write_fence_epoch_not_current")
-    if str(row["state"]) not in {"bounded_active", "steady_active"}:
+    if str(row["state"]) != "steady_active":
         raise ExternalWriteFenceError("external_write_fence_epoch_not_current")
     if str(row["decision"]) != "admit" or not row["bound_at"]:
         raise ExternalWriteFenceError("external_write_fence_operation_denied")

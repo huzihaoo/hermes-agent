@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import signal
 import socket
 import sqlite3
@@ -31,23 +32,6 @@ from gateway.pnc_rca_admission import (
     build_rca_admission,
     validate_rca_admission,
     validate_rca_trigger_context,
-)
-from gateway import pnc_rca_capacity_transition as capacity_transition
-from gateway.pnc_rca_capacity_runtime import (
-    CapacityRuntimePaths,
-    load_capacity_hmac_key,
-)
-from gateway.pnc_rca_capacity_sample_evidence import (
-    CapacitySampleEvidenceError,
-    TERMINAL_HMAC_ENV,
-    build_capacity_sample,
-    ensure_owner_only_lock_file,
-    host_success_receipt_path,
-    producer_activation_path,
-    read_and_validate_producer_activation,
-    read_remote_vm_terminal_receipt,
-    validate_host_success_receipt,
-    write_owner_only_create_once,
 )
 from gateway.pnc_rca_control_store import RcaControlStore, RecordConflictError
 from gateway.pnc_rca_delivery_contract import (
@@ -136,6 +120,20 @@ ARTIFACT_READ_LEASE_MARGIN_SECONDS = 15
 MAX_HEALTH_HEARTBEAT_INTERVAL_SECONDS = 15.0
 MAX_FAILURE_RECEIPT_BYTES = 256 * 1024
 FAILURE_RECEIPT_SCHEMA_VERSION = "g1q3_rca_service_result_v2"
+VM_EXECUTION_IDENTITY_EVIDENCE_SCHEMA_VERSION = (
+    "pnc_rca_vm_execution_identity_evidence_v1"
+)
+EXECUTION_IDENTITY_READBACK_SCHEMA_VERSION = "pnc_rca_execution_identity_readback_v1"
+REMOTE_SHARED_STATE_ROOT = "/home/mini/.hermes/shared-state"
+REMOTE_WORKER_REPO_ROOT = "/home/mini/.hermes/worker-state"
+REMOTE_REPORT_RUNTIME_MANIFEST_PATH = (
+    "/home/mini/.config/g1q3-rca/report-runtime-manifest.json"
+)
+REMOTE_WORKER_ENTRYPOINT_RELATIVE = "vm_coding_worker_v2.py"
+REMOTE_PIPELINE_ENTRYPOINT_RELATIVE = (
+    "api/g1q3_rca/scripts/run_rca_service_request.py"
+)
+REMOTE_REPORT_ENTRYPOINT_RELATIVE = "api/g1q3_rca/scripts/serve_rca_reports.py"
 INFRA_REMEDIATION_SCHEMA_VERSION = "pnc_rca_infra_remediation_receipt_v1"
 MAX_INFRA_REMEDIATION_SECONDS = 10
 _EVENTUAL_ARTIFACT_CODES = frozenset({
@@ -201,7 +199,6 @@ InfraRemediationRunner = Callable[
     [ExecutionWatchClaim, Mapping[str, Any], Mapping[str, Any], int],
     Mapping[str, Any],
 ]
-TerminalReceiptReader = Callable[[str, str], bytes]
 
 
 def _utc_now() -> datetime:
@@ -446,10 +443,6 @@ class CollectorConfig:
     release_epoch_id: str = ""
     release_fingerprint_sha256: str = ""
     release_note_sha256: str = ""
-    capacity_sample_enabled: bool = False
-    capacity_sample_batch_size: int = 20
-    capacity_sample_lock_timeout_seconds: int = 5
-    capacity_terminal_receipt_timeout_seconds: int = 15
     w3_snapshot_read_mode: str = "legacy"
     w3_snapshot_authority: W3SnapshotAuthority | None = None
 
@@ -463,13 +456,6 @@ class CollectorConfig:
         source = os.environ if env is None else env
         home = Path(hermes_home or get_hermes_home()).expanduser()
         enabled = _boolean(source, f"{ENV_PREFIX}ENABLED", False)
-        capacity_sample_enabled = _strict_boolean(
-            source, f"{ENV_PREFIX}CAPACITY_SAMPLE_ENABLED", False
-        )
-        if capacity_sample_enabled and not enabled:
-            raise ValueError(
-                f"{ENV_PREFIX}CAPACITY_SAMPLE_ENABLED requires collector ENABLED"
-            )
         poll = _integer(source, f"{ENV_PREFIX}POLL_INTERVAL_SECONDS", 5)
         running_poll = _integer(source, f"{ENV_PREFIX}RUNNING_POLL_SECONDS", 20)
         max_poll = _integer(source, f"{ENV_PREFIX}MAX_POLL_SECONDS", 300)
@@ -497,27 +483,6 @@ class CollectorConfig:
             raise ValueError(
                 f"{ENV_PREFIX}LEASE_SECONDS must exceed "
                 "ARTIFACT_READ_TIMEOUT_SECONDS plus the lease margin"
-            )
-        capacity_batch = _integer(
-            source,
-            f"{ENV_PREFIX}CAPACITY_SAMPLE_BATCH_SIZE",
-            20,
-            minimum=1,
-        )
-        if capacity_batch > 100:
-            raise ValueError(
-                f"{ENV_PREFIX}CAPACITY_SAMPLE_BATCH_SIZE must be at most 100"
-            )
-        terminal_receipt_timeout = _integer(
-            source,
-            f"{ENV_PREFIX}CAPACITY_TERMINAL_RECEIPT_TIMEOUT_SECONDS",
-            15,
-            minimum=1,
-        )
-        if terminal_receipt_timeout > 30:
-            raise ValueError(
-                f"{ENV_PREFIX}CAPACITY_TERMINAL_RECEIPT_TIMEOUT_SECONDS "
-                "must be at most 30"
             )
         control_db_path = Path(
             source.get(
@@ -591,15 +556,6 @@ class CollectorConfig:
             release_env_path=Path(
                 str(source.get(f"{ENV_PREFIX}ENV_FILE", home / ".env") or "")
             ).expanduser(),
-            capacity_sample_enabled=capacity_sample_enabled,
-            capacity_sample_batch_size=capacity_batch,
-            capacity_sample_lock_timeout_seconds=_integer(
-                source,
-                f"{ENV_PREFIX}CAPACITY_SAMPLE_LOCK_TIMEOUT_SECONDS",
-                5,
-                minimum=1,
-            ),
-            capacity_terminal_receipt_timeout_seconds=terminal_receipt_timeout,
             w3_snapshot_read_mode=w3_snapshot_read_mode,
             w3_snapshot_authority=w3_snapshot_authority,
         )
@@ -639,14 +595,6 @@ class CollectorConfig:
             ),
             "failure_route_outlet_max_attempts": (
                 self.failure_route_outlet_max_attempts
-            ),
-            "capacity_sample_enabled": self.capacity_sample_enabled,
-            "capacity_sample_batch_size": self.capacity_sample_batch_size,
-            "capacity_sample_lock_timeout_seconds": (
-                self.capacity_sample_lock_timeout_seconds
-            ),
-            "capacity_terminal_receipt_timeout_seconds": (
-                self.capacity_terminal_receipt_timeout_seconds
             ),
             "remote_css_parser": {
                 **expected_remote_css_runtime_dependency(),
@@ -703,12 +651,6 @@ class CollectorStats:
     internal_outlet_errors: int = 0
     taxonomy_gaps: int = 0
     terminal_fallbacks: int = 0
-    capacity_scanned: int = 0
-    capacity_eligible: int = 0
-    capacity_appended: int = 0
-    capacity_rejected: int = 0
-    capacity_frozen: int = 0
-    capacity_last_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -961,6 +903,7 @@ def _remote_bundle_script(submission_key: str) -> str:
         import os
         import posixpath
         import stat
+        import subprocess
         from html.parser import HTMLParser
         from importlib import metadata
         from urllib.parse import unquote, urlsplit
@@ -971,6 +914,20 @@ def _remote_bundle_script(submission_key: str) -> str:
             tinycss2 = None
 
         ROOT = {root!r}
+        TASK_ID = {submission_key!r}
+        SHARED_STATE_ROOT = {REMOTE_SHARED_STATE_ROOT!r}
+        WORKER_RESULT_PATH = posixpath.join(
+            SHARED_STATE_ROOT, 'tasks', TASK_ID, 'result.md'
+        )
+        WORKER_REPO_ROOT = {REMOTE_WORKER_REPO_ROOT!r}
+        WORKER_ENTRYPOINT_PATH = posixpath.join(
+            WORKER_REPO_ROOT, {REMOTE_WORKER_ENTRYPOINT_RELATIVE!r}
+        )
+        SERVICE_RECEIPT_PATH = ROOT + 'rca_service_result.json'
+        REPORT_MANIFEST_PATH = {REMOTE_REPORT_RUNTIME_MANIFEST_PATH!r}
+        REPORT_MANIFEST_ROOT = posixpath.dirname(REPORT_MANIFEST_PATH)
+        PIPELINE_ENTRYPOINT_RELATIVE = {REMOTE_PIPELINE_ENTRYPOINT_RELATIVE!r}
+        REPORT_ENTRYPOINT_RELATIVE = {REMOTE_REPORT_ENTRYPOINT_RELATIVE!r}
         MAX_JSON_BYTES = 8 * 1024 * 1024
         MAX_ARTIFACTS = 512
         MAX_FILE_BYTES = 256 * 1024 * 1024
@@ -1083,6 +1040,458 @@ def _remote_bundle_script(submission_key: str) -> str:
                 raise RuntimeError(changed_code)
             finally:
                 os.close(fd)
+
+        def read_stable_bytes(
+            path, missing_code, anchor=None, max_bytes=MAX_JSON_BYTES
+        ):
+            fd, info = open_regular(path, missing_code, max_bytes, anchor)
+            changed_code = (
+                missing_code.replace('_missing', '') + '_changed_during_read'
+            )
+            raw_buffer = bytearray()
+            try:
+                while len(raw_buffer) <= max_bytes:
+                    chunk = os.read(
+                        fd,
+                        min(1024 * 1024, max_bytes + 1 - len(raw_buffer)),
+                    )
+                    if not chunk:
+                        break
+                    raw_buffer.extend(chunk)
+                if len(raw_buffer) > max_bytes:
+                    raise RuntimeError(
+                        changed_code.replace('_changed_during_read', '')
+                        + '_size_invalid'
+                    )
+                stable_after = os.fstat(fd=fd)
+                try:
+                    current = os.lstat(path)
+                except FileNotFoundError:
+                    raise RuntimeError(changed_code)
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or info.st_dev != stable_after.st_dev
+                    or info.st_ino != stable_after.st_ino
+                    or info.st_size != stable_after.st_size
+                    or info.st_mtime_ns != stable_after.st_mtime_ns
+                    or info.st_ctime_ns != stable_after.st_ctime_ns
+                    or current.st_dev != stable_after.st_dev
+                    or current.st_ino != stable_after.st_ino
+                    or current.st_size != stable_after.st_size
+                    or current.st_mtime_ns != stable_after.st_mtime_ns
+                    or current.st_ctime_ns != stable_after.st_ctime_ns
+                    or len(raw_buffer) != stable_after.st_size
+                ):
+                    raise RuntimeError(changed_code)
+                raw = bytes(raw_buffer)
+            except OSError:
+                raise RuntimeError(changed_code)
+            finally:
+                os.close(fd)
+            return raw, hashlib.sha256(raw).hexdigest()
+
+        def read_stable_json(path, missing_code, anchor=None):
+            raw, raw_sha256 = read_stable_bytes(
+                path, missing_code, anchor
+            )
+            try:
+                value = json.loads(raw.decode('utf-8'))
+            except Exception:
+                raise RuntimeError(missing_code.replace('_missing', '') + '_json_invalid')
+            if not isinstance(value, dict):
+                raise RuntimeError(missing_code.replace('_missing', '') + '_json_invalid')
+            return value, raw_sha256
+
+        def read_worker_result():
+            raw, raw_sha256 = read_stable_bytes(
+                WORKER_RESULT_PATH,
+                'worker_terminal_receipt_missing',
+                SHARED_STATE_ROOT,
+            )
+            marker = b'\\n## Result JSON\\n\\n```json\\n'
+            closing = b'\\n```\\n'
+            heading = ('# Result: ' + TASK_ID + '\\n').encode('utf-8')
+            if (
+                not raw.startswith(heading)
+                or raw.count(marker) != 1
+                or not raw.endswith(closing)
+            ):
+                raise RuntimeError('worker_terminal_receipt_envelope_invalid')
+            encoded = raw.split(marker, 1)[1][:-len(closing)]
+            try:
+                value = json.loads(encoded.decode('utf-8'))
+            except Exception:
+                raise RuntimeError('worker_terminal_receipt_json_invalid')
+            if not isinstance(value, dict):
+                raise RuntimeError('worker_terminal_receipt_json_invalid')
+            return value, raw_sha256
+
+        def require_hex(value, length, code):
+            text = str(value or '').strip().lower()
+            if (
+                len(text) != length
+                or text == '0' * length
+                or any(char not in '0123456789abcdef' for char in text)
+            ):
+                raise RuntimeError(code)
+            return text
+
+        def canonical_absolute_path(value, code):
+            text = str(value or '')
+            if (
+                not text.startswith('/')
+                or text.startswith('//')
+                or posixpath.normpath(text) != text
+                or '..' in text.split('/')
+            ):
+                raise RuntimeError(code)
+            return text
+
+        def require_child_path(value, root, code):
+            path = canonical_absolute_path(value, code)
+            try:
+                inside = posixpath.commonpath((root, path)) == root
+            except ValueError:
+                inside = False
+            if not inside or path == root:
+                raise RuntimeError(code)
+            return path
+
+        def git_output(repo_root, arguments, code):
+            try:
+                environment = {{
+                    'GIT_CONFIG_GLOBAL': '/dev/null',
+                    'GIT_CONFIG_NOSYSTEM': '1',
+                    'GIT_CONFIG_SYSTEM': '/dev/null',
+                    'GIT_OPTIONAL_LOCKS': '0',
+                    'LANG': 'C',
+                    'LC_ALL': 'C',
+                    'PATH': '/usr/bin:/bin',
+                }}
+                process = subprocess.run(
+                    ['/usr/bin/git', '-C', repo_root] + list(arguments),
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                    env=environment,
+                )
+            except Exception:
+                raise RuntimeError(code)
+            if process.returncode != 0:
+                raise RuntimeError(code)
+            return str(process.stdout or '').strip()
+
+        def git_identity(repo_root, prefix):
+            repo_root = canonical_absolute_path(
+                repo_root, prefix + '_root_invalid'
+            )
+            try:
+                root_info = os.lstat(repo_root)
+            except OSError:
+                raise RuntimeError(prefix + '_root_invalid')
+            if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+                raise RuntimeError(prefix + '_root_invalid')
+            top = canonical_absolute_path(
+                git_output(
+                    repo_root,
+                    ['rev-parse', '--show-toplevel'],
+                    prefix + '_toplevel_readback_invalid',
+                ),
+                prefix + '_toplevel_readback_invalid',
+            )
+            if top != repo_root:
+                raise RuntimeError(prefix + '_toplevel_readback_invalid')
+            head = require_hex(
+                git_output(
+                    repo_root,
+                    ['rev-parse', '--verify', 'HEAD'],
+                    prefix + '_head_readback_invalid',
+                ).lower(),
+                40,
+                prefix + '_head_readback_invalid',
+            )
+            tree = require_hex(
+                git_output(
+                    repo_root,
+                    ['rev-parse', '--verify', 'HEAD^{{tree}}'],
+                    prefix + '_tree_readback_invalid',
+                ).lower(),
+                40,
+                prefix + '_tree_readback_invalid',
+            )
+            if git_output(
+                repo_root,
+                ['status', '--porcelain=v1', '--untracked-files=all'],
+                prefix + '_status_readback_invalid',
+            ):
+                raise RuntimeError(prefix + '_dirty')
+            confirmed_head = require_hex(
+                git_output(
+                    repo_root,
+                    ['rev-parse', '--verify', 'HEAD'],
+                    prefix + '_head_readback_invalid',
+                ).lower(),
+                40,
+                prefix + '_head_readback_invalid',
+            )
+            confirmed_tree = require_hex(
+                git_output(
+                    repo_root,
+                    ['rev-parse', '--verify', 'HEAD^{{tree}}'],
+                    prefix + '_tree_readback_invalid',
+                ).lower(),
+                40,
+                prefix + '_tree_readback_invalid',
+            )
+            if confirmed_head != head or confirmed_tree != tree:
+                raise RuntimeError(prefix + '_identity_changed_during_read')
+            return {{'commit': head, 'tree': tree, 'clean': True}}
+
+        def execution_identity_evidence(delivery_manifest_sha256):
+            worker_result, worker_result_sha256 = read_worker_result()
+            service_result, service_result_sha256 = read_stable_json(
+                SERVICE_RECEIPT_PATH,
+                'service_terminal_receipt_missing',
+                root_norm,
+            )
+            report_manifest, report_manifest_sha256 = read_stable_json(
+                REPORT_MANIFEST_PATH,
+                'report_runtime_manifest_missing',
+                REPORT_MANIFEST_ROOT,
+            )
+            worker = worker_result.get('execution_attestation')
+            provenance = service_result.get('service_provenance')
+            if (
+                worker_result.get('schema_version') != 'g1q3_rca_worker_result_v1'
+                or worker_result.get('task_id') != TASK_ID
+                or worker_result.get('rca_submission_key') != TASK_ID
+                or worker_result.get('execution_route') != 'rca_direct_cli'
+                or not isinstance(worker, dict)
+                or worker.get('schema_version')
+                != 'g1q3_rca_worker_execution_attestation_v2'
+                or worker.get('task_id') != TASK_ID
+                or worker.get('available') is not True
+                or worker.get('agent_backend') != 'none'
+                or worker.get('worker_tree_clean') is not True
+            ):
+                raise RuntimeError('worker_terminal_receipt_identity_invalid')
+            worker_receipt_commit = require_hex(
+                worker.get('worker_source_commit'),
+                40,
+                'worker_terminal_receipt_identity_invalid',
+            )
+            worker_entrypoint = require_child_path(
+                worker.get('worker_entrypoint_path'),
+                WORKER_REPO_ROOT,
+                'worker_terminal_receipt_identity_invalid',
+            )
+            if (
+                worker_entrypoint != WORKER_ENTRYPOINT_PATH
+            ):
+                raise RuntimeError('worker_terminal_receipt_identity_invalid')
+            worker_receipt_entrypoint_sha256 = require_hex(
+                worker.get('worker_entrypoint_sha256'),
+                64,
+                'worker_terminal_receipt_identity_invalid',
+            )
+
+            root_path = canonical_absolute_path(
+                root_norm, 'service_terminal_receipt_identity_invalid'
+            )
+            output_dir = canonical_absolute_path(
+                service_result.get('output_dir'),
+                'service_terminal_receipt_identity_invalid',
+            )
+            pipeline_root = canonical_absolute_path(
+                report_manifest.get('runtime_root'),
+                'report_runtime_manifest_identity_invalid',
+            )
+            pipeline_receipt_root = canonical_absolute_path(
+                worker_result.get('repo_root'),
+                'service_terminal_receipt_identity_invalid',
+            )
+            worker_cwd = canonical_absolute_path(
+                worker.get('cwd'),
+                'service_terminal_receipt_identity_invalid',
+            )
+            if (
+                service_result.get('schema_version')
+                != 'g1q3_rca_service_result_v2'
+                or service_result.get('task_id') != TASK_ID
+                or output_dir != root_path
+                or service_result.get('success') is not True
+                or service_result.get('status') != 'completed'
+                or not isinstance(provenance, dict)
+                or provenance.get('schema_version')
+                != 'g1q3_rca_service_provenance_v1'
+                or provenance.get('available') is not True
+                or provenance.get('vm_tree_clean') is not True
+                or pipeline_receipt_root != pipeline_root
+                or worker_cwd != pipeline_root
+            ):
+                raise RuntimeError('service_terminal_receipt_identity_invalid')
+            pipeline_receipt_commit = require_hex(
+                provenance.get('vm_source_commit'),
+                40,
+                'service_terminal_receipt_identity_invalid',
+            )
+            service_entrypoint = require_child_path(
+                provenance.get('service_entrypoint_path'),
+                pipeline_root,
+                'service_terminal_receipt_identity_invalid',
+            )
+            expected_service_entrypoint = posixpath.join(
+                pipeline_root, PIPELINE_ENTRYPOINT_RELATIVE
+            )
+            if service_entrypoint != expected_service_entrypoint:
+                raise RuntimeError('service_terminal_receipt_identity_invalid')
+            service_receipt_entrypoint_sha256 = require_hex(
+                provenance.get('service_entrypoint_sha256'),
+                64,
+                'service_terminal_receipt_identity_invalid',
+            )
+
+            if (
+                report_manifest.get('schema_version')
+                != 'pnc_rca_report_manifest_v1'
+            ):
+                raise RuntimeError('report_runtime_manifest_identity_invalid')
+            report_pipeline_commit = require_hex(
+                report_manifest.get('pipeline_commit'),
+                40,
+                'report_runtime_manifest_identity_invalid',
+            )
+            report_pipeline_tree = require_hex(
+                report_manifest.get('pipeline_tree'),
+                40,
+                'report_runtime_manifest_identity_invalid',
+            )
+            report_manifest_script_sha256 = require_hex(
+                report_manifest.get('report_script_sha256'),
+                64,
+                'report_runtime_manifest_identity_invalid',
+            )
+
+            worker_identity_before = git_identity(
+                WORKER_REPO_ROOT, 'worker_git'
+            )
+            pipeline_identity_before = git_identity(
+                pipeline_root, 'pipeline_git'
+            )
+            if worker_identity_before['commit'] != worker_receipt_commit:
+                raise RuntimeError('worker_git_head_receipt_mismatch')
+            if pipeline_identity_before['commit'] != pipeline_receipt_commit:
+                raise RuntimeError('pipeline_git_head_receipt_mismatch')
+            if report_pipeline_commit != pipeline_identity_before['commit']:
+                raise RuntimeError('pipeline_git_head_manifest_mismatch')
+            if report_pipeline_tree != pipeline_identity_before['tree']:
+                raise RuntimeError('pipeline_git_tree_manifest_mismatch')
+
+            _worker_entrypoint_raw, worker_entrypoint_sha256 = read_stable_bytes(
+                worker_entrypoint,
+                'worker_entrypoint_missing',
+                WORKER_REPO_ROOT,
+            )
+            if worker_entrypoint_sha256 != worker_receipt_entrypoint_sha256:
+                raise RuntimeError('worker_entrypoint_sha256_mismatch')
+            _service_entrypoint_raw, service_entrypoint_sha256 = read_stable_bytes(
+                service_entrypoint,
+                'service_entrypoint_missing',
+                pipeline_root,
+            )
+            if service_entrypoint_sha256 != service_receipt_entrypoint_sha256:
+                raise RuntimeError('service_entrypoint_sha256_mismatch')
+            report_entrypoint = posixpath.join(
+                pipeline_root, REPORT_ENTRYPOINT_RELATIVE
+            )
+            _report_entrypoint_raw, report_script_sha256 = read_stable_bytes(
+                report_entrypoint,
+                'report_entrypoint_missing',
+                pipeline_root,
+            )
+            if report_script_sha256 != report_manifest_script_sha256:
+                raise RuntimeError('report_script_sha256_mismatch')
+
+            worker_identity_after = git_identity(
+                WORKER_REPO_ROOT, 'worker_git'
+            )
+            pipeline_identity_after = git_identity(
+                pipeline_root, 'pipeline_git'
+            )
+            if worker_identity_after != worker_identity_before:
+                raise RuntimeError('worker_git_identity_changed_during_read')
+            if pipeline_identity_after != pipeline_identity_before:
+                raise RuntimeError('pipeline_git_identity_changed_during_read')
+            _worker_result_after, worker_result_sha256_after = read_worker_result()
+            _service_result_after, service_result_sha256_after = read_stable_json(
+                SERVICE_RECEIPT_PATH,
+                'service_terminal_receipt_missing',
+                root_norm,
+            )
+            _report_manifest_after, report_manifest_sha256_after = read_stable_json(
+                REPORT_MANIFEST_PATH,
+                'report_runtime_manifest_missing',
+                REPORT_MANIFEST_ROOT,
+            )
+            _delivery_manifest_after, delivery_manifest_sha256_after = (
+                read_stable_json(
+                    ROOT + 'delivery_manifest.json',
+                    'delivery_manifest_missing',
+                    root_norm,
+                )
+            )
+            if worker_result_sha256_after != worker_result_sha256:
+                raise RuntimeError('worker_terminal_receipt_changed_during_read')
+            if service_result_sha256_after != service_result_sha256:
+                raise RuntimeError('service_terminal_receipt_changed_during_read')
+            if report_manifest_sha256_after != report_manifest_sha256:
+                raise RuntimeError('report_runtime_manifest_changed_during_read')
+            if delivery_manifest_sha256_after != delivery_manifest_sha256:
+                raise RuntimeError('delivery_manifest_changed_during_read')
+
+            worker_commit = worker_identity_before['commit']
+            worker_tree = worker_identity_before['tree']
+            pipeline_commit = pipeline_identity_before['commit']
+            pipeline_tree = pipeline_identity_before['tree']
+            return {{
+                'schema_version': {VM_EXECUTION_IDENTITY_EVIDENCE_SCHEMA_VERSION!r},
+                'source': 'canonical_vm_terminal_service_report_receipts',
+                'task_id': TASK_ID,
+                'submission_key': TASK_ID,
+                'worker': {{
+                    'commit': worker_commit,
+                    'tree': worker_tree,
+                    'runtime_root': WORKER_REPO_ROOT,
+                    'clean': True,
+                    'entrypoint_path': worker_entrypoint,
+                    'entrypoint_sha256': worker_entrypoint_sha256,
+                    'receipt_path': WORKER_RESULT_PATH,
+                    'receipt_sha256': worker_result_sha256,
+                }},
+                'pipeline': {{
+                    'commit': pipeline_commit,
+                    'tree': pipeline_tree,
+                    'runtime_root': pipeline_root,
+                    'clean': True,
+                    'entrypoint_path': service_entrypoint,
+                    'entrypoint_sha256': service_entrypoint_sha256,
+                    'receipt_path': SERVICE_RECEIPT_PATH,
+                    'receipt_sha256': service_result_sha256,
+                }},
+                'report_service': {{
+                    'manifest_path': REPORT_MANIFEST_PATH,
+                    'manifest_sha256': report_manifest_sha256,
+                    'pipeline_commit': pipeline_commit,
+                    'pipeline_tree': pipeline_tree,
+                    'runtime_root': pipeline_root,
+                    'report_script_sha256': report_script_sha256,
+                }},
+                'delivery_manifest': {{
+                    'path': ROOT + 'delivery_manifest.json',
+                    'sha256': delivery_manifest_sha256,
+                }},
+            }}
 
         def read_text_artifact(path, expected):
             fd, info = open_regular(path, 'html_dependency_missing', MAX_TEXT_FILE_BYTES)
@@ -1428,8 +1837,24 @@ def _remote_bundle_script(submission_key: str) -> str:
 
         try:
             root_norm = posixpath.normpath(ROOT)
-            contract = read_json(ROOT + 'delivery_contract.json', 'delivery_contract_missing')
-            manifest = read_json(ROOT + 'delivery_manifest.json', 'delivery_manifest_missing')
+            contract, _contract_sha256 = read_stable_json(
+                ROOT + 'delivery_contract.json',
+                'delivery_contract_missing',
+                root_norm,
+            )
+            manifest, delivery_manifest_sha256 = read_stable_json(
+                ROOT + 'delivery_manifest.json',
+                'delivery_manifest_missing',
+                root_norm,
+            )
+            identity_evidence = None
+            identity_error = ''
+            try:
+                identity_evidence = execution_identity_evidence(
+                    delivery_manifest_sha256
+                )
+            except RuntimeError as exc:
+                identity_error = str(exc)
             contract = dict(contract)
             contract_artifacts = contract.get('artifacts')
             if not isinstance(contract_artifacts, dict):
@@ -1660,6 +2085,8 @@ def _remote_bundle_script(submission_key: str) -> str:
                 'ok': True,
                 'delivery_contract': contract,
                 'delivery_manifest': manifest,
+                'execution_identity_evidence': identity_evidence,
+                'execution_identity_error': identity_error,
                 'observed_files': observed,
                 'html_dependencies': dependencies,
                 'report_issue_focus': report_data.get('issue_focus') or (
@@ -1741,6 +2168,182 @@ def default_artifact_bundle_reader(
             code, str(payload.get("error") or code), permanent=permanent
         )
     return payload
+
+
+def _execution_identity_readback(
+    *,
+    claim: ExecutionWatchClaim,
+    bundle: Mapping[str, Any],
+    release_binding: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind canonical VM receipt identity to the collector's live Host release."""
+
+    evidence = bundle.get("execution_identity_evidence")
+    evidence_error = str(bundle.get("execution_identity_error") or "").strip()
+    if evidence_error:
+        raise DeliveryContractError("execution_identity_readback_unavailable", evidence_error)
+    if not isinstance(evidence, Mapping):
+        raise DeliveryContractError("execution_identity_readback_unavailable")
+    evidence = dict(evidence)
+    expected_top = {
+        "schema_version",
+        "source",
+        "task_id",
+        "submission_key",
+        "worker",
+        "pipeline",
+        "report_service",
+        "delivery_manifest",
+    }
+    if (
+        set(evidence) != expected_top
+        or evidence.get("schema_version")
+        != VM_EXECUTION_IDENTITY_EVIDENCE_SCHEMA_VERSION
+        or evidence.get("source")
+        != "canonical_vm_terminal_service_report_receipts"
+        or evidence.get("task_id") != claim.task_id
+        or evidence.get("submission_key") != claim.submission_key
+        or claim.task_id != claim.submission_key
+    ):
+        raise DeliveryContractError("execution_identity_readback_invalid")
+
+    worker = evidence.get("worker")
+    pipeline = evidence.get("pipeline")
+    report = evidence.get("report_service")
+    delivery_manifest = evidence.get("delivery_manifest")
+    if (
+        not isinstance(worker, Mapping)
+        or set(worker)
+        != {
+            "commit",
+            "tree",
+            "runtime_root",
+            "clean",
+            "entrypoint_path",
+            "entrypoint_sha256",
+            "receipt_path",
+            "receipt_sha256",
+        }
+        or not isinstance(pipeline, Mapping)
+        or set(pipeline)
+        != {
+            "commit",
+            "tree",
+            "runtime_root",
+            "clean",
+            "entrypoint_path",
+            "entrypoint_sha256",
+            "receipt_path",
+            "receipt_sha256",
+        }
+        or not isinstance(report, Mapping)
+        or set(report)
+        != {
+            "manifest_path",
+            "manifest_sha256",
+            "pipeline_commit",
+            "pipeline_tree",
+            "runtime_root",
+            "report_script_sha256",
+        }
+        or not isinstance(delivery_manifest, Mapping)
+        or set(delivery_manifest) != {"path", "sha256"}
+    ):
+        raise DeliveryContractError("execution_identity_readback_invalid")
+
+    expected_worker_receipt = (
+        f"{REMOTE_SHARED_STATE_ROOT}/tasks/{claim.task_id}/result.md"
+    )
+    expected_service_receipt = (
+        canonical_artifact_root(claim.submission_key) + "rca_service_result.json"
+    )
+    expected_delivery_manifest = (
+        canonical_artifact_root(claim.submission_key) + "delivery_manifest.json"
+    )
+    def hex40(value: object) -> bool:
+        text = str(value or "")
+        return text != "0" * 40 and re.fullmatch(r"[0-9a-f]{40}", text) is not None
+
+    def hex64(value: object) -> bool:
+        text = str(value or "")
+        return text != "0" * 64 and re.fullmatch(r"[0-9a-f]{64}", text) is not None
+
+    def canonical_absolute_path(value: object) -> PurePosixPath | None:
+        text = str(value or "")
+        path = PurePosixPath(text)
+        if not path.is_absolute() or ".." in path.parts or str(path) != text:
+            return None
+        return path
+
+    worker_root = canonical_absolute_path(worker.get("runtime_root"))
+    pipeline_root = canonical_absolute_path(pipeline.get("runtime_root"))
+    worker_entrypoint = canonical_absolute_path(worker.get("entrypoint_path"))
+    pipeline_entrypoint = canonical_absolute_path(pipeline.get("entrypoint_path"))
+    expected_worker_root = PurePosixPath(REMOTE_WORKER_REPO_ROOT)
+    if (
+        worker.get("clean") is not True
+        or pipeline.get("clean") is not True
+        or not all(
+            hex40(section.get(field))
+            for section in (worker, pipeline)
+            for field in ("commit", "tree")
+        )
+        or not all(
+            hex64(section.get(field))
+            for section in (worker, pipeline)
+            for field in ("entrypoint_sha256", "receipt_sha256")
+        )
+        or worker_root is None
+        or pipeline_root is None
+        or worker_entrypoint is None
+        or pipeline_entrypoint is None
+        or worker_root != expected_worker_root
+        or worker_entrypoint
+        != expected_worker_root / REMOTE_WORKER_ENTRYPOINT_RELATIVE
+        or str(worker.get("receipt_path") or "") != expected_worker_receipt
+        or pipeline_entrypoint
+        != pipeline_root / REMOTE_PIPELINE_ENTRYPOINT_RELATIVE
+        or str(pipeline.get("receipt_path") or "") != expected_service_receipt
+        or str(delivery_manifest.get("path") or "") != expected_delivery_manifest
+        or not hex64(delivery_manifest.get("sha256"))
+        or str(report.get("manifest_path") or "")
+        != REMOTE_REPORT_RUNTIME_MANIFEST_PATH
+        or not hex64(report.get("manifest_sha256"))
+        or not hex64(report.get("report_script_sha256"))
+        or report.get("pipeline_commit") != pipeline.get("commit")
+        or report.get("pipeline_tree") != pipeline.get("tree")
+        or report.get("runtime_root") != pipeline.get("runtime_root")
+    ):
+        raise DeliveryContractError("execution_identity_readback_invalid")
+
+    release_id = str(release_binding.get("release_id") or "").strip()
+    epoch_id = str(release_binding.get("epoch_id") or "").strip()
+    fingerprint = str(
+        release_binding.get("release_fingerprint_sha256") or ""
+    ).strip()
+    note_sha256 = str(release_binding.get("release_note_sha256") or "").strip()
+    if (
+        not release_id
+        or not epoch_id
+        or not hex64(fingerprint)
+        or not hex64(note_sha256)
+    ):
+        raise DeliveryContractError("execution_identity_host_binding_invalid")
+
+    return {
+        "schema_version": EXECUTION_IDENTITY_READBACK_SCHEMA_VERSION,
+        "source": "host_collector_canonical_vm_receipts_v1",
+        "release_id": release_id,
+        "activation_epoch_id": epoch_id,
+        "release_fingerprint_sha256": fingerprint,
+        "release_note_sha256": note_sha256,
+        "task_id": claim.task_id,
+        "submission_key": claim.submission_key,
+        "worker": dict(worker),
+        "pipeline": dict(pipeline),
+        "report_service": dict(report),
+        "delivery_manifest": dict(delivery_manifest),
+    }
 
 
 def _apply_gate_a_bundle_projection(bundle: Mapping[str, Any]) -> dict[str, Any]:
@@ -2287,8 +2890,7 @@ class DeliveryCollector:
         artifact_bundle_reader: ArtifactBundleReader | None = None,
         failure_receipt_reader: FailureReceiptReader | None = None,
         infra_remediation_runner: InfraRemediationRunner | None = None,
-        terminal_receipt_reader: TerminalReceiptReader | None = None,
-        capacity_control_store: RcaControlStore | None = None,
+        control_store: RcaControlStore | None = None,
         failure_route_outlet: FailureRouteOutlet | None = None,
         now: Callable[[], datetime] = _utc_now,
         lease_owner: str | None = None,
@@ -2319,18 +2921,8 @@ class DeliveryCollector:
         )
         self.stats = CollectorStats()
         self.runtime_identity: Mapping[str, Any] | None = None
-        self.capacity_control_store = capacity_control_store
+        self.control_store = control_store
         self._failure_route_outlet = failure_route_outlet
-        self.terminal_receipt_reader = terminal_receipt_reader or (
-            lambda task_id, attempt_id: read_remote_vm_terminal_receipt(
-                ssh_mini_agent=self.config.ssh_mini_agent,
-                task_id=task_id,
-                attempt_id=attempt_id,
-                timeout_seconds=(self.config.capacity_terminal_receipt_timeout_seconds),
-            )
-        )
-        self.capacity_last_error = ""
-        self.capacity_last_outcome = "disabled"
         self.release_binding: dict[str, Any] = {}
 
     def _validate_runtime_release(self) -> dict[str, Any]:
@@ -3028,6 +3620,12 @@ class DeliveryCollector:
                 issue_title=issue_title,
                 report_issue_focus=bundle.get("report_issue_focus"),
             )
+            if self.config.resident_release_enforced:
+                status["execution_identity_readback"] = _execution_identity_readback(
+                    claim=claim,
+                    bundle=bundle,
+                    release_binding=self.release_binding,
+                )
         except ArtifactBundleReadError as exc:
             return self._handle_observed_failure(
                 claim,
@@ -3109,202 +3707,14 @@ class DeliveryCollector:
             outcomes.append(outcome)
             if outcome.status in {"disabled", "idle"}:
                 break
-        try:
-            self.collect_capacity_samples()
-        except Exception as exc:
-            self.stats.capacity_rejected += 1
-            code = getattr(exc, "code", "rca_capacity_sample_collection_failed")
-            self.capacity_last_error = str(code)[:120]
-            self.stats.capacity_last_error = self.capacity_last_error
-            self.capacity_last_outcome = "rejected"
-            raise
         return outcomes
 
     def _control_store(self) -> RcaControlStore:
-        if self.capacity_control_store is None:
-            self.capacity_control_store = RcaControlStore(
+        if self.control_store is None:
+            self.control_store = RcaControlStore(
                 self.config.control_db_path, require_current=True
             )
-        return self.capacity_control_store
-
-    def _capacity_store(self) -> RcaControlStore:
-        return self._control_store()
-
-    def _capacity_ledger_identities(
-        self, paths: CapacityRuntimePaths, *, hmac_key: bytes
-    ) -> set[tuple[str, str]]:
-        try:
-            paths.sample_ledger.lstat()
-        except FileNotFoundError:
-            return set()
-        ledger = capacity_transition.read_sample_ledger(
-            paths.sample_ledger,
-            hmac_key=hmac_key,
-            timeout_seconds=self.config.capacity_sample_lock_timeout_seconds,
-        )
-        return {
-            (str(sample["task_id"]), str(sample["attempt_id"]))
-            for sample in ledger.samples
-        }
-
-    def collect_capacity_samples(self) -> None:
-        if not self.config.capacity_sample_enabled:
-            self.capacity_last_outcome = "disabled"
-            self.capacity_last_error = ""
-            self.stats.capacity_last_error = ""
-            return
-        paths = CapacityRuntimePaths.from_control_db(self.config.control_db_path)
-        key = load_capacity_hmac_key()
-        raw_terminal_key = os.environ.get(TERMINAL_HMAC_ENV, "").strip()
-        terminal_key = (
-            load_capacity_hmac_key(raw_terminal_key) if raw_terminal_key else None
-        )
-        control = self._capacity_store()
-        self.capacity_last_error = ""
-        self.stats.capacity_last_error = ""
-        ensure_owner_only_lock_file(paths.global_lock)
-        with capacity_transition.capacity_flock(
-            paths.global_lock,
-            exclusive=False,
-            timeout_seconds=self.config.capacity_sample_lock_timeout_seconds,
-        ):
-            state = control.capacity_transition_state()
-            if state is None:
-                raise CapacitySampleEvidenceError(
-                    "rca_capacity_persisted_state_missing"
-                )
-            if state.get("state") == capacity_transition.STEADY_ACTIVE:
-                self.stats.capacity_frozen += 1
-                self.capacity_last_outcome = "frozen"
-                return
-            if state.get("state") != capacity_transition.BOOTSTRAP_PRODUCTION:
-                raise CapacitySampleEvidenceError(
-                    "rca_capacity_sample_producer_not_bootstrap"
-                )
-            activation, activation_sha = read_and_validate_producer_activation(
-                producer_activation_path(paths.state_root),
-                hmac_key=key,
-                expected_release_id=str(state.get("release_id") or ""),
-                expected_bootstrap_epoch_id=str(state.get("bootstrap_epoch_id") or ""),
-            )
-            excluded = self._capacity_ledger_identities(paths, hmac_key=key)
-        activated_at = datetime.fromisoformat(
-            str(activation["activated_at"]).replace("Z", "+00:00")
-        ).astimezone(timezone.utc)
-        snapshots = self.store.capacity_sample_candidates(
-            activated_at=activated_at,
-            limit=self.config.capacity_sample_batch_size,
-            excluded_task_attempts=excluded,
-        )
-        self.stats.capacity_scanned += len(snapshots)
-        if not snapshots:
-            self.capacity_last_outcome = "idle"
-            return
-        for snapshot in snapshots:
-            payload = snapshot.payload
-            task_id = str(payload.get("task_id") or "")
-            attempt_id = str(payload.get("attempt_id") or "")
-            try:
-                if not task_id or not attempt_id:
-                    raise CapacitySampleEvidenceError(
-                        "rca_capacity_delivery_snapshot_identity_invalid"
-                    )
-                terminal_raw = self.terminal_receipt_reader(task_id, attempt_id)
-                observed_at = datetime.fromisoformat(
-                    str(payload.get("snapshot_at") or "").replace("Z", "+00:00")
-                ).astimezone(timezone.utc)
-                built = build_capacity_sample(
-                    snapshot=payload,
-                    delivery_snapshot_sha256=snapshot.snapshot_sha256,
-                    task_meta=payload.get("task_meta") or {},
-                    vm_terminal_raw=terminal_raw,
-                    producer_activation=activation,
-                    producer_activation_receipt_sha256=activation_sha,
-                    admission_hmac_key=key,
-                    terminal_hmac_key=terminal_key,
-                    observed_at=observed_at,
-                )
-                self.stats.capacity_eligible += 1
-                with capacity_transition.capacity_flock(
-                    paths.global_lock,
-                    exclusive=True,
-                    timeout_seconds=(self.config.capacity_sample_lock_timeout_seconds),
-                ):
-                    current_state = control.capacity_transition_state()
-                    if current_state is None:
-                        raise CapacitySampleEvidenceError(
-                            "rca_capacity_persisted_state_missing"
-                        )
-                    if current_state.get("state") == capacity_transition.STEADY_ACTIVE:
-                        self.stats.capacity_frozen += 1
-                        self.capacity_last_outcome = "frozen"
-                        return
-                    if (
-                        current_state.get("state")
-                        != capacity_transition.BOOTSTRAP_PRODUCTION
-                        or current_state.get("release_id") != state.get("release_id")
-                        or current_state.get("bootstrap_epoch_id")
-                        != state.get("bootstrap_epoch_id")
-                    ):
-                        raise CapacitySampleEvidenceError(
-                            "rca_capacity_sample_producer_state_changed"
-                        )
-                    current_activation, current_activation_sha = (
-                        read_and_validate_producer_activation(
-                            producer_activation_path(paths.state_root),
-                            hmac_key=key,
-                            expected_release_id=str(
-                                current_state.get("release_id") or ""
-                            ),
-                            expected_bootstrap_epoch_id=str(
-                                current_state.get("bootstrap_epoch_id") or ""
-                            ),
-                        )
-                    )
-                    if (
-                        current_activation != activation
-                        or current_activation_sha != activation_sha
-                    ):
-                        raise CapacitySampleEvidenceError(
-                            "rca_capacity_producer_receipt_changed"
-                        )
-                    excluded = self._capacity_ledger_identities(paths, hmac_key=key)
-                    if (task_id, attempt_id) in excluded:
-                        self.capacity_last_outcome = "deduped"
-                        continue
-                    host_path = host_success_receipt_path(
-                        paths.state_root,
-                        task_id=task_id,
-                        attempt_id=attempt_id,
-                    )
-                    host_sha = write_owner_only_create_once(
-                        host_path, built.host_success_receipt
-                    )
-                    if host_sha != built.host_success_receipt_sha256:
-                        raise CapacitySampleEvidenceError(
-                            "rca_capacity_host_receipt_publish_mismatch"
-                        )
-                    validate_host_success_receipt(
-                        built.host_success_receipt, hmac_key=key
-                    )
-                    capacity_transition.append_capacity_sample(
-                        paths.sample_ledger,
-                        built.sample,
-                        hmac_key=key,
-                        persisted_state_loader=control.capacity_transition_state,
-                        timeout_seconds=(
-                            self.config.capacity_sample_lock_timeout_seconds
-                        ),
-                    )
-                    excluded.add((task_id, attempt_id))
-                    self.stats.capacity_appended += 1
-                    self.capacity_last_outcome = "appended"
-            except Exception as exc:
-                self.stats.capacity_rejected += 1
-                code = getattr(exc, "code", "rca_capacity_sample_collection_failed")
-                self.capacity_last_error = str(code)[:120]
-                self.stats.capacity_last_error = self.capacity_last_error
-                self.capacity_last_outcome = "rejected"
+        return self.control_store
 
     def dry_run_once(self) -> dict[str, Any]:
         rows = self.store.preview_unwatched_completed(
@@ -3571,20 +3981,6 @@ class HealthReporter:
             "release": release_binding,
             "release_error": release_error,
             "stats": asdict(stats),
-            "capacity_samples": {
-                "enabled": self.config.capacity_sample_enabled,
-                "observation_healthy": (
-                    not self.config.capacity_sample_enabled
-                    or not stats.capacity_last_error
-                ),
-                "blocks_delivery_health": False,
-                "scanned": stats.capacity_scanned,
-                "eligible": stats.capacity_eligible,
-                "appended": stats.capacity_appended,
-                "rejected": stats.capacity_rejected,
-                "frozen": stats.capacity_frozen,
-                "last_error": stats.capacity_last_error,
-            },
             "store": store_health,
             "last_outcome": asdict(last_outcome) if last_outcome else None,
             "error": str(error or "")[:1000],

@@ -4,13 +4,11 @@ import hashlib
 import json
 import os
 import subprocess
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 from gateway.pnc_rca_data_access import build_remote_data_access
-from scripts import pnc_rca_release_gate as release_gate
 from scripts import rca_issue_workload_export as exporter
 
 
@@ -410,7 +408,7 @@ def _sealed_scan() -> tuple[exporter.ScanResult, exporter.DomainMapping]:
     return scan, mapping
 
 
-def test_manifest_is_deterministic_and_accepted_by_release_gate_consumer() -> None:
+def test_manifest_is_deterministic_and_self_consistent() -> None:
     scan, mapping = _sealed_scan()
 
     manifest, receipt = exporter.build_manifest(
@@ -441,52 +439,6 @@ def test_manifest_is_deterministic_and_accepted_by_release_gate_consumer() -> No
     serialized = exporter._canonical_json_bytes(manifest).decode()
     assert "mdi download" not in serialized
     assert "-s ./" not in serialized
-
-    soak_records = []
-    for case in manifest["cases"]:
-        reference = case["data_access"]["references"][0]
-        kind = reference["kind"]
-        locator_field = "clip_uuid" if kind == "clip" else "event_uuid"
-        reader_class = reference["reader_class"]
-        locator_sha256 = hashlib.sha256(reference[locator_field].encode()).hexdigest()
-        reference_material = {
-            "kind": kind,
-            "reader_class": reader_class,
-            "locator_field": locator_field,
-            "locator_sha256": locator_sha256,
-        }
-        soak_records.append(
-            {
-                "case_id": case["case_id"],
-                "work_item_id": case["work_item_id"],
-                "function_domain": case["function_domain"],
-                "quota_domain": exporter._quota_domain(case["function_domain"]),
-                "workload_manifest_record_sha256": release_gate._remote_soak_sha256(
-                    case
-                ),
-                "reference": {
-                    **reference_material,
-                    "reference_binding_sha256": release_gate._remote_soak_sha256(
-                        reference_material
-                    ),
-                },
-            }
-        )
-    started_at = datetime.strptime(OBSERVED_AT, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
-        tzinfo=timezone.utc
-    ) + timedelta(seconds=1)
-    detail = release_gate._check_remote_reader_soak_manifest(
-        manifest,
-        summary={
-            "source": manifest["source"],
-            "sha256": release_gate._remote_soak_sha256(manifest),
-        },
-        records=soak_records,
-        attempted=200,
-        soak_started_at=started_at,
-    )
-    assert detail["case_count"] == 200
-    assert detail["source_artifact_sha256"] == "b" * 64
 
 
 def test_secure_atomic_write_is_canonical_owner_only_and_rejects_symlink(

@@ -82,7 +82,6 @@ def _fixed_workspace_runtime(monkeypatch):
 
 
 def _submit_service(**kwargs):
-    kwargs.setdefault("capacity_mode", "steady")
     return vm_task_tool.vm_task_submit_service(**kwargs)
 
 
@@ -498,7 +497,6 @@ def _matching_status(
     request,
     *,
     state="pending",
-    bootstrap_meta=None,
     capability=CAPABILITY,
     operation=OPERATION,
 ):
@@ -564,7 +562,6 @@ def _matching_status(
                 f"{RCA_PROD_VM_RELEASE_ROOT}/api/g1q3_rca/scripts/"
                 "run_rca_service_request.py"
             ),
-            **(bootstrap_meta or {}),
         },
     }
 
@@ -741,9 +738,7 @@ def test_platform_rca_service_requires_and_binds_ready_business_profile(
     assert captured["routing_meta_extra"]["service_capability"] == PLATFORM_CAPABILITY
 
 
-def test_service_capacity_mode_is_required_and_bootstrap_is_explicit(
-    monkeypatch, tmp_path
-):
+def test_service_issues_only_steady_production_admission(monkeypatch, tmp_path):
     _configure_service_policy(monkeypatch, tmp_path)
     admission, request = _contracts()
     issued = []
@@ -761,10 +756,10 @@ def test_service_capacity_mode_is_required_and_bootstrap_is_explicit(
     def issue_gate(**kwargs):
         issued.append(kwargs)
         return SimpleNamespace(
-            receipt={"fixture": kwargs["capacity_mode"]},
+            receipt={"fixture": "steady"},
             meta={
-                "rca_prod_admission_receipt": {"fixture": kwargs["capacity_mode"]},
-                "rca_prod_attempt_id": f"attempt-{kwargs['capacity_mode']}",
+                "rca_prod_admission_receipt": {"fixture": "steady"},
+                "rca_prod_attempt_id": "attempt-steady",
             },
             key_fingerprint="f" * 64,
         )
@@ -776,118 +771,19 @@ def test_service_capacity_mode_is_required_and_bootstrap_is_explicit(
         lambda **kwargs: submitted.append(kwargs)
         or {"success": False, "error": "fixture", "retryable": True},
     )
-    omitted = vm_task_tool.vm_task_submit_service(
-        service_id=SERVICE_ID,
-        capability=CAPABILITY,
-        operation=OPERATION,
-        admission=admission,
-        execution_request=request,
-    )
-    assert omitted["error_code"] == "vm_task_service_capacity_mode_invalid"
-    assert not issued
-
     _submit_service(
         service_id=SERVICE_ID,
         capability=CAPABILITY,
         operation=OPERATION,
         admission=admission,
         execution_request=request,
-        capacity_mode="steady",
     )
-    assert issued[-1]["capacity_mode"] == "steady"
-    assert issued[-1]["bootstrap_epoch_id"] == ""
-    assert issued[-1]["release_bom_sha256"] == ""
-
-    _submit_service(
-        service_id=SERVICE_ID,
-        capability=CAPABILITY,
-        operation=OPERATION,
-        admission=admission,
-        execution_request=request,
-        capacity_mode="bootstrap",
-        bootstrap_epoch_id="rca-bootstrap-release-20260713",
-        release_bom_sha256="a" * 64,
-        bootstrap_started_at="2026-07-13T00:00:00+00:00",
-        bootstrap_deadline="2026-07-21T00:00:00+00:00",
-        bootstrap_authorization_fingerprint="b" * 64,
-        active_release_binding_sha256="c" * 64,
-    )
-    assert issued[-1]["capacity_mode"] == "bootstrap"
-    assert issued[-1]["bootstrap_epoch_id"] == "rca-bootstrap-release-20260713"
-    assert issued[-1]["release_bom_sha256"] == "a" * 64
-    assert issued[-1]["bootstrap_authorization_fingerprint"] == "b" * 64
-    assert issued[-1]["active_release_binding_sha256"] == "c" * 64
-    assert submitted[-1]["routing_meta_extra"]["rca_prod_capacity_mode"] == "bootstrap"
+    assert len(issued) == 1
+    assert not any("bootstrap" in key or key == "capacity_mode" for key in issued[0])
+    assert submitted[-1]["routing_meta_extra"]["rca_prod_capacity_mode"] == "steady"
 
 
-def test_post_submit_bootstrap_validation_keeps_active_release_binding(
-    monkeypatch, tmp_path
-):
-    _configure_service_policy(monkeypatch, tmp_path)
-    admission, request = _contracts()
-    binding_sha = "c" * 64
-    bootstrap_meta = {
-        "rca_prod_capacity_mode": "bootstrap",
-        "rca_prod_bootstrap_epoch_id": "rca-bootstrap-release-20260713",
-        "rca_prod_bootstrap_started_at": "2026-07-13T00:00:00+00:00",
-        "rca_prod_bootstrap_deadline": "2026-07-21T00:00:00+00:00",
-        "rca_prod_bootstrap_authorization_fingerprint": "b" * 64,
-        "rca_prod_release_bom_sha256": "a" * 64,
-        "rca_prod_active_release_binding_sha256": binding_sha,
-    }
-    status_calls = []
-
-    def status(_task_id, include_markdown=False):
-        status_calls.append(include_markdown)
-        if len(status_calls) == 1:
-            return {
-                "success": False,
-                "state": "missing",
-                "task_id": admission.submission_key,
-            }
-        return _matching_status(
-            admission,
-            request,
-            bootstrap_meta=bootstrap_meta,
-        )
-
-    validated = []
-    monkeypatch.setattr(vm_task_tool, "vm_task_status", status)
-    monkeypatch.setattr(
-        vm_task_tool,
-        "validate_existing_rca_prod_meta",
-        lambda *args, **kwargs: validated.append(kwargs),
-    )
-    monkeypatch.setattr(
-        vm_task_tool,
-        "_vm_task_submit_trusted",
-        lambda **kwargs: {
-            "success": True,
-            "task": {"task_id": kwargs["task_id"], "status": "created"},
-        },
-    )
-
-    result = _submit_service(
-        service_id=SERVICE_ID,
-        capability=CAPABILITY,
-        operation=OPERATION,
-        admission=admission,
-        execution_request=request,
-        capacity_mode="bootstrap",
-        bootstrap_epoch_id="rca-bootstrap-release-20260713",
-        release_bom_sha256="a" * 64,
-        bootstrap_started_at="2026-07-13T00:00:00+00:00",
-        bootstrap_deadline="2026-07-21T00:00:00+00:00",
-        bootstrap_authorization_fingerprint="b" * 64,
-        active_release_binding_sha256=binding_sha,
-    )
-
-    assert result["success"] is True
-    assert len(validated) == 1
-    assert validated[0]["active_release_binding_sha256"] == binding_sha
-
-
-def test_service_never_selects_bootstrap_from_environment_or_receipt_presence(
+def test_service_ignores_retired_bootstrap_environment(
     monkeypatch, tmp_path
 ):
     _configure_service_policy(monkeypatch, tmp_path)
@@ -918,45 +814,7 @@ def test_service_never_selects_bootstrap_from_environment_or_receipt_presence(
         execution_request=request,
     )
     assert result["create_suppressed"] is True
-    assert observed["capacity_mode"] == "steady"
-    assert observed["bootstrap_epoch_id"] == ""
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"capacity_mode": "bootstrap"},
-        {
-            "capacity_mode": "bootstrap",
-            "bootstrap_epoch_id": "rca-bootstrap-release-20260713",
-            "release_bom_sha256": "bad",
-        },
-        {
-            "capacity_mode": "steady",
-            "bootstrap_epoch_id": "rca-bootstrap-release-20260713",
-        },
-    ],
-)
-def test_service_invalid_bootstrap_activation_fails_before_status_or_create(
-    monkeypatch, tmp_path, kwargs
-):
-    _configure_service_policy(monkeypatch, tmp_path)
-    admission, request = _contracts()
-    monkeypatch.setattr(
-        vm_task_tool,
-        "vm_task_status",
-        lambda *args, **kw: pytest.fail("invalid activation must fail before status"),
-    )
-    result = _submit_service(
-        service_id=SERVICE_ID,
-        capability=CAPABILITY,
-        operation=OPERATION,
-        admission=admission,
-        execution_request=request,
-        **kwargs,
-    )
-    assert result["success"] is False
-    assert "capacity_mode" in result["error_code"] or "bootstrap_binding" in result["error_code"]
+    assert not any("bootstrap" in key or key == "capacity_mode" for key in observed)
 
 
 def test_workspace_runtime_drift_during_prod_admission_suppresses_create(

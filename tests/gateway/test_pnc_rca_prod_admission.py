@@ -76,7 +76,6 @@ def issue(**overrides):
         "now": NOW,
         "attempt_id": "attempt-1",
         "receipt_id": "receipt-1",
-        "capacity_mode": "steady",
         "run_func": lambda *args, **kwargs: completed(report()),
     }
     values.update(overrides)
@@ -232,7 +231,6 @@ def test_retry_uses_unique_attempt_and_receipt_and_existing_identity_is_historic
         reservation_contract_sha256=RESERVATION_SHA,
         hmac_key=KEY,
         now=NOW,
-        capacity_mode="steady",
         run_func=lambda *args, **kwargs: completed(report()),
     )
     second = admission.issue_rca_prod_admission(
@@ -245,7 +243,6 @@ def test_retry_uses_unique_attempt_and_receipt_and_existing_identity_is_historic
         reservation_contract_sha256=RESERVATION_SHA,
         hmac_key=KEY,
         now=NOW,
-        capacity_mode="steady",
         run_func=lambda *args, **kwargs: completed(report()),
     )
     assert first.receipt["receipt_id"] != second.receipt["receipt_id"]
@@ -260,7 +257,6 @@ def test_retry_uses_unique_attempt_and_receipt_and_existing_identity_is_historic
         reservation_contract_sha256=RESERVATION_SHA,
         hmac_key=KEY,
         now=NOW + timedelta(days=1),
-        capacity_mode="steady",
     )
     tampered = copy.deepcopy(first.meta)
     tampered["rca_prod_attempt_id"] = "attempt-other"
@@ -275,7 +271,6 @@ def test_retry_uses_unique_attempt_and_receipt_and_existing_identity_is_historic
             reservation_contract_sha256=RESERVATION_SHA,
             hmac_key=KEY,
             now=NOW + timedelta(days=1),
-            capacity_mode="steady",
         )
 
 
@@ -298,5 +293,4 @@ def test_command_drift_changes_bound_hash_and_old_receipt_is_rejected(monkeypatc
             reservation_contract_sha256=RESERVATION_SHA,
             hmac_key=KEY,
             now=NOW,
-            capacity_mode="steady",
         )

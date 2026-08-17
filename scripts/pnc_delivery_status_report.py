@@ -30,7 +30,6 @@ from scripts.hermes_live_drift_guard import (  # noqa: E402
     validate_pnc_feishu_delivery_repair_launchd,
     validate_pnc_vm_task_sync_launchd,
 )
-from scripts.pnc_g1q3_gray_route_audit import build_audit as build_g1q3_gray_route_audit  # noqa: E402
 
 DEFAULT_PUBLIC_URL = "http://127.0.0.1:9125/tasks"
 USER_VISIBLE_URL = "http://192.168.14.32:9125/tasks"
@@ -147,7 +146,6 @@ def build_report(*, public_url: str = DEFAULT_PUBLIC_URL) -> dict[str, Any]:
     public_probe = _http_probe(public_url)
     notices = _completion_notice_summary()
     groups = _business_group_task_summary()
-    gray_route_audit = build_g1q3_gray_route_audit(get_hermes_home() / "pnc_agent" / "receipts" / "g1q3_rca", since_days=7)
     errors: list[str] = []
     warnings: list[str] = []
     if not public_probe.get("ok"):
@@ -166,8 +164,6 @@ def build_report(*, public_url: str = DEFAULT_PUBLIC_URL) -> dict[str, Any]:
             warnings.append(f"{group.get('label')} TaskStore/effective status mismatch count={mismatch_count}")
     if notices["counts"].get("failed", 0):
         warnings.append(f"completion_notice failed count={notices['counts'].get('failed')}")
-    if gray_route_audit.get("false_rejection_candidate_count", 0):
-        warnings.append(f"G1Q3 gray route false-rejection candidates={gray_route_audit.get('false_rejection_candidate_count')}")
     return {
         "ok": not errors,
         "governance_ok": not errors and not warnings,
@@ -177,7 +173,6 @@ def build_report(*, public_url: str = DEFAULT_PUBLIC_URL) -> dict[str, Any]:
         "pnc_feishu_delivery": guard,
         "launchd": launchd,
         "completion_notices": notices,
-        "g1q3_gray_route_audit": gray_route_audit,
         "business_groups": groups,
         "warnings": warnings,
         "errors": errors,
@@ -219,13 +214,6 @@ def format_markdown_report(report: dict[str, Any]) -> str:
         "飞书回传：",
         f"- pending={notice_counts.get('pending', 0)}，failed={notice_counts.get('failed', 0)}，sent={notice_counts.get('sent', 0)}",
     ])
-    gray = report.get("g1q3_gray_route_audit") or {}
-    gray_counts = (gray.get("counts") or {}).get("by_decision") or {}
-    lines.extend([
-        "",
-        "G1Q3 灰度路由：",
-        f"- accepted={gray_counts.get('accepted', 0)}，dry_run={gray_counts.get('dry_run', 0)}，reject={gray_counts.get('reject', 0)}，疑似误拒绝={gray.get('false_rejection_candidate_count', 0)}",
-    ])
     if report.get("reconcile_command"):
         lines.extend(["", f"状态收敛命令：`{report['reconcile_command']}`"])
     if report.get("warnings"):
@@ -262,9 +250,6 @@ def main(argv: list[str] | None = None) -> int:
             print(f"- {row['label']}: running={counts.get('running', 0)} completed={counts.get('completed', 0)} failed={counts.get('failed', 0)}{suffix}")
         notice_counts = report["completion_notices"]["counts"]
         print(f"completion_notices: pending={notice_counts.get('pending', 0)} failed={notice_counts.get('failed', 0)} sent={notice_counts.get('sent', 0)}")
-        gray = report.get("g1q3_gray_route_audit") or {}
-        gray_counts = (gray.get("counts") or {}).get("by_decision") or {}
-        print(f"g1q3_gray_route: accepted={gray_counts.get('accepted', 0)} dry_run={gray_counts.get('dry_run', 0)} reject={gray_counts.get('reject', 0)} false_rejection_candidates={gray.get('false_rejection_candidate_count', 0)}")
         if report.get("reconcile_command"):
             print(f"reconcile_command: {report['reconcile_command']}")
         for warn in report["warnings"]:

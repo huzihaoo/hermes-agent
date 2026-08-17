@@ -32,7 +32,9 @@ from gateway.pnc_rca_delivery_contract import (
     build_terminal_delivery,
     build_terminal_thread_reply_effect,
     build_thread_reply_effect,
+    compute_delivery_effect_key,
     compute_delivery_effect_payload_sha256,
+    delivery_effect_marker,
     validate_card_patch_effect_payload,
     validate_delivery_subscription_target,
 )
@@ -100,10 +102,7 @@ _DELIVERY_OBSERVATION_OUTBOX_SCHEMA_OBJECTS = {
 DELIVERY_BACKPRESSURE_SNAPSHOT_SCHEMA_VERSION = (
     "pnc_rca_delivery_backpressure_snapshot_v2"
 )
-DELIVERY_CAPACITY_SNAPSHOT_SCHEMA_VERSION = "pnc_rca_delivery_capacity_snapshot_v1"
-MAX_DELIVERY_CAPACITY_CANDIDATES = 100
-MAX_DELIVERY_CAPACITY_EVIDENCE_ROWS = 33
-MAX_DELIVERY_CAPACITY_SNAPSHOT_BYTES = 2 * 1024 * 1024
+CANONICAL_CANARY_READBACK_SCHEMA_VERSION = "pnc_rca_canonical_canary_readback_v1"
 DELIVERY_OUTCOME_SLO_SCHEMA_VERSION = "pnc_rca_delivery_outcome_slo_v2"
 DELIVERY_OUTCOME_SLO_SUCCESS_STATUSES = ("delivered", "partial")
 DELIVERY_OUTCOME_SLO_FAILURE_STATUSES = ("quarantined",)
@@ -149,26 +148,12 @@ DELIVERY_CIRCUIT_RESET_REQUIRED_FIELDS = frozenset(
         "destination_binding",
         "circuit_scope",
         "effect_kind",
-        "active_release_binding",
+        "release_binding",
         "tool_provenance",
         "permanent_failure_before",
         "permanent_failure_after",
     }
 )
-PRE_W3_EFFECT_DISPOSITION_META_PREFIX = "rca_pre_w3_effect_disposition:"
-PRE_W3_EFFECT_DISPOSITION_SCHEMA_VERSION = (
-    "pnc_rca_pre_w3_effect_disposition_v1"
-)
-PRE_W3_EFFECT_DISPOSITION_SNAPSHOT_SCHEMA_VERSION = (
-    "pnc_rca_pre_w3_effect_disposition_snapshot_v1"
-)
-PRE_W3_CONTROL_DB_LOGICAL_DIGEST_SCHEMA_VERSION = (
-    "pnc_rca_control_db_logical_digest_v1"
-)
-PRE_W3_EFFECT_DISPOSITION_COMMAND = "quarantine-exact-pre-w3-effects"
-PRE_W3_EFFECT_DISPOSITION_ERROR_CODE = "external_write_fence_missing"
-PRE_W3_EFFECT_DISPOSITION_MAX_EFFECTS = 32
-PRE_W3_EFFECT_DISPOSITION_MAX_AUDIT_BYTES = 512 * 1024
 _NON_PIPELINE_QUARANTINE_CODES = frozenset({
     "feishu_work_item_not_found",
     *OUTBOX_SILENT_PROFILE_TERMINAL_ERROR_CODES,
@@ -281,10 +266,9 @@ DELIVERY_EFFECT_UNRESOLVED_STATES = (
 )
 DELIVERY_WATCH_STATES = WATCH_ACTIVE_STATES | WATCH_TERMINAL_STATES
 REQUIRED_DELIVERY_EFFECT_KINDS = tuple(sorted(DELIVERY_EFFECT_KINDS))
-ACTIVATION_DELIVERY_STATES = frozenset({"bounded_active", "steady_active"})
+ACTIVATION_DELIVERY_STATES = frozenset({"steady_active"})
 _ACTIVATION_REQUIRED_TABLES = frozenset({
     "rca_activation_epochs",
-    "rca_activation_budget_slots",
     "rca_activation_admission_ledger",
     "business_triggers",
     "rca_outbox",
@@ -296,11 +280,8 @@ EXISTS (
       JOIN rca_activation_admission_ledger AS activation_ledger
         ON activation_ledger.epoch_id = activation_epoch.epoch_id
        AND activation_ledger.ledger_id = o.activation_ledger_id
- LEFT JOIN rca_activation_budget_slots AS activation_slot
-        ON activation_slot.epoch_id = activation_epoch.epoch_id
-       AND activation_slot.slot_kind = activation_ledger.slot_kind
      WHERE activation_epoch.is_current = 1
-       AND activation_epoch.state IN ('bounded_active', 'steady_active')
+       AND activation_epoch.state = 'steady_active'
        AND o.activation_epoch_id = activation_epoch.epoch_id
        AND t.activation_epoch_id = activation_epoch.epoch_id
        AND t.activation_ledger_id = o.activation_ledger_id
@@ -309,13 +290,6 @@ EXISTS (
        AND activation_ledger.business_key = o.business_key
        AND activation_ledger.submission_key = o.submission_key
        AND activation_ledger.generation = o.generation
-       AND (
-            activation_epoch.state = 'steady_active'
-            OR (
-                activation_epoch.state = 'bounded_active'
-                AND activation_slot.consumed_ledger_id = activation_ledger.ledger_id
-            )
-       )
 )
 """
 _ACTIVATION_CURRENT_BINDING_SQL = """
@@ -337,7 +311,7 @@ EXISTS (
         ON adjudication_epoch.epoch_id = adjudication.activation_epoch_id
        AND adjudication_epoch.is_current = 1
      WHERE adjudication.correction_effect_key = e.effect_key
-       AND adjudication_epoch.state IN ('bounded_active', 'steady_active')
+       AND adjudication_epoch.state = 'steady_active'
 )
 """
 _CARD_PATCH_ACTIVATION_ELIGIBLE_SQL = """
@@ -355,7 +329,7 @@ EXISTS (
        AND (
             (
                 card_epoch.is_current = 1
-                AND card_epoch.state IN ('bounded_active', 'steady_active')
+                AND card_epoch.state = 'steady_active'
             )
             OR e.write_phase = 'write_started'
        )
@@ -565,12 +539,6 @@ class DeliveryBackpressureSnapshot:
         }
 
 
-@dataclass(frozen=True)
-class DeliveryCapacitySnapshot:
-    payload: dict[str, Any]
-    snapshot_sha256: str
-
-
 def _utc_datetime(value: datetime | None = None) -> datetime:
     current = value or datetime.now(timezone.utc)
     if current.tzinfo is None:
@@ -596,135 +564,6 @@ def _canonical_json(value: Any) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
-
-
-def _sqlite_identifier(identifier: str) -> str:
-    """Quote a SQLite identifier without allowing query text injection."""
-    return '"' + str(identifier).replace('"', '""') + '"'
-
-
-def _sqlite_value_material(value: Any) -> dict[str, Any]:
-    """Encode SQLite values with type information for a stable logical digest."""
-    if value is None:
-        return {"type": "null"}
-    if isinstance(value, bool):
-        return {"type": "integer", "value": int(value)}
-    if isinstance(value, int):
-        return {"type": "integer", "value": value}
-    if isinstance(value, float):
-        # ``float.hex`` preserves the exact IEEE value and is JSON-safe even for
-        # the non-finite values a custom SQLite adapter might return.
-        return {"type": "real", "value": value.hex()}
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return {"type": "blob", "value": bytes(value).hex()}
-    if isinstance(value, str):
-        return {"type": "text", "value": value}
-    raise TypeError(f"unsupported SQLite value type: {type(value).__name__}")
-
-
-def _sqlite_logical_digest_tx(conn: sqlite3.Connection) -> dict[str, Any]:
-    """Digest all SQLite logical schema and row content under the caller's snapshot.
-
-    The caller must already hold a read or write transaction.  Rows are encoded
-    with SQLite type tags and sorted by their canonical bytes, so a page-layout
-    or index rebuild cannot change the result while any user-table mutation can.
-    """
-    digest = hashlib.sha256()
-    object_rows = conn.execute(
-        "SELECT type, name, tbl_name, sql FROM sqlite_master "
-        "ORDER BY type COLLATE BINARY, name COLLATE BINARY, "
-        "tbl_name COLLATE BINARY"
-    ).fetchall()
-    objects: list[dict[str, Any]] = []
-    table_names: list[str] = []
-    for row in object_rows:
-        item = {
-            "type": str(row[0]),
-            "name": str(row[1]),
-            "table": str(row[2]),
-            "sql": None if row[3] is None else str(row[3]),
-        }
-        objects.append(item)
-        # sqlite_stat* is planner-maintenance state rather than application
-        # content; sqlite_sequence is retained because it is part of rowid
-        # allocation semantics.
-        if item["type"] == "table" and not item["name"].startswith("sqlite_stat"):
-            table_names.append(item["name"])
-
-    def feed(value: Any) -> None:
-        raw = _canonical_json(value).encode("utf-8")
-        digest.update(len(raw).to_bytes(8, "big"))
-        digest.update(raw)
-
-    feed({
-        "schema_version": PRE_W3_CONTROL_DB_LOGICAL_DIGEST_SCHEMA_VERSION,
-        "application_id": int(conn.execute("PRAGMA application_id").fetchone()[0]),
-        "user_version": int(conn.execute("PRAGMA user_version").fetchone()[0]),
-        "encoding": str(conn.execute("PRAGMA encoding").fetchone()[0]),
-        "objects": objects,
-    })
-    row_count = 0
-    for table_name in table_names:
-        quoted_table = _sqlite_identifier(table_name)
-        column_rows = conn.execute(
-            f"PRAGMA table_xinfo({quoted_table})"
-        ).fetchall()
-        columns = [
-            {
-                "cid": int(row[0]),
-                "name": str(row[1]),
-                "type": str(row[2] or ""),
-                "notnull": int(row[3]),
-                "default": None if row[4] is None else str(row[4]),
-                "pk": int(row[5]),
-                "hidden": int(row[6]),
-            }
-            for row in column_rows
-        ]
-        visible = [row for row in columns if row["hidden"] == 0]
-        select_columns = ", ".join(
-            _sqlite_identifier(row["name"]) for row in visible
-        )
-        # Include rowid when available.  WITHOUT ROWID tables are represented by
-        # their complete typed row values and schema/PK metadata.
-        has_rowid = False
-        try:
-            conn.execute(f"SELECT rowid FROM {quoted_table} LIMIT 0")
-            has_rowid = True
-        except sqlite3.Error:
-            pass
-        projection_parts = (["rowid"] if has_rowid else []) + [
-            _sqlite_identifier(row["name"]) for row in visible
-        ]
-        projection = ", ".join(projection_parts) or "1"
-        try:
-            rows = conn.execute(f"SELECT {projection} FROM {quoted_table}").fetchall()
-        except sqlite3.Error:
-            # A malformed/unsupported table must fail closed rather than silently
-            # producing a partial digest.
-            raise
-        encoded_rows: list[bytes] = []
-        for row in rows:
-            values = [_sqlite_value_material(value) for value in tuple(row)]
-            encoded_rows.append(_canonical_json(values).encode("utf-8"))
-        encoded_rows.sort()
-        feed({
-            "table": table_name,
-            "columns": columns,
-            "has_rowid": has_rowid,
-            "row_count": len(encoded_rows),
-        })
-        for encoded in encoded_rows:
-            digest.update(len(encoded).to_bytes(8, "big"))
-            digest.update(encoded)
-        row_count += len(encoded_rows)
-    return {
-        "schema_version": PRE_W3_CONTROL_DB_LOGICAL_DIGEST_SCHEMA_VERSION,
-        "sha256": digest.hexdigest(),
-        "object_count": len(objects),
-        "table_count": len(table_names),
-        "row_count": row_count,
-    }
 
 
 def _reject_delivery_circuit_reset_json_constant(_value: str) -> None:
@@ -768,21 +607,23 @@ def _validate_delivery_circuit_reset_audit(
         or normalized.get("effect_kind") not in DELIVERY_EFFECT_KINDS
     ):
         raise ValueError("delivery_circuit_reset_audit_schema_invalid")
-    release = normalized.get("active_release_binding")
+    release = normalized.get("release_binding")
     if (
         not isinstance(release, Mapping)
-        or not isinstance(release.get("path"), str)
-        or not Path(release["path"]).is_absolute()
-        or re.fullmatch(r"[0-9a-f]{64}", str(release.get("sha256") or "")) is None
         or re.fullmatch(
-            r"[0-9a-f]{64}", str(release.get("authority_sha256") or "")
+            r"[0-9a-f]{64}", str(release.get("release_fingerprint_sha256") or "")
+        )
+        is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(release.get("release_note_sha256") or "")
         )
         is None
         or not str(release.get("release_id") or "").strip()
-        or not str(release.get("authority_epoch_id") or "").strip()
-        or not str(release.get("bootstrap_epoch_id") or "").strip()
+        or not str(release.get("epoch_id") or "").strip()
+        or not isinstance(release.get("release_note_path"), str)
+        or not Path(release["release_note_path"]).is_absolute()
     ):
-        raise ValueError("delivery_circuit_reset_active_binding_invalid")
+        raise ValueError("delivery_circuit_reset_release_binding_invalid")
     provenance = normalized.get("tool_provenance")
     if not isinstance(provenance, Mapping) or any(
         not isinstance(provenance.get(path_name), str)
@@ -794,7 +635,6 @@ def _validate_delivery_circuit_reset_audit(
             ("delivery_store_path", "delivery_store_sha256"),
             ("receipt_helper_path", "receipt_helper_sha256"),
             ("control_store_path", "control_store_sha256"),
-            ("bootstrap_path", "bootstrap_sha256"),
         )
     ):
         raise ValueError("delivery_circuit_reset_tool_provenance_invalid")
@@ -835,363 +675,6 @@ def _validate_delivery_circuit_reset_audit(
     return normalized
 
 
-def _pre_w3_disposition_sha256(value: Any) -> str:
-    try:
-        raw = json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
-        raise ValueError("pre_w3_effect_disposition_json_invalid") from exc
-    return hashlib.sha256(raw).hexdigest()
-
-
-def _normalize_pre_w3_effect_keys(value: Sequence[str]) -> tuple[str, ...]:
-    if isinstance(value, (str, bytes)):
-        raise ValueError("pre_w3_effect_disposition_effect_keys_invalid")
-    normalized = tuple(str(item or "").strip() for item in value)
-    if (
-        not normalized
-        or len(normalized) > PRE_W3_EFFECT_DISPOSITION_MAX_EFFECTS
-        or len(set(normalized)) != len(normalized)
-        or any(
-            re.fullmatch(r"g1q3-rca-terminal-effect-v1-[0-9a-f]{64}", item)
-            is None
-            for item in normalized
-        )
-    ):
-        raise ValueError("pre_w3_effect_disposition_effect_keys_invalid")
-    return tuple(sorted(normalized))
-
-
-def _pre_w3_effect_disposition_after(
-    before: Mapping[str, Any],
-    *,
-    disposition_id: str,
-    recorded_at: str,
-) -> dict[str, Any]:
-    detail = f"operator_audited_pre_w3_disposition:{disposition_id}"
-    effects = []
-    for row in before.get("effects", []):
-        effects.append({
-            "effect_key": row["effect_key"],
-            "delivery_id": row["delivery_id"],
-            "effect_status": "quarantined",
-            "effect_write_phase": "settled",
-            "effect_attempt": row["effect_attempt"],
-            "effect_fence": row["effect_fence"],
-            "effect_remote_receipt_present": False,
-            "effect_last_error_code": PRE_W3_EFFECT_DISPOSITION_ERROR_CODE,
-            "effect_last_error_detail": detail,
-            "effect_quarantined_at": recorded_at,
-            "effect_updated_at": recorded_at,
-            "job_status": "quarantined",
-            "job_updated_at": recorded_at,
-            "attempt_audit": {
-                "attempt_no": 1,
-                "fence": row["effect_fence"],
-                "request_id": (
-                    f"pre-w3-disposition:{disposition_id}:{row['effect_key']}"
-                ),
-                "outcome": "quarantined",
-                "error_code": PRE_W3_EFFECT_DISPOSITION_ERROR_CODE,
-                "detail": "operator-audited pre-W3 disposition; no provider call",
-                "finished_at": recorded_at,
-            },
-        })
-    body = {"effects": effects}
-    return {**body, "sha256": _pre_w3_disposition_sha256(body)}
-
-
-def _pre_w3_effect_disposition_fingerprint(value: Mapping[str, Any]) -> str:
-    body = dict(value)
-    body.pop("receipt_fingerprint", None)
-    return _pre_w3_disposition_sha256(body)
-
-
-def _validate_pre_w3_effect_disposition_audit(
-    value: Mapping[str, Any],
-) -> dict[str, Any]:
-    required = {
-        "schema_version",
-        "command",
-        "disposition_id",
-        "plan_id",
-        "recorded_at",
-        "operator",
-        "reason",
-        "effect_kind",
-        "effect_keys",
-        "effect_set_sha256",
-        "before_snapshot_sha256",
-        "control_db_identity",
-        "destination_binding",
-        "backup_binding",
-        "active_release_binding",
-        "config_binding_sha256",
-        "tool_provenance",
-        "tool_provenance_sha256",
-        "before",
-        "after",
-        "effect_delta",
-        "external_writes_performed",
-        "provider_calls_performed",
-        "receipt_fingerprint",
-    }
-    if not isinstance(value, Mapping) or set(value) != required:
-        raise ValueError("pre_w3_effect_disposition_audit_fields_invalid")
-    normalized = json.loads(
-        json.dumps(
-            dict(value),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ),
-        parse_constant=lambda _value: (_ for _ in ()).throw(
-            ValueError("pre_w3_effect_disposition_non_finite_json")
-        ),
-    )
-    keys = _normalize_pre_w3_effect_keys(normalized["effect_keys"])
-    if list(keys) != normalized["effect_keys"]:
-        raise ValueError("pre_w3_effect_disposition_effect_keys_invalid")
-    for field in (
-        "disposition_id",
-        "plan_id",
-        "effect_set_sha256",
-        "before_snapshot_sha256",
-        "config_binding_sha256",
-        "tool_provenance_sha256",
-        "receipt_fingerprint",
-    ):
-        if re.fullmatch(r"[0-9a-f]{64}", str(normalized.get(field) or "")) is None:
-            raise ValueError("pre_w3_effect_disposition_hash_invalid")
-    try:
-        recorded_at = _parse_iso(str(normalized["recorded_at"]))
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("pre_w3_effect_disposition_timestamp_invalid") from exc
-    if (
-        normalized["schema_version"] != PRE_W3_EFFECT_DISPOSITION_SCHEMA_VERSION
-        or normalized["command"] != PRE_W3_EFFECT_DISPOSITION_COMMAND
-        or normalized["disposition_id"]
-        != _pre_w3_disposition_sha256({"plan_id": normalized["plan_id"]})
-        or normalized["effect_kind"] != DELIVERY_EFFECT_KIND
-        or not str(normalized["operator"] or "").strip()
-        or not str(normalized["reason"] or "").strip()
-        or normalized["external_writes_performed"] is not False
-        or normalized["provider_calls_performed"] != 0
-    ):
-        raise ValueError("pre_w3_effect_disposition_audit_invalid")
-    del recorded_at
-    before = normalized["before"]
-    if (
-        not isinstance(before, Mapping)
-        or before.get("schema_version")
-        != PRE_W3_EFFECT_DISPOSITION_SNAPSHOT_SCHEMA_VERSION
-        or before.get("effect_kind") != DELIVERY_EFFECT_KIND
-        or before.get("effect_keys") != list(keys)
-        or before.get("effect_set_sha256") != normalized["effect_set_sha256"]
-        or before.get("snapshot_sha256") != normalized["before_snapshot_sha256"]
-        or before.get("snapshot_sha256")
-        != _pre_w3_disposition_sha256(
-            {key: item for key, item in before.items() if key != "snapshot_sha256"}
-        )
-        or not isinstance(before.get("effects"), list)
-        or len(before["effects"]) != len(keys)
-    ):
-        raise ValueError("pre_w3_effect_disposition_before_invalid")
-    logical_digest = before.get("control_db_logical_digest")
-    if (
-        not isinstance(logical_digest, Mapping)
-        or set(logical_digest)
-        != {"schema_version", "sha256", "object_count", "table_count", "row_count"}
-        or logical_digest.get("schema_version")
-        != PRE_W3_CONTROL_DB_LOGICAL_DIGEST_SCHEMA_VERSION
-        or re.fullmatch(r"[0-9a-f]{64}", str(logical_digest.get("sha256") or ""))
-        is None
-        or any(
-            isinstance(logical_digest.get(field), bool)
-            or not isinstance(logical_digest.get(field), int)
-            or logical_digest.get(field) < 0
-            for field in ("object_count", "table_count", "row_count")
-        )
-    ):
-        raise ValueError("pre_w3_effect_disposition_logical_digest_invalid")
-    if [row.get("effect_key") for row in before["effects"]] != list(keys):
-        raise ValueError("pre_w3_effect_disposition_before_invalid")
-    activation = before.get("current_activation")
-    circuit = before.get("circuit")
-    circuit_row = circuit.get("circuit") if isinstance(circuit, Mapping) else None
-    if (
-        not isinstance(activation, Mapping)
-        or activation.get("state") != "steady_active"
-        or activation.get("is_current") != 1
-        or re.fullmatch(r"[0-9a-f]{64}", str(activation.get("sha256") or ""))
-        is None
-        or not isinstance(circuit_row, Mapping)
-        or circuit_row.get("state") != "open"
-    ):
-        raise ValueError("pre_w3_effect_disposition_guard_invalid")
-    expected_after = _pre_w3_effect_disposition_after(
-        before,
-        disposition_id=normalized["disposition_id"],
-        recorded_at=normalized["recorded_at"],
-    )
-    if normalized["after"] != expected_after:
-        raise ValueError("pre_w3_effect_disposition_after_invalid")
-    expected_delta = {
-        "external_effects_triggered": False,
-        "provider_calls": 0,
-        "control_meta_inserted": 1,
-        "attempt_audits_inserted": len(keys),
-        "effects_updated": len(keys),
-        "jobs_updated": len(keys),
-        "quarantine_audits_inserted": 2 * len(keys),
-        "total_database_rows": 1 + (5 * len(keys)),
-    }
-    if normalized["effect_delta"] != expected_delta:
-        raise ValueError("pre_w3_effect_disposition_effect_delta_invalid")
-    identity = normalized["control_db_identity"]
-    destination = normalized["destination_binding"]
-    backup = normalized["backup_binding"]
-    release = normalized["active_release_binding"]
-    provenance = normalized["tool_provenance"]
-    if (
-        not isinstance(identity, Mapping)
-        or set(identity) != {"path", "device", "inode", "size", "mtime_ns"}
-        or not isinstance(identity.get("path"), str)
-        or not Path(identity["path"]).is_absolute()
-        or any(
-            isinstance(identity.get(field), bool)
-            or not isinstance(identity.get(field), int)
-            or identity.get(field) < 0
-            for field in ("device", "inode", "size", "mtime_ns")
-        )
-        or not isinstance(destination, Mapping)
-        or set(destination) != {"path_sha256", "parent_device", "parent_inode"}
-        or re.fullmatch(r"[0-9a-f]{64}", str(destination.get("path_sha256") or ""))
-        is None
-        or any(
-            isinstance(destination.get(field), bool)
-            or not isinstance(destination.get(field), int)
-            or destination.get(field) < 0
-            for field in ("parent_device", "parent_inode")
-        )
-        or not isinstance(backup, Mapping)
-        or set(backup)
-        != {
-            "path",
-            "sha256",
-            "size_bytes",
-            "device",
-            "inode",
-            "mtime_ns",
-            "source_path",
-            "source_sha256",
-            "source_device",
-            "source_inode",
-            "source_size_bytes",
-            "source_mtime_ns",
-            "journal_mode",
-            "quick_check",
-            "foreign_key_check",
-            "snapshot_sha256",
-            "effect_set_sha256",
-            "logical_digest_sha256",
-        }
-        or not Path(str(backup.get("path") or "")).is_absolute()
-        or re.fullmatch(r"[0-9a-f]{64}", str(backup.get("sha256") or "")) is None
-        or not Path(str(backup.get("source_path") or "")).is_absolute()
-        or re.fullmatch(
-            r"[0-9a-f]{64}", str(backup.get("source_sha256") or "")
-        )
-        is None
-        or backup.get("source_path") != identity.get("path")
-        or backup.get("source_device") != identity.get("device")
-        or backup.get("source_inode") != identity.get("inode")
-        or backup.get("source_size_bytes") != identity.get("size")
-        or backup.get("source_mtime_ns") != identity.get("mtime_ns")
-        or backup.get("journal_mode") != "delete"
-        or backup.get("quick_check") != "ok"
-        or backup.get("foreign_key_check") != "ok"
-        or backup.get("snapshot_sha256") != normalized["before_snapshot_sha256"]
-        or backup.get("effect_set_sha256") != normalized["effect_set_sha256"]
-        or backup.get("logical_digest_sha256")
-        != logical_digest["sha256"]
-        or (
-            backup.get("device"),
-            backup.get("inode"),
-        ) == (
-            backup.get("source_device"),
-            backup.get("source_inode"),
-        )
-        or isinstance(backup.get("size_bytes"), bool)
-        or not isinstance(backup.get("size_bytes"), int)
-        or backup.get("size_bytes") < 512
-        or any(
-            isinstance(backup.get(field), bool)
-            or not isinstance(backup.get(field), int)
-            or backup.get(field) < 0
-            for field in (
-                "device",
-                "inode",
-                "mtime_ns",
-                "source_device",
-                "source_inode",
-                "source_size_bytes",
-                "source_mtime_ns",
-            )
-        )
-        or not isinstance(release, Mapping)
-        or not Path(str(release.get("path") or "")).is_absolute()
-        or re.fullmatch(r"[0-9a-f]{64}", str(release.get("sha256") or "")) is None
-        or not str(release.get("release_id") or "").strip()
-        or not str(release.get("bootstrap_epoch_id") or "").strip()
-        or re.fullmatch(
-            r"[0-9a-f]{64}", str(release.get("candidate_env_sha256") or "")
-        )
-        is None
-        or re.fullmatch(r"[0-9a-f]{64}", str(release.get("live_env_sha256") or ""))
-        is None
-        or type(release.get("live_env_matches_candidate")) is not bool
-        or not isinstance(provenance, Mapping)
-        or any(
-            not Path(str(provenance.get(path_field) or "")).is_absolute()
-            or re.fullmatch(
-                r"[0-9a-f]{64}", str(provenance.get(sha_field) or "")
-            )
-            is None
-            for path_field, sha_field in (
-                ("entrypoint_path", "entrypoint_sha256"),
-                ("delivery_store_path", "delivery_store_sha256"),
-                ("receipt_helper_path", "receipt_helper_sha256"),
-                ("control_store_path", "control_store_sha256"),
-                ("bootstrap_path", "bootstrap_sha256"),
-            )
-        )
-        or normalized["tool_provenance_sha256"]
-        != _pre_w3_disposition_sha256(provenance)
-    ):
-        raise ValueError("pre_w3_effect_disposition_binding_invalid")
-    if normalized["receipt_fingerprint"] != _pre_w3_effect_disposition_fingerprint(
-        normalized
-    ):
-        raise ValueError("pre_w3_effect_disposition_fingerprint_invalid")
-    serialized = json.dumps(
-        normalized,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    )
-    if len(serialized.encode("utf-8")) > PRE_W3_EFFECT_DISPOSITION_MAX_AUDIT_BYTES:
-        raise ValueError("pre_w3_effect_disposition_audit_too_large")
-    return normalized
-
-
 def _execute_schema_script_in_transaction(
     conn: sqlite3.Connection,
     script: str,
@@ -1227,24 +710,18 @@ def _card_patch_success_receipt(payload: Mapping[str, Any]) -> dict[str, Any]:
         "render_hash": str(payload.get("render_hash") or ""),
         "adjudication_id": str(payload.get("adjudication_id") or ""),
         "conclusion_state": str(payload.get("conclusion_state") or ""),
-        "correction_effect_key": str(
-            payload.get("correction_effect_key") or ""
-        ),
+        "correction_effect_key": str(payload.get("correction_effect_key") or ""),
     }
 
 
-def _card_patch_suppression_receipt(
-    payload: Mapping[str, Any],
-) -> dict[str, Any]:
+def _card_patch_suppression_receipt(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "source": "card_message_expired",
         "message_id": str(payload.get("message_id") or ""),
         "render_hash": str(payload.get("render_hash") or ""),
         "adjudication_id": str(payload.get("adjudication_id") or ""),
         "conclusion_state": str(payload.get("conclusion_state") or ""),
-        "correction_effect_key": str(
-            payload.get("correction_effect_key") or ""
-        ),
+        "correction_effect_key": str(payload.get("correction_effect_key") or ""),
         "error_code": "feishu_card_patch_message_expired",
     }
 
@@ -1297,12 +774,7 @@ def validate_delivery_outcome_slo(
         "failure_rate",
         "breached",
     }
-    for (
-        name,
-        window_seconds,
-        min_samples,
-        max_failure_rate,
-    ) in DELIVERY_OUTCOME_SLO_WINDOWS:
+    for name, window_seconds, min_samples, max_failure_rate in DELIVERY_OUTCOME_SLO_WINDOWS:
         window = windows.get(name)
         if not isinstance(window, Mapping) or set(window) != window_keys:
             raise ValueError("delivery outcome SLO window contract is invalid")
@@ -1360,10 +832,7 @@ def validate_delivery_outcome_slo(
     expected_healthy = (
         value["contract_valid"] and not any_window_breached and not consecutive_breached
     )
-    if (
-        type(value.get("healthy")) is not bool
-        or value["healthy"] is not expected_healthy
-    ):
+    if type(value.get("healthy")) is not bool or value["healthy"] is not expected_healthy:
         raise ValueError("delivery outcome SLO health is invalid")
     return expected_healthy
 
@@ -1528,7 +997,7 @@ class RcaDeliveryStore:
             conn.close()
         if row is None or int(row["is_current"]) != 1:
             raise RuntimeError("external_write_fence_epoch_not_current")
-        if str(row["state"]) not in {"bounded_active", "steady_active"}:
+        if str(row["state"]) != "steady_active":
             raise RuntimeError("external_write_fence_epoch_not_current")
         if str(row["decision"]) != "admit" or not row["bound_at"]:
             raise RuntimeError("external_write_fence_operation_denied")
@@ -2085,15 +1554,9 @@ class RcaDeliveryStore:
                 "production_fingerprint",
                 "production_gate_receipt_sha256",
             },
-            "rca_activation_budget_slots": {
-                "epoch_id",
-                "slot_kind",
-                "consumed_ledger_id",
-            },
             "rca_activation_admission_ledger": {
                 "ledger_id",
                 "epoch_id",
-                "slot_kind",
                 "decision",
                 "bound_at",
                 "business_key",
@@ -4167,10 +3630,7 @@ class RcaDeliveryStore:
             )
         if require_current_activation and (
             row["activation_is_current"] != 1
-            or row["activation_state"] not in {
-                "bounded_active",
-                "steady_active",
-            }
+            or row["activation_state"] != "steady_active"
         ):
             raise DeliveryRecordConflictError(
                 "delivery_card_patch_activation_stale"
@@ -6145,7 +5605,7 @@ class RcaDeliveryStore:
               JOIN rca_activation_epochs AS epoch
                 ON epoch.epoch_id = ledger.epoch_id
                AND epoch.is_current = 1
-               AND epoch.state IN ('bounded_active', 'steady_active')
+               AND epoch.state = 'steady_active'
              WHERE authority.business_key = ?
                AND authority.generation = ?
                AND authority.effect_kind = 'feishu_issue_comment'
@@ -6301,7 +5761,7 @@ class RcaDeliveryStore:
               JOIN rca_activation_epochs AS epoch
                 ON epoch.epoch_id = ledger.epoch_id
                AND epoch.is_current = 1
-               AND epoch.state IN ('bounded_active', 'steady_active')
+               AND epoch.state = 'steady_active'
              WHERE authority.business_key = ?
                AND authority.generation = ?
                AND authority.effect_kind = 'feishu_issue_comment'
@@ -7756,7 +7216,7 @@ class RcaDeliveryStore:
                 active_payload_epoch = conn.execute(
                     "SELECT 1 FROM rca_activation_epochs "
                     "WHERE epoch_id = ? AND is_current = 1 "
-                    "AND state IN ('bounded_active', 'steady_active')",
+                    "AND state = 'steady_active'",
                     (payload_epoch_id,),
                 ).fetchone()
                 if active_payload_epoch is not None:
@@ -7769,7 +7229,7 @@ class RcaDeliveryStore:
             )
         if (
             row["activation_is_current"] != 1
-            or row["activation_state"] not in {"bounded_active", "steady_active"}
+            or row["activation_state"] != "steady_active"
         ):
             raise ConclusionAdjudicationError(
                 "conclusion_adjudication_effect_activation_stale"
@@ -9816,634 +9276,6 @@ class RcaDeliveryStore:
             },
         }
 
-    @staticmethod
-    def _pre_w3_current_activation_tx(conn: sqlite3.Connection) -> dict[str, Any]:
-        rows = conn.execute(
-            """
-            SELECT epoch_id, state, is_current, config_sha256,
-                   db_logical_identity_json, db_logical_identity_sha256,
-                   preproduction_fingerprint,
-                   preproduction_gate_receipt_sha256,
-                   production_fingerprint, production_gate_receipt_sha256
-              FROM rca_activation_epochs
-             WHERE is_current = 1
-            """
-        ).fetchall()
-        if len(rows) != 1:
-            raise RuntimeError("pre_w3_effect_disposition_activation_not_unique")
-        row = rows[0]
-        try:
-            identity = json.loads(
-                str(row["db_logical_identity_json"]),
-                parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
-            )
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise RuntimeError(
-                "pre_w3_effect_disposition_activation_binding_invalid"
-            ) from exc
-        raw_identity = str(row["db_logical_identity_json"])
-        required_hashes = (
-            "config_sha256",
-            "db_logical_identity_sha256",
-            "preproduction_fingerprint",
-            "preproduction_gate_receipt_sha256",
-            "production_fingerprint",
-            "production_gate_receipt_sha256",
-        )
-        if (
-            str(row["state"]) != "steady_active"
-            or int(row["is_current"]) != 1
-            or not isinstance(identity, Mapping)
-            or _canonical_json(identity) != raw_identity
-            or hashlib.sha256(raw_identity.encode("utf-8")).hexdigest()
-            != str(row["db_logical_identity_sha256"])
-            or any(
-                re.fullmatch(r"[0-9a-f]{64}", str(row[field] or "")) is None
-                for field in required_hashes
-            )
-        ):
-            raise RuntimeError("pre_w3_effect_disposition_activation_binding_invalid")
-        body = {
-            "epoch_id": str(row["epoch_id"]),
-            "state": str(row["state"]),
-            "is_current": int(row["is_current"]),
-            "config_sha256": str(row["config_sha256"]),
-            "db_logical_identity_sha256": str(row["db_logical_identity_sha256"]),
-            "preproduction_fingerprint": str(row["preproduction_fingerprint"]),
-            "preproduction_gate_receipt_sha256": str(
-                row["preproduction_gate_receipt_sha256"]
-            ),
-            "production_fingerprint": str(row["production_fingerprint"]),
-            "production_gate_receipt_sha256": str(
-                row["production_gate_receipt_sha256"]
-            ),
-        }
-        return {**body, "sha256": _pre_w3_disposition_sha256(body)}
-
-    @classmethod
-    def _pre_w3_effect_disposition_snapshot_tx(
-        cls,
-        conn: sqlite3.Connection,
-        *,
-        effect_keys: Sequence[str],
-    ) -> dict[str, Any]:
-        keys = _normalize_pre_w3_effect_keys(effect_keys)
-        cls._require_activation_schema(conn)
-        activation = cls._pre_w3_current_activation_tx(conn)
-        circuit = cls._delivery_circuit_reset_state_in_transaction(
-            conn,
-            effect_kind=DELIVERY_EFFECT_KIND,
-        )
-        if circuit is None or circuit["circuit"]["state"] != "open":
-            raise RuntimeError("pre_w3_effect_disposition_requires_open_circuit")
-        effects: list[dict[str, Any]] = []
-        for effect_key in keys:
-            row = conn.execute(
-                """
-                SELECT effect.effect_key, effect.delivery_id,
-                       effect.effect_kind, effect.required, effect.target_key,
-                       effect.payload_json, effect.payload_sha256,
-                       effect.outcome AS effect_outcome,
-                       effect.status AS effect_status,
-                       effect.write_phase AS effect_write_phase,
-                       effect.write_started_at, effect.reconciliation_miss_count,
-                       effect.recovery_write_count, effect.last_recovery_write_at,
-                       effect.status, effect.attempt AS effect_attempt,
-                       effect.next_attempt_at, effect.fence AS effect_fence,
-                       effect.lease_token AS effect_lease_token,
-                       effect.lease_owner AS effect_lease_owner,
-                       effect.lease_expires_at AS effect_lease_expires_at,
-                       effect.remote_receipt_json, effect.last_error_code,
-                       effect.last_error_detail, effect.completed_at,
-                       effect.quarantined_at,
-                       effect.created_at AS effect_created_at,
-                       effect.updated_at AS effect_updated_at,
-                       job.submission_key, job.business_key, job.generation,
-                       job.project_key, job.work_item_type_key, job.work_item_id,
-                       job.target_key AS job_target_key, job.issue_url,
-                       job.report_url, job.status AS job_status,
-                       job.contract_json, job.manifest_json,
-                       job.updated_at AS job_updated_at,
-                       watch.submission_outbox_id, watch.state AS watch_state,
-                       watch.delivery_id AS watch_delivery_id,
-                       outbox.status AS outbox_status,
-                       outbox.activation_epoch_id,
-                       outbox.activation_ledger_id,
-                       outbox.lease_token AS outbox_lease_token,
-                       outbox.lease_owner AS outbox_lease_owner,
-                       outbox.lease_expires_at AS outbox_lease_expires_at,
-                       outbox.last_error_code AS outbox_last_error_code,
-                       outbox.last_error_detail AS outbox_last_error_detail,
-                       trigger.activation_epoch_id AS trigger_activation_epoch_id,
-                       trigger.activation_ledger_id AS trigger_activation_ledger_id,
-                       trigger.origin_source_id,
-                       source.source_kind, source.mode AS source_mode,
-                       ledger.admission_key AS ledger_admission_key,
-                       ledger.entrypoint AS ledger_entrypoint,
-                       ledger.source_kind AS ledger_source_kind,
-                       ledger.decision AS ledger_decision,
-                       ledger.bound_at AS ledger_bound_at,
-                       ledger.business_key AS ledger_business_key,
-                       ledger.submission_key AS ledger_submission_key,
-                       ledger.generation AS ledger_generation,
-                       (SELECT COUNT(*) FROM rca_admission_snapshots AS snapshot
-                         WHERE snapshot.business_key = job.business_key
-                           AND snapshot.submission_key = job.submission_key
-                           AND snapshot.generation = job.generation)
-                           AS admission_snapshot_count,
-                       (SELECT COUNT(*) FROM rca_delivery_attempts AS attempt
-                         WHERE attempt.effect_key = effect.effect_key)
-                           AS attempt_audit_count,
-                       (SELECT COUNT(*) FROM rca_delivery_effects AS sibling
-                         WHERE sibling.delivery_id = effect.delivery_id)
-                           AS delivery_effect_count
-                  FROM rca_delivery_effects AS effect
-                  JOIN rca_delivery_jobs AS job
-                    ON job.delivery_id = effect.delivery_id
-                  JOIN rca_execution_watch AS watch
-                    ON watch.submission_key = job.submission_key
-                  JOIN rca_outbox AS outbox
-                    ON outbox.outbox_id = watch.submission_outbox_id
-                  JOIN business_triggers AS trigger
-                    ON trigger.business_key = job.business_key
-                   AND trigger.generation = job.generation
-                   AND trigger.submission_key = job.submission_key
-                  JOIN rca_trigger_sources AS source
-                    ON source.source_id = trigger.origin_source_id
-                  JOIN rca_activation_admission_ledger AS ledger
-                    ON ledger.epoch_id = outbox.activation_epoch_id
-                   AND ledger.ledger_id = outbox.activation_ledger_id
-                 WHERE effect.effect_key = ?
-                """,
-                (effect_key,),
-            ).fetchone()
-            if row is None:
-                raise DeliveryRecordConflictError(
-                    "pre_w3_effect_disposition_effect_missing"
-                )
-            try:
-                payload = json.loads(str(row["payload_json"] or ""))
-                contract = json.loads(str(row["contract_json"] or ""))
-                manifest = json.loads(str(row["manifest_json"] or ""))
-            except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise DeliveryRecordConflictError(
-                    "pre_w3_effect_disposition_payload_invalid"
-                ) from exc
-            if (
-                not isinstance(payload, Mapping)
-                or not isinstance(contract, Mapping)
-                or not isinstance(manifest, Mapping)
-                or "w3_execution_snapshot" in contract
-                or "w3_execution_snapshot" in manifest
-                or str(row["effect_kind"]) != DELIVERY_EFFECT_KIND
-                or int(row["required"]) != 1
-                or str(row["effect_outcome"]) != "quarantined"
-                or str(row["effect_status"]) != "pending"
-                or str(row["effect_write_phase"]) != "prewrite"
-                or int(row["effect_attempt"]) != 0
-                or int(row["effect_fence"]) != 0
-                or row["next_attempt_at"] is not None
-                or row["write_started_at"] is not None
-                or int(row["reconciliation_miss_count"]) != 0
-                or int(row["recovery_write_count"]) != 0
-                or row["last_recovery_write_at"] is not None
-                or any(
-                    row[field] is not None
-                    for field in (
-                        "effect_lease_token",
-                        "effect_lease_owner",
-                        "effect_lease_expires_at",
-                        "remote_receipt_json",
-                        "completed_at",
-                        "quarantined_at",
-                    )
-                )
-                or str(row["last_error_code"] or "")
-                or str(row["last_error_detail"] or "")
-                or str(row["job_status"]) != "ready"
-                or str(row["issue_url"] or "")
-                or str(row["report_url"] or "")
-                or str(row["target_key"]) != str(row["job_target_key"])
-                or str(row["watch_state"]) != "delivery_created"
-                or str(row["watch_delivery_id"]) != str(row["delivery_id"])
-                or str(row["outbox_status"]) != "quarantined"
-                or any(
-                    row[field] is not None
-                    for field in (
-                        "outbox_lease_token",
-                        "outbox_lease_owner",
-                        "outbox_lease_expires_at",
-                    )
-                )
-                or str(row["activation_epoch_id"]) != activation["epoch_id"]
-                or row["activation_ledger_id"] is None
-                or str(row["trigger_activation_epoch_id"])
-                != activation["epoch_id"]
-                or int(row["trigger_activation_ledger_id"])
-                != int(row["activation_ledger_id"])
-                or str(row["source_kind"]) != "kafka_workflow_event"
-                or str(row["source_mode"]) != "issue_created"
-                or str(row["ledger_entrypoint"]) != "kafka_ingest"
-                or str(row["ledger_source_kind"]) != "kafka"
-                or str(row["ledger_decision"]) != "admit"
-                or not str(row["ledger_bound_at"] or "").strip()
-                or str(row["ledger_business_key"]) != str(row["business_key"])
-                or str(row["ledger_submission_key"])
-                != str(row["submission_key"])
-                or int(row["ledger_generation"]) != int(row["generation"])
-                or int(row["admission_snapshot_count"]) != 0
-                or int(row["attempt_audit_count"]) != 0
-                or int(row["delivery_effect_count"]) != 1
-                or re.fullmatch(r"[0-9a-f]{64}", str(row["payload_sha256"] or ""))
-                is None
-                or str(payload.get("semantic_payload_sha256") or "")
-                != str(row["payload_sha256"])
-                or not cls._execution_activation_eligible_tx(
-                    conn,
-                    submission_key=str(row["submission_key"]),
-                )
-            ):
-                raise DeliveryRecordConflictError(
-                    "pre_w3_effect_disposition_effect_not_eligible"
-                )
-            body = {
-                "effect_key": str(row["effect_key"]),
-                "delivery_id": str(row["delivery_id"]),
-                "submission_key": str(row["submission_key"]),
-                "business_key": str(row["business_key"]),
-                "generation": int(row["generation"]),
-                "project_key": str(row["project_key"]),
-                "work_item_type_key": str(row["work_item_type_key"]),
-                "work_item_id": str(row["work_item_id"]),
-                "target_key": str(row["target_key"]),
-                "payload_sha256": str(row["payload_sha256"]),
-                "effect_outcome": str(row["effect_outcome"]),
-                "effect_status": str(row["effect_status"]),
-                "effect_write_phase": str(row["effect_write_phase"]),
-                "effect_attempt": int(row["effect_attempt"]),
-                "effect_fence": int(row["effect_fence"]),
-                "effect_created_at": str(row["effect_created_at"]),
-                "effect_updated_at": str(row["effect_updated_at"]),
-                "job_status": str(row["job_status"]),
-                "job_updated_at": str(row["job_updated_at"]),
-                "job_contract_sha256": hashlib.sha256(
-                    str(row["contract_json"]).encode("utf-8")
-                ).hexdigest(),
-                "job_manifest_sha256": hashlib.sha256(
-                    str(row["manifest_json"]).encode("utf-8")
-                ).hexdigest(),
-                "watch_state": str(row["watch_state"]),
-                "submission_outbox_id": int(row["submission_outbox_id"]),
-                "outbox_status": str(row["outbox_status"]),
-                "outbox_last_error_code": str(row["outbox_last_error_code"] or ""),
-                "outbox_last_error_detail_sha256": hashlib.sha256(
-                    str(row["outbox_last_error_detail"] or "").encode("utf-8")
-                ).hexdigest(),
-                "activation_epoch_id": str(row["activation_epoch_id"]),
-                "activation_ledger_id": int(row["activation_ledger_id"]),
-                "ledger_admission_key": str(row["ledger_admission_key"]),
-                "ledger_bound_at": str(row["ledger_bound_at"]),
-                "origin_source_id": str(row["origin_source_id"]),
-                "source_kind": str(row["source_kind"]),
-                "source_mode": str(row["source_mode"]),
-                "admission_snapshot_count": int(row["admission_snapshot_count"]),
-                "attempt_audit_count": int(row["attempt_audit_count"]),
-                "delivery_effect_count": int(row["delivery_effect_count"]),
-                "w3_execution_snapshot_present": False,
-                "remote_receipt_present": False,
-            }
-            effects.append({**body, "row_sha256": _pre_w3_disposition_sha256(body)})
-        set_binding = [
-            {"effect_key": row["effect_key"], "row_sha256": row["row_sha256"]}
-            for row in effects
-        ]
-        logical_digest = _sqlite_logical_digest_tx(conn)
-        body = {
-            "schema_version": PRE_W3_EFFECT_DISPOSITION_SNAPSHOT_SCHEMA_VERSION,
-            "effect_kind": DELIVERY_EFFECT_KIND,
-            "effect_keys": list(keys),
-            "effect_set_sha256": _pre_w3_disposition_sha256(set_binding),
-            "current_activation": activation,
-            "circuit": circuit,
-            "control_db_logical_digest": logical_digest,
-            "effects": effects,
-        }
-        return {**body, "snapshot_sha256": _pre_w3_disposition_sha256(body)}
-
-    def pre_w3_effect_disposition_snapshot(
-        self,
-        *,
-        effect_keys: Sequence[str],
-    ) -> dict[str, Any]:
-        """Read the exact no-write disposition cohort without taking a lease."""
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN")
-            return self._pre_w3_effect_disposition_snapshot_tx(
-                conn,
-                effect_keys=effect_keys,
-            )
-        finally:
-            if conn.in_transaction:
-                conn.rollback()
-            conn.close()
-
-    def control_db_logical_digest(self) -> dict[str, Any]:
-        """Return a full logical digest from one consistent read transaction."""
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN")
-            return _sqlite_logical_digest_tx(conn)
-        finally:
-            if conn.in_transaction:
-                conn.rollback()
-            conn.close()
-
-    @staticmethod
-    def _pre_w3_after_state_matches_tx(
-        conn: sqlite3.Connection,
-        *,
-        payload: Mapping[str, Any],
-    ) -> bool:
-        for expected in payload["after"]["effects"]:
-            row = conn.execute(
-                """
-                SELECT effect.status AS effect_status,
-                       effect.write_phase AS effect_write_phase,
-                       effect.attempt AS effect_attempt,
-                       effect.fence AS effect_fence,
-                       effect.remote_receipt_json,
-                       effect.last_error_code, effect.last_error_detail,
-                       effect.quarantined_at,
-                       effect.updated_at AS effect_updated_at,
-                       job.status AS job_status, job.updated_at AS job_updated_at
-                  FROM rca_delivery_effects AS effect
-                  JOIN rca_delivery_jobs AS job
-                    ON job.delivery_id = effect.delivery_id
-                 WHERE effect.effect_key = ? AND effect.delivery_id = ?
-                """,
-                (expected["effect_key"], expected["delivery_id"]),
-            ).fetchone()
-            attempt = conn.execute(
-                """
-                SELECT attempt_no, fence, request_id, outcome, error_code,
-                       detail, finished_at
-                  FROM rca_delivery_attempts
-                 WHERE effect_key = ? AND request_id = ?
-                """,
-                (
-                    expected["effect_key"],
-                    expected["attempt_audit"]["request_id"],
-                ),
-            ).fetchone()
-            if row is None or attempt is None:
-                return False
-            observed = {
-                "effect_status": str(row["effect_status"]),
-                "effect_write_phase": str(row["effect_write_phase"]),
-                "effect_attempt": int(row["effect_attempt"]),
-                "effect_fence": int(row["effect_fence"]),
-                "effect_remote_receipt_present": row["remote_receipt_json"] is not None,
-                "effect_last_error_code": str(row["last_error_code"]),
-                "effect_last_error_detail": str(row["last_error_detail"]),
-                "effect_quarantined_at": str(row["quarantined_at"]),
-                "effect_updated_at": str(row["effect_updated_at"]),
-                "job_status": str(row["job_status"]),
-                "job_updated_at": str(row["job_updated_at"]),
-                "attempt_audit": {
-                    "attempt_no": int(attempt["attempt_no"]),
-                    "fence": int(attempt["fence"]),
-                    "request_id": str(attempt["request_id"]),
-                    "outcome": str(attempt["outcome"]),
-                    "error_code": str(attempt["error_code"]),
-                    "detail": str(attempt["detail"]),
-                    "finished_at": str(attempt["finished_at"]),
-                },
-            }
-            if any(
-                observed[field] != expected[field]
-                for field in observed
-            ):
-                return False
-        return True
-
-    def quarantine_pre_w3_effects_with_audit(
-        self,
-        *,
-        audit: Mapping[str, Any],
-        now: datetime | None = None,
-    ) -> tuple[dict[str, Any], bool]:
-        """Atomically quarantine an exact pre-W3 cohort without a provider call."""
-        if self.read_only:
-            raise RuntimeError(
-                "pre_w3_effect_disposition_mutation_requires_read_write_store"
-            )
-        payload = _validate_pre_w3_effect_disposition_audit(audit)
-        current = _iso(now)
-        if payload["recorded_at"] != current:
-            raise ValueError("pre_w3_effect_disposition_timestamp_mismatch")
-        try:
-            observed_db = self.db_path.expanduser().absolute().lstat()
-        except OSError as exc:
-            raise RuntimeError("pre_w3_effect_disposition_control_db_missing") from exc
-        identity = payload["control_db_identity"]
-        observed_identity = {
-            "path": str(self.db_path.expanduser().absolute()),
-            "device": int(observed_db.st_dev),
-            "inode": int(observed_db.st_ino),
-            "size": int(observed_db.st_size),
-            "mtime_ns": int(observed_db.st_mtime_ns),
-        }
-        if any(
-            identity[field] != observed_identity[field]
-            for field in ("path", "device", "inode")
-        ):
-            raise RuntimeError("pre_w3_effect_disposition_control_db_changed")
-        serialized = _canonical_json(payload)
-        meta_key = (
-            f"{PRE_W3_EFFECT_DISPOSITION_META_PREFIX}{payload['disposition_id']}"
-        )
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            existing = conn.execute(
-                "SELECT value FROM control_meta WHERE key = ?",
-                (meta_key,),
-            ).fetchone()
-            if existing is not None:
-                if (
-                    str(existing["value"]) == serialized
-                    and self._pre_w3_after_state_matches_tx(conn, payload=payload)
-                ):
-                    conn.rollback()
-                    return payload, False
-                raise DeliveryRecordConflictError(
-                    "pre_w3_effect_disposition_audit_conflict"
-                )
-            if identity != observed_identity:
-                raise RuntimeError("pre_w3_effect_disposition_control_db_changed")
-            if (
-                _sqlite_logical_digest_tx(conn)
-                != payload["before"]["control_db_logical_digest"]
-            ):
-                raise DeliveryRecordConflictError(
-                    "pre_w3_effect_disposition_control_db_logical_state_changed"
-                )
-            observed_before = self._pre_w3_effect_disposition_snapshot_tx(
-                conn,
-                effect_keys=payload["effect_keys"],
-            )
-            if observed_before != payload["before"]:
-                raise DeliveryRecordConflictError(
-                    "pre_w3_effect_disposition_before_changed"
-                )
-            changes_before = conn.total_changes
-            conn.execute(
-                "INSERT INTO control_meta(key, value) VALUES(?, ?)",
-                (meta_key, serialized),
-            )
-            detail = (
-                "operator_audited_pre_w3_disposition:"
-                f"{payload['disposition_id']}"
-            )
-            for row in observed_before["effects"]:
-                request_id = (
-                    f"pre-w3-disposition:{payload['disposition_id']}:"
-                    f"{row['effect_key']}"
-                )
-                self._append_attempt_event(
-                    conn,
-                    effect_key=row["effect_key"],
-                    attempt_no=0,
-                    fence=row["effect_fence"],
-                    request_id=request_id,
-                    outcome="quarantined",
-                    current=current,
-                    error_code=PRE_W3_EFFECT_DISPOSITION_ERROR_CODE,
-                    detail="operator-audited pre-W3 disposition; no provider call",
-                )
-                updated = conn.execute(
-                    """
-                    UPDATE rca_delivery_effects
-                       SET status = 'quarantined', write_phase = 'settled',
-                           next_attempt_at = NULL, quarantined_at = ?,
-                           last_error_code = ?, last_error_detail = ?,
-                           lease_token = NULL, lease_owner = NULL,
-                           lease_expires_at = NULL, updated_at = ?
-                     WHERE effect_key = ? AND delivery_id = ?
-                       AND status = 'pending' AND write_phase = 'prewrite'
-                       AND attempt = 0 AND fence = 0
-                       AND payload_sha256 = ? AND updated_at = ?
-                       AND next_attempt_at IS NULL
-                       AND write_started_at IS NULL
-                       AND lease_token IS NULL AND lease_owner IS NULL
-                       AND lease_expires_at IS NULL
-                       AND remote_receipt_json IS NULL
-                       AND completed_at IS NULL AND quarantined_at IS NULL
-                    """,
-                    (
-                        current,
-                        PRE_W3_EFFECT_DISPOSITION_ERROR_CODE,
-                        detail,
-                        current,
-                        row["effect_key"],
-                        row["delivery_id"],
-                        row["payload_sha256"],
-                        row["effect_updated_at"],
-                    ),
-                )
-                if updated.rowcount != 1:
-                    raise DeliveryRecordConflictError(
-                        "pre_w3_effect_disposition_effect_cas_lost"
-                    )
-                job_status = self._aggregate_job_status(
-                    conn,
-                    row["delivery_id"],
-                    current,
-                )
-                if job_status != "quarantined":
-                    raise DeliveryRecordConflictError(
-                        "pre_w3_effect_disposition_job_not_quarantined"
-                    )
-            if not self._pre_w3_after_state_matches_tx(conn, payload=payload):
-                raise DeliveryRecordConflictError(
-                    "pre_w3_effect_disposition_after_changed"
-                )
-            if (
-                self._pre_w3_current_activation_tx(conn)
-                != observed_before["current_activation"]
-                or self._delivery_circuit_reset_state_in_transaction(
-                    conn,
-                    effect_kind=DELIVERY_EFFECT_KIND,
-                )
-                != observed_before["circuit"]
-                or conn.total_changes - changes_before
-                != payload["effect_delta"]["total_database_rows"]
-            ):
-                raise DeliveryRecordConflictError(
-                    "pre_w3_effect_disposition_guard_changed"
-                )
-            conn.commit()
-            return payload, True
-        except Exception:
-            if conn.in_transaction:
-                conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-    def pre_w3_effect_disposition_audit(
-        self,
-        disposition_id: str,
-    ) -> dict[str, Any] | None:
-        normalized = str(disposition_id or "").strip()
-        if re.fullmatch(r"[0-9a-f]{64}", normalized) is None:
-            raise ValueError("pre_w3_effect_disposition_id_invalid")
-        conn = self._connect()
-        try:
-            row = conn.execute(
-                "SELECT value FROM control_meta WHERE key = ?",
-                (f"{PRE_W3_EFFECT_DISPOSITION_META_PREFIX}{normalized}",),
-            ).fetchone()
-            if row is None:
-                return None
-            raw = str(row["value"])
-            value = _validate_pre_w3_effect_disposition_audit(
-                json.loads(
-                    raw,
-                    parse_constant=lambda _value: (_ for _ in ()).throw(
-                        ValueError("pre_w3_effect_disposition_non_finite_json")
-                    ),
-                )
-            )
-            if value["disposition_id"] != normalized or _canonical_json(value) != raw:
-                raise RuntimeError("pre_w3_effect_disposition_audit_tampered")
-            observed_db = self.db_path.expanduser().absolute().lstat()
-            identity = value["control_db_identity"]
-            if (
-                identity["path"] != str(self.db_path.expanduser().absolute())
-                or int(identity["device"]) != int(observed_db.st_dev)
-                or int(identity["inode"]) != int(observed_db.st_ino)
-            ):
-                raise RuntimeError("pre_w3_effect_disposition_control_db_mismatch")
-            return value
-        except (json.JSONDecodeError, ValueError) as exc:
-            raise RuntimeError("pre_w3_effect_disposition_audit_invalid") from exc
-        finally:
-            conn.close()
-
-    def pre_w3_effect_disposition_is_applied(
-        self,
-        audit: Mapping[str, Any],
-    ) -> bool:
-        """Verify that an existing durable disposition still has its exact after-state."""
-        payload = _validate_pre_w3_effect_disposition_audit(audit)
-        conn = self._connect()
-        try:
-            return self._pre_w3_after_state_matches_tx(conn, payload=payload)
-        finally:
-            conn.close()
-
     def delivery_dispatcher_circuit_reset_state(
         self,
         effect_kind: str = DELIVERY_EFFECT_KIND,
@@ -11526,206 +10358,426 @@ class RcaDeliveryStore:
             },
         }
 
-    def capacity_sample_candidates(
+    def canonical_canary_readback(
         self,
         *,
-        activated_at: datetime,
-        limit: int = 20,
-        excluded_task_attempts: set[tuple[str, str]] | None = None,
-    ) -> list[DeliveryCapacitySnapshot]:
-        """Return immutable delivered candidates from one read transaction.
+        batch_id: str,
+        issue_id: str,
+        submission_key: str,
+        activation_epoch_id: str,
+    ) -> dict[str, Any]:
+        """Project one delivered canary from canonical rows in one transaction."""
 
-        This is deliberately a read-only projection over the existing delivery
-        tables. It neither marks rows nor creates a capacity-specific DB schema;
-        create-once evidence files and the signed ledger own deduplication.
-        """
-        activation = _utc_datetime(activated_at)
+        batch = str(batch_id or "").strip()
+        issue = str(issue_id or "").strip()
+        submission = str(submission_key or "").strip()
+        epoch_id = str(activation_epoch_id or "").strip()
         if (
-            isinstance(limit, bool)
-            or not isinstance(limit, int)
-            or not (1 <= limit <= MAX_DELIVERY_CAPACITY_CANDIDATES)
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{2,127}", batch) is None
+            or re.fullmatch(r"[0-9]{6,24}", issue) is None
+            or re.fullmatch(r"g1q3-rca-s1-[0-9a-f]{64}", submission) is None
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{5,127}", epoch_id)
+            is None
         ):
-            raise ValueError("capacity candidate limit is invalid")
-        excluded = set(excluded_task_attempts or set())
-        if any(
-            not isinstance(item, tuple)
-            or len(item) != 2
-            or not all(isinstance(value, str) and value for value in item)
-            for item in excluded
-        ):
-            raise ValueError("excluded task attempts are invalid")
+            raise ValueError("canonical_canary_readback_identity_invalid")
+
+        def invalid(detail: str) -> None:
+            raise DeliveryRecordConflictError(
+                f"canonical_canary_readback_invalid:{detail}"
+            )
+
+        def exact_object(raw: Any, detail: str) -> dict[str, Any]:
+            if not isinstance(raw, str) or not raw:
+                invalid(detail)
+            try:
+                value = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                invalid(detail)
+            if not isinstance(value, dict) or _canonical_json(value) != raw:
+                invalid(detail)
+            return value
+
         conn = self._connect()
         try:
             conn.execute("BEGIN")
-            rows = conn.execute(
-                """
-                SELECT j.*, w.task_id, w.last_status_json,
-                       o.completed_at AS submission_completed_at,
-                       o.payload_json AS submission_payload_json,
-                       o.result_json AS submission_result_json
-                  FROM rca_delivery_jobs AS j
-                  JOIN rca_execution_watch AS w
-                    ON w.submission_key = j.submission_key
-                  JOIN rca_outbox AS o
-                    ON o.outbox_id = w.submission_outbox_id
-                 WHERE j.status = 'delivered'
-                   AND j.outcome = 'success'
-                   AND w.state = 'delivery_created'
-                   AND w.task_id IS NOT NULL
-                   AND w.last_status_json IS NOT NULL
-                   AND o.status = 'completed'
-                   AND o.result_json IS NOT NULL
-                   AND j.updated_at >= ?
-                 ORDER BY j.updated_at, j.delivery_id
-                 LIMIT ?
-                """,
-                (
-                    _iso(activation),
-                    min(
-                        MAX_DELIVERY_CAPACITY_CANDIDATES * 4,
-                        limit + len(excluded),
-                    ),
-                ),
+            epochs = conn.execute(
+                "SELECT epoch_id, state FROM rca_activation_epochs "
+                "WHERE is_current = 1"
             ).fetchall()
-            snapshots: list[DeliveryCapacitySnapshot] = []
-            subscriptions_ready = self._table_exists(conn, "rca_delivery_subscriptions")
-            for row in rows:
-                status = _json_object(row["last_status_json"])
-                task_meta = status.get("meta")
-                task_meta = dict(task_meta) if isinstance(task_meta, Mapping) else {}
-                if task_meta.get("rca_prod_capacity_sample_eligible") is not True:
-                    continue
-                task_id = str(row["task_id"] or "")
-                attempt_id = str(task_meta.get("rca_prod_attempt_id") or "")
-                if (task_id, attempt_id) in excluded:
-                    continue
-                effect_rows = conn.execute(
-                    """
-                    SELECT e.effect_key, e.effect_kind, e.required, e.target_key,
-                           e.status, e.remote_receipt_json, e.completed_at,
-                           e.updated_at,
-                           (
-                               SELECT a.remote_id
-                                 FROM rca_delivery_attempts AS a
-                                WHERE a.effect_key = e.effect_key
-                                  AND a.outcome IN ('ack', 'reconciled')
-                                  AND a.finished_at IS NOT NULL
-                                ORDER BY a.event_seq DESC, a.attempt_id DESC
-                                LIMIT 1
-                           ) AS remote_id
-                      FROM rca_delivery_effects AS e
-                     WHERE e.delivery_id = ? AND e.required = 1
-                     ORDER BY e.effect_kind, e.effect_key
-                     LIMIT ?
-                    """,
-                    (row["delivery_id"], MAX_DELIVERY_CAPACITY_EVIDENCE_ROWS),
-                ).fetchall()
-                effects = [
+            if (
+                len(epochs) != 1
+                or str(epochs[0]["epoch_id"]) != epoch_id
+                or str(epochs[0]["state"]) != "steady_active"
+            ):
+                invalid("activation_not_current")
+
+            core_rows = conn.execute(
+                """
+                SELECT t.business_key, t.generation,
+                       t.project_key, t.work_item_type_key, t.work_item_id,
+                       t.state AS trigger_state,
+                       t.activation_epoch_id AS trigger_epoch_id,
+                       t.activation_ledger_id AS trigger_ledger_id,
+                       t.origin_source_id AS trigger_source_id,
+                       o.outbox_id, o.status AS outbox_status,
+                       o.activation_epoch_id AS outbox_epoch_id,
+                       o.activation_ledger_id AS outbox_ledger_id,
+                       o.origin_source_id AS outbox_source_id,
+                       o.result_json AS outbox_result_json,
+                       w.submission_outbox_id, w.business_key AS watch_business_key,
+                       w.generation AS watch_generation,
+                       w.project_key AS watch_project_key,
+                       w.work_item_type_key AS watch_work_item_type_key,
+                       w.work_item_id AS watch_work_item_id,
+                       w.task_id, w.state AS watch_state,
+                       w.last_status_json, w.delivery_id AS watch_delivery_id,
+                       b.role AS source_role,
+                       s.source_id, s.source_kind, s.platform, s.chat_id,
+                       s.thread_id, s.message_id, s.requester_id,
+                       s.mode AS source_mode, s.outcome AS source_outcome,
+                       l.epoch_id AS ledger_epoch_id,
+                       l.business_key AS ledger_business_key,
+                       l.submission_key AS ledger_submission_key,
+                       l.generation AS ledger_generation,
+                       l.decision AS ledger_decision, l.bound_at AS ledger_bound_at
+                  FROM business_triggers AS t
+                  JOIN rca_outbox AS o
+                    ON o.business_key = t.business_key
+                   AND o.generation = t.generation
+                   AND o.submission_key = t.submission_key
+                  JOIN rca_execution_watch AS w
+                    ON w.submission_key = t.submission_key
+                   AND w.submission_outbox_id = o.outbox_id
+                  JOIN rca_trigger_bindings AS b
+                    ON b.source_id = t.origin_source_id
+                   AND b.business_key = t.business_key
+                   AND b.generation = t.generation
+                  JOIN rca_trigger_sources AS s
+                    ON s.source_id = b.source_id
+                  JOIN rca_activation_admission_ledger AS l
+                    ON l.ledger_id = t.activation_ledger_id
+                 WHERE t.submission_key = ? AND t.work_item_id = ?
+                """,
+                (submission, issue),
+            ).fetchall()
+            if len(core_rows) != 1:
+                invalid("execution_lineage_missing")
+            core = core_rows[0]
+            generation = int(core["generation"])
+            business_key = str(core["business_key"])
+            source_id = str(core["source_id"])
+            expected_message_prefix = f"{batch}-{issue}-try-"
+            if (
+                generation < 1
+                or str(core["trigger_state"]) != "submitted"
+                or str(core["outbox_status"]) != "completed"
+                or str(core["trigger_epoch_id"] or "") != epoch_id
+                or str(core["outbox_epoch_id"] or "") != epoch_id
+                or core["trigger_ledger_id"] is None
+                or core["trigger_ledger_id"] != core["outbox_ledger_id"]
+                or str(core["ledger_epoch_id"] or "") != epoch_id
+                or str(core["ledger_business_key"]) != business_key
+                or str(core["ledger_submission_key"]) != submission
+                or int(core["ledger_generation"]) != generation
+                or str(core["ledger_decision"]) != "admit"
+                or not str(core["ledger_bound_at"] or "")
+                or str(core["trigger_source_id"] or "") != source_id
+                or str(core["outbox_source_id"] or "") != source_id
+                or str(core["source_role"]) != "origin"
+                or str(core["source_kind"]) != "feishu_group_manual"
+                or str(core["platform"]) != "operator"
+                or str(core["chat_id"] or "")
+                or str(core["thread_id"] or "")
+                or str(core["source_mode"]) != "rerun"
+                or str(core["source_outcome"]) != "created"
+                or not str(core["requester_id"] or "").startswith("automation:")
+                or re.fullmatch(
+                    re.escape(expected_message_prefix) + r"[1-9][0-9]*",
+                    str(core["message_id"] or ""),
+                )
+                is None
+                or int(core["submission_outbox_id"]) != int(core["outbox_id"])
+                or str(core["watch_business_key"]) != business_key
+                or int(core["watch_generation"]) != generation
+                or str(core["watch_project_key"]) != str(core["project_key"])
+                or str(core["watch_work_item_type_key"])
+                != str(core["work_item_type_key"])
+                or str(core["watch_work_item_id"]) != issue
+                or str(core["task_id"] or "") != submission
+                or str(core["watch_state"]) != "delivery_created"
+                or not str(core["watch_delivery_id"] or "")
+            ):
+                invalid("execution_lineage_mismatch")
+
+            outbox_result = exact_object(
+                core["outbox_result_json"], "outbox_result_invalid"
+            )
+            if (
+                outbox_result.get("success") is not True
+                or outbox_result.get("submission_key") != submission
+                or outbox_result.get("task_id") != submission
+            ):
+                invalid("outbox_result_mismatch")
+            watch_status = exact_object(
+                core["last_status_json"], "watch_status_invalid"
+            )
+            execution_readback = watch_status.get("execution_identity_readback")
+            if (
+                watch_status.get("success") is not True
+                or watch_status.get("state") != "completed"
+                or not isinstance(execution_readback, dict)
+            ):
+                invalid("watch_status_mismatch")
+
+            if generation <= 1:
+                invalid("rerun_authority_missing")
+            authorities = conn.execute(
+                """
+                SELECT authority_family, outbox_id, business_key, generation,
+                       batch_id, issue_id, submission_key, activation_epoch_id,
+                       activation_ledger_id, source_id, effect_kind,
+                       project_key, work_item_type_key
+                  FROM rca_owner_authorized_rerun_delivery_authorities
+                 WHERE submission_key = ?
+                """,
+                (submission,),
+            ).fetchall()
+            if len(authorities) != 1:
+                invalid("rerun_authority_missing")
+            authority = authorities[0]
+            if (
+                str(authority["authority_family"])
+                not in {"terminal_rerun", "historical_epoch_rerun"}
+                or int(authority["outbox_id"]) != int(core["outbox_id"])
+                or str(authority["business_key"]) != business_key
+                or int(authority["generation"]) != generation
+                or str(authority["batch_id"]) != batch
+                or str(authority["issue_id"]) != issue
+                or str(authority["submission_key"]) != submission
+                or str(authority["activation_epoch_id"]) != epoch_id
+                or authority["activation_ledger_id"] != core["trigger_ledger_id"]
+                or str(authority["source_id"]) != source_id
+                or str(authority["effect_kind"]) != "feishu_issue_comment"
+                or str(authority["project_key"]) != str(core["project_key"])
+                or str(authority["work_item_type_key"])
+                != str(core["work_item_type_key"])
+            ):
+                invalid("rerun_authority_mismatch")
+
+            jobs = conn.execute(
+                "SELECT * FROM rca_delivery_jobs WHERE submission_key = ?",
+                (submission,),
+            ).fetchall()
+            if len(jobs) != 1:
+                invalid("delivery_job_missing")
+            job = jobs[0]
+            delivery_id = str(job["delivery_id"])
+            if (
+                delivery_id != str(core["watch_delivery_id"])
+                or str(job["business_key"]) != business_key
+                or int(job["generation"]) != generation
+                or str(job["project_key"]) != str(core["project_key"])
+                or str(job["work_item_type_key"])
+                != str(core["work_item_type_key"])
+                or str(job["work_item_id"]) != issue
+                or str(job["status"]) != "delivered"
+                or str(job["outcome"]) != "success"
+            ):
+                invalid("delivery_job_mismatch")
+
+            effects = conn.execute(
+                "SELECT * FROM rca_delivery_effects "
+                "WHERE delivery_id = ? AND required = 1 "
+                "ORDER BY effect_kind, effect_key",
+                (delivery_id,),
+            ).fetchall()
+            if (
+                len(effects) != 1
+                or str(effects[0]["effect_kind"]) != "feishu_issue_comment"
+                or str(effects[0]["status"]) != "succeeded"
+                or str(effects[0]["write_phase"]) != "settled"
+                or not str(effects[0]["completed_at"] or "")
+            ):
+                invalid("required_effects_mismatch")
+            effect = effects[0]
+            effect_key = str(effect["effect_key"])
+            effect_payload = exact_object(
+                effect["payload_json"], "effect_payload_invalid"
+            )
+            field_updates = effect_payload.get("field_updates")
+            expected_target = str(job["target_key"])
+            expected_report_url = str(job["report_url"])
+            expected_result_value = effect_payload.get("result_field_value")
+            expected_field_updates = [
+                {
+                    "field_key": RCA_RESULT_FIELD_KEY,
+                    "field_value": expected_result_value,
+                },
+                {
+                    "field_key": RCA_REPORT_FIELD_KEY,
+                    "field_value": expected_report_url,
+                },
+            ]
+            try:
+                computed_payload_sha256 = compute_delivery_effect_payload_sha256(
+                    effect_payload, DELIVERY_EFFECT_KIND
+                )
+                computed_effect_key = compute_delivery_effect_key(
+                    delivery_id=delivery_id,
+                    effect_kind=DELIVERY_EFFECT_KIND,
+                    target_key=expected_target,
+                    semantic_payload_sha256=computed_payload_sha256,
+                )
+                expected_marker = delivery_effect_marker(
+                    computed_effect_key, str(job["artifact_set_id"])
+                )
+            except (DeliveryContractError, TypeError, ValueError):
+                invalid("effect_payload_invalid")
+            if (
+                str(effect["target_key"]) != expected_target
+                or effect_payload.get("schema_version")
+                != DELIVERY_EFFECT_SCHEMA_VERSION
+                or effect_payload.get("delivery_id") != delivery_id
+                or effect_payload.get("effect_kind") != DELIVERY_EFFECT_KIND
+                or effect_payload.get("target_key") != expected_target
+                or effect_payload.get("project_key") != str(core["project_key"])
+                or effect_payload.get("work_item_type_key")
+                != str(core["work_item_type_key"])
+                or effect_payload.get("work_item_id") != issue
+                or effect_payload.get("issue_url") != str(job["issue_url"])
+                or effect_payload.get("artifact_set_id")
+                != str(job["artifact_set_id"])
+                or not expected_report_url
+                or effect_payload.get("report_url") != expected_report_url
+                or not isinstance(expected_result_value, str)
+                or not expected_result_value.strip()
+                or field_updates != expected_field_updates
+                or str(effect["payload_sha256"]) != computed_payload_sha256
+                or effect_payload.get("semantic_payload_sha256")
+                != computed_payload_sha256
+                or effect_key != computed_effect_key
+                or effect_payload.get("effect_key") != computed_effect_key
+                or effect_payload.get("marker") != expected_marker
+            ):
+                invalid("effect_payload_mismatch")
+            receipt = exact_object(
+                effect["remote_receipt_json"], "remote_receipt_invalid"
+            )
+            remote_id = str(receipt.get("remote_id") or "")
+            source = str(receipt.get("source") or "")
+            fields = receipt.get("confirmed_field_keys")
+            canonical_fields = (
+                sorted(fields)
+                if isinstance(fields, list)
+                and all(isinstance(value, str) for value in fields)
+                else []
+            )
+            content = str(effect_payload.get("comment_content") or "")
+            if (
+                not remote_id
+                or source not in {"read_after_write", "read_after_recovery_write"}
+                or canonical_fields != ["field_8c912e", "field_9193cb"]
+                or receipt.get("confirmed_report_url") != str(job["report_url"])
+                or receipt.get("marker") != effect_payload.get("marker")
+                or not content
+                or receipt.get("confirmed_content_sha256")
+                != hashlib.sha256(content.encode("utf-8")).hexdigest()
+            ):
+                invalid("remote_receipt_mismatch")
+
+            attempts = conn.execute(
+                "SELECT remote_id FROM rca_delivery_attempts "
+                "WHERE effect_key = ? AND outcome IN ('ack', 'reconciled') "
+                "AND finished_at IS NOT NULL ORDER BY attempt_id",
+                (effect_key,),
+            ).fetchall()
+            if len(attempts) != 1 or str(attempts[0]["remote_id"] or "") != remote_id:
+                invalid("delivery_attempt_mismatch")
+
+            observations = conn.execute(
+                "SELECT * FROM rca_delivery_observation_outbox WHERE effect_key = ?",
+                (effect_key,),
+            ).fetchall()
+            if (
+                len(observations) != 1
+                or str(observations[0]["status"]) != "appended"
+                or not str(observations[0]["appended_at"] or "")
+            ):
+                invalid("delivery_observation_missing")
+            observation_row = observations[0]
+            observation = exact_object(
+                observation_row["payload_json"], "delivery_observation_invalid"
+            )
+            try:
+                validated_observation = validate_delivery_observation(observation)
+            except (TypeError, ValueError) as exc:
+                raise DeliveryRecordConflictError(
+                    "canonical_canary_readback_invalid:delivery_observation_invalid"
+                ) from exc
+            if (
+                str(observation_row["payload_sha256"])
+                != hashlib.sha256(_canonical_json(observation).encode()).hexdigest()
+                or str(validated_observation["observation_id"])
+                != str(observation_row["observation_id"])
+                or str(validated_observation["work_item_id"]) != issue
+                or str(validated_observation["case_key"]) != submission
+                or str(validated_observation["remote_receipt_id"]) != remote_id
+                or str(validated_observation["release_id"])
+                != str(execution_readback.get("release_id") or "")
+                or str(validated_observation["outcome_content_sha256"])
+                != hashlib.sha256(content.encode("utf-8")).hexdigest()
+            ):
+                invalid("delivery_observation_mismatch")
+
+            result = {
+                "schema_version": CANONICAL_CANARY_READBACK_SCHEMA_VERSION,
+                "batch_id": batch,
+                "issue_id": issue,
+                "submission_key": submission,
+                "activation_epoch_id": epoch_id,
+                "trigger": {
+                    "business_key": business_key,
+                    "generation": generation,
+                    "state": str(core["trigger_state"]),
+                    "source_id": source_id,
+                },
+                "outbox": {
+                    "outbox_id": int(core["outbox_id"]),
+                    "status": str(core["outbox_status"]),
+                },
+                "watch": {
+                    "state": str(core["watch_state"]),
+                    "task_id": str(core["task_id"]),
+                    "delivery_id": delivery_id,
+                },
+                "delivery_job": {
+                    "delivery_id": delivery_id,
+                    "status": str(job["status"]),
+                    "outcome": str(job["outcome"]),
+                },
+                "required_effects": [
                     {
-                        "effect_key": str(effect["effect_key"]),
+                        "effect_key": effect_key,
                         "effect_kind": str(effect["effect_kind"]),
-                        "required": int(effect["required"]) == 1,
-                        "target_key": str(effect["target_key"]),
                         "status": str(effect["status"]),
-                        "remote_receipt": _json_object(effect["remote_receipt_json"]),
-                        "remote_id": str(effect["remote_id"] or ""),
-                        "completed_at": (
-                            str(effect["completed_at"])
-                            if effect["completed_at"]
-                            else None
-                        ),
-                        "updated_at": str(effect["updated_at"]),
+                        "write_phase": str(effect["write_phase"]),
+                        "remote_id": remote_id,
+                        "observation_id": str(observation_row["observation_id"]),
                     }
-                    for effect in effect_rows
-                ]
-                subscriptions: list[dict[str, Any]] = []
-                if subscriptions_ready:
-                    subscription_rows = conn.execute(
-                        """
-                        SELECT subscription_key, effect_kind, target_key,
-                               required, status, delivery_id, effect_key,
-                               reason, materialized_at, updated_at
-                          FROM rca_delivery_subscriptions
-                         WHERE business_key = ? AND generation = ?
-                           AND required = 1
-                         ORDER BY effect_kind, subscription_key
-                         LIMIT ?
-                        """,
-                        (
-                            row["business_key"],
-                            row["generation"],
-                            MAX_DELIVERY_CAPACITY_EVIDENCE_ROWS,
-                        ),
-                    ).fetchall()
-                    subscriptions = [
-                        {
-                            "subscription_key": str(item["subscription_key"]),
-                            "effect_kind": str(item["effect_kind"]),
-                            "target_key": str(item["target_key"]),
-                            "required": int(item["required"]) == 1,
-                            "status": str(item["status"]),
-                            "delivery_id": str(item["delivery_id"] or ""),
-                            "effect_key": str(item["effect_key"] or ""),
-                            "reason": str(item["reason"] or ""),
-                            "materialized_at": (
-                                str(item["materialized_at"])
-                                if item["materialized_at"]
-                                else None
-                            ),
-                            "updated_at": str(item["updated_at"]),
-                        }
-                        for item in subscription_rows
-                    ]
-                submission_payload = _json_object(row["submission_payload_json"])
-                trigger_context = submission_payload.get("trigger_context")
-                source_kind = (
-                    str(trigger_context.get("source_kind") or "")
-                    if isinstance(trigger_context, Mapping)
-                    else ""
-                )
-                updated_values = [
-                    str(row["updated_at"]),
-                    *(item["updated_at"] for item in effects),
-                    *(item["updated_at"] for item in subscriptions),
-                ]
-                payload = {
-                    "schema_version": DELIVERY_CAPACITY_SNAPSHOT_SCHEMA_VERSION,
-                    "snapshot_at": max(updated_values),
-                    "task_id": task_id,
-                    "attempt_id": attempt_id,
-                    "source_kind": source_kind,
-                    "submission_completed_at": str(
-                        row["submission_completed_at"] or ""
-                    ),
-                    "task_meta": task_meta,
-                    "job": {
-                        "delivery_id": str(row["delivery_id"]),
-                        "submission_key": str(row["submission_key"]),
-                        "business_key": str(row["business_key"]),
-                        "generation": int(row["generation"]),
-                        "outcome": str(row["outcome"]),
-                        "status": str(row["status"]),
-                        "created_at": str(row["created_at"]),
-                        "updated_at": str(row["updated_at"]),
-                    },
-                    "effects": effects,
-                    "required_subscriptions": subscriptions,
-                }
-                raw = _canonical_json(payload).encode("utf-8")
-                if len(raw) > MAX_DELIVERY_CAPACITY_SNAPSHOT_BYTES:
-                    raise RuntimeError("rca_delivery_capacity_snapshot_too_large")
-                snapshots.append(
-                    DeliveryCapacitySnapshot(
-                        payload=payload,
-                        snapshot_sha256=hashlib.sha256(raw).hexdigest(),
-                    )
-                )
-                if len(snapshots) >= limit:
-                    break
+                ],
+                "transport": {
+                    "status": "pass",
+                    "official_comment_id": remote_id,
+                    "official_field_keys": canonical_fields,
+                    "official_readback_source": source,
+                },
+                "execution_identity_readback": dict(execution_readback),
+            }
             conn.commit()
-            return snapshots
+            return result
         except Exception:
-            conn.rollback()
+            if conn.in_transaction:
+                conn.rollback()
             raise
         finally:
             conn.close()

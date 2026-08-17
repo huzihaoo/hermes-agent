@@ -1369,13 +1369,6 @@ def vm_task_submit_service(
     admission: Any,
     execution_request: Any,
     reconcile_only: bool = False,
-    capacity_mode: str = "",
-    bootstrap_epoch_id: str = "",
-    release_bom_sha256: str = "",
-    bootstrap_started_at: str = "",
-    bootstrap_deadline: str = "",
-    bootstrap_authorization_fingerprint: str = "",
-    active_release_binding_sha256: str = "",
     snapshot_required: bool = False,
     live_write_fence_authority: Callable[
         [Mapping[str, Any]], Mapping[str, Any]
@@ -1392,46 +1385,6 @@ def vm_task_submit_service(
     normalized_service = str(service_id or "").strip()
     normalized_capability = str(capability or "").strip()
     normalized_operation = str(operation or "").strip()
-    normalized_capacity_mode = str(capacity_mode or "").strip()
-    normalized_bootstrap_epoch = str(bootstrap_epoch_id or "").strip()
-    normalized_release_bom = str(release_bom_sha256 or "").strip().lower()
-    normalized_bootstrap_started = str(bootstrap_started_at or "").strip()
-    normalized_bootstrap_deadline = str(bootstrap_deadline or "").strip()
-    normalized_bootstrap_fingerprint = str(
-        bootstrap_authorization_fingerprint or ""
-    ).strip().lower()
-    normalized_active_release_binding = str(
-        active_release_binding_sha256 or ""
-    ).strip().lower()
-    if normalized_capacity_mode not in {"steady", "bootstrap"}:
-        return _vm_task_service_denied_payload(
-            "vm_task_service_capacity_mode_invalid",
-            "capacity_mode must be explicitly steady or bootstrap",
-        )
-    if normalized_capacity_mode == "steady" and (
-        normalized_bootstrap_epoch
-        or normalized_release_bom
-        or normalized_bootstrap_started
-        or normalized_bootstrap_deadline
-        or normalized_bootstrap_fingerprint
-        or normalized_active_release_binding
-    ):
-        return _vm_task_service_denied_payload(
-            "vm_task_service_capacity_mode_invalid",
-            "steady capacity mode cannot carry bootstrap release bindings",
-        )
-    if normalized_capacity_mode == "bootstrap" and (
-        not normalized_bootstrap_epoch
-        or not re.fullmatch(r"[0-9a-f]{64}", normalized_release_bom)
-        or not normalized_bootstrap_started
-        or not normalized_bootstrap_deadline
-        or not re.fullmatch(r"[0-9a-f]{64}", normalized_bootstrap_fingerprint)
-        or not re.fullmatch(r"[0-9a-f]{64}", normalized_active_release_binding)
-    ):
-        return _vm_task_service_denied_payload(
-            "vm_task_service_bootstrap_binding_invalid",
-            "bootstrap capacity mode requires an epoch id and release BOM SHA",
-        )
     if not isinstance(reconcile_only, bool):
         return _vm_task_service_denied_payload(
             "vm_task_service_request_invalid",
@@ -1985,7 +1938,7 @@ def vm_task_submit_service(
             "lane": "heavy",
             "queue_if_blocked": False,
             "resource_gate_bypass": False,
-            "rca_prod_capacity_mode": normalized_capacity_mode,
+            "rca_prod_capacity_mode": "steady",
             "reservation_id": reservation_id,
             "reservation_fence": reservation_fence,
             "reservation_contract_sha256": reservation_contract_sha256,
@@ -1999,22 +1952,6 @@ def vm_task_submit_service(
         return _vm_task_service_denied_payload(
             "vm_task_service_rca_prod_command_invalid",
             f"fixed RCA VM command contract is invalid: {exc.code}",
-        )
-    if normalized_capacity_mode == "bootstrap":
-        stable_rca_prod_meta.update(
-            {
-                "rca_prod_capacity_mode": "bootstrap",
-                "rca_prod_bootstrap_epoch_id": normalized_bootstrap_epoch,
-                "rca_prod_bootstrap_started_at": normalized_bootstrap_started,
-                "rca_prod_bootstrap_deadline": normalized_bootstrap_deadline,
-                "rca_prod_bootstrap_authorization_fingerprint": (
-                    normalized_bootstrap_fingerprint
-                ),
-                "rca_prod_release_bom_sha256": normalized_release_bom,
-                "rca_prod_active_release_binding_sha256": (
-                    normalized_active_release_binding
-                ),
-            }
         )
     identity_meta = {**base_identity_meta, **stable_rca_prod_meta}
     try:
@@ -2056,15 +1993,6 @@ def vm_task_submit_service(
                 reservation_id=reservation_id,
                 reservation_fence=reservation_fence,
                 reservation_contract_sha256=reservation_contract_sha256,
-                capacity_mode=normalized_capacity_mode,
-                bootstrap_epoch_id=normalized_bootstrap_epoch,
-                release_bom_sha256=normalized_release_bom,
-                bootstrap_started_at=normalized_bootstrap_started,
-                bootstrap_deadline=normalized_bootstrap_deadline,
-                bootstrap_authorization_fingerprint=(
-                    normalized_bootstrap_fingerprint
-                ),
-                active_release_binding_sha256=(normalized_active_release_binding),
             )
         except RcaProdAdmissionError as exc:
             return {
@@ -2358,13 +2286,6 @@ def vm_task_submit_service(
             reservation_id=reservation_id,
             reservation_fence=reservation_fence,
             reservation_contract_sha256=reservation_contract_sha256,
-            capacity_mode=normalized_capacity_mode,
-            bootstrap_epoch_id=normalized_bootstrap_epoch,
-            release_bom_sha256=normalized_release_bom,
-            bootstrap_started_at=normalized_bootstrap_started,
-            bootstrap_deadline=normalized_bootstrap_deadline,
-            bootstrap_authorization_fingerprint=normalized_bootstrap_fingerprint,
-            active_release_binding_sha256=normalized_active_release_binding,
         )
     except RcaProdAdmissionError as exc:
         return {
@@ -2470,17 +2391,6 @@ def vm_task_submit_service(
                 reservation_id=reservation_id,
                 reservation_fence=reservation_fence,
                 reservation_contract_sha256=reservation_contract_sha256,
-                capacity_mode=normalized_capacity_mode,
-                bootstrap_epoch_id=normalized_bootstrap_epoch,
-                release_bom_sha256=normalized_release_bom,
-                bootstrap_started_at=normalized_bootstrap_started,
-                bootstrap_deadline=normalized_bootstrap_deadline,
-                bootstrap_authorization_fingerprint=(
-                    normalized_bootstrap_fingerprint
-                ),
-                active_release_binding_sha256=(
-                    normalized_active_release_binding
-                ),
             )
         except RcaProdAdmissionError as exc:
             return {

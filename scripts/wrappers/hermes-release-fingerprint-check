@@ -1,11 +1,5 @@
 #!/bin/zsh
 set -euo pipefail
 launcher="${HOME}/.hermes/runtime/governance-tools/pnc_live_exec.py"
-for arg in "$@"; do
-  if [[ "$arg" == "--watchers-fresh" ]]; then
-    /usr/bin/python3 "$launcher" local.pnc.release-freshness-gate
-    break
-  fi
-done
 exec /usr/bin/python3 "$launcher" \
   local.pnc.release-fingerprint-check "$@"

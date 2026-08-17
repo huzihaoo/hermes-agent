@@ -27,7 +27,6 @@ from gateway.pnc_rca_control_store import (  # noqa: E402
     CONTROL_STORE_SCHEMA_VERSION,
     DEFAULT_OUTBOX_HIGH_WATERMARK,
     MANUAL_TRIGGER_SCHEMA_VERSION,
-    PRE_W3_NO_WRITE_RERUN_OUTBOX_ERROR_CODES,
     SILENT_TERMINAL_RERUN_ERROR_CODES,
     ManualRcaAdmissionError,
     ManualRcaTriggerRequest,
@@ -125,6 +124,11 @@ OFFICIAL_READBACK_SOURCES = frozenset(
         "recovery_read_before_write",
     }
 )
+TRANSPORT_READBACK_SOURCES = frozenset(
+    {"read_after_write", "read_after_recovery_write"}
+)
+ACCEPTANCE_AXES = frozenset({"causal", "transport"})
+DEFAULT_ACCEPTANCE_AXIS = "causal"
 DRY_RUN_PRODUCTION_EFFECTS = {
     "state_write": False,
     "control_db_write": False,
@@ -522,6 +526,7 @@ def _load_or_create_state(
     owner_receipt_path: str,
     owner_receipt_sha256: str,
     selected_issue_ids: Sequence[str],
+    acceptance_axis: str = DEFAULT_ACCEPTANCE_AXIS,
 ) -> dict[str, Any]:
     if path.exists():
         value, _raw_sha = _read_json(path)
@@ -538,10 +543,13 @@ def _load_or_create_state(
             or state.get("activation_required") is not True
             or state.get("runtime_commit") != runtime_commit
             or state.get("runtime_tree") != runtime_tree
+            or state.get("acceptance_axis", DEFAULT_ACCEPTANCE_AXIS)
+            != acceptance_axis
         ):
             raise BatchRerunError("batch_state_binding_mismatch")
         if not isinstance(state.get("items"), Mapping):
             raise BatchRerunError("batch_state_schema_invalid")
+        state["acceptance_axis"] = acceptance_axis
         state["items"] = dict(state["items"])
         return state
     current = _now()
@@ -555,6 +563,7 @@ def _load_or_create_state(
         "activation_required": True,
         "runtime_commit": runtime_commit,
         "runtime_tree": runtime_tree,
+        "acceptance_axis": acceptance_axis,
         "created_at": current,
         "updated_at": current,
         "status": "running",
@@ -570,6 +579,11 @@ def _json_object(raw: Any) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _watch_execution_identity(raw: Any) -> dict[str, Any] | None:
+    value = _json_object(raw).get("execution_identity_readback")
+    return dict(value) if isinstance(value, Mapping) else None
 
 
 def _causal_delivery_quality(contract_raw: Any) -> dict[str, str] | None:
@@ -695,6 +709,9 @@ def _issue_snapshot(
         if row is None:
             return None
         snapshot = {key: row[key] for key in row.keys()}
+        snapshot["execution_identity_readback"] = _watch_execution_identity(
+            snapshot.get("watch_status_json")
+        )
         table_names = {
             str(item["name"])
             for item in conn.execute(
@@ -771,9 +788,12 @@ def _issue_snapshot(
         conn.close()
 
 
-def _approval(
-    snapshot: Mapping[str, Any], *, issue_title: str = ""
+def _official_delivery(
+    snapshot: Mapping[str, Any],
+    *,
+    readback_sources: frozenset[str] = OFFICIAL_READBACK_SOURCES,
 ) -> dict[str, Any] | None:
+    """Return evidence for a completed external delivery with provider readback."""
     if snapshot.get("job_status") != "delivered":
         return None
     if snapshot.get("job_outcome") != "success":
@@ -796,14 +816,11 @@ def _approval(
     field_keys = sorted(str(value) for value in receipt.get("confirmed_field_keys", []))
     if (
         not receipt.get("remote_id")
-        or receipt.get("source") not in OFFICIAL_READBACK_SOURCES
+        or receipt.get("source") not in readback_sources
         or field_keys != ["field_8c912e", "field_9193cb"]
     ):
         return None
-    quality = _causal_delivery_quality(snapshot.get("contract_json"))
-    if quality is None:
-        return None
-    return {
+    result = {
         "generation": int(snapshot["generation"]),
         "submission_key": str(snapshot["submission_key"]),
         "delivery_id": str(snapshot["delivery_id"]),
@@ -813,22 +830,127 @@ def _approval(
         "official_comment_id": str(receipt["remote_id"]),
         "official_field_keys": field_keys,
         "official_readback_source": str(receipt.get("source") or ""),
-        "quality": quality,
         "manifest": _json_object(snapshot.get("manifest_json")),
         "artifacts": _json_object(snapshot.get("artifacts_json")),
         "completed_at": str(issue_effects[0].get("completed_at") or ""),
     }
+    execution_readback = snapshot.get("execution_identity_readback")
+    if isinstance(execution_readback, Mapping):
+        result["execution_identity_readback"] = dict(execution_readback)
+    return result
 
 
-def _batch_completion(
+def _transport_delivery(snapshot: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Require a write followed by readback for release transport acceptance."""
+    return _official_delivery(snapshot, readback_sources=TRANSPORT_READBACK_SOURCES)
+
+
+def _acceptance_axes(
+    snapshot: Mapping[str, Any], *, issue_title: str = ""
+) -> dict[str, dict[str, Any]]:
+    """Report transport and causal readiness without letting either imply the other."""
+    del issue_title
+    transport = _transport_delivery(snapshot)
+    contract = _json_object(snapshot.get("contract_json"))
+    quality = _causal_delivery_quality(snapshot.get("contract_json"))
+    causal: dict[str, Any]
+    if quality is None:
+        causal = {
+            "status": "not_ready",
+            "reason": (
+                "gate_a_projection_not_causal"
+                if contract.get("gate_a_projection") is not None
+                else "causal_quality_not_satisfied"
+            ),
+        }
+    else:
+        causal = {"status": "pass", "quality": quality}
+    transport_status = (
+        {
+            "status": "pass",
+            "official_comment_id": transport["official_comment_id"],
+            "official_field_keys": transport["official_field_keys"],
+            "official_readback_source": transport["official_readback_source"],
+        }
+        if transport is not None
+        else {
+            "status": "not_ready",
+            "reason": "write_readback_not_confirmed",
+        }
+    )
+    return {
+        "transport": transport_status,
+        "causal_attribution": causal,
+    }
+
+
+def _completion_for_axis(
+    snapshot: Mapping[str, Any],
+    *,
+    acceptance_axis: str,
+    issue_title: str = "",
+) -> dict[str, Any] | None:
+    if acceptance_axis not in ACCEPTANCE_AXES:
+        raise BatchRerunError("batch_acceptance_axis_invalid")
+    delivery = (
+        _transport_delivery(snapshot)
+        if acceptance_axis == "transport"
+        else _official_delivery(snapshot)
+    )
+    axes = _acceptance_axes(snapshot, issue_title=issue_title)
+    selected = (
+        axes["transport"]
+        if acceptance_axis == "transport"
+        else axes["causal_attribution"]
+    )
+    if delivery is None or selected.get("status") != "pass":
+        return None
+    completion = {
+        **delivery,
+        "acceptance_axis": acceptance_axis,
+        "acceptance": axes,
+    }
+    causal = axes["causal_attribution"]
+    completion["quality"] = dict(
+        causal.get("quality")
+        or {
+            "status": "not_ready",
+            "reason": str(causal.get("reason") or "causal_quality_not_satisfied"),
+        }
+    )
+    return completion
+
+
+def _approval(
     snapshot: Mapping[str, Any], *, issue_title: str = ""
 ) -> dict[str, Any] | None:
     """Return only an officially read-back causal RCA result."""
-    return _approval(snapshot, issue_title=issue_title)
+    return _completion_for_axis(
+        snapshot,
+        acceptance_axis=DEFAULT_ACCEPTANCE_AXIS,
+        issue_title=issue_title,
+    )
+
+
+def _batch_completion(
+    snapshot: Mapping[str, Any],
+    *,
+    issue_title: str = "",
+    acceptance_axis: str = DEFAULT_ACCEPTANCE_AXIS,
+) -> dict[str, Any] | None:
+    """Return a result only when the explicitly selected acceptance axis passes."""
+    return _completion_for_axis(
+        snapshot,
+        acceptance_axis=acceptance_axis,
+        issue_title=issue_title,
+    )
 
 
 def _terminal_failure(
-    snapshot: Mapping[str, Any], *, issue_title: str = ""
+    snapshot: Mapping[str, Any],
+    *,
+    issue_title: str = "",
+    acceptance_axis: str = DEFAULT_ACCEPTANCE_AXIS,
 ) -> dict[str, Any] | None:
     effects = [
         effect
@@ -838,8 +960,10 @@ def _terminal_failure(
     if any(effect.get("status") in ACTIVE_EFFECT_STATUSES for effect in effects):
         return None
     job_status = str(snapshot.get("job_status") or "")
-    if job_status in TERMINAL_JOB_STATUSES and _approval(
-        snapshot, issue_title=issue_title
+    if job_status in TERMINAL_JOB_STATUSES and _batch_completion(
+        snapshot,
+        issue_title=issue_title,
+        acceptance_axis=acceptance_axis,
     ) is None:
         return {
             "job_status": job_status,
@@ -855,6 +979,8 @@ def _terminal_failure(
                 }
                 for effect in effects
             ],
+            "acceptance_axis": acceptance_axis,
+            "acceptance": _acceptance_axes(snapshot, issue_title=issue_title),
         }
     if snapshot.get("outbox_status") == "quarantined" and not job_status:
         return {
@@ -1020,7 +1146,7 @@ def _silent_terminal_authority(
         and snapshot.get("watch_error_code")
         in SILENT_TERMINAL_RERUN_ERROR_CODES
     )
-    if not deadline_terminal and not _pre_w3_no_write_terminal(snapshot):
+    if not deadline_terminal:
         return None
     return build_silent_terminal_rerun_authority(
         batch_id=batch_id,
@@ -1034,74 +1160,6 @@ def _silent_terminal_authority(
         reason=reason,
     )
 
-
-def _pre_w3_no_write_terminal(snapshot: Mapping[str, Any]) -> bool:
-    subscriptions = snapshot.get("subscriptions")
-    if not isinstance(subscriptions, list):
-        return False
-    required = [
-        item
-        for item in subscriptions
-        if isinstance(item, Mapping) and int(item.get("required") or 0) == 1
-    ]
-    try:
-        status = json.loads(str(snapshot.get("watch_status_json") or ""))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return False
-    return bool(required) and (
-        snapshot.get("trigger_state") == "quarantined"
-        and snapshot.get("outbox_status") == "quarantined"
-        and snapshot.get("outbox_error_code")
-        in PRE_W3_NO_WRITE_RERUN_OUTBOX_ERROR_CODES
-        and bool(str(snapshot.get("outbox_error_detail") or "").strip())
-        and int(snapshot.get("outbox_attempt") or 0) >= 1
-        and snapshot.get("outbox_next_attempt_at") is None
-        and bool(str(snapshot.get("outbox_claimed_at") or "").strip())
-        and snapshot.get("outbox_completed_at") is None
-        and bool(str(snapshot.get("outbox_quarantined_at") or "").strip())
-        and snapshot.get("outbox_result_json") is None
-        and not any(
-            snapshot.get(name) is not None
-            for name in (
-                "outbox_lease_token",
-                "outbox_lease_owner",
-                "outbox_lease_expires_at",
-                "watch_lease_token",
-                "watch_lease_owner",
-                "watch_lease_expires_at",
-            )
-        )
-        and snapshot.get("watch_state") == "quarantined"
-        and snapshot.get("watch_business_key") == snapshot.get("business_key")
-        and snapshot.get("watch_generation") == snapshot.get("generation")
-        and snapshot.get("watch_task_id") is None
-        and snapshot.get("watch_delivery_id") is None
-        and snapshot.get("watch_error_code") == "w3_execution_snapshot_missing"
-        and bool(str(snapshot.get("watch_error_detail") or "").strip())
-        and snapshot.get("watch_terminal_at")
-        == snapshot.get("outbox_quarantined_at")
-        and snapshot.get("delivery_id") is None
-        and not snapshot.get("job_status")
-        and snapshot.get("admission_snapshot_count") == 0
-        and snapshot.get("delivery_job_count") == 0
-        and snapshot.get("delivery_effect_count") == 0
-        and snapshot.get("provider_attempt_count") == 0
-        and snapshot.get("effects") == []
-        and isinstance(status, Mapping)
-        and status.get("success") is False
-        and status.get("state") == "quarantined"
-        and status.get("error_code") == "w3_execution_snapshot_missing"
-        and status.get("external_writes") is False
-        and status.get("terminal_delivery_policy")
-        == "silent_internal_alert_only"
-        and all(
-            str(item.get("status") or "") == "quarantined"
-            and item.get("delivery_id") is None
-            and item.get("effect_key") is None
-            and str(item.get("reason") or "") == "w3_execution_snapshot_missing"
-            for item in subscriptions
-        )
-    )
 
 
 def _batch_terminal_authority(
@@ -1361,6 +1419,7 @@ def _dry_run_plan(
     owner_receipt_path: str,
     owner_receipt_sha256: str,
     database: Mapping[str, Any],
+    acceptance_axis: str = DEFAULT_ACCEPTANCE_AXIS,
 ) -> dict[str, Any]:
     issue_ids = sorted(str(item["issue_id"]) for item in queue)
     material = {
@@ -1377,6 +1436,7 @@ def _dry_run_plan(
         },
         "execution_policy": {
             "activation_required": QUEUE_AUTHORITY_FLAGS["activation_required"],
+            "acceptance_axis": acceptance_axis,
             "daily_started_attempt_quota": QUEUE_AUTHORITY_FLAGS[
                 "daily_started_attempt_quota"
             ],
@@ -1462,6 +1522,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     batch_id = str(args.batch_id or "").strip()
     if BATCH_ID_RE.fullmatch(batch_id) is None:
         raise BatchRerunError("batch_id_invalid")
+    acceptance_axis = str(
+        getattr(args, "acceptance_axis", DEFAULT_ACCEPTANCE_AXIS) or ""
+    ).strip()
+    if acceptance_axis not in ACCEPTANCE_AXES:
+        raise BatchRerunError("batch_acceptance_axis_invalid")
     runtime_commit, runtime_tree = _runtime_identity()
     if (
         runtime_commit != str(args.expected_runtime_commit or "").strip()
@@ -1505,6 +1570,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             owner_receipt_path=owner_receipt_path,
             owner_receipt_sha256=owner_receipt_sha256,
             database=database,
+            acceptance_axis=acceptance_axis,
         )
     state_path = Path(args.state)
     state = _load_or_create_state(
@@ -1516,6 +1582,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         owner_receipt_path=owner_receipt_path,
         owner_receipt_sha256=owner_receipt_sha256,
         selected_issue_ids=selected_issue_ids,
+        acceptance_axis=acceptance_axis,
     )
     store = RcaControlStore(Path(args.control_db))
     completed = 0
@@ -1556,7 +1623,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 submission_key=str(item["submission_key"]),
             )
             if accepted_snapshot is None or _batch_completion(
-                accepted_snapshot, issue_title=str(queue_item["title"])
+                accepted_snapshot,
+                issue_title=str(queue_item["title"]),
+                acceptance_axis=acceptance_axis,
             ) is None:
                 raise BatchRerunError("batch_accepted_item_invalid")
             completed += 1
@@ -1581,6 +1650,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 _batch_completion(
                     tracked_snapshot,
                     issue_title=str(queue_item["title"]),
+                    acceptance_axis=acceptance_axis,
                 )
                 if tracked_snapshot is not None
                 else None
@@ -1601,6 +1671,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 _terminal_failure(
                     tracked_snapshot,
                     issue_title=str(queue_item["title"]),
+                    acceptance_axis=acceptance_axis,
                 )
                 if tracked_snapshot is not None
                 else None
@@ -1630,6 +1701,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 _batch_completion(
                     failed_snapshot,
                     issue_title=str(queue_item["title"]),
+                    acceptance_axis=acceptance_axis,
                 )
                 if failed_snapshot is not None
                 else None
@@ -1808,7 +1880,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if latest is None:
                 raise BatchRerunError("batch_issue_generation_drift")
             accepted = _batch_completion(
-                latest, issue_title=str(queue_item["title"])
+                latest,
+                issue_title=str(queue_item["title"]),
+                acceptance_axis=acceptance_axis,
             )
             if accepted is not None:
                 item.update({
@@ -1822,7 +1896,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 completed += 1
                 break
             failure = _terminal_failure(
-                latest, issue_title=str(queue_item["title"])
+                latest,
+                issue_title=str(queue_item["title"]),
+                acceptance_axis=acceptance_axis,
             )
             if failure is not None:
                 item.update({
@@ -1880,6 +1956,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-seconds", type=int, default=5)
     parser.add_argument("--item-timeout-seconds", type=int, default=7200)
     parser.add_argument("--retry-failed", action="store_true")
+    parser.add_argument(
+        "--acceptance-axis",
+        choices=sorted(ACCEPTANCE_AXES),
+        default=DEFAULT_ACCEPTANCE_AXIS,
+        help=(
+            "Completion gate: causal (default) requires attribution; transport "
+            "requires official delivery readback and reports causal readiness separately."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--submit-all", action="store_true")
     parser.add_argument(

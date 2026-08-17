@@ -219,7 +219,6 @@ def test_pinned_release_goal_bytes_survive_creator_and_vm_admission(
         now=NOW,
         attempt_id="offline-attempt",
         receipt_id="offline-receipt",
-        capacity_mode="steady",
     )
     refs = admission_payload["source_refs"]
     artifact_root = f"/mnt/tmp/{task_id}/"

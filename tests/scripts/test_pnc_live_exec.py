@@ -190,8 +190,10 @@ def test_check_and_exec_use_the_manifest_bound_release(tmp_path: Path):
     }
 
 
-@pytest.mark.parametrize("service_label", sorted(live_exec.SIGNED_RCA_ENV_LABELS))
-def test_signed_rca_residents_drop_business_config_overrides(
+@pytest.mark.parametrize(
+    "service_label", sorted(live_exec.REQUIRED_RCA_RESIDENT_LABELS)
+)
+def test_required_rca_residents_drop_inherited_rca_config_per_label(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, service_label: str
 ):
     monkeypatch.setenv("HERMES_OUTBOUND_MODE", "live")
@@ -209,10 +211,14 @@ def test_signed_rca_residents_drop_business_config_overrides(
 
     environment = live_exec._exec_environment(resolved, tmp_path / "hermes")
 
-    assert "HERMES_OUTBOUND_MODE" not in environment
     assert "HERMES_RCA_DELIVERY_DISPATCHER_ENABLED" not in environment
     assert "HERMES_RCA_RELEASE_NOTE_PATH" not in environment
-    assert "PNC_FOXGLOVE_RENDER_HOST" not in environment
+    if service_label in live_exec.OUTBOUND_MODE_RESET_LABELS:
+        assert "HERMES_OUTBOUND_MODE" not in environment
+        assert "PNC_FOXGLOVE_RENDER_HOST" not in environment
+    else:
+        assert environment["HERMES_OUTBOUND_MODE"] == "live"
+        assert environment["PNC_FOXGLOVE_RENDER_HOST"] == "https://stale.invalid"
 
 
 @pytest.mark.parametrize(
