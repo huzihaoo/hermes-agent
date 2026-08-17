@@ -215,7 +215,24 @@ done
 
 检查时必须把进程存在、PID/cwd、heartbeat 新鲜度、release block 和业务 readiness 分开看。任何一个绿色字段都不能覆盖其他轴的失败。
 
-## 9. 回滚
+## 9. Resident Liveness 与旧 Watchdog 退役
+
+RCA resident 的生存和版本证据只由 `pnc_rca_minimal_release.py` 的 readback 判定：
+
+- `launchctl` 必须返回唯一正 PID；
+- 实际进程的 cwd、entrypoint、create time 必须匹配 immutable Host runtime；
+- health 中的 PID、runtime identity、release block 必须与进程及 release note 一致；
+- 三个带 schema 的 RCA health 必须在 120 秒 freshness 窗口内，状态不得为 starting、stopped、disabled、error 或 circuit open；Gateway 没有连续 heartbeat，常规 `verify` 以 live PID/cwd/entrypoint 和 `gateway_state=running` 为准，apply 的 restart transition 仍受 120 秒窗口约束；
+- Kafka consumer 与 completion relay 必须保持未加载；
+- `verify` 在同一 release lock 内做两次 resident identity 读回，期间 PID 或 identity 变化即失败。
+
+旧 `local.pnc.watcher-staleness-watchdog` 通过 launchd plist 文本和进程命令行猜测加载关系，既不能可靠识别 `pnc_live_exec.py` exec 后的进程，也没有把 `actual=down` 纳入告警，因此不再作为 RCA liveness 或发布门禁。仓库不再分发它的 plist 和 shell 脚本。
+
+`hermes-release-fingerprint-check` 暂时保留为通用、手工调用的非 RCA binding 审计工具；它的 `--watchers-fresh` 结果不得用于 RCA 验收。删除该通用 CLI 前必须先迁移 `context_local_source_retirement.py` 和 `context_local_rebuildable_retirement.py` 的 strict binding 消费链。
+
+生产机上的历史 label、plist 和 `runtime/governance-tools/watcher-staleness-watchdog.sh` 不随候选代码删除。只有在新 release 的 completed apply receipt、resident readback 和 transport canary 全部通过后，才能在单独的生产审批中执行 `launchctl bootout` 和 live 文件退役；随后至少跨过两个旧 `StartInterval` 窗口，确认旧日志不再增长，并再次运行 minimal `verify`。候选代码审查、测试或 GitLab push 均不得执行这些 live 动作。
+
+## 10. 回滚
 
 回滚也使用同一个最小流程：
 
@@ -225,7 +242,7 @@ done
 
 禁止原地修改当前 runtime、手工拼 binding、复活旧 epoch、直接改 SQLite 或绕过 canary。历史任务和 delivery effect 保持不可变；确需业务重试时创建新 generation。
 
-## 10. 定向验证
+## 11. 定向验证
 
 代码变更在 clean GitLab worktree 中运行最小相关测试；不要进入 production runtime 改代码或跑会生成文件的开发测试。Host 发布工具至少覆盖：
 
