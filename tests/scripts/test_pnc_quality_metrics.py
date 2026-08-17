@@ -11,6 +11,10 @@ import pytest
 
 from scripts import pnc_business_metrics as business_metrics
 from scripts import pnc_quality_metrics as quality_metrics
+from tests.gateway.test_pnc_rca_delivery_store import (
+    _physical_v15_delivery_fixture,
+    _sqlite_storage_identity,
+)
 
 
 OBSERVED_AT = "2026-07-26T00:00:00Z"
@@ -1390,6 +1394,29 @@ def test_sqlite_observation_accepts_integrated_control_schema(
         golden_input=golden_path,
     )
     assert len(rows) == 8
+
+
+def test_sqlite_schema_validator_accepts_physical_v15_without_mutation(
+    tmp_path: Path,
+) -> None:
+    db_path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    before = _sqlite_storage_identity(db_path)
+
+    connection = sqlite3.connect(
+        f"{db_path.as_uri()}?mode=ro&immutable=1",
+        uri=True,
+        isolation_level=None,
+    )
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        business_metrics._validate_sqlite_schema(connection)
+    finally:
+        connection.close()
+
+    assert "pnc_rca_control_store_v15" in (
+        business_metrics.SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS
+    )
+    assert _sqlite_storage_identity(db_path) == before
 
 
 @pytest.mark.parametrize("corruption", ["missing_schema", "malformed_marker"])

@@ -160,6 +160,7 @@ CREATE TABLE rca_activation_epochs_v15_new (
     config_sha256 TEXT NOT NULL CHECK (
         length(config_sha256) = 64
         AND config_sha256 NOT GLOB '*[^0-9a-f]*'
+        AND config_sha256 != printf('%064d', 0)
     ),
     db_logical_identity_json TEXT NOT NULL CHECK (
         json_valid(db_logical_identity_json)
@@ -168,6 +169,7 @@ CREATE TABLE rca_activation_epochs_v15_new (
     db_logical_identity_sha256 TEXT NOT NULL CHECK (
         length(db_logical_identity_sha256) = 64
         AND db_logical_identity_sha256 NOT GLOB '*[^0-9a-f]*'
+        AND db_logical_identity_sha256 != printf('%064d', 0)
     ),
     partition_start_fence_json TEXT NOT NULL CHECK (
         json_valid(partition_start_fence_json)
@@ -176,6 +178,7 @@ CREATE TABLE rca_activation_epochs_v15_new (
     partition_start_fence_sha256 TEXT NOT NULL CHECK (
         length(partition_start_fence_sha256) = 64
         AND partition_start_fence_sha256 NOT GLOB '*[^0-9a-f]*'
+        AND partition_start_fence_sha256 != printf('%064d', 0)
     ),
     created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
     updated_at TEXT NOT NULL CHECK (length(trim(updated_at)) > 0),
@@ -230,6 +233,14 @@ CREATE TABLE rca_activation_transition_audit (
     FOREIGN KEY(epoch_id) REFERENCES rca_activation_epochs(epoch_id)
 )
 """
+_V15_ACTIVATION_CROSS_TRIGGER_NAMES = (
+    "trg_rca_admission_snapshot_execution_guard",
+    "trg_terminal_rerun_delivery_authority_binding_guard",
+    "trg_historical_epoch_rerun_delivery_authority_binding_guard",
+)
+_MINIMAL_RELEASE_EPOCH_CONTRACT_SCHEMA_VERSION = (
+    "pnc_rca_minimal_release_epoch_contract_v1"
+)
 CONTROL_DB_MIN_AVAILABLE_BYTES = 1024 * 1024 * 1024
 DEFAULT_OUTBOX_HIGH_WATERMARK = 100
 MANUAL_OUTBOX_SHARE_NUMERATOR = 4
@@ -1368,6 +1379,7 @@ class RcaControlStore:
         require_current: bool = False,
         read_only: bool = False,
         allow_successor_read_only: bool = False,
+        allow_successor_write: bool = False,
     ):
         self.db_path = Path(db_path).expanduser()
         if not isinstance(require_current, bool):
@@ -1376,16 +1388,31 @@ class RcaControlStore:
             raise TypeError("read_only must be true or false")
         if not isinstance(allow_successor_read_only, bool):
             raise TypeError("allow_successor_read_only must be true or false")
+        if not isinstance(allow_successor_write, bool):
+            raise TypeError("allow_successor_write must be true or false")
         if read_only and not require_current:
             raise ValueError("read_only control store requires current schema")
         if allow_successor_read_only and not require_current:
             raise ValueError(
                 "successor-read-only control store requires current schema"
             )
+        if allow_successor_write and not require_current:
+            raise ValueError("successor-write control store requires current schema")
+        if allow_successor_write and (read_only or allow_successor_read_only):
+            raise ValueError(
+                "successor-write control store cannot also be read-only"
+            )
         self.require_current = require_current
         self.requested_read_only = read_only
         self.allow_successor_read_only = allow_successor_read_only
+        self.allow_successor_write = allow_successor_write
         self.read_only = read_only
+        self._binary_write_schema_version = CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+        self._connection_write_schema_version = (
+            CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+            if allow_successor_write
+            else CONTROL_STORE_SCHEMA_VERSION
+        )
         self._enforce_binary_write_schema = False
         self._schema_probe_snapshot: ControlStoreSchemaSnapshot | None = None
         self._read_only_db_path: Path | None = None
@@ -1406,7 +1433,14 @@ class RcaControlStore:
                 (
                     source_schema_version,
                     probe_snapshot,
-                ) = self.probe_writable_schema_source(self.db_path)
+                ) = self.probe_writable_schema_source(
+                    self.db_path,
+                    expected_write_schema_version=(
+                        self._connection_write_schema_version
+                        if self.allow_successor_write
+                        else None
+                    ),
+                )
                 if probe_snapshot is not None:
                     if source_schema_version == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:
                         self._schema_probe_snapshot = probe_snapshot
@@ -1415,10 +1449,12 @@ class RcaControlStore:
                     else:
                         probe_snapshot.close()
         if source_schema_version == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:
-            if not require_current or not allow_successor_read_only:
+            if require_current and allow_successor_write:
+                self.read_only = False
+            elif not require_current or not allow_successor_read_only:
                 self._discard_schema_probe_snapshot()
                 raise RuntimeError("incompatible_control_store_schema:version")
-            if self._schema_probe_snapshot is None:
+            elif self._schema_probe_snapshot is None:
                 self._create_read_only_snapshot()
                 assert self._schema_probe_snapshot is not None
                 if (
@@ -1429,7 +1465,11 @@ class RcaControlStore:
                     raise RuntimeError(
                         "incompatible_control_store_schema:source_changed"
                     )
-            self.read_only = True
+            if not allow_successor_write:
+                self.read_only = True
+        elif allow_successor_write:
+            self._discard_schema_probe_snapshot()
+            raise RuntimeError("rca_control_store_successor_write_schema_required")
         if self.read_only and self._schema_probe_snapshot is None:
             self._create_read_only_snapshot()
         self._initialization_mode = "unknown"
@@ -1729,9 +1769,17 @@ class RcaControlStore:
     def probe_writable_schema_source(
         cls,
         db_path: str | Path,
+        *,
+        expected_write_schema_version: str | None = None,
     ) -> tuple[str | None, ControlStoreSchemaSnapshot | None]:
         """Probe a writer source; the caller owns any returned snapshot lease."""
 
+        if expected_write_schema_version not in {
+            None,
+            CONTROL_STORE_SCHEMA_VERSION,
+            CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        }:
+            raise ValueError("control_store_expected_write_schema_invalid")
         source_db = Path(db_path).expanduser()
         before = cls._source_storage_metadata(source_db)
         wal_present = bool(before["wal"]["present"])
@@ -1744,6 +1792,11 @@ class RcaControlStore:
             allow_successor_read_only=True,
             immutable=not wal_present,
         )
+        if (
+            expected_write_schema_version is not None
+            and version != expected_write_schema_version
+        ):
+            raise RuntimeError("incompatible_control_store_schema:write_marker")
         return version, None
 
     def _require_binary_write_schema_at_source(self) -> None:
@@ -1768,21 +1821,27 @@ class RcaControlStore:
         finally:
             if "conn" in locals():
                 conn.close()
-        if observed != CONTROL_STORE_SCHEMA_VERSION:
+        if observed != self._connection_write_schema_version:
             raise RuntimeError("incompatible_control_store_schema:write_marker")
 
     @classmethod
-    def _install_v14_connection_write_guards_tx(
+    def _install_connection_write_guards_tx(
         cls,
         conn: sqlite3.Connection,
         *,
+        expected_schema_version: str,
         require_exact_schema_cookie: bool,
     ) -> None:
-        """Fence every main-table DML statement to this v14 schema snapshot."""
+        """Fence every main-table DML statement to one exact schema snapshot."""
 
         if not conn.in_transaction:
             raise RuntimeError("rca_control_store_write_guard_transaction_required")
-        if cls._activation_schema_version_tx(conn) != CONTROL_STORE_SCHEMA_VERSION:
+        if expected_schema_version not in {
+            CONTROL_STORE_SCHEMA_VERSION,
+            CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        }:
+            raise RuntimeError("incompatible_control_store_schema:write_marker")
+        if cls._activation_schema_version_tx(conn) != expected_schema_version:
             raise RuntimeError("incompatible_control_store_schema:write_marker")
         expected_schema_cookie: int | None = None
         if require_exact_schema_cookie:
@@ -1802,8 +1861,8 @@ class RcaControlStore:
         if not table_names or "control_meta" not in table_names:
             raise RuntimeError("incompatible_control_store_schema:write_marker")
 
-        marker_literal = CONTROL_STORE_SCHEMA_VERSION.replace("'", "''")
-        trigger_prefix = "pnc_rca_v14_write_guard_"
+        marker_literal = expected_schema_version.replace("'", "''")
+        trigger_prefix = "pnc_rca_write_guard_"
         expected_triggers: set[str] = set()
         for table_index, table_name in enumerate(table_names):
             quoted_table = '"' + table_name.replace('"', '""') + '"'
@@ -1853,6 +1912,21 @@ class RcaControlStore:
         }
         if observed_triggers != expected_triggers:
             raise RuntimeError("incompatible_control_store_schema:write_guard")
+
+    @classmethod
+    def _install_v14_connection_write_guards_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        require_exact_schema_cookie: bool,
+    ) -> None:
+        """Compatibility wrapper for DeliveryStore's MR-A v14 writer."""
+
+        cls._install_connection_write_guards_tx(
+            conn,
+            expected_schema_version=CONTROL_STORE_SCHEMA_VERSION,
+            require_exact_schema_cookie=require_exact_schema_cookie,
+        )
 
     @classmethod
     def _verify_schema_probe_source_unchanged(
@@ -1927,7 +2001,7 @@ class RcaControlStore:
                 raise RuntimeError(
                     "incompatible_control_store_schema:write_marker"
                 ) from exc
-            if observed_write_schema != CONTROL_STORE_SCHEMA_VERSION:
+            if observed_write_schema != self._connection_write_schema_version:
                 conn.close()
                 raise RuntimeError("incompatible_control_store_schema:write_marker")
         conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
@@ -1945,8 +2019,9 @@ class RcaControlStore:
             if self._enforce_binary_write_schema:
                 try:
                     conn.execute("BEGIN")
-                    self._install_v14_connection_write_guards_tx(
+                    self._install_connection_write_guards_tx(
                         conn,
+                        expected_schema_version=self._connection_write_schema_version,
                         require_exact_schema_cookie=self.require_current,
                     )
                     conn.commit()
@@ -1963,9 +2038,16 @@ class RcaControlStore:
         accepted_current_versions = {CONTROL_STORE_SCHEMA_VERSION}
         if self.allow_successor_read_only:
             accepted_current_versions.add(CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION)
+        if self.allow_successor_write:
+            accepted_current_versions = {CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION}
         if self.require_current and marker_value not in accepted_current_versions:
             raise RuntimeError("rca_control_store_schema_not_current")
         if marker_value == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:
+            if self.allow_successor_write and not self.read_only:
+                self._validate_current_schema_read_only()
+                self._validate_no_installation_marker()
+                self._initialization_mode = "steady"
+                return
             if not self.allow_successor_read_only or not self.read_only:
                 raise RuntimeError("rca_control_store_successor_requires_read_only")
             self._validate_current_schema_read_only()
@@ -4906,24 +4988,59 @@ class RcaControlStore:
     def _validate_activation_reference_contract_tx(
         conn: sqlite3.Connection,
     ) -> None:
+        no_action = ("NO ACTION", "NO ACTION", "NONE")
         expected_foreign_keys = {
-            "rca_activation_admission_ledger": ("epoch_id", "epoch_id"),
-            "rca_activation_transition_audit": ("epoch_id", "epoch_id"),
+            "rca_activation_admission_ledger": (
+                (0, 0, "rca_activation_epochs", "epoch_id", "epoch_id", *no_action),
+            ),
+            "rca_activation_transition_audit": (
+                (0, 0, "rca_activation_epochs", "epoch_id", "epoch_id", *no_action),
+            ),
             "rca_terminal_rerun_delivery_authorities": (
-                "activation_epoch_id",
-                "epoch_id",
+                (0, 0, "business_triggers", "prior_submission_key", "submission_key", *no_action),
+                (1, 0, "business_triggers", "business_key", "business_key", *no_action),
+                (1, 1, "business_triggers", "prior_generation", "generation", *no_action),
+                (2, 0, "rca_activation_admission_ledger", "activation_ledger_id", "ledger_id", *no_action),
+                (3, 0, "rca_activation_epochs", "activation_epoch_id", "epoch_id", *no_action),
+                (4, 0, "business_triggers", "submission_key", "submission_key", *no_action),
+                (5, 0, "business_triggers", "business_key", "business_key", *no_action),
+                (5, 1, "business_triggers", "generation", "generation", *no_action),
+                (6, 0, "rca_outbox", "outbox_id", "outbox_id", *no_action),
+                (7, 0, "rca_trigger_sources", "source_id", "source_id", *no_action),
             ),
             "rca_historical_epoch_rerun_delivery_authorities": (
-                "activation_epoch_id",
-                "epoch_id",
+                (0, 0, "rca_activation_admission_ledger", "prior_activation_ledger_id", "ledger_id", *no_action),
+                (1, 0, "business_triggers", "prior_submission_key", "submission_key", *no_action),
+                (2, 0, "business_triggers", "business_key", "business_key", *no_action),
+                (2, 1, "business_triggers", "prior_generation", "generation", *no_action),
+                (3, 0, "rca_activation_admission_ledger", "activation_ledger_id", "ledger_id", *no_action),
+                (4, 0, "rca_activation_epochs", "activation_epoch_id", "epoch_id", *no_action),
+                (5, 0, "business_triggers", "submission_key", "submission_key", *no_action),
+                (6, 0, "business_triggers", "business_key", "business_key", *no_action),
+                (6, 1, "business_triggers", "generation", "generation", *no_action),
+                (7, 0, "rca_outbox", "outbox_id", "outbox_id", *no_action),
+                (8, 0, "rca_trigger_sources", "source_id", "source_id", *no_action),
             ),
         }
-        for table, (source, target) in expected_foreign_keys.items():
-            references = {
-                (str(row["table"]), str(row["from"]), str(row["to"]))
-                for row in conn.execute(f"PRAGMA foreign_key_list({table})").fetchall()
-            }
-            if ("rca_activation_epochs", source, target) not in references:
+        for table, expected in expected_foreign_keys.items():
+            observed = tuple(
+                sorted(
+                    (
+                        int(row["id"]),
+                        int(row["seq"]),
+                        str(row["table"]),
+                        str(row["from"]),
+                        str(row["to"]),
+                        str(row["on_update"]),
+                        str(row["on_delete"]),
+                        str(row["match"]),
+                    )
+                    for row in conn.execute(
+                        f"PRAGMA foreign_key_list({table})"
+                    ).fetchall()
+                )
+            )
+            if observed != expected:
                 raise RuntimeError(
                     "incompatible_control_store_schema:activation_foreign_keys"
                 )
@@ -4948,6 +5065,69 @@ class RcaControlStore:
             raise RuntimeError(
                 "incompatible_control_store_schema:activation_cross_triggers"
             )
+
+    @staticmethod
+    def _validate_activation_child_rows_against_parent_tx(
+        conn: sqlite3.Connection,
+        *,
+        parent_table: str,
+    ) -> None:
+        if parent_table not in {
+            "rca_activation_epochs",
+            "rca_activation_epochs_v15_new",
+        }:
+            raise RuntimeError("activation_parent_table_invalid")
+        child_references = {
+            "rca_activation_admission_ledger": "epoch_id",
+            "rca_activation_transition_audit": "epoch_id",
+            "rca_terminal_rerun_delivery_authorities": "activation_epoch_id",
+            "rca_historical_epoch_rerun_delivery_authorities": (
+                "activation_epoch_id"
+            ),
+        }
+        for table, column in child_references.items():
+            orphan = conn.execute(
+                f"SELECT 1 FROM {table} AS child "
+                f"LEFT JOIN {parent_table} AS parent "
+                f"ON parent.epoch_id = child.{column} "
+                f"WHERE child.{column} IS NOT NULL AND parent.epoch_id IS NULL "
+                "LIMIT 1"
+            ).fetchone()
+            if orphan is not None:
+                raise RuntimeError(
+                    "incompatible_control_store_schema:activation_child_orphan"
+                )
+
+    @staticmethod
+    def _validate_activation_child_rows_tx(conn: sqlite3.Connection) -> None:
+        RcaControlStore._validate_activation_child_rows_against_parent_tx(
+            conn,
+            parent_table="rca_activation_epochs",
+        )
+
+    @staticmethod
+    def _validate_partition_start_fence_cas_tx(
+        conn: sqlite3.Connection,
+        *,
+        partition_start_fence: Mapping[str, Any],
+    ) -> None:
+        observed: dict[str, dict[str, int]] = {}
+        for row in conn.execute(
+            "SELECT topic, partition_id, durable_next_offset "
+            "FROM kafka_partition_progress ORDER BY topic, partition_id"
+        ).fetchall():
+            observed.setdefault(str(row["topic"]), {})[
+                str(int(row["partition_id"]))
+            ] = int(row["durable_next_offset"])
+        expected = {
+            str(topic): {
+                str(partition): int(offset)
+                for partition, offset in dict(partitions).items()
+            }
+            for topic, partitions in dict(partition_start_fence).items()
+        }
+        if observed != expected:
+            raise ActivationEpochError("activation_partition_fence_changed")
 
     @classmethod
     def _validate_v15_activation_schema_tx(cls, conn: sqlite3.Connection) -> None:
@@ -5000,39 +5180,110 @@ class RcaControlStore:
             raise RuntimeError(
                 "incompatible_control_store_schema:v15_activation_audit_sql"
             )
-        invalid_epoch = conn.execute(
-            """
-            SELECT 1 FROM rca_activation_epochs
-             WHERE NOT (
-                    state = 'steady_active' AND is_current = 1
-                    AND release_fingerprint_sha256 IS NOT NULL
-                    AND release_note_sha256 IS NOT NULL
-                    AND activated_at IS NOT NULL
-                    AND retired_at IS NULL
-                   )
-               AND NOT (
-                    state = 'retired' AND is_current = 0
-                    AND retired_at IS NOT NULL
-                   )
-             LIMIT 1
-            """
-        ).fetchone()
-        if invalid_epoch is not None:
-            raise RuntimeError("incompatible_control_store_schema:v15_activation_state")
+        for epoch in conn.execute(
+            "SELECT * FROM rca_activation_epochs ORDER BY epoch_id"
+        ).fetchall():
+            try:
+                db_identity = json.loads(str(epoch["db_logical_identity_json"]))
+                partition_fence = json.loads(
+                    str(epoch["partition_start_fence_json"])
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    "incompatible_control_store_schema:v15_activation_state"
+                ) from exc
+            release_pair = (
+                epoch["release_fingerprint_sha256"],
+                epoch["release_note_sha256"],
+            )
+            release_pair_is_null = all(value is None for value in release_pair)
+            release_pair_is_valid = all(
+                isinstance(value, str)
+                and _ACTIVATION_SHA256_RE.fullmatch(value) is not None
+                and value != "0" * 64
+                for value in release_pair
+            )
+            required_digests = (
+                epoch["config_sha256"],
+                epoch["db_logical_identity_sha256"],
+                epoch["partition_start_fence_sha256"],
+            )
+            state = str(epoch["state"] or "")
+            if (
+                _ACTIVATION_EPOCH_ID_RE.fullmatch(str(epoch["epoch_id"] or ""))
+                is None
+                or not all(
+                    isinstance(value, str)
+                    and _ACTIVATION_SHA256_RE.fullmatch(value) is not None
+                    and value != "0" * 64
+                    for value in required_digests
+                )
+                or not (release_pair_is_null or release_pair_is_valid)
+                or _canonical_json(db_identity)
+                != str(epoch["db_logical_identity_json"])
+                or _canonical_sha256(db_identity)
+                != str(epoch["db_logical_identity_sha256"])
+                or _canonical_json(partition_fence)
+                != str(epoch["partition_start_fence_json"])
+                or _canonical_sha256(partition_fence)
+                != str(epoch["partition_start_fence_sha256"])
+                or (
+                    state == "steady_active"
+                    and (
+                        int(epoch["is_current"]) != 1
+                        or not release_pair_is_valid
+                        or epoch["activated_at"] is None
+                        or epoch["retired_at"] is not None
+                    )
+                )
+                or (
+                    state == "retired"
+                    and (
+                        int(epoch["is_current"]) != 0
+                        or epoch["retired_at"] is None
+                    )
+                )
+                or state not in {"steady_active", "retired"}
+            ):
+                raise RuntimeError(
+                    "incompatible_control_store_schema:v15_activation_state"
+                )
 
+    @classmethod
     def _validate_current_activation_binding_tx(
-        self,
+        cls,
         conn: sqlite3.Connection,
         *,
         schema_version: str,
     ) -> None:
-        current_epoch = self._current_activation_epoch_unchecked_tx(conn)
+        current_epoch = cls._current_activation_epoch_unchecked_tx(conn)
         if current_epoch is not None:
-            self._activation_transition_binding_tx(
+            cls._activation_transition_binding_tx(
                 conn,
                 epoch=current_epoch,
                 schema_version=schema_version,
             )
+
+    @classmethod
+    def validate_current_activation_binding_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        schema_version: str,
+    ) -> None:
+        """Validate the exact current epoch binding in the caller's transaction."""
+
+        if not conn.in_transaction:
+            raise RuntimeError("rca_control_store_binding_transaction_required")
+        observed = cls._activation_schema_version_tx(conn)
+        if observed != schema_version:
+            raise RuntimeError("incompatible_control_store_schema:activation_layout")
+        if observed == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:
+            cls._validate_v15_activation_schema_tx(conn)
+        cls._validate_current_activation_binding_tx(
+            conn,
+            schema_version=observed,
+        )
 
     def _validate_current_schema_read_only(self) -> None:
         """Validate fixed-size schema metadata without taking a SQLite write lock."""
@@ -5079,10 +5330,10 @@ class RcaControlStore:
         }
         write_enabled = (
             read_supported
-            and observed == CONTROL_STORE_SCHEMA_VERSION
+            and observed == self._connection_write_schema_version
             and not self.read_only
         )
-        if observed == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:
+        if observed == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION and self.read_only:
             mode = "successor_read_only"
         elif self.read_only:
             mode = "explicit_read_only"
@@ -5090,7 +5341,7 @@ class RcaControlStore:
             mode = "current_write"
         return {
             "observed_control_schema_version": observed,
-            "binary_write_schema_version": CONTROL_STORE_SCHEMA_VERSION,
+            "binary_write_schema_version": self._binary_write_schema_version,
             "mode": mode,
             "read_supported": read_supported,
             "write_enabled": write_enabled,
@@ -5354,6 +5605,77 @@ class RcaControlStore:
             ),
         )
 
+    @staticmethod
+    def _v15_direct_steady_binding_matches(
+        row: sqlite3.Row,
+        *,
+        release_fingerprint_sha256: str,
+        release_note_sha256: str,
+        config_sha256: str,
+        db_logical_identity_json: str,
+        db_logical_identity_sha256: str,
+        partition_start_fence_json: str,
+        partition_start_fence_sha256: str,
+    ) -> bool:
+        expected = {
+            "state": "steady_active",
+            "release_fingerprint_sha256": release_fingerprint_sha256,
+            "release_note_sha256": release_note_sha256,
+            "config_sha256": config_sha256,
+            "db_logical_identity_sha256": db_logical_identity_sha256,
+            "partition_start_fence_sha256": partition_start_fence_sha256,
+        }
+        return (
+            int(row["is_current"]) == 1
+            and all(
+                str(row[field] or "") == str(value)
+                for field, value in expected.items()
+            )
+            and str(row["db_logical_identity_json"]) == db_logical_identity_json
+            and str(row["partition_start_fence_json"])
+            == partition_start_fence_json
+        )
+
+    @staticmethod
+    def _insert_v15_direct_steady_epoch_tx(
+        conn: sqlite3.Connection,
+        *,
+        epoch_id: str,
+        release_fingerprint_sha256: str,
+        release_note_sha256: str,
+        config_sha256: str,
+        db_logical_identity_json: str,
+        db_logical_identity_sha256: str,
+        partition_start_fence_json: str,
+        partition_start_fence_sha256: str,
+        created_at: str,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO rca_activation_epochs(
+                epoch_id, state, is_current,
+                release_fingerprint_sha256, release_note_sha256,
+                config_sha256, db_logical_identity_json,
+                db_logical_identity_sha256, partition_start_fence_json,
+                partition_start_fence_sha256, created_at, updated_at,
+                activated_at, retired_at
+            ) VALUES (?, 'steady_active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                epoch_id,
+                release_fingerprint_sha256,
+                release_note_sha256,
+                config_sha256,
+                db_logical_identity_json,
+                db_logical_identity_sha256,
+                partition_start_fence_json,
+                partition_start_fence_sha256,
+                created_at,
+                created_at,
+                created_at,
+            ),
+        )
+
     @classmethod
     def _public_activation_epoch(
         cls,
@@ -5394,6 +5716,187 @@ class RcaControlStore:
         if not justification or len(justification.encode("utf-8")) > 1000:
             raise ActivationEpochError("activation_reason_invalid")
         return actor, justification
+
+    @classmethod
+    def _normalize_direct_steady_activation_contract(
+        cls,
+        *,
+        epoch_id: str,
+        release_fingerprint_sha256: str,
+        release_note_sha256: str,
+        config_sha256: str,
+        db_logical_identity: Mapping[str, Any],
+        partition_start_fence: Mapping[str, Any],
+        expected_predecessor_epoch_id: str,
+        expected_predecessor_state: str,
+        expected_predecessor_binding_fingerprint: str,
+        expected_control_schema_version: str,
+        target_control_schema_version: str,
+        epoch_contract_sha256: str,
+    ) -> dict[str, Any]:
+        identity = cls._normalize_activation_epoch_id(epoch_id)
+        release_hash = cls._normalize_activation_sha256(
+            release_fingerprint_sha256,
+            "release_fingerprint_sha256",
+        )
+        release_note_hash = cls._normalize_activation_sha256(
+            release_note_sha256,
+            "release_note_sha256",
+        )
+        config_hash = cls._normalize_activation_sha256(
+            config_sha256,
+            "config_sha256",
+        )
+        db_identity_json = cls._normalize_activation_db_identity(db_logical_identity)
+        db_identity = json.loads(db_identity_json)
+        db_identity_sha = hashlib.sha256(db_identity_json.encode("utf-8")).hexdigest()
+        fence_json = cls._normalize_partition_fence(partition_start_fence)
+        fence = json.loads(fence_json)
+        fence_sha = hashlib.sha256(fence_json.encode("utf-8")).hexdigest()
+        predecessor = (
+            str(expected_predecessor_epoch_id or "").strip(),
+            str(expected_predecessor_state or "").strip(),
+            str(expected_predecessor_binding_fingerprint or "").strip().lower(),
+        )
+        if any(predecessor) and not all(predecessor):
+            raise ActivationEpochError("activation_predecessor_binding_incomplete")
+        predecessor_id, predecessor_state, predecessor_fingerprint = predecessor
+        if predecessor_id:
+            predecessor_id = cls._normalize_activation_epoch_id(predecessor_id)
+            if predecessor_state not in {"aborted", "steady_active"}:
+                raise ActivationEpochError("activation_predecessor_state_invalid")
+            predecessor_fingerprint = cls._normalize_activation_sha256(
+                predecessor_fingerprint,
+                "predecessor_binding_fingerprint",
+            )
+        schema_pair = (
+            str(expected_control_schema_version or "").strip(),
+            str(target_control_schema_version or "").strip(),
+        )
+        if schema_pair not in {
+            (
+                CONTROL_STORE_SCHEMA_VERSION,
+                CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+            ),
+            (
+                CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+                CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+            ),
+        }:
+            raise ActivationEpochError("activation_control_schema_transition_invalid")
+        contract_hash = cls._normalize_activation_sha256(
+            epoch_contract_sha256,
+            "epoch_contract_sha256",
+        )
+        if any(
+            value == "0" * 64
+            for value in (
+                release_hash,
+                release_note_hash,
+                config_hash,
+                db_identity_sha,
+                fence_sha,
+                contract_hash,
+            )
+        ):
+            raise ActivationEpochError("activation_v15_required_digest_invalid")
+        contract_material = {
+            "schema_version": _MINIMAL_RELEASE_EPOCH_CONTRACT_SCHEMA_VERSION,
+            "expected_control_schema_version": schema_pair[0],
+            "target_control_schema_version": schema_pair[1],
+            "expected_predecessor_epoch_id": predecessor_id,
+            "expected_predecessor_state": predecessor_state,
+            "expected_predecessor_binding_fingerprint": predecessor_fingerprint,
+            "db_logical_identity": db_identity,
+            "db_logical_identity_sha256": db_identity_sha,
+            "partition_start_fence": fence,
+            "partition_start_fence_sha256": fence_sha,
+        }
+        if _canonical_sha256(contract_material) != contract_hash:
+            raise ActivationEpochError("activation_epoch_contract_invalid")
+        return {
+            "epoch_id": identity,
+            "release_fingerprint_sha256": release_hash,
+            "release_note_sha256": release_note_hash,
+            "config_sha256": config_hash,
+            "db_logical_identity": db_identity,
+            "db_logical_identity_json": db_identity_json,
+            "db_logical_identity_sha256": db_identity_sha,
+            "partition_start_fence": fence,
+            "partition_start_fence_json": fence_json,
+            "partition_start_fence_sha256": fence_sha,
+            "expected_predecessor_epoch_id": predecessor_id,
+            "expected_predecessor_state": predecessor_state,
+            "expected_predecessor_binding_fingerprint": predecessor_fingerprint,
+            "expected_control_schema_version": schema_pair[0],
+            "target_control_schema_version": schema_pair[1],
+            "epoch_contract_sha256": contract_hash,
+        }
+
+    @staticmethod
+    def _validate_v14_parent_for_v15_projection_tx(
+        conn: sqlite3.Connection,
+        epoch: sqlite3.Row,
+    ) -> tuple[str | None, str | None]:
+        del conn
+        try:
+            db_identity = json.loads(str(epoch["db_logical_identity_json"]))
+            start_fence = json.loads(str(epoch["partition_start_fence_json"]))
+            end_raw = epoch["partition_end_fence_json"]
+            end_fence = json.loads(str(end_raw)) if end_raw is not None else None
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ActivationEpochError("activation_v15_parent_projection_invalid") from exc
+        release_fingerprint = epoch["production_fingerprint"]
+        release_note = epoch["production_gate_receipt_sha256"]
+        release_pair_null = release_fingerprint is None and release_note is None
+        release_pair_valid = all(
+            isinstance(value, str)
+            and _ACTIVATION_SHA256_RE.fullmatch(value) is not None
+            and value != "0" * 64
+            for value in (release_fingerprint, release_note)
+        )
+        required_digests = (
+            "config_sha256",
+            "db_logical_identity_sha256",
+            "partition_start_fence_sha256",
+        )
+        end_sha = epoch["partition_end_fence_sha256"]
+        if (
+            _ACTIVATION_EPOCH_ID_RE.fullmatch(str(epoch["epoch_id"] or "")) is None
+            or any(
+                _ACTIVATION_SHA256_RE.fullmatch(str(epoch[field] or "")) is None
+                or str(epoch[field] or "") == "0" * 64
+                for field in required_digests
+            )
+            or _canonical_json(db_identity) != str(epoch["db_logical_identity_json"])
+            or _canonical_sha256(db_identity)
+            != str(epoch["db_logical_identity_sha256"])
+            or _canonical_json(start_fence) != str(epoch["partition_start_fence_json"])
+            or _canonical_sha256(start_fence)
+            != str(epoch["partition_start_fence_sha256"])
+            or (end_fence is None) != (end_sha is None)
+            or (
+                end_fence is not None
+                and (
+                    _canonical_json(end_fence) != str(end_raw)
+                    or _canonical_sha256(end_fence) != str(end_sha)
+                )
+            )
+            or not (release_pair_null or release_pair_valid)
+        ):
+            raise ActivationEpochError("activation_v15_parent_projection_invalid")
+        return (
+            str(release_fingerprint) if release_fingerprint is not None else None,
+            str(release_note) if release_note is not None else None,
+        )
+
+    @staticmethod
+    def _v15_migration_fault(_stage: str) -> None:
+        """No-op fault seam used only by transaction rollback tests."""
+
+    @staticmethod
+    def _commit_v15_migration_tx(conn: sqlite3.Connection) -> None:
+        conn.commit()
 
     @staticmethod
     def _v14_compat_activation_transition_binding_material_tx(
@@ -5563,6 +6066,7 @@ class RcaControlStore:
             )
             or any(
                 _ACTIVATION_SHA256_RE.fullmatch(str(epoch[field] or "")) is None
+                or str(epoch[field] or "") == "0" * 64
                 for field in digest_fields
             )
             or _canonical_json(db_identity) != str(epoch["db_logical_identity_json"])
@@ -5632,8 +6136,9 @@ class RcaControlStore:
             return cls._v15_activation_transition_binding_tx(conn, epoch=epoch)
         raise RuntimeError("incompatible_control_store_schema:activation_layout")
 
-    @staticmethod
+    @classmethod
     def _insert_activation_transition_audit_tx(
+        cls,
         conn: sqlite3.Connection,
         *,
         epoch: sqlite3.Row,
@@ -5642,31 +6147,52 @@ class RcaControlStore:
         operator: str,
         reason: str,
         transitioned_at: str,
+        schema_version: str | None = None,
     ) -> int:
-        binding_fingerprint = _canonical_sha256(
-            RcaControlStore._v14_compat_activation_transition_binding_material_tx(
+        resolved_schema_version = schema_version or (
+            CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+            if "release_fingerprint_sha256" in epoch.keys()
+            else CONTROL_STORE_SCHEMA_VERSION
+        )
+        if resolved_schema_version == CONTROL_STORE_SCHEMA_VERSION:
+            material = cls._v14_compat_activation_transition_binding_material_tx(
                 conn,
                 epoch=epoch,
                 from_state=from_state,
                 to_state=to_state,
             )
+        elif resolved_schema_version == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:
+            material = cls._v15_activation_transition_binding_material_tx(
+                conn,
+                epoch=epoch,
+                from_state=from_state,
+                to_state=to_state,
+            )
+        else:
+            raise RuntimeError("incompatible_control_store_schema:activation_layout")
+        binding_fingerprint = _canonical_sha256(material)
+        columns = (
+            "epoch_id, from_state, to_state, operator, reason, "
+            "binding_fingerprint, transitioned_at"
         )
+        placeholders = "?, ?, ?, ?, ?, ?, ?"
+        parameters: tuple[Any, ...] = (
+            epoch["epoch_id"],
+            from_state,
+            to_state,
+            operator,
+            reason,
+            binding_fingerprint,
+            transitioned_at,
+        )
+        if resolved_schema_version == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:
+            columns += ", binding_schema_version"
+            placeholders += ", ?"
+            parameters += (ACTIVATION_TRANSITION_BINDING_SCHEMA_V15,)
         cursor = conn.execute(
-            """
-            INSERT INTO rca_activation_transition_audit(
-                epoch_id, from_state, to_state, operator, reason,
-                binding_fingerprint, transitioned_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                epoch["epoch_id"],
-                from_state,
-                to_state,
-                operator,
-                reason,
-                binding_fingerprint,
-                transitioned_at,
-            ),
+            f"INSERT INTO rca_activation_transition_audit({columns}) "
+            f"VALUES ({placeholders})",
+            parameters,
         )
         if cursor.lastrowid is None:
             raise ActivationEpochError("activation_transition_audit_failed")
@@ -5729,6 +6255,674 @@ class RcaControlStore:
             "total": pending_inbox + dispatchable_outbox + execution_delivery,
         }
 
+    @classmethod
+    def _direct_steady_activation_outcome_tx(
+        cls,
+        conn: sqlite3.Connection,
+        *,
+        contract: Mapping[str, Any],
+    ) -> tuple[Literal["not_committed", "committed", "unknown"], sqlite3.Row | None]:
+        try:
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE name = 'rca_activation_epochs_v15_new'"
+            ).fetchone() is not None:
+                return "unknown", None
+            observed = cls._activation_schema_version_tx(conn)
+            cls._validate_structural_contract(conn, integrity_check=True)
+            cls._validate_activation_reference_contract_tx(conn)
+            cls._validate_activation_child_rows_tx(conn)
+            if observed == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:
+                cls._validate_v15_activation_schema_tx(conn)
+        except (ActivationEpochError, RuntimeError, sqlite3.Error):
+            return "unknown", None
+        if observed not in {
+            str(contract["expected_control_schema_version"]),
+            str(contract["target_control_schema_version"]),
+        }:
+            return "unknown", None
+        if observed == CONTROL_STORE_SCHEMA_VERSION:
+            try:
+                for parent in conn.execute(
+                    "SELECT * FROM rca_activation_epochs ORDER BY epoch_id"
+                ).fetchall():
+                    cls._validate_v14_parent_for_v15_projection_tx(conn, parent)
+                    cls._v14_compat_activation_transition_binding_tx(
+                        conn,
+                        epoch=parent,
+                    )
+            except (ActivationEpochError, RuntimeError, sqlite3.Error):
+                return "unknown", None
+        current = cls._current_activation_epoch_unchecked_tx(conn)
+        if current is not None and str(current["epoch_id"]) == contract["epoch_id"]:
+            if observed != contract["target_control_schema_version"]:
+                return "unknown", None
+            try:
+                binding = cls._activation_transition_binding_tx(
+                    conn,
+                    epoch=current,
+                    schema_version=observed,
+                )
+            except (ActivationEpochError, RuntimeError, sqlite3.Error):
+                return "unknown", None
+            matches = (
+                cls._v15_direct_steady_binding_matches(
+                    current,
+                    release_fingerprint_sha256=str(
+                        contract["release_fingerprint_sha256"]
+                    ),
+                    release_note_sha256=str(contract["release_note_sha256"]),
+                    config_sha256=str(contract["config_sha256"]),
+                    db_logical_identity_json=str(
+                        contract["db_logical_identity_json"]
+                    ),
+                    db_logical_identity_sha256=str(
+                        contract["db_logical_identity_sha256"]
+                    ),
+                    partition_start_fence_json=str(
+                        contract["partition_start_fence_json"]
+                    ),
+                    partition_start_fence_sha256=str(
+                        contract["partition_start_fence_sha256"]
+                    ),
+                )
+                and binding["state"] == "steady_active"
+                and binding["binding_schema_version"]
+                == ACTIVATION_TRANSITION_BINDING_SCHEMA_V15
+            )
+            if not matches:
+                return "unknown", None
+            predecessor_id = str(contract["expected_predecessor_epoch_id"])
+            if predecessor_id:
+                predecessor_binding_schema = (
+                    ACTIVATION_TRANSITION_BINDING_SCHEMA_V14
+                    if contract["expected_control_schema_version"]
+                    == CONTROL_STORE_SCHEMA_VERSION
+                    else ACTIVATION_TRANSITION_BINDING_SCHEMA_V15
+                )
+                predecessor = conn.execute(
+                    "SELECT state, is_current FROM rca_activation_epochs "
+                    "WHERE epoch_id = ?",
+                    (predecessor_id,),
+                ).fetchone()
+                predecessor_audit = conn.execute(
+                    "SELECT binding_fingerprint, binding_schema_version "
+                    "FROM rca_activation_transition_audit "
+                    "WHERE epoch_id = ? AND binding_schema_version = ? "
+                    "AND binding_fingerprint = ? "
+                    "ORDER BY audit_id DESC LIMIT 1",
+                    (
+                        predecessor_id,
+                        predecessor_binding_schema,
+                        contract["expected_predecessor_binding_fingerprint"],
+                    ),
+                ).fetchone()
+                if (
+                    predecessor is None
+                    or str(predecessor["state"]) != "retired"
+                    or int(predecessor["is_current"]) != 0
+                    or predecessor_audit is None
+                ):
+                    return "unknown", None
+                if predecessor_binding_schema == ACTIVATION_TRANSITION_BINDING_SCHEMA_V15:
+                    predecessor_row = conn.execute(
+                        "SELECT * FROM rca_activation_epochs WHERE epoch_id = ?",
+                        (predecessor_id,),
+                    ).fetchone()
+                    try:
+                        if predecessor_row is None:
+                            return "unknown", None
+                        cls._v15_activation_transition_binding_tx(
+                            conn,
+                            epoch=predecessor_row,
+                        )
+                    except (ActivationEpochError, RuntimeError, sqlite3.Error):
+                        return "unknown", None
+            return "committed", current
+
+        predecessor_id = str(contract["expected_predecessor_epoch_id"])
+        if (
+            observed == contract["expected_control_schema_version"]
+            and current is None
+            and not predecessor_id
+            and conn.execute(
+                "SELECT 1 FROM rca_activation_epochs WHERE epoch_id = ?",
+                (contract["epoch_id"],),
+            ).fetchone()
+            is None
+        ):
+            try:
+                cls._validate_partition_start_fence_cas_tx(
+                    conn,
+                    partition_start_fence=contract["partition_start_fence"],
+                )
+            except (ActivationEpochError, RuntimeError, sqlite3.Error):
+                return "unknown", None
+            return "not_committed", None
+        if (
+            observed != contract["expected_control_schema_version"]
+            or current is None
+            or not predecessor_id
+            or str(current["epoch_id"]) != predecessor_id
+            or str(current["state"] or "")
+            != str(contract["expected_predecessor_state"])
+        ):
+            return "unknown", None
+        try:
+            binding = cls._activation_transition_binding_tx(
+                conn,
+                epoch=current,
+                schema_version=observed,
+            )
+            cls._validate_partition_start_fence_cas_tx(
+                conn,
+                partition_start_fence=contract["partition_start_fence"],
+            )
+            inflight = cls._direct_steady_current_inflight_tx(
+                conn,
+                epoch_id=predecessor_id,
+            )
+        except (ActivationEpochError, RuntimeError, sqlite3.Error):
+            return "unknown", None
+        if (
+            binding["binding_fingerprint"]
+            != contract["expected_predecessor_binding_fingerprint"]
+            or inflight["total"] != 0
+            or conn.execute(
+                "SELECT 1 FROM rca_activation_epochs WHERE epoch_id = ?",
+                (contract["epoch_id"],),
+            ).fetchone()
+            is not None
+            or conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE name = 'rca_activation_epochs_v15_new'"
+            ).fetchone()
+            is not None
+        ):
+            return "unknown", None
+        return "not_committed", None
+
+    @classmethod
+    def _probe_direct_steady_activation_contract(
+        cls,
+        db_path: str | Path,
+        *,
+        contract: Mapping[str, Any],
+        busy_timeout_ms: int,
+    ) -> tuple[Literal["not_committed", "committed", "unknown"], dict[str, Any] | None]:
+        path = Path(db_path).expanduser()
+        if not path.is_absolute():
+            return "unknown", None
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=max(1, int(busy_timeout_ms)) / 1000,
+                isolation_level=None,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute(f"PRAGMA busy_timeout={max(1, int(busy_timeout_ms))}")
+            conn.execute("PRAGMA foreign_keys=ON")
+            foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()
+            if foreign_keys is None or int(foreign_keys[0]) != 1:
+                return "unknown", None
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("PRAGMA recursive_triggers=ON")
+            conn.execute("BEGIN")
+            outcome, row = cls._direct_steady_activation_outcome_tx(
+                conn,
+                contract=contract,
+            )
+            public = (
+                cls._public_activation_epoch(
+                    row,
+                    schema_version=CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+                )
+                if outcome == "committed" and row is not None
+                else None
+            )
+            conn.commit()
+            return outcome, public
+        except (OSError, RuntimeError, sqlite3.Error, ValueError):
+            if conn is not None and conn.in_transaction:
+                conn.rollback()
+            return "unknown", None
+        finally:
+            if conn is not None:
+                conn.close()
+
+    @classmethod
+    def probe_direct_steady_activation_outcome(
+        cls,
+        db_path: str | Path,
+        *,
+        epoch_id: str,
+        release_fingerprint_sha256: str,
+        release_note_sha256: str,
+        config_sha256: str,
+        db_logical_identity: Mapping[str, Any],
+        partition_start_fence: Mapping[str, Any],
+        expected_predecessor_epoch_id: str,
+        expected_predecessor_state: str,
+        expected_predecessor_binding_fingerprint: str,
+        expected_control_schema_version: str,
+        target_control_schema_version: str,
+        epoch_contract_sha256: str,
+        busy_timeout_ms: int = 5000,
+    ) -> Literal["not_committed", "committed", "unknown"]:
+        """Classify one exact activation without trusting the caller's connection."""
+
+        try:
+            contract = cls._normalize_direct_steady_activation_contract(
+                epoch_id=epoch_id,
+                release_fingerprint_sha256=release_fingerprint_sha256,
+                release_note_sha256=release_note_sha256,
+                config_sha256=config_sha256,
+                db_logical_identity=db_logical_identity,
+                partition_start_fence=partition_start_fence,
+                expected_predecessor_epoch_id=expected_predecessor_epoch_id,
+                expected_predecessor_state=expected_predecessor_state,
+                expected_predecessor_binding_fingerprint=(
+                    expected_predecessor_binding_fingerprint
+                ),
+                expected_control_schema_version=expected_control_schema_version,
+                target_control_schema_version=target_control_schema_version,
+                epoch_contract_sha256=epoch_contract_sha256,
+            )
+        except (ActivationEpochError, TypeError, ValueError):
+            return "unknown"
+        outcome, _public = cls._probe_direct_steady_activation_contract(
+            db_path,
+            contract=contract,
+            busy_timeout_ms=busy_timeout_ms,
+        )
+        return outcome
+
+    @classmethod
+    def probe_v14_to_v15_migration_outcome(
+        cls,
+        db_path: str | Path,
+        **kwargs: Any,
+    ) -> Literal["not_committed", "committed", "unknown"]:
+        """Classify only the explicit v14-to-v15 migration contract."""
+
+        if (
+            kwargs.get("expected_control_schema_version")
+            != CONTROL_STORE_SCHEMA_VERSION
+            or kwargs.get("target_control_schema_version")
+            != CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+        ):
+            return "unknown"
+        return cls.probe_direct_steady_activation_outcome(db_path, **kwargs)
+
+    @classmethod
+    def migrate_v14_to_v15_and_activate(
+        cls,
+        db_path: str | Path,
+        *,
+        epoch_id: str,
+        release_fingerprint_sha256: str,
+        release_note_sha256: str,
+        config_sha256: str,
+        db_logical_identity: Mapping[str, Any],
+        partition_start_fence: Mapping[str, Any],
+        operator: str,
+        reason: str,
+        expected_predecessor_epoch_id: str,
+        expected_predecessor_state: str,
+        expected_predecessor_binding_fingerprint: str,
+        expected_control_schema_version: str,
+        target_control_schema_version: str,
+        epoch_contract_sha256: str,
+        busy_timeout_ms: int = 5000,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Atomically rebuild exact v14 activation state as writable v15."""
+
+        contract = cls._normalize_direct_steady_activation_contract(
+            epoch_id=epoch_id,
+            release_fingerprint_sha256=release_fingerprint_sha256,
+            release_note_sha256=release_note_sha256,
+            config_sha256=config_sha256,
+            db_logical_identity=db_logical_identity,
+            partition_start_fence=partition_start_fence,
+            expected_predecessor_epoch_id=expected_predecessor_epoch_id,
+            expected_predecessor_state=expected_predecessor_state,
+            expected_predecessor_binding_fingerprint=(
+                expected_predecessor_binding_fingerprint
+            ),
+            expected_control_schema_version=expected_control_schema_version,
+            target_control_schema_version=target_control_schema_version,
+            epoch_contract_sha256=epoch_contract_sha256,
+        )
+        if (
+            contract["expected_control_schema_version"]
+            != CONTROL_STORE_SCHEMA_VERSION
+            or contract["target_control_schema_version"]
+            != CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+        ):
+            raise ActivationEpochError("activation_control_schema_transition_invalid")
+        if (
+            not contract["expected_predecessor_epoch_id"]
+            or contract["expected_predecessor_state"] != "steady_active"
+            or contract["epoch_id"] == contract["expected_predecessor_epoch_id"]
+        ):
+            raise ActivationEpochError("activation_predecessor_binding_incomplete")
+        actor, justification = cls._normalize_activation_audit_text(operator, reason)
+        path = Path(db_path).expanduser()
+        if not path.is_absolute():
+            raise RuntimeError("rca_control_store_existing_path_not_absolute")
+        try:
+            observed_path = path.lstat()
+        except OSError as exc:
+            raise RuntimeError("rca_control_store_existing_path_missing") from exc
+        if (
+            stat.S_ISLNK(observed_path.st_mode)
+            or not stat.S_ISREG(observed_path.st_mode)
+            or observed_path.st_nlink != 1
+            or observed_path.st_size <= 0
+        ):
+            raise RuntimeError("rca_control_store_existing_path_invalid")
+
+        observed_version, snapshot = cls.probe_writable_schema_source(path)
+        if snapshot is not None:
+            snapshot.close()
+        if observed_version == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:
+            outcome, public = cls._probe_direct_steady_activation_contract(
+                path,
+                contract=contract,
+                busy_timeout_ms=busy_timeout_ms,
+            )
+            if outcome == "committed" and public is not None:
+                return public
+            raise ActivationEpochError("activation_v15_migration_binding_conflict")
+        if observed_version != CONTROL_STORE_SCHEMA_VERSION:
+            raise RuntimeError("incompatible_control_store_schema:version")
+
+        current = _iso(now)
+        conn: sqlite3.Connection | None = None
+        commit_started = False
+        commit_error: Exception | None = None
+        try:
+            conn = sqlite3.connect(
+                path,
+                timeout=max(1, int(busy_timeout_ms)) / 1000,
+                isolation_level=None,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute(f"PRAGMA busy_timeout={max(1, int(busy_timeout_ms))}")
+            conn.execute("PRAGMA recursive_triggers=ON")
+            conn.execute("PRAGMA foreign_keys=OFF")
+            foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()
+            if foreign_keys is None or int(foreign_keys[0]) != 0:
+                raise RuntimeError("activation_v15_migration_foreign_keys_not_disabled")
+            conn.execute("BEGIN IMMEDIATE")
+            if cls._activation_schema_version_tx(conn) != CONTROL_STORE_SCHEMA_VERSION:
+                raise RuntimeError("incompatible_control_store_schema:activation_layout")
+            cls._validate_structural_contract(conn, integrity_check=True)
+            cls._validate_activation_reference_contract_tx(conn)
+            cls._validate_activation_child_rows_tx(conn)
+
+            old_epochs = conn.execute(
+                "SELECT * FROM rca_activation_epochs ORDER BY epoch_id"
+            ).fetchall()
+            old_audits = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT audit_id, epoch_id, from_state, to_state, operator, "
+                    "reason, binding_fingerprint, transitioned_at "
+                    "FROM rca_activation_transition_audit ORDER BY audit_id"
+                ).fetchall()
+            ]
+            projected: list[tuple[sqlite3.Row, str | None, str | None]] = []
+            for old_epoch in old_epochs:
+                release_pair = cls._validate_v14_parent_for_v15_projection_tx(
+                    conn,
+                    old_epoch,
+                )
+                cls._v14_compat_activation_transition_binding_tx(
+                    conn,
+                    epoch=old_epoch,
+                )
+                projected.append((old_epoch, *release_pair))
+            predecessor = cls._current_activation_epoch_unchecked_tx(conn)
+            if predecessor is None:
+                raise ActivationEpochError("activation_predecessor_binding_changed")
+            predecessor_binding = cls._v14_compat_activation_transition_binding_tx(
+                conn,
+                epoch=predecessor,
+            )
+            if (
+                str(predecessor["epoch_id"])
+                != contract["expected_predecessor_epoch_id"]
+                or str(predecessor["state"])
+                != contract["expected_predecessor_state"]
+                or predecessor_binding["binding_fingerprint"]
+                != contract["expected_predecessor_binding_fingerprint"]
+            ):
+                raise ActivationEpochError("activation_predecessor_binding_changed")
+            if conn.execute(
+                "SELECT 1 FROM rca_activation_epochs WHERE epoch_id = ?",
+                (contract["epoch_id"],),
+            ).fetchone() is not None:
+                raise ActivationEpochError("activation_direct_steady_binding_conflict")
+            inflight = cls._direct_steady_current_inflight_tx(
+                conn,
+                epoch_id=str(predecessor["epoch_id"]),
+            )
+            if inflight["total"]:
+                raise ActivationEpochError(
+                    "activation_predecessor_inflight_not_drained"
+                )
+            cls._validate_partition_start_fence_cas_tx(
+                conn,
+                partition_start_fence=contract["partition_start_fence"],
+            )
+            trigger_sql = {
+                str(row["name"]): str(row["sql"] or "")
+                for row in conn.execute(
+                    "SELECT name, sql FROM sqlite_master "
+                    "WHERE type = 'trigger' AND name IN (?, ?, ?)",
+                    _V15_ACTIVATION_CROSS_TRIGGER_NAMES,
+                ).fetchall()
+            }
+            if set(trigger_sql) != set(_V15_ACTIVATION_CROSS_TRIGGER_NAMES) or any(
+                not trigger_sql[name].strip()
+                for name in _V15_ACTIVATION_CROSS_TRIGGER_NAMES
+            ):
+                raise RuntimeError(
+                    "incompatible_control_store_schema:activation_cross_triggers"
+                )
+            transition_index_sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' "
+                "AND name = 'idx_rca_activation_transition_epoch'"
+            ).fetchone()
+            if transition_index_sql is None or not str(transition_index_sql["sql"] or ""):
+                raise RuntimeError("incompatible_control_store_schema:required_indexes")
+            old_sequence = {
+                str(row["name"]): int(row["seq"])
+                for row in conn.execute("SELECT name, seq FROM sqlite_sequence").fetchall()
+            }
+            old_audit_sequence = max(
+                old_sequence.get("rca_activation_transition_audit", 0),
+                int(old_audits[-1][0]) if old_audits else 0,
+            )
+            cls._v15_migration_fault("after_preflight")
+
+            for name in _V15_ACTIVATION_CROSS_TRIGGER_NAMES:
+                conn.execute(f'DROP TRIGGER "{name}"')
+            cls._v15_migration_fault("after_trigger_drop")
+            conn.execute(
+                "ALTER TABLE rca_activation_transition_audit ADD COLUMN "
+                "binding_schema_version TEXT NOT NULL "
+                f"DEFAULT '{ACTIVATION_TRANSITION_BINDING_SCHEMA_V14}' "
+                "CHECK(binding_schema_version IN ("
+                f"'{ACTIVATION_TRANSITION_BINDING_SCHEMA_V14}', "
+                f"'{ACTIVATION_TRANSITION_BINDING_SCHEMA_V15}'))"
+            )
+            cls._v15_migration_fault("after_audit_upgrade")
+            conn.execute(_V15_ACTIVATION_EPOCH_NEW_TABLE_SQL)
+            for old_epoch, old_release, old_note in projected:
+                conn.execute(
+                    """
+                    INSERT INTO rca_activation_epochs_v15_new(
+                        epoch_id, state, is_current,
+                        release_fingerprint_sha256, release_note_sha256,
+                        config_sha256, db_logical_identity_json,
+                        db_logical_identity_sha256, partition_start_fence_json,
+                        partition_start_fence_sha256, created_at, updated_at,
+                        activated_at, retired_at
+                    ) VALUES (?, 'retired', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        old_epoch["epoch_id"],
+                        old_release,
+                        old_note,
+                        old_epoch["config_sha256"],
+                        old_epoch["db_logical_identity_json"],
+                        old_epoch["db_logical_identity_sha256"],
+                        old_epoch["partition_start_fence_json"],
+                        old_epoch["partition_start_fence_sha256"],
+                        old_epoch["created_at"],
+                        current,
+                        old_epoch["steady_activated_at"],
+                        current,
+                    ),
+                )
+            cls._v15_migration_fault("after_epoch_copy")
+            cls._validate_activation_child_rows_against_parent_tx(
+                conn,
+                parent_table="rca_activation_epochs_v15_new",
+            )
+            cls._v15_migration_fault("after_child_preflight")
+            conn.execute("DROP TABLE rca_activation_epochs")
+            conn.execute(
+                "ALTER TABLE rca_activation_epochs_v15_new "
+                "RENAME TO rca_activation_epochs"
+            )
+            conn.execute(_V15_CURRENT_ACTIVATION_INDEX_SQL)
+            for name in _V15_ACTIVATION_CROSS_TRIGGER_NAMES:
+                conn.execute(trigger_sql[name])
+            cls._v15_migration_fault("after_epoch_swap")
+
+            cls._insert_v15_direct_steady_epoch_tx(
+                conn,
+                epoch_id=str(contract["epoch_id"]),
+                release_fingerprint_sha256=str(
+                    contract["release_fingerprint_sha256"]
+                ),
+                release_note_sha256=str(contract["release_note_sha256"]),
+                config_sha256=str(contract["config_sha256"]),
+                db_logical_identity_json=str(contract["db_logical_identity_json"]),
+                db_logical_identity_sha256=str(
+                    contract["db_logical_identity_sha256"]
+                ),
+                partition_start_fence_json=str(
+                    contract["partition_start_fence_json"]
+                ),
+                partition_start_fence_sha256=str(
+                    contract["partition_start_fence_sha256"]
+                ),
+                created_at=current,
+            )
+
+            successor = cls._current_activation_epoch_unchecked_tx(conn)
+            if successor is None or str(successor["epoch_id"]) != contract["epoch_id"]:
+                raise ActivationEpochError("activation_epoch_create_lost")
+            cls._insert_activation_transition_audit_tx(
+                conn,
+                epoch=successor,
+                from_state="v15_migration",
+                to_state="steady_active",
+                operator=actor,
+                reason=justification,
+                transitioned_at=current,
+                schema_version=CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+            )
+            cls._v15_migration_fault("after_successor_audit")
+            updated = conn.execute(
+                "UPDATE control_meta SET value = ? "
+                "WHERE key = 'schema_version' AND value = ?",
+                (
+                    CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+                    CONTROL_STORE_SCHEMA_VERSION,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("activation_v15_migration_marker_cas_failed")
+            cls._v15_migration_fault("after_marker_cas")
+
+            preserved_audits = [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT audit_id, epoch_id, from_state, to_state, operator, "
+                    "reason, binding_fingerprint, transitioned_at "
+                    "FROM rca_activation_transition_audit "
+                    "WHERE binding_schema_version = ? ORDER BY audit_id",
+                    (ACTIVATION_TRANSITION_BINDING_SCHEMA_V14,),
+                ).fetchall()
+            ]
+            if preserved_audits != old_audits:
+                raise RuntimeError("activation_v15_migration_audit_changed")
+            observed_transition_index = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' "
+                "AND name = 'idx_rca_activation_transition_epoch'"
+            ).fetchone()
+            if (
+                observed_transition_index is None
+                or str(observed_transition_index["sql"] or "")
+                != str(transition_index_sql["sql"])
+            ):
+                raise RuntimeError("activation_v15_migration_index_changed")
+            new_sequence = {
+                str(row["name"]): int(row["seq"])
+                for row in conn.execute("SELECT name, seq FROM sqlite_sequence").fetchall()
+            }
+            for name, sequence in old_sequence.items():
+                if name == "rca_activation_transition_audit":
+                    continue
+                expected = sequence
+                if new_sequence.get(name) != expected:
+                    raise RuntimeError("activation_v15_migration_sequence_changed")
+            if (
+                new_sequence.get("rca_activation_transition_audit")
+                != old_audit_sequence + 1
+            ):
+                raise RuntimeError("activation_v15_migration_sequence_changed")
+            cls._validate_v15_activation_schema_tx(conn)
+            cls._validate_structural_contract(conn, integrity_check=True)
+            cls._validate_activation_reference_contract_tx(conn)
+            cls._validate_activation_child_rows_tx(conn)
+            cls._validate_current_activation_binding_tx(
+                conn,
+                schema_version=CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+            )
+            cls._v15_migration_fault("before_commit")
+            commit_started = True
+            cls._commit_v15_migration_tx(conn)
+        except Exception as exc:
+            if conn is not None and conn.in_transaction:
+                conn.rollback()
+            if commit_started:
+                commit_error = exc
+            else:
+                raise
+        finally:
+            if conn is not None:
+                conn.close()
+
+        outcome, public = cls._probe_direct_steady_activation_contract(
+            path,
+            contract=contract,
+            busy_timeout_ms=busy_timeout_ms,
+        )
+        if outcome == "committed" and public is not None:
+            return public
+        if outcome == "not_committed":
+            raise ActivationEpochError("activation_v15_migration_not_committed") from commit_error
+        raise ActivationEpochError("activation_v15_migration_outcome_unknown") from commit_error
+
     def direct_steady_predecessor(self) -> dict[str, Any] | None:
         """Return the exact current binding and current-only in-flight count."""
         conn = self._connect()
@@ -5752,6 +6946,198 @@ class RcaControlStore:
         finally:
             conn.close()
 
+    def _activate_v15_direct_steady_epoch(
+        self,
+        *,
+        contract: Mapping[str, Any],
+        operator: str,
+        reason: str,
+        now: datetime | None,
+    ) -> dict[str, Any]:
+        actor, justification = self._normalize_activation_audit_text(operator, reason)
+        if (
+            contract["expected_control_schema_version"]
+            != CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+            or contract["target_control_schema_version"]
+            != CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+        ):
+            raise ActivationEpochError("activation_control_schema_transition_invalid")
+        current_time = _iso(now)
+        conn = self._connect()
+        commit_started = False
+        commit_error: Exception | None = None
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            if (
+                self._activation_schema_version_tx(conn)
+                != CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+            ):
+                raise RuntimeError("incompatible_control_store_schema:activation_layout")
+            existing = self._current_activation_epoch_tx(conn)
+            if existing is not None and str(existing["epoch_id"]) == contract["epoch_id"]:
+                if not self._v15_direct_steady_binding_matches(
+                    existing,
+                    release_fingerprint_sha256=str(
+                        contract["release_fingerprint_sha256"]
+                    ),
+                    release_note_sha256=str(contract["release_note_sha256"]),
+                    config_sha256=str(contract["config_sha256"]),
+                    db_logical_identity_json=str(
+                        contract["db_logical_identity_json"]
+                    ),
+                    db_logical_identity_sha256=str(
+                        contract["db_logical_identity_sha256"]
+                    ),
+                    partition_start_fence_json=str(
+                        contract["partition_start_fence_json"]
+                    ),
+                    partition_start_fence_sha256=str(
+                        contract["partition_start_fence_sha256"]
+                    ),
+                ):
+                    raise ActivationEpochError(
+                        "activation_direct_steady_binding_conflict"
+                    )
+                conn.commit()
+                return self._public_activation_epoch(
+                    existing,
+                    schema_version=CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+                )
+
+            self._validate_partition_start_fence_cas_tx(
+                conn,
+                partition_start_fence=contract["partition_start_fence"],
+            )
+            predecessor_id = str(contract["expected_predecessor_epoch_id"])
+            if existing is None:
+                if predecessor_id:
+                    raise ActivationEpochError("activation_predecessor_binding_changed")
+            else:
+                predecessor_binding = self._v15_activation_transition_binding_tx(
+                    conn,
+                    epoch=existing,
+                )
+                if (
+                    not predecessor_id
+                    or predecessor_binding["epoch_id"] != predecessor_id
+                    or predecessor_binding["state"]
+                    != contract["expected_predecessor_state"]
+                    or predecessor_binding["binding_fingerprint"]
+                    != contract["expected_predecessor_binding_fingerprint"]
+                ):
+                    raise ActivationEpochError("activation_predecessor_binding_changed")
+                inflight = self._direct_steady_current_inflight_tx(
+                    conn,
+                    epoch_id=str(existing["epoch_id"]),
+                )
+                if inflight["total"]:
+                    raise ActivationEpochError(
+                        "activation_predecessor_inflight_not_drained"
+                    )
+                retired = conn.execute(
+                    """
+                    UPDATE rca_activation_epochs
+                       SET state = 'retired', is_current = 0,
+                           updated_at = ?, retired_at = ?
+                     WHERE epoch_id = ? AND state = 'steady_active'
+                       AND is_current = 1
+                       AND EXISTS (
+                           SELECT 1 FROM rca_activation_transition_audit
+                            WHERE audit_id = ? AND epoch_id = ?
+                              AND to_state = 'steady_active'
+                              AND binding_schema_version = ?
+                              AND binding_fingerprint = ?
+                       )
+                    """,
+                    (
+                        current_time,
+                        current_time,
+                        predecessor_id,
+                        predecessor_binding["audit_id"],
+                        predecessor_id,
+                        ACTIVATION_TRANSITION_BINDING_SCHEMA_V15,
+                        contract["expected_predecessor_binding_fingerprint"],
+                    ),
+                )
+                if retired.rowcount != 1:
+                    raise ActivationEpochError("activation_epoch_state_changed")
+                retired_epoch = conn.execute(
+                    "SELECT * FROM rca_activation_epochs WHERE epoch_id = ?",
+                    (predecessor_id,),
+                ).fetchone()
+                if retired_epoch is None:
+                    raise ActivationEpochError("activation_epoch_state_changed")
+                self._insert_activation_transition_audit_tx(
+                    conn,
+                    epoch=retired_epoch,
+                    from_state="steady_active",
+                    to_state="retired",
+                    operator=actor,
+                    reason=justification,
+                    transitioned_at=current_time,
+                    schema_version=CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+                )
+
+            self._insert_v15_direct_steady_epoch_tx(
+                conn,
+                epoch_id=str(contract["epoch_id"]),
+                release_fingerprint_sha256=str(
+                    contract["release_fingerprint_sha256"]
+                ),
+                release_note_sha256=str(contract["release_note_sha256"]),
+                config_sha256=str(contract["config_sha256"]),
+                db_logical_identity_json=str(contract["db_logical_identity_json"]),
+                db_logical_identity_sha256=str(
+                    contract["db_logical_identity_sha256"]
+                ),
+                partition_start_fence_json=str(
+                    contract["partition_start_fence_json"]
+                ),
+                partition_start_fence_sha256=str(
+                    contract["partition_start_fence_sha256"]
+                ),
+                created_at=current_time,
+            )
+            successor = self._current_activation_epoch_unchecked_tx(conn)
+            if successor is None or str(successor["epoch_id"]) != contract["epoch_id"]:
+                raise ActivationEpochError("activation_epoch_create_lost")
+            self._insert_activation_transition_audit_tx(
+                conn,
+                epoch=successor,
+                from_state="direct_release",
+                to_state="steady_active",
+                operator=actor,
+                reason=justification,
+                transitioned_at=current_time,
+                schema_version=CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+            )
+            self._validate_current_activation_binding_tx(
+                conn,
+                schema_version=CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+            )
+            commit_started = True
+            self._commit_v15_migration_tx(conn)
+        except Exception as exc:
+            if conn.in_transaction:
+                conn.rollback()
+            if commit_started:
+                commit_error = exc
+            else:
+                raise
+        finally:
+            conn.close()
+
+        outcome, public = self._probe_direct_steady_activation_contract(
+            self.db_path,
+            contract=contract,
+            busy_timeout_ms=self.busy_timeout_ms,
+        )
+        if outcome == "committed" and public is not None:
+            return public
+        if outcome == "not_committed":
+            raise ActivationEpochError("activation_direct_steady_not_committed") from commit_error
+        raise ActivationEpochError("activation_direct_steady_outcome_unknown") from commit_error
+
     def activate_direct_steady_epoch(
         self,
         *,
@@ -5766,6 +7152,9 @@ class RcaControlStore:
         expected_predecessor_epoch_id: str = "",
         expected_predecessor_state: str = "",
         expected_predecessor_binding_fingerprint: str = "",
+        expected_control_schema_version: str | None = None,
+        target_control_schema_version: str | None = None,
+        epoch_contract_sha256: str | None = None,
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Atomically install one explicit direct-release steady epoch.
@@ -5779,6 +7168,37 @@ class RcaControlStore:
         represents a Kafka-disabled release; a later Kafka consumer still
         fails closed when it requests a missing topic or partition fence.
         """
+        if self._observed_schema_version == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:
+            if self.read_only:
+                raise sqlite3.OperationalError("attempt to write a readonly database")
+            if (
+                expected_control_schema_version is None
+                or target_control_schema_version is None
+                or epoch_contract_sha256 is None
+            ):
+                raise ActivationEpochError("activation_epoch_contract_required")
+            contract = self._normalize_direct_steady_activation_contract(
+                epoch_id=epoch_id,
+                release_fingerprint_sha256=release_fingerprint_sha256,
+                release_note_sha256=release_note_sha256,
+                config_sha256=config_sha256,
+                db_logical_identity=db_logical_identity,
+                partition_start_fence=partition_start_fence,
+                expected_predecessor_epoch_id=expected_predecessor_epoch_id,
+                expected_predecessor_state=expected_predecessor_state,
+                expected_predecessor_binding_fingerprint=(
+                    expected_predecessor_binding_fingerprint
+                ),
+                expected_control_schema_version=expected_control_schema_version,
+                target_control_schema_version=target_control_schema_version,
+                epoch_contract_sha256=epoch_contract_sha256,
+            )
+            return self._activate_v15_direct_steady_epoch(
+                contract=contract,
+                operator=operator,
+                reason=reason,
+                now=now,
+            )
         identity = self._normalize_activation_epoch_id(epoch_id)
         release_hash = self._normalize_activation_sha256(
             release_fingerprint_sha256, "release_fingerprint_sha256"

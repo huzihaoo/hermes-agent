@@ -8,6 +8,7 @@ import sqlite3
 
 import pytest
 
+from scripts import pnc_rca_failure_route_outlet as outlet_module
 from scripts.pnc_rca_failure_route_outlet import (
     FailureRouteOutlet,
     FailureRouteOutletPermanentError,
@@ -30,6 +31,45 @@ def _route_keys(db_path: Path) -> dict[str, str]:
                 "ORDER BY route_kind"
             )
         }
+
+
+def test_cli_opens_exact_v15_delivery_writer(tmp_path, monkeypatch, capsys):
+    calls = []
+    route_store = object()
+
+    def store_factory(path, **kwargs):
+        calls.append(("store", Path(path), kwargs))
+        return route_store
+
+    class Outlet:
+        def __init__(self, store, root, **kwargs):
+            calls.append(("outlet", store, Path(root), kwargs))
+
+        def process_route(self, route_key):
+            calls.append(("process", route_key))
+            return {"status": "settled"}
+
+    monkeypatch.setattr(outlet_module, "RcaDeliveryStore", store_factory)
+    monkeypatch.setattr(outlet_module, "FailureRouteOutlet", Outlet)
+
+    assert outlet_module.main(
+        [
+            "--delivery-db",
+            str(tmp_path / "control.sqlite3"),
+            "--outlet-root",
+            str(tmp_path / "outlet"),
+            "--route-key",
+            "route-1",
+        ]
+    ) == 0
+    assert calls[0] == (
+        "store",
+        tmp_path / "control.sqlite3",
+        {"require_current": True, "allow_successor_write": True},
+    )
+    assert calls[1][0:3] == ("outlet", route_store, tmp_path / "outlet")
+    assert calls[2] == ("process", "route-1")
+    assert json.loads(capsys.readouterr().out)["ok"] is True
 
 
 def test_internal_routes_settle_idempotently_without_main_effects(tmp_path):

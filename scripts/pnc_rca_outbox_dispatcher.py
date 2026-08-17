@@ -36,6 +36,7 @@ from gateway.pnc_rca_admission import (
     validate_rca_trigger_context,
 )
 from gateway.pnc_rca_control_store import (
+    CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
     OutboxClaim,
     OUTBOX_CIRCUIT_RESET_SCHEMA_VERSION,
     RcaControlStore,
@@ -2963,6 +2964,9 @@ class OutboxDispatcher:
                     self.config.delivery_db_path,
                     now=self.now(),
                     activation_required=self.config.activation_required,
+                    expected_control_schema_version=(
+                        CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+                    ),
                 )
             else:
                 snapshot = self.delivery_store.backpressure_snapshot(
@@ -4016,8 +4020,7 @@ def main(argv: list[str] | None = None) -> int:
                 check_store = RcaControlStore(
                     config.control_db_path,
                     require_current=True,
-                    read_only=True,
-                    allow_successor_read_only=True,
+                    allow_successor_write=True,
                 )
                 capability = _schema_runtime_capability(check_store)
                 if capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
@@ -4052,26 +4055,18 @@ def main(argv: list[str] | None = None) -> int:
             config.control_db_path,
             require_current=True,
             read_only=read_only_operator,
-            allow_successor_read_only=True,
+            allow_successor_read_only=read_only_operator,
+            allow_successor_write=not read_only_operator,
         )
         capability = _schema_runtime_capability(store)
         if capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
-            if args.dry_run or args.clear_circuit or args.materialize_reset:
-                operation = (
-                    "dry_run"
-                    if args.dry_run
-                    else (
-                        "materialize_reset"
-                        if args.materialize_reset
-                        else "clear_circuit"
-                    )
-                )
+            if args.dry_run:
                 print(
                     json.dumps(
                         _successor_read_only_diagnostic(
                             config,
                             capability,
-                            operation=operation,
+                            operation="dry_run",
                         ),
                         ensure_ascii=False,
                         indent=2,
@@ -4079,22 +4074,22 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 )
                 return 2
+            if not (args.clear_circuit or args.materialize_reset):
+                stopping = False
 
-            stopping = False
+                def request_successor_stop(_signum: int, _frame: Any) -> None:
+                    nonlocal stopping
+                    stopping = True
 
-            def request_successor_stop(_signum: int, _frame: Any) -> None:
-                nonlocal stopping
-                stopping = True
-
-            signal.signal(signal.SIGTERM, request_successor_stop)
-            signal.signal(signal.SIGINT, request_successor_stop)
-            return run_successor_read_only_loop(
-                config,
-                store,
-                capability,
-                once=args.once,
-                stop_requested=lambda: stopping,
-            )
+                signal.signal(signal.SIGTERM, request_successor_stop)
+                signal.signal(signal.SIGINT, request_successor_stop)
+                return run_successor_read_only_loop(
+                    config,
+                    store,
+                    capability,
+                    once=args.once,
+                    stop_requested=lambda: stopping,
+                )
         if args.materialize_reset:
             receipt_path = _absolute_new_receipt_path(args.receipt)
             audit = store.dispatcher_circuit_reset_audit(args.materialize_reset)

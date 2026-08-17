@@ -230,20 +230,30 @@ def _silent_deadline_terminal_store(tmp_path):
         clock=clock,
         blocker={"kind": "service_provenance_unavailable", "retryable": False},
     )
-    control = RcaControlStore(collector.store.db_path)
     collector.config = replace(collector.config, activation_required=True)
     assert collector.collect_one().status == "failure_hold"
     clock[0] = delivery_now + timedelta(seconds=1800)
     terminal = collector.collect_one()
     assert terminal.status == "terminal_failed"
     assert terminal.error_code == "service_provenance_unavailable"
-    return RcaControlStore(collector.store.db_path), clock[0]
+    return (
+        RcaControlStore(
+            collector.store.db_path,
+            require_current=True,
+            allow_successor_write=True,
+        ),
+        clock[0],
+    )
 
 
 def _rewrite_silent_terminal_error_code(
     store: RcaControlStore, error_code: str
 ) -> None:
-    delivery = RcaDeliveryStore(store.db_path)
+    delivery = RcaDeliveryStore(
+        store.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
     [watch] = delivery.list_rows("rca_execution_watch")
     [route] = delivery.list_rows("rca_failure_routes")
     status = json.loads(watch["last_status_json"])
@@ -382,7 +392,11 @@ def test_operator_silent_terminal_rerun_creates_new_generation_without_old_mutat
         _rewrite_silent_terminal_error_code(store, error_code)
     request = _silent_batch_request()
     authority = _silent_batch_authority(store, request)
-    delivery = RcaDeliveryStore(store.db_path)
+    delivery = RcaDeliveryStore(
+        store.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
     old_watch = dict(delivery.list_rows("rca_execution_watch")[0])
     old_route = dict(delivery.list_rows("rca_failure_routes")[0])
 
@@ -446,7 +460,11 @@ def test_owner_authorized_silent_terminal_rerun_can_publish_success_conclusion(
         activation_required=True,
         now=terminal_at + timedelta(seconds=1),
     )
-    delivery = RcaDeliveryStore(store.db_path)
+    delivery = RcaDeliveryStore(
+        store.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
     target_key = "feishu_project:g1q3:issue:7041712812"
     delivery_id = "silent-terminal-success-delivery"
     current = (terminal_at + timedelta(seconds=2)).isoformat()
@@ -661,7 +679,11 @@ def test_operator_silent_terminal_rerun_rejects_materialized_old_effect(
     _rewrite_silent_terminal_error_code(store, error_code)
     request = _silent_batch_request()
     authority = _silent_batch_authority(store, request)
-    [watch] = RcaDeliveryStore(store.db_path).list_rows("rca_execution_watch")
+    [watch] = RcaDeliveryStore(
+        store.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    ).list_rows("rca_execution_watch")
     with sqlite3.connect(store.db_path) as conn:
         conn.execute(
             """
@@ -1287,6 +1309,79 @@ def _migrate_v14_fixture_to_v15(
     }
 
 
+def _direct_steady_contract(
+    *,
+    predecessor,
+    epoch_id="rca-v15-successor",
+    expected_schema=CONTROL_STORE_SCHEMA_VERSION,
+    target_schema=CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+    release_fingerprint_sha256="3" * 64,
+    release_note_sha256="4" * 64,
+    config_sha256="5" * 64,
+    db_logical_identity=None,
+    partition_start_fence=None,
+):
+    db_identity = (
+        {"database": "v15-control-test"}
+        if db_logical_identity is None
+        else db_logical_identity
+    )
+    partition_fence = {} if partition_start_fence is None else partition_start_fence
+    predecessor = predecessor or {
+        "epoch_id": "",
+        "state": "",
+        "binding_fingerprint": "",
+    }
+    activation = {
+        "expected_control_schema_version": expected_schema,
+        "target_control_schema_version": target_schema,
+        "expected_predecessor_epoch_id": predecessor["epoch_id"],
+        "expected_predecessor_state": predecessor["state"],
+        "expected_predecessor_binding_fingerprint": predecessor[
+            "binding_fingerprint"
+        ],
+        "db_logical_identity": db_identity,
+        "db_logical_identity_sha256": control_store_module._canonical_sha256(
+            db_identity
+        ),
+        "partition_start_fence": partition_fence,
+        "partition_start_fence_sha256": control_store_module._canonical_sha256(
+            partition_fence
+        ),
+    }
+    material = {
+        "schema_version": (
+            control_store_module._MINIMAL_RELEASE_EPOCH_CONTRACT_SCHEMA_VERSION
+        ),
+        **activation,
+    }
+    return {
+        "epoch_id": epoch_id,
+        "release_fingerprint_sha256": release_fingerprint_sha256,
+        "release_note_sha256": release_note_sha256,
+        "config_sha256": config_sha256,
+        "db_logical_identity": db_identity,
+        "partition_start_fence": partition_fence,
+        "expected_predecessor_epoch_id": predecessor["epoch_id"],
+        "expected_predecessor_state": predecessor["state"],
+        "expected_predecessor_binding_fingerprint": predecessor[
+            "binding_fingerprint"
+        ],
+        "expected_control_schema_version": expected_schema,
+        "target_control_schema_version": target_schema,
+        "epoch_contract_sha256": control_store_module._canonical_sha256(material),
+    }
+
+
+def _migration_apply_kwargs(contract):
+    return {
+        **contract,
+        "operator": "control-v15-migration-test",
+        "reason": "atomically migrate exact v14 and activate v15",
+        "now": datetime(2026, 8, 18, tzinfo=timezone.utc),
+    }
+
+
 def test_nminus1_successor_flag_keeps_exact_v14_writable(tmp_path):
     path = tmp_path / "control.sqlite3"
     RcaControlStore(path)
@@ -1300,7 +1395,7 @@ def test_nminus1_successor_flag_keeps_exact_v14_writable(tmp_path):
 
     assert store.schema_runtime_capability() == {
         "observed_control_schema_version": CONTROL_STORE_SCHEMA_VERSION,
-        "binary_write_schema_version": CONTROL_STORE_SCHEMA_VERSION,
+        "binary_write_schema_version": CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
         "mode": "current_write",
         "read_supported": True,
         "write_enabled": True,
@@ -1331,7 +1426,7 @@ def test_nminus1_exact_v15_opens_only_as_snapshot_query_only(tmp_path):
     assert migration["predecessor_epoch_id"] == predecessor["epoch_id"]
     assert store.schema_runtime_capability() == {
         "observed_control_schema_version": CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
-        "binary_write_schema_version": CONTROL_STORE_SCHEMA_VERSION,
+        "binary_write_schema_version": CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
         "mode": "successor_read_only",
         "read_supported": True,
         "write_enabled": False,
@@ -1647,9 +1742,9 @@ def test_v15_fixture_freezes_post_rename_sql_and_preserves_v14_audit(tmp_path):
         "idx_rca_single_current_activation_epoch": (
             "420643b44c4c0930a565204caa9c13b64d082d00ad7bb90154ce7864f1493828"
         ),
-        "rca_activation_epochs": (
-            "499619bfac9ae554a4a89ea0c33d4cacafc352d6719ffd49d2bc0f84364a8548"
-        ),
+            "rca_activation_epochs": (
+                "37524df29261dcada26541544e1b911c47b5ae59285f3c55ece6ce66275a3b21"
+            ),
         "rca_activation_transition_audit": (
             "bd44ef62a5acca229421259d71364456847f2cc988b9bc14ec1666eb7511473b"
         ),
@@ -1720,6 +1815,726 @@ def test_v15_fixture_rejects_invalid_parent_release_pair_before_ddl(
                 "WHERE name = 'rca_activation_epochs_v15_new'"
             ).fetchone()
             is None
+        )
+
+
+def test_successor_write_requires_exact_v15_and_reports_current_write(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:write_marker",
+    ):
+        RcaControlStore(path, require_current=True, allow_successor_write=True)
+    _migrate_v14_fixture_to_v15(path)
+
+    store = RcaControlStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+
+    assert store.schema_runtime_capability() == {
+        "observed_control_schema_version": CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        "binary_write_schema_version": CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        "mode": "current_write",
+        "read_supported": True,
+        "write_enabled": True,
+        "work_admission_enabled": True,
+        "lease_acquisition_enabled": True,
+        "external_effect_enabled": True,
+    }
+    store.open_dispatcher_circuit(reason_code="v15_writer_test")
+    assert store.dispatcher_circuit().state == "open"
+    assert control.schema_runtime_capability()["binary_write_schema_version"] == (
+        CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+    )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"allow_successor_write": True},
+        {"require_current": True, "read_only": True, "allow_successor_write": True},
+        {
+            "require_current": True,
+            "allow_successor_read_only": True,
+            "allow_successor_write": True,
+        },
+    ],
+)
+def test_successor_write_constructor_flags_fail_closed(tmp_path, arguments):
+    path = tmp_path / "control.sqlite3"
+    RcaControlStore(path)
+
+    with pytest.raises(ValueError):
+        RcaControlStore(path, **arguments)
+
+
+def test_atomic_v14_to_v15_migration_preserves_audit_index_and_sequence(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(predecessor=predecessor)
+    probe_kwargs = dict(contract)
+    with sqlite3.connect(path) as conn:
+        old_audits = conn.execute(
+            "SELECT audit_id, epoch_id, from_state, to_state, operator, reason, "
+            "binding_fingerprint, transitioned_at "
+            "FROM rca_activation_transition_audit ORDER BY audit_id"
+        ).fetchall()
+        old_index_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_rca_activation_transition_epoch'"
+        ).fetchone()[0]
+        old_sequence = conn.execute(
+            "SELECT seq FROM sqlite_sequence "
+            "WHERE name = 'rca_activation_transition_audit'"
+        ).fetchone()[0]
+    assert RcaControlStore.probe_v14_to_v15_migration_outcome(
+        path,
+        **probe_kwargs,
+    ) == "not_committed"
+
+    migrated = RcaControlStore.migrate_v14_to_v15_and_activate(
+        path,
+        **_migration_apply_kwargs(contract),
+    )
+
+    assert migrated["epoch_id"] == contract["epoch_id"]
+    assert "partition_end_fence_sha256" not in migrated
+    assert RcaControlStore.probe_v14_to_v15_migration_outcome(
+        path,
+        **probe_kwargs,
+    ) == "committed"
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA foreign_key_check").fetchone() is None
+        assert conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_rca_activation_transition_epoch'"
+        ).fetchone()[0] == old_index_sql
+        assert conn.execute(
+            "SELECT seq FROM sqlite_sequence "
+            "WHERE name = 'rca_activation_transition_audit'"
+        ).fetchone()[0] == old_sequence + 1
+        preserved = conn.execute(
+            "SELECT audit_id, epoch_id, from_state, to_state, operator, reason, "
+            "binding_fingerprint, transitioned_at "
+            "FROM rca_activation_transition_audit "
+            "WHERE binding_schema_version = ? ORDER BY audit_id",
+            (ACTIVATION_TRANSITION_BINDING_SCHEMA_V14,),
+        ).fetchall()
+        assert preserved == old_audits
+        assert conn.execute(
+            "SELECT state, is_current FROM rca_activation_epochs WHERE epoch_id = ?",
+            (predecessor["epoch_id"],),
+        ).fetchone() == ("retired", 0)
+        audit_count = conn.execute(
+            "SELECT COUNT(*) FROM rca_activation_transition_audit"
+        ).fetchone()[0]
+
+    retried = RcaControlStore.migrate_v14_to_v15_and_activate(
+        path,
+        **_migration_apply_kwargs(contract),
+    )
+    assert retried == migrated
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM rca_activation_transition_audit"
+        ).fetchone()[0] == audit_count
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "after_preflight",
+        "after_trigger_drop",
+        "after_audit_upgrade",
+        "after_epoch_copy",
+        "after_child_preflight",
+        "after_epoch_swap",
+        "after_successor_audit",
+        "after_marker_cas",
+        "before_commit",
+    ],
+)
+def test_atomic_v14_to_v15_migration_rolls_back_every_fault_stage(
+    tmp_path,
+    monkeypatch,
+    stage,
+):
+    path = tmp_path / f"control-{stage}.sqlite3"
+    control = _steady_control_store(path)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(predecessor=predecessor)
+
+    def fail_at(observed):
+        if observed == stage:
+            raise RuntimeError(f"fault:{stage}")
+
+    monkeypatch.setattr(
+        RcaControlStore,
+        "_v15_migration_fault",
+        staticmethod(fail_at),
+    )
+
+    with pytest.raises(RuntimeError, match=f"fault:{stage}"):
+        RcaControlStore.migrate_v14_to_v15_and_activate(
+            path,
+            **_migration_apply_kwargs(contract),
+        )
+
+    assert RcaControlStore.probe_v14_to_v15_migration_outcome(
+        path,
+        **contract,
+    ) == "not_committed"
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT value FROM control_meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == CONTROL_STORE_SCHEMA_VERSION
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE name = 'rca_activation_epochs_v15_new'"
+        ).fetchone() is None
+        assert [
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(rca_activation_transition_audit)"
+            ).fetchall()
+        ] == list(control_store_module._V14_ACTIVATION_AUDIT_COLUMNS)
+
+
+def test_atomic_v14_to_v15_commit_loss_converges_and_retry_is_idempotent(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(predecessor=predecessor)
+
+    def commit_then_lose_ack(conn):
+        conn.commit()
+        raise sqlite3.OperationalError("commit acknowledgement lost")
+
+    monkeypatch.setattr(
+        RcaControlStore,
+        "_commit_v15_migration_tx",
+        staticmethod(commit_then_lose_ack),
+    )
+
+    migrated = RcaControlStore.migrate_v14_to_v15_and_activate(
+        path,
+        **_migration_apply_kwargs(contract),
+    )
+
+    assert migrated["epoch_id"] == contract["epoch_id"]
+    assert RcaControlStore.probe_v14_to_v15_migration_outcome(
+        path,
+        **contract,
+    ) == "committed"
+    assert RcaControlStore.migrate_v14_to_v15_and_activate(
+        path,
+        **_migration_apply_kwargs(contract),
+    ) == migrated
+
+
+@pytest.mark.parametrize("partial", ["audit_column", "temporary_epoch_table"])
+def test_v15_migration_outcome_probe_rejects_partial_layout(tmp_path, partial):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(predecessor=predecessor)
+    with sqlite3.connect(path) as conn:
+        if partial == "audit_column":
+            conn.execute(
+                "ALTER TABLE rca_activation_transition_audit ADD COLUMN "
+                "binding_schema_version TEXT"
+            )
+        else:
+            conn.execute(control_store_module._V15_ACTIVATION_EPOCH_NEW_TABLE_SQL)
+
+    assert RcaControlStore.probe_v14_to_v15_migration_outcome(
+        path,
+        **contract,
+    ) == "unknown"
+
+
+def test_atomic_v15_migration_does_not_invalidate_active_v14_reader(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(predecessor=predecessor)
+    reader = sqlite3.connect(path, isolation_level=None)
+    try:
+        assert reader.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        reader.execute("BEGIN")
+        assert reader.execute(
+            "SELECT value FROM control_meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == CONTROL_STORE_SCHEMA_VERSION
+
+        RcaControlStore.migrate_v14_to_v15_and_activate(
+            path,
+            **_migration_apply_kwargs(contract),
+        )
+
+        assert reader.execute(
+            "SELECT value FROM control_meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == CONTROL_STORE_SCHEMA_VERSION
+        assert RcaControlStore.probe_v14_to_v15_migration_outcome(
+            path,
+            **contract,
+        ) == "committed"
+    finally:
+        if reader.in_transaction:
+            reader.rollback()
+        reader.close()
+
+
+def test_atomic_v15_migration_validates_every_historical_parent_json(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    second = _direct_steady_contract(
+        predecessor=predecessor,
+        epoch_id="rca-v14-second",
+        expected_schema=CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        target_schema=CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+    )
+    # Use the v14 API to create one historical parent before migration.
+    control.activate_direct_steady_epoch(
+        epoch_id=second["epoch_id"],
+        release_fingerprint_sha256=second["release_fingerprint_sha256"],
+        release_note_sha256=second["release_note_sha256"],
+        config_sha256=second["config_sha256"],
+        db_logical_identity=second["db_logical_identity"],
+        partition_start_fence=second["partition_start_fence"],
+        operator="control-v15-migration-test",
+        reason="create historical v14 parent",
+        expected_predecessor_epoch_id=predecessor["epoch_id"],
+        expected_predecessor_state=predecessor["state"],
+        expected_predecessor_binding_fingerprint=predecessor["binding_fingerprint"],
+    )
+    current = control.direct_steady_predecessor()
+    assert current is not None
+    contract = _direct_steady_contract(predecessor=current)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs SET db_logical_identity_json = ? "
+            "WHERE epoch_id = ?",
+            ('{ "database": "control-test" }', predecessor["epoch_id"]),
+        )
+
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_v15_parent_projection_invalid",
+    ):
+        RcaControlStore.migrate_v14_to_v15_and_activate(
+            path,
+            **_migration_apply_kwargs(contract),
+        )
+
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT value FROM control_meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == CONTROL_STORE_SCHEMA_VERSION
+
+
+def test_v15_writer_direct_successor_and_outcome_are_idempotent(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    v14 = _steady_control_store(path)
+    v14_predecessor = v14.direct_steady_predecessor()
+    assert v14_predecessor is not None
+    migration = _direct_steady_contract(predecessor=v14_predecessor)
+    RcaControlStore.migrate_v14_to_v15_and_activate(
+        path,
+        **_migration_apply_kwargs(migration),
+    )
+    writer = RcaControlStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    predecessor = writer.direct_steady_predecessor()
+    assert predecessor is not None
+    successor = _direct_steady_contract(
+        predecessor=predecessor,
+        epoch_id="rca-v15-next",
+        expected_schema=CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        target_schema=CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        release_fingerprint_sha256="6" * 64,
+        release_note_sha256="7" * 64,
+        config_sha256="8" * 64,
+    )
+    assert RcaControlStore.probe_direct_steady_activation_outcome(
+        path,
+        **successor,
+    ) == "not_committed"
+
+    activated = writer.activate_direct_steady_epoch(
+        **successor,
+        operator="control-v15-successor-test",
+        reason="activate next exact v15 successor",
+        now=datetime(2026, 8, 18, 1, tzinfo=timezone.utc),
+    )
+
+    assert activated["epoch_id"] == successor["epoch_id"]
+    assert RcaControlStore.probe_direct_steady_activation_outcome(
+        path,
+        **successor,
+    ) == "committed"
+    assert writer.activate_direct_steady_epoch(
+        **successor,
+        operator="control-v15-successor-test",
+        reason="activate next exact v15 successor",
+    ) == activated
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        retired = conn.execute(
+            "SELECT * FROM rca_activation_epochs WHERE epoch_id = ?",
+            (predecessor["epoch_id"],),
+        ).fetchone()
+        assert retired is not None
+        assert RcaControlStore._v15_activation_transition_binding_tx(
+            conn,
+            epoch=retired,
+        )["state"] == "retired"
+
+
+def test_v15_connection_guard_rejects_schema_cookie_drift(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    v14 = _steady_control_store(path)
+    predecessor = v14.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(predecessor=predecessor)
+    RcaControlStore.migrate_v14_to_v15_and_activate(
+        path,
+        **_migration_apply_kwargs(contract),
+    )
+    writer = RcaControlStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    writer.open_dispatcher_circuit(reason_code="v15_schema_cookie_test")
+    guarded = writer._connect()
+    try:
+        with sqlite3.connect(path) as external:
+            external.execute("CREATE TABLE unrelated_v15_schema_drift(id INTEGER)")
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="incompatible_control_store_schema:write_marker",
+        ):
+            guarded.execute(
+                "UPDATE rca_dispatcher_circuit SET state = 'closed' "
+                "WHERE circuit_name = 'submission'"
+            )
+    finally:
+        guarded.close()
+
+
+def test_v15_migration_contract_hash_mismatch_is_prewrite(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(predecessor=predecessor)
+    contract["epoch_contract_sha256"] = "f" * 64
+    before = _sqlite_storage_identity(path)
+
+    with pytest.raises(ActivationEpochError, match="activation_epoch_contract_invalid"):
+        RcaControlStore.migrate_v14_to_v15_and_activate(
+            path,
+            **_migration_apply_kwargs(contract),
+        )
+
+    _assert_sqlite_payload_unchanged(before, _sqlite_storage_identity(path))
+
+
+def test_v15_migration_partition_fence_exactly_cas_matches_progress(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    record = _record(offset=25)
+    control.persist_raw(record, policy=_policy())
+    control.process_event(record.event_uid)
+    assert control.partition_progress(topic=TOPIC, partitions=[2]) == {2: 26}
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(
+        predecessor=predecessor,
+        partition_start_fence={TOPIC: {"2": 26}},
+    )
+
+    migrated = RcaControlStore.migrate_v14_to_v15_and_activate(
+        path,
+        **_migration_apply_kwargs(contract),
+    )
+
+    assert migrated["partition_start_fence_sha256"] == (
+        control_store_module._canonical_sha256({TOPIC: {"2": 26}})
+    )
+
+
+def test_v15_migration_rejects_partition_progress_drift_before_ddl(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    first = _record(offset=25)
+    control.persist_raw(first, policy=_policy())
+    control.process_event(first.event_uid)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(
+        predecessor=predecessor,
+        partition_start_fence={TOPIC: {"2": 26}},
+    )
+    assert RcaControlStore.probe_v14_to_v15_migration_outcome(
+        path,
+        **contract,
+    ) == "not_committed"
+    second = _record(offset=26, value=_value(updated_at=1783650000001))
+    control.persist_raw(second, policy=_policy())
+    control.process_event(second.event_uid)
+    assert control.partition_progress(topic=TOPIC, partitions=[2]) == {2: 27}
+
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_partition_fence_changed",
+    ):
+        RcaControlStore.migrate_v14_to_v15_and_activate(
+            path,
+            **_migration_apply_kwargs(contract),
+        )
+
+    assert RcaControlStore.probe_v14_to_v15_migration_outcome(
+        path,
+        **contract,
+    ) == "unknown"
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT value FROM control_meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == CONTROL_STORE_SCHEMA_VERSION
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE name = 'rca_activation_epochs_v15_new'"
+        ).fetchone() is None
+
+
+def test_v15_migration_outcome_rejects_v14_preimage_with_inflight_work(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(predecessor=predecessor)
+    control.admit_manual_trigger(
+        _manual_request("om-v15-outcome-inflight"),
+        allowed_chat_ids={"oc_allowed"},
+        submit_enabled=True,
+        active_policy=_policy(),
+        activation_required=True,
+    )
+    observed = control.direct_steady_predecessor()
+    assert observed is not None
+    assert observed["inflight"]["total"] == 1
+
+    assert RcaControlStore.probe_v14_to_v15_migration_outcome(
+        path,
+        **contract,
+    ) == "unknown"
+
+
+@pytest.mark.parametrize("weakened", ["cascade", "extra"])
+def test_v15_migration_rejects_weakened_activation_child_fk_prewrite(
+    tmp_path,
+    weakened,
+):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(predecessor=predecessor)
+    with sqlite3.connect(path) as conn:
+        original = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_activation_admission_ledger'"
+        ).fetchone()[0]
+        needle = (
+            "FOREIGN KEY(epoch_id) REFERENCES rca_activation_epochs(epoch_id)"
+        )
+        replacement = (
+            f"{needle} ON DELETE CASCADE"
+            if weakened == "cascade"
+            else f"{needle}, {needle}"
+        )
+        changed = original.replace(needle, replacement)
+        assert changed != original
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "UPDATE sqlite_master SET sql = ? WHERE type = 'table' "
+            "AND name = 'rca_activation_admission_ledger'",
+            (changed,),
+        )
+        schema_cookie = conn.execute("PRAGMA schema_version").fetchone()[0]
+        conn.execute(f"PRAGMA schema_version={schema_cookie + 1}")
+        conn.execute("PRAGMA writable_schema=OFF")
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:activation_foreign_keys",
+    ):
+        RcaControlStore.migrate_v14_to_v15_and_activate(
+            path,
+            **_migration_apply_kwargs(contract),
+        )
+
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT value FROM control_meta WHERE key = 'schema_version'"
+        ).fetchone()[0] == CONTROL_STORE_SCHEMA_VERSION
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE name = 'rca_activation_epochs_v15_new'"
+        ).fetchone() is None
+
+
+def test_committed_outcome_rejects_residual_v15_new_table(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(predecessor=predecessor)
+    RcaControlStore.migrate_v14_to_v15_and_activate(
+        path,
+        **_migration_apply_kwargs(contract),
+    )
+    with sqlite3.connect(path) as conn:
+        conn.execute(control_store_module._V15_ACTIVATION_EPOCH_NEW_TABLE_SQL)
+
+    assert RcaControlStore.probe_v14_to_v15_migration_outcome(
+        path,
+        **contract,
+    ) == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("digest_column", "constraint"),
+    [
+        (
+            "release_fingerprint_sha256",
+            "AND release_fingerprint_sha256 != printf('%064d', 0)",
+        ),
+        (
+            "release_note_sha256",
+            "AND release_note_sha256 != printf('%064d', 0)",
+        ),
+        (
+            "config_sha256",
+            "AND config_sha256 != printf('%064d', 0)",
+        ),
+        (
+            "db_logical_identity_sha256",
+            "AND db_logical_identity_sha256 != printf('%064d', 0)",
+        ),
+        (
+            "partition_start_fence_sha256",
+            "AND partition_start_fence_sha256 != printf('%064d', 0)",
+        ),
+    ],
+)
+def test_v15_required_digests_reject_zero_and_weakened_ddl(
+    tmp_path,
+    digest_column,
+    constraint,
+):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(predecessor=predecessor)
+    RcaControlStore.migrate_v14_to_v15_and_activate(
+        path,
+        **_migration_apply_kwargs(contract),
+    )
+    with sqlite3.connect(path) as conn:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                f"UPDATE rca_activation_epochs SET {digest_column} = ? "
+                "WHERE is_current = 1",
+                ("0" * 64,),
+            )
+        original = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'rca_activation_epochs'"
+        ).fetchone()[0]
+        weakened = original.replace(constraint, "")
+        assert weakened != original
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "UPDATE sqlite_master SET sql = ? WHERE type = 'table' "
+            "AND name = 'rca_activation_epochs'",
+            (weakened,),
+        )
+        schema_cookie = conn.execute("PRAGMA schema_version").fetchone()[0]
+        conn.execute(f"PRAGMA schema_version={schema_cookie + 1}")
+        conn.execute("PRAGMA writable_schema=OFF")
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:v15_activation_sql",
+    ):
+        RcaControlStore(
+            path,
+            require_current=True,
+            allow_successor_write=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "digest_column",
+    [
+        "release_fingerprint_sha256",
+        "release_note_sha256",
+        "config_sha256",
+        "db_logical_identity_sha256",
+        "partition_start_fence_sha256",
+    ],
+)
+def test_v15_application_validator_rejects_zero_historical_digest(
+    tmp_path,
+    digest_column,
+):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(predecessor=predecessor)
+    RcaControlStore.migrate_v14_to_v15_and_activate(
+        path,
+        **_migration_apply_kwargs(contract),
+    )
+    with sqlite3.connect(path) as conn:
+        conn.execute("PRAGMA ignore_check_constraints=ON")
+        conn.execute(
+            f"UPDATE rca_activation_epochs SET {digest_column} = ? "
+            "WHERE epoch_id = ?",
+            ("0" * 64, predecessor["epoch_id"]),
+        )
+        conn.execute("PRAGMA ignore_check_constraints=OFF")
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:v15_activation_state",
+    ):
+        RcaControlStore(
+            path,
+            require_current=True,
+            allow_successor_write=True,
         )
 
 

@@ -22,6 +22,8 @@ ZERO_INFLIGHT = {
     "pending_inbox": 0,
     "total": 0,
 }
+DEFAULT_PREDECESSOR_ID = "rca-activation-r15av-20260817"
+DEFAULT_PREDECESSOR_FINGERPRINT = "a" * 64
 
 
 def test_script_path_help_is_executable_from_repository_root():
@@ -62,14 +64,25 @@ class FakeStore:
         predecessor=None,
         source_snapshot=None,
         partition_progress=None,
-        observed_control_schema_version=release.MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
-        binary_write_schema_version=release.MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+        observed_control_schema_version=release.CONTROL_SCHEMA_V14,
+        binary_write_schema_version=release.CONTROL_SCHEMA_V15,
     ):
+        if current is None and predecessor is None:
+            current = {
+                "epoch_id": DEFAULT_PREDECESSOR_ID,
+                "state": "steady_active",
+            }
+            predecessor = {
+                **current,
+                "binding_fingerprint": DEFAULT_PREDECESSOR_FINGERPRINT,
+                "inflight": dict(ZERO_INFLIGHT),
+            }
         self.current = current
         self.predecessor = predecessor
         self.source_snapshot = source_snapshot
         self.progress = partition_progress or {}
         self.activation_calls = []
+        self.migration_calls = []
         self.partition_calls = []
         self.read_only = True
         self.observed_control_schema_version = observed_control_schema_version
@@ -77,10 +90,17 @@ class FakeStore:
 
     def schema_runtime_capability(self):
         writable = not self.read_only
+        successor = self.observed_control_schema_version == release.CONTROL_SCHEMA_V15
         return {
             "observed_control_schema_version": self.observed_control_schema_version,
             "binary_write_schema_version": self.binary_write_schema_version,
-            "mode": "current_write" if writable else "explicit_read_only",
+            "mode": (
+                "current_write"
+                if writable
+                else "successor_read_only"
+                if successor
+                else "explicit_read_only"
+            ),
             "read_supported": True,
             "write_enabled": writable,
             "work_admission_enabled": writable,
@@ -109,12 +129,19 @@ class FakeStore:
 
     def activate_direct_steady_epoch(self, **kwargs):
         self.activation_calls.append(kwargs)
+        return self._record_activation(kwargs)
+
+    def migrate_v14_to_v15_and_activate(self, _path, **kwargs):
+        self.migration_calls.append(kwargs)
+        self.observed_control_schema_version = release.CONTROL_SCHEMA_V15
+        self.binary_write_schema_version = release.CONTROL_SCHEMA_V15
+        return self._record_activation(kwargs)
+
+    def _record_activation(self, kwargs):
         self.current = {
             "epoch_id": kwargs["epoch_id"],
             **release._activation_expected({
-                "release_fingerprint_sha256": kwargs[
-                    "release_fingerprint_sha256"
-                ],
+                "release_fingerprint_sha256": kwargs["release_fingerprint_sha256"],
                 "release_note_sha256": kwargs["release_note_sha256"],
                 "config_sha256": kwargs["config_sha256"],
                 "db_logical_identity_sha256": release._sha(
@@ -127,6 +154,29 @@ class FakeStore:
             "updated_at": "2026-08-17T12:00:00+00:00",
         }
         return self.current
+
+    def probe_activation_outcome(self, _path, **kwargs):
+        if self.observed_control_schema_version == release.CONTROL_SCHEMA_V14:
+            return "not_committed"
+        if self.current is None:
+            return "unknown"
+        expected = release._activation_expected({
+            "release_fingerprint_sha256": kwargs["release_fingerprint_sha256"],
+            "release_note_sha256": kwargs["release_note_sha256"],
+            "config_sha256": kwargs["config_sha256"],
+            "db_logical_identity_sha256": release._sha(
+                release._canonical(kwargs["db_logical_identity"])
+            ),
+            "partition_start_fence_sha256": release._sha(
+                release._canonical(kwargs["partition_start_fence"])
+            ),
+        })
+        return (
+            "committed"
+            if self.current.get("epoch_id") == kwargs["epoch_id"]
+            and all(self.current.get(key) == value for key, value in expected.items())
+            else "unknown"
+        )
 
 
 class FakeRunner:
@@ -141,9 +191,13 @@ class FakeRunner:
         loaded_without_pid=(),
     ):
         self.data = data
-        self.pids = dict(pids or {
-            row[0]: 1000 + index for index, row in enumerate(release.REQUIRED_RESIDENTS)
-        })
+        self.pids = dict(
+            pids
+            or {
+                row[0]: 1000 + index
+                for index, row in enumerate(release.REQUIRED_RESIDENTS)
+            }
+        )
         self.initial_pids = dict(self.pids)
         self.loaded = {
             label for label, pid in self.pids.items() if pid is not None
@@ -332,22 +386,18 @@ def release_files(tmp_path):
         "control_db_path": str(control_db),
         "operator": "owner:test",
         "reason": "test minimal release",
-        "expected_control_schema_version": (
-            release.MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
-        ),
-        "target_control_schema_version": (
-            release.MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
-        ),
-        "expected_predecessor_epoch_id": "",
-        "expected_predecessor_state": "",
-        "expected_predecessor_binding_fingerprint": "",
+        "expected_control_schema_version": (release.CONTROL_SCHEMA_V14),
+        "target_control_schema_version": (release.CONTROL_SCHEMA_V15),
+        "expected_predecessor_epoch_id": DEFAULT_PREDECESSOR_ID,
+        "expected_predecessor_state": "steady_active",
+        "expected_predecessor_binding_fingerprint": (DEFAULT_PREDECESSOR_FINGERPRINT),
         "db_logical_identity": db_identity,
         "db_logical_identity_sha256": release._sha(release._canonical(db_identity)),
         "partition_start_fence": fence,
         "partition_start_fence_sha256": release._sha(release._canonical(fence)),
     }
-    activation["epoch_contract_sha256"] = (
-        release.minimal_release_epoch_contract_sha256(activation)
+    activation["epoch_contract_sha256"] = release.minimal_release_epoch_contract_sha256(
+        activation
     )
     note = {
         "schema_version": release.NOTE_SCHEMA,
@@ -395,6 +445,98 @@ def _factory(store, calls):
         return store
 
     return factory
+
+
+def _migration_args(store):
+    return {
+        "migration_apply": store.migrate_v14_to_v15_and_activate,
+        "outcome_probe": store.probe_activation_outcome,
+    }
+
+
+def _atomic_activation_kwargs(note, binding):
+    activation = note["activation"]
+    return {
+        "epoch_id": binding["epoch_id"],
+        "release_fingerprint_sha256": binding["release_fingerprint_sha256"],
+        "release_note_sha256": binding["release_note_sha256"],
+        "config_sha256": binding["config_sha256"],
+        "db_logical_identity": binding["db_logical_identity"],
+        "partition_start_fence": binding["partition_start_fence"],
+        "operator": activation["operator"],
+        "reason": activation["reason"],
+        "expected_predecessor_epoch_id": activation["expected_predecessor_epoch_id"],
+        "expected_predecessor_state": activation["expected_predecessor_state"],
+        "expected_predecessor_binding_fingerprint": activation[
+            "expected_predecessor_binding_fingerprint"
+        ],
+        "expected_control_schema_version": activation[
+            "expected_control_schema_version"
+        ],
+        "target_control_schema_version": activation["target_control_schema_version"],
+        "epoch_contract_sha256": activation["epoch_contract_sha256"],
+    }
+
+
+def _seed_real_v14_predecessor_note(data):
+    legacy = release.RcaControlStore(data["control_db"])
+    with sqlite3.connect(data["control_db"]) as conn:
+        conn.execute(
+            "INSERT INTO kafka_inbox("
+            "event_uid, topic, partition_id, offset_id, raw_value, raw_size_bytes, "
+            "raw_sha256, headers_json, policy_json, creation_rule_version, "
+            "submission_mode, received_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "test-v14-predecessor-event",
+                "feishu-project-workflow-event",
+                0,
+                1983,
+                b"",
+                0,
+                release._sha(b""),
+                "[]",
+                "{}",
+                "test-v1",
+                "shadow",
+                "2026-08-17T10:00:00+00:00",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO kafka_partition_progress("
+            "topic, partition_id, first_offset, durable_next_offset, "
+            "last_event_uid, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "feishu-project-workflow-event",
+                0,
+                1983,
+                1984,
+                "test-v14-predecessor-event",
+                "2026-08-17T10:00:00+00:00",
+            ),
+        )
+    legacy.activate_direct_steady_epoch(
+        epoch_id="rca-activation-r15ax-predecessor",
+        release_fingerprint_sha256="b" * 64,
+        release_note_sha256="c" * 64,
+        config_sha256="d" * 64,
+        db_logical_identity={"source": "v14-predecessor"},
+        partition_start_fence={"feishu-project-workflow-event": {"0": 1984}},
+        operator="owner:test",
+        reason="seed v14 predecessor",
+    )
+    predecessor = legacy.direct_steady_predecessor()
+    assert predecessor is not None
+    note = json.loads(json.dumps(data["note"]))
+    note["activation"].update({
+        "expected_predecessor_epoch_id": predecessor["epoch_id"],
+        "expected_predecessor_state": predecessor["state"],
+        "expected_predecessor_binding_fingerprint": predecessor["binding_fingerprint"],
+    })
+    note["activation"]["epoch_contract_sha256"] = (
+        release.minimal_release_epoch_contract_sha256(note["activation"])
+    )
+    note_raw = _write_json(data["note_path"], note)
+    return note, note_raw, release._bound_binding(note_raw, note)
 
 
 def _plan_args(data):
@@ -522,10 +664,10 @@ def test_prepare_derives_and_writes_deterministic_owner_only_outputs(release_fil
         "feishu-project-workflow-event": {"0": 1984}
     }
     assert note["activation"]["expected_control_schema_version"] == (
-        release.MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
+        release.CONTROL_SCHEMA_V14
     )
     assert note["activation"]["target_control_schema_version"] == (
-        release.MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
+        release.CONTROL_SCHEMA_V15
     )
     assert note["activation"]["epoch_contract_sha256"] == (
         release.minimal_release_epoch_contract_sha256(note["activation"])
@@ -551,19 +693,32 @@ def test_prepare_derives_and_writes_deterministic_owner_only_outputs(release_fil
 def test_prepare_rejects_v15_control_store_without_outputs(release_files):
     store = FakeStore(
         observed_control_schema_version="pnc_rca_control_store_v15",
-        binary_write_schema_version=release.MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+        binary_write_schema_version=release.CONTROL_SCHEMA_V15,
     )
     prepared = _prepare_fixture(release_files, store=store)
 
-    with pytest.raises(release.ReleaseError, match="control_schema_v14_required"):
-        release.prepare_release(
-            **prepared["args"], runner=FakeRunner(release_files)
-        )
+    with pytest.raises(
+        release.ReleaseError, match="prepare_control_schema_already_v15"
+    ):
+        release.prepare_release(**prepared["args"], runner=FakeRunner(release_files))
 
     assert not prepared["note_path"].exists()
     assert not prepared["env_output"].exists()
     assert not prepared["manifest_output"].exists()
     assert not store.activation_calls
+
+
+def test_prepare_rejects_v14_without_steady_predecessor(release_files):
+    prepared = _prepare_fixture(release_files)
+    prepared["store"].current = None
+    prepared["store"].predecessor = None
+
+    with pytest.raises(release.ReleaseError, match="prepare_predecessor_required"):
+        release.prepare_release(**prepared["args"], runner=FakeRunner(release_files))
+
+    assert not prepared["note_path"].exists()
+    assert not prepared["env_output"].exists()
+    assert not prepared["manifest_output"].exists()
 
 
 def test_prepare_rejects_existing_output_and_cleans_new_reservations(release_files):
@@ -1020,7 +1175,7 @@ def test_release_note_epoch_contract_hash_binds_activation_inputs(
     note = json.loads(release_files["note_path"].read_text())
     activation = note["activation"]
     if change == "schema":
-        activation["target_control_schema_version"] = "pnc_rca_control_store_v15"
+        activation["target_control_schema_version"] = release.CONTROL_SCHEMA_V14
     elif change == "predecessor":
         activation.update({
             "expected_predecessor_epoch_id": "rca-activation-r15av-20260817",
@@ -1041,33 +1196,80 @@ def test_release_note_epoch_contract_hash_binds_activation_inputs(
         )
     _write_json(release_files["note_path"], note)
 
-    with pytest.raises(release.ReleaseError, match="release_note_epoch_contract_invalid"):
+    with pytest.raises(
+        release.ReleaseError, match="release_note_epoch_contract_invalid"
+    ):
         release._load_note(release_files["note_path"], release_files["home"])
 
 
-@pytest.mark.parametrize("operation", ["plan", "apply", "status"])
-def test_activation_paths_reject_v15_store_before_activation_writer(
-    release_files, operation
+def test_activation_exact_v15_retry_is_a_noop_with_successor_write_readback(
+    release_files,
 ):
     note = release_files["note"]
     binding = release._bound_binding(release_files["note_raw"], note)
     store = FakeStore(
-        observed_control_schema_version="pnc_rca_control_store_v15",
-        binary_write_schema_version=release.MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+        observed_control_schema_version=release.CONTROL_SCHEMA_V15,
+        binary_write_schema_version=release.CONTROL_SCHEMA_V15,
     )
-    factory = _factory(store, [])
+    store._record_activation({
+        "epoch_id": binding["epoch_id"],
+        "release_fingerprint_sha256": binding["release_fingerprint_sha256"],
+        "release_note_sha256": binding["release_note_sha256"],
+        "config_sha256": binding["config_sha256"],
+        "db_logical_identity": binding["db_logical_identity"],
+        "partition_start_fence": binding["partition_start_fence"],
+    })
+    calls = []
+    factory = _factory(store, calls)
 
-    with pytest.raises(release.ReleaseError, match="control_schema_v14_required"):
-        if operation == "plan":
-            release._activation_plan(note, binding, factory)
-        elif operation == "apply":
-            release._activation_apply(
-                note, binding, {"would_change": True}, factory
-            )
-        else:
-            release._activation_status(note, binding, factory)
+    plan = release._activation_plan(
+        note,
+        binding,
+        factory,
+        store.probe_activation_outcome,
+    )
+    applied = release._activation_apply(note, binding, plan, factory)
+    status = release._activation_status(note, binding, factory)
 
+    assert plan["transition"] == "v15_noop"
+    assert plan["would_change"] is False
+    assert applied == {"changed": False, "current_epoch": status}
     assert not store.activation_calls
+    assert not store.migration_calls
+    assert calls == [
+        (release_files["control_db"], True),
+        (release_files["control_db"], False),
+        (release_files["control_db"], False),
+    ]
+
+
+def test_activation_v15_retry_with_different_epoch_is_unknown(release_files):
+    note = release_files["note"]
+    binding = release._bound_binding(release_files["note_raw"], note)
+    store = FakeStore(
+        current={"epoch_id": "other-epoch", "state": "steady_active"},
+        observed_control_schema_version=release.CONTROL_SCHEMA_V15,
+        binary_write_schema_version=release.CONTROL_SCHEMA_V15,
+    )
+
+    with pytest.raises(
+        release.ReleaseError, match="activation_migration_outcome_unknown"
+    ):
+        release._activation_plan(note, binding, _factory(store, []))
+
+
+def test_activation_plan_rejects_v14_without_predecessor(release_files):
+    note = json.loads(json.dumps(release_files["note"]))
+    note["activation"].update({
+        "expected_predecessor_epoch_id": "",
+        "expected_predecessor_state": "",
+        "expected_predecessor_binding_fingerprint": "",
+    })
+    binding = release._bound_binding(release_files["note_raw"], release_files["note"])
+    store = FakeStore(current={}, predecessor=None)
+
+    with pytest.raises(release.ReleaseError, match="activation_predecessor_required"):
+        release._activation_plan(note, binding, _factory(store, []))
 
 
 @pytest.mark.parametrize(
@@ -1106,12 +1308,23 @@ def test_activation_plan_rejects_forged_v14_read_capability(
         ("external_effect_enabled", False),
     ],
 )
-def test_activation_apply_rejects_forged_v14_write_capability_before_writer(
+def test_activation_apply_rejects_forged_v15_write_capability_before_restart(
     release_files, field, value
 ):
     note = release_files["note"]
     binding = release._bound_binding(release_files["note_raw"], note)
-    store = FakeStore()
+    store = FakeStore(
+        observed_control_schema_version=release.CONTROL_SCHEMA_V15,
+        binary_write_schema_version=release.CONTROL_SCHEMA_V15,
+    )
+    store._record_activation({
+        "epoch_id": binding["epoch_id"],
+        "release_fingerprint_sha256": binding["release_fingerprint_sha256"],
+        "release_note_sha256": binding["release_note_sha256"],
+        "config_sha256": binding["config_sha256"],
+        "db_logical_identity": binding["db_logical_identity"],
+        "partition_start_fence": binding["partition_start_fence"],
+    })
     capability = {
         **store.schema_runtime_capability(),
         "mode": "current_write",
@@ -1124,16 +1337,19 @@ def test_activation_apply_rejects_forged_v14_write_capability_before_writer(
     store.schema_runtime_capability = lambda: dict(capability)
 
     with pytest.raises(
-        release.ReleaseError, match="control_schema_v14_write_unavailable"
+        release.ReleaseError, match="control_schema_v15_write_unavailable"
     ):
         release._activation_apply(
-            note, binding, {"would_change": True}, _factory(store, [])
+            note,
+            binding,
+            {"would_change": False, "transition": "v15_noop"},
+            _factory(store, []),
         )
 
     assert not store.activation_calls
 
 
-def test_activation_uses_control_store_directly_and_hides_legacy_columns(release_files):
+def test_activation_uses_atomic_migration_and_hides_legacy_columns(release_files):
     note = dict(release_files["note"])
     binding = release._bound_binding(release_files["note_raw"], note)
     store = FakeStore()
@@ -1141,45 +1357,63 @@ def test_activation_uses_control_store_directly_and_hides_legacy_columns(release
     factory = _factory(store, calls)
 
     plan = release._activation_plan(note, binding, factory)
-    applied = release._activation_apply(note, binding, plan, factory)
+    applied = release._activation_apply(
+        note,
+        binding,
+        plan,
+        factory,
+        store.migrate_v14_to_v15_and_activate,
+    )
 
     assert calls == [
         (release_files["control_db"], True),
         (release_files["control_db"], False),
     ]
-    assert len(store.activation_calls) == 1
+    assert plan["transition"] == "v14_to_v15_atomic"
+    assert len(store.migration_calls) == 1
+    assert not store.activation_calls
     assert applied["current_epoch"]["epoch_id"] == binding["epoch_id"]
-    assert applied["current_epoch"]["partition_end_fence_sha256"] == binding[
-        "partition_start_fence_sha256"
-    ]
     assert "capsule" not in json.dumps(applied)
 
-    store.current["partition_end_fence_sha256"] = "f" * 64
-    with pytest.raises(
-        release.ReleaseError,
-        match="activation_direct_steady_binding_conflict",
-    ):
-        release._activation_plan(note, binding, _factory(store, []))
+
+def test_activation_real_store_atomic_migration_and_exact_v15_retry(release_files):
+    note, _note_raw, binding = _seed_real_v14_predecessor_note(release_files)
+
+    plan = release._activation_plan(note, binding, release._open_store)
+    applied = release._activation_apply(note, binding, plan, release._open_store)
+    status = release._activation_status(note, binding, release._open_store)
+    retry = release._activation_plan(note, binding, release._open_store)
+    retried = release._activation_apply(note, binding, retry, release._open_store)
+
+    assert plan["transition"] == "v14_to_v15_atomic"
+    assert applied == {"changed": True, "current_epoch": status}
+    assert retry["transition"] == "v15_noop"
+    assert retried == {"changed": False, "current_epoch": status}
+    assert release._open_store(
+        release_files["control_db"], False
+    ).schema_runtime_capability() == {
+        "observed_control_schema_version": release.CONTROL_SCHEMA_V15,
+        "binary_write_schema_version": release.CONTROL_SCHEMA_V15,
+        "mode": "current_write",
+        "read_supported": True,
+        "write_enabled": True,
+        "work_admission_enabled": True,
+        "lease_acquisition_enabled": True,
+        "external_effect_enabled": True,
+    }
 
 
-def test_activation_plan_and_status_reject_hidden_v14_binding_tamper(release_files):
-    note = release_files["note"]
-    binding = release._bound_binding(release_files["note_raw"], note)
-    store = release.RcaControlStore(release_files["control_db"])
-    store.activate_direct_steady_epoch(
-        epoch_id=binding["epoch_id"],
-        release_fingerprint_sha256=binding["release_fingerprint_sha256"],
-        release_note_sha256=binding["release_note_sha256"],
-        config_sha256=binding["config_sha256"],
-        db_logical_identity=binding["db_logical_identity"],
-        partition_start_fence=binding["partition_start_fence"],
-        operator=note["activation"]["operator"],
-        reason=note["activation"]["reason"],
+def test_activation_plan_and_status_reject_hidden_v15_binding_tamper(release_files):
+    note, _note_raw, binding = _seed_real_v14_predecessor_note(release_files)
+    release.RcaControlStore.migrate_v14_to_v15_and_activate(
+        release_files["control_db"],
+        **_atomic_activation_kwargs(note, binding),
     )
     with sqlite3.connect(release_files["control_db"]) as conn:
         conn.execute(
-            "UPDATE rca_activation_epochs "
-            "SET preauthorization_fingerprint = ? WHERE is_current = 1",
+            "UPDATE rca_activation_transition_audit "
+            "SET binding_fingerprint = ? WHERE audit_id = "
+            "(SELECT MAX(audit_id) FROM rca_activation_transition_audit)",
             ("f" * 64,),
         )
 
@@ -1281,12 +1515,27 @@ def test_apply_requires_confirmation_then_installs_and_calls_store(
         release, "_resident_profile_readback", lambda *_args, **_kwargs: residents
     )
     receipt = release_files["note_path"].with_name("apply-receipt.json")
+
+    def migrate_after_quiesce(path, **kwargs):
+        assert not runner.loaded
+        assert (
+            release_files["live_env"].read_bytes()
+            == release_files["env_source"].read_bytes()
+        )
+        assert (
+            release_files["live_manifest"].read_bytes()
+            == release_files["manifest_source"].read_bytes()
+        )
+        return store.migrate_v14_to_v15_and_activate(path, **kwargs)
+
     result = release.apply_release(
         **_plan_args(release_files),
         confirm_release_id=release_files["note"]["release_id"],
         receipt=receipt,
         runner=runner,
         store_factory=_factory(store, calls),
+        migration_apply=migrate_after_quiesce,
+        outcome_probe=store.probe_activation_outcome,
     )
 
     assert result["applied"] is True
@@ -1298,7 +1547,8 @@ def test_apply_requires_confirmation_then_installs_and_calls_store(
         release_files["live_manifest"].read_bytes()
         == release_files["manifest_source"].read_bytes()
     )
-    assert store.activation_calls
+    assert store.migration_calls
+    assert result["activation_outcome"] == "committed"
     assert stat.S_IMODE(receipt.stat().st_mode) == 0o600
     assert json.loads(receipt.read_bytes())["transaction_state"] == "completed"
     assert runner.fetch_rounds == {"host": 3, "worker": 3, "pipeline": 3}
@@ -1520,10 +1770,7 @@ def test_apply_preserves_recovery_preimage_when_rollback_itself_fails(
             and ".minimal-candidate-" in source.name
         ):
             raise OSError("injected manifest install failure")
-        if (
-            target == release_files["live_env"]
-            and ".minimal-preimage-" in source.name
-        ):
+        if target == release_files["live_env"] and ".minimal-preimage-" in source.name:
             raise OSError("injected env rollback failure")
         return real_replace(source, target)
 
@@ -1547,7 +1794,10 @@ def test_apply_preserves_recovery_preimage_when_rollback_itself_fails(
     assert failed["rollback_error"] == "install_rollback_failed"
     assert recovery and all(path.exists() for path in recovery)
     assert not list(release_files["home"].rglob("*.minimal-candidate-*"))
-    assert release_files["live_env"].read_bytes() == release_files["env_source"].read_bytes()
+    assert (
+        release_files["live_env"].read_bytes()
+        == release_files["env_source"].read_bytes()
+    )
     assert release_files["live_manifest"].read_bytes() == b'{"old":true}\n'
     assert failed["resident_stop"]["all_stopped"] is True
 
@@ -1597,11 +1847,14 @@ def test_apply_rechecks_release_note_after_resident_readback(
             receipt=receipt,
             runner=FakeRunner(release_files),
             store_factory=_factory(store, []),
+            **_migration_args(store),
         )
-    assert store.activation_calls
+    assert store.migration_calls
     failed = json.loads(receipt.read_bytes())
     assert failed["transaction_state"] == "failed"
     assert failed["activation_committed"] is True
+    assert failed["activation_outcome"] == "committed"
+    assert failed["rollback_ceiling"] == "successor_read_only_or_forward_fix"
     assert failed["resident_stop"]["all_stopped"] is True
 
 
@@ -1617,6 +1870,11 @@ def test_apply_reserves_started_receipt_and_rolls_back_preactivation_failure(
         if command[:2] == ("/bin/launchctl", "bootout") and not receipt_identity:
             started = json.loads(receipt.read_bytes())
             assert started["transaction_state"] == "started"
+            assert started["activation_attempted"] is False
+            assert started["activation_committed"] is False
+            assert started["activation_outcome_known"] is False
+            assert started["activation_outcome"] == "unknown"
+            assert started["rollback_ceiling"] == "operator_adjudication_required"
             assert stat.S_IMODE(receipt.stat().st_mode) == 0o600
             receipt_identity.append((receipt.stat().st_dev, receipt.stat().st_ino))
         return base_runner(command)
@@ -1631,7 +1889,9 @@ def test_apply_reserves_started_receipt_and_rolls_back_preactivation_failure(
             raise release.ReleaseError("preactivation_injected")
         return real_assert_stopped(current_runner)
 
-    monkeypatch.setattr(release, "_assert_all_residents_stopped", fail_before_activation)
+    monkeypatch.setattr(
+        release, "_assert_all_residents_stopped", fail_before_activation
+    )
     store = FakeStore()
     with pytest.raises(release.ReleaseError, match="preactivation_injected"):
         release.apply_release(
@@ -1640,6 +1900,7 @@ def test_apply_reserves_started_receipt_and_rolls_back_preactivation_failure(
             receipt=receipt,
             runner=runner,
             store_factory=_factory(store, []),
+            **_migration_args(store),
         )
 
     failed = json.loads(receipt.read_bytes())
@@ -1680,17 +1941,23 @@ def test_apply_postactivation_failure_keeps_epoch_and_leaves_every_service_stopp
             receipt=receipt,
             runner=runner,
             store_factory=_factory(store, []),
+            **_migration_args(store),
         )
 
     failed = json.loads(receipt.read_bytes())
     assert failed["transaction_state"] == "failed"
     assert failed["activation_attempted"] is True
     assert failed["activation_committed"] is True
+    assert failed["activation_outcome"] == "committed"
+    assert failed["rollback_ceiling"] == "successor_read_only_or_forward_fix"
     assert failed["artifacts_restored"] is False
     assert failed["resident_stop"]["all_stopped"] is True
     assert not runner.loaded
     assert store.current["epoch_id"] == release_files["note"]["activation"]["epoch_id"]
-    assert release_files["live_env"].read_bytes() == release_files["env_source"].read_bytes()
+    assert (
+        release_files["live_env"].read_bytes()
+        == release_files["env_source"].read_bytes()
+    )
     assert (
         release_files["live_manifest"].read_bytes()
         == release_files["manifest_source"].read_bytes()
@@ -1701,6 +1968,14 @@ def test_apply_activation_store_rollback_restores_artifacts(release_files, monke
     receipt = release_files["note_path"].with_name("activation-rollback.json")
     runner = FakeRunner(release_files)
     store = FakeStore()
+    observed_checkpoint = []
+    real_stop = release._stop_all_residents
+
+    def stop_after_outcome_checkpoint(current_runner):
+        checkpoint = json.loads(receipt.read_bytes())
+        observed_checkpoint.append(checkpoint)
+        return real_stop(current_runner)
+
     monkeypatch.setattr(
         release,
         "_activation_apply",
@@ -1708,6 +1983,7 @@ def test_apply_activation_store_rollback_restores_artifacts(release_files, monke
             release.ReleaseError("activation_predecessor_binding_changed")
         ),
     )
+    monkeypatch.setattr(release, "_stop_all_residents", stop_after_outcome_checkpoint)
 
     with pytest.raises(
         release.ReleaseError, match="activation_predecessor_binding_changed"
@@ -1718,16 +1994,141 @@ def test_apply_activation_store_rollback_restores_artifacts(release_files, monke
             receipt=receipt,
             runner=runner,
             store_factory=_factory(store, []),
+            outcome_probe=store.probe_activation_outcome,
         )
 
     failed = json.loads(receipt.read_bytes())
     assert failed["activation_attempted"] is True
     assert failed["activation_outcome_known"] is True
     assert failed["activation_committed"] is False
+    assert failed["activation_outcome"] == "not_committed"
+    assert failed["rollback_ceiling"] == "artifact_restore_permitted"
     assert failed["artifacts_restored"] is True
     assert failed["resident_stop"]["all_stopped"] is True
+    assert len(observed_checkpoint) == 1
+    checkpoint = observed_checkpoint[0]
+    assert checkpoint["activation_attempted"] is True
+    assert checkpoint["activation_committed"] is False
+    assert checkpoint["activation_outcome_known"] is True
+    assert checkpoint["activation_outcome"] == "not_committed"
+    assert checkpoint["rollback_ceiling"] == "artifact_restore_permitted"
     assert release_files["live_env"].read_bytes() == b"OLD_ENV=1\n"
     assert release_files["live_manifest"].read_bytes() == b'{"old":true}\n'
+
+
+def test_apply_unknown_activation_outcome_keeps_candidate_and_all_residents_stopped(
+    release_files, monkeypatch
+):
+    receipt = release_files["note_path"].with_name("activation-unknown.json")
+    runner = FakeRunner(release_files)
+    store = FakeStore()
+
+    def lose_commit_visibility(*_args, **_kwargs):
+        checkpoint = json.loads(receipt.read_bytes())
+        assert checkpoint["transaction_state"] == "started"
+        assert checkpoint["activation_attempted"] is True
+        assert checkpoint["activation_committed"] is False
+        assert checkpoint["activation_outcome_known"] is False
+        assert checkpoint["activation_outcome"] == "unknown"
+        assert checkpoint["rollback_ceiling"] == "operator_adjudication_required"
+        raise OSError("injected_commit_visibility_loss")
+
+    monkeypatch.setattr(release, "_activation_apply", lose_commit_visibility)
+
+    with pytest.raises(OSError, match="injected_commit_visibility_loss"):
+        release.apply_release(
+            **_plan_args(release_files),
+            confirm_release_id=release_files["note"]["release_id"],
+            receipt=receipt,
+            runner=runner,
+            store_factory=_factory(store, []),
+            outcome_probe=lambda *_args, **_kwargs: "unknown",
+        )
+
+    failed = json.loads(receipt.read_bytes())
+    assert failed["activation_attempted"] is True
+    assert failed["activation_outcome"] == "unknown"
+    assert failed["rollback_ceiling"] == "operator_adjudication_required"
+    assert failed["activation_outcome_known"] is False
+    assert failed["activation_committed"] is False
+    assert failed["artifacts_restored"] is False
+    assert failed["rollback_error"] == "activation_outcome_unknown"
+    assert failed["resident_stop"]["all_stopped"] is True
+    assert not runner.loaded
+    assert (
+        release_files["live_env"].read_bytes()
+        == release_files["env_source"].read_bytes()
+    )
+    assert (
+        release_files["live_manifest"].read_bytes()
+        == release_files["manifest_source"].read_bytes()
+    )
+    assert all(Path(path).exists() for path in failed["rollback_recovery_paths"])
+
+
+def test_apply_committed_checkpoint_survives_terminal_interrupt_and_blocks_retry(
+    release_files, monkeypatch
+):
+    class SimulatedSigkill(BaseException):
+        pass
+
+    receipt = release_files["note_path"].with_name("committed-interrupted.json")
+    runner = FakeRunner(release_files)
+    store = FakeStore()
+    receipt_identity = []
+    real_quiesce = release._quiesce_residents
+
+    def capture_reserved_identity(current_runner):
+        observed = receipt.stat()
+        receipt_identity.append((observed.st_dev, observed.st_ino))
+        return real_quiesce(current_runner)
+
+    def fail_after_commit(*_args, **_kwargs):
+        raise release.ReleaseError("injected_before_terminal_receipt")
+
+    def interrupt_terminal_handling(_runner):
+        checkpoint = json.loads(receipt.read_bytes())
+        assert checkpoint["transaction_state"] == "started"
+        assert checkpoint["activation_attempted"] is True
+        assert checkpoint["activation_committed"] is True
+        assert checkpoint["activation_outcome_known"] is True
+        assert checkpoint["activation_outcome"] == "committed"
+        assert checkpoint["rollback_ceiling"] == (
+            "successor_read_only_or_forward_fix"
+        )
+        raise SimulatedSigkill
+
+    monkeypatch.setattr(release, "_quiesce_residents", capture_reserved_identity)
+    monkeypatch.setattr(release, "_restart", fail_after_commit)
+    monkeypatch.setattr(release, "_stop_all_residents", interrupt_terminal_handling)
+
+    with pytest.raises(SimulatedSigkill):
+        release.apply_release(
+            **_plan_args(release_files),
+            confirm_release_id=release_files["note"]["release_id"],
+            receipt=receipt,
+            runner=runner,
+            store_factory=_factory(store, []),
+            **_migration_args(store),
+        )
+
+    checkpoint_raw = receipt.read_bytes()
+    checkpoint = json.loads(checkpoint_raw)
+    assert checkpoint["activation_outcome"] == "committed"
+    assert checkpoint["rollback_ceiling"] == "successor_read_only_or_forward_fix"
+    observed = receipt.stat()
+    assert (observed.st_dev, observed.st_ino) == receipt_identity[0]
+
+    with pytest.raises(release.ReleaseError, match="receipt_exists"):
+        release.apply_release(
+            **_plan_args(release_files),
+            confirm_release_id=release_files["note"]["release_id"],
+            receipt=receipt,
+            runner=runner,
+            store_factory=_factory(store, []),
+            **_migration_args(store),
+        )
+    assert receipt.read_bytes() == checkpoint_raw
 
 
 def test_apply_keyboard_interrupt_writes_failed_receipt_and_stops_all(release_files):
@@ -1806,13 +2207,15 @@ def test_apply_cleanup_failure_never_publishes_completed_receipt(
         return real_cleanup(staged)
 
     monkeypatch.setattr(release, "_cleanup_staged", fail_once)
+    store = FakeStore()
     with pytest.raises(OSError, match="injected cleanup failure"):
         release.apply_release(
             **_plan_args(release_files),
             confirm_release_id=release_files["note"]["release_id"],
             receipt=receipt,
             runner=runner,
-            store_factory=_factory(FakeStore(), []),
+            store_factory=_factory(store, []),
+            **_migration_args(store),
         )
 
     failed = json.loads(receipt.read_bytes())
@@ -1912,9 +2315,7 @@ def test_apply_reports_when_terminal_receipt_and_fallback_marker_both_fail(
 
 
 @pytest.mark.parametrize("timeout", [0, -1, float("nan"), float("inf")])
-def test_apply_rejects_nonpositive_or_nonfinite_restart_timeout(
-    release_files, timeout
-):
+def test_apply_rejects_nonpositive_or_nonfinite_restart_timeout(release_files, timeout):
     runner = FakeRunner(release_files)
     with pytest.raises(release.ReleaseError, match="restart_timeout_invalid"):
         release.apply_release(
@@ -1936,8 +2337,7 @@ def test_quiesce_persists_profile_and_recovers_loaded_service_without_pid(
         for index, row in enumerate(release.REQUIRED_RESIDENTS)
     }
     pids.update({
-        label: 2000 + index
-        for index, label in enumerate(release.DISABLED_RESIDENTS)
+        label: 2000 + index for index, label in enumerate(release.DISABLED_RESIDENTS)
     })
     runner = FakeRunner(
         release_files,
@@ -1953,7 +2353,9 @@ def test_quiesce_persists_profile_and_recovers_loaded_service_without_pid(
         "pid": None,
     }
     assert not runner.loaded
-    assert all(runner.disabled[label] is False for label, *_ in release.REQUIRED_RESIDENTS)
+    assert all(
+        runner.disabled[label] is False for label, *_ in release.REQUIRED_RESIDENTS
+    )
     assert all(runner.disabled[label] is True for label in release.DISABLED_RESIDENTS)
     assert any(
         call[:2] == ("/bin/launchctl", "bootout") and call[-1].endswith(first)
@@ -2248,9 +2650,7 @@ def _configure_verify_fixture(
                 {
                     "target": str(data["live_env"]),
                     "before_sha256": "d" * 64,
-                    "after_sha256": data["note"]["runtime_projection"][
-                        "env_sha256"
-                    ],
+                    "after_sha256": data["note"]["runtime_projection"]["env_sha256"],
                     "changed": True,
                 },
                 {
@@ -2264,6 +2664,7 @@ def _configure_verify_fixture(
             ],
             "activation": activation,
             "activation_changed": True,
+            "activation_outcome": "committed",
             "resident_profile": residents,
             "resident_transition": transition,
             "single_canary": {
@@ -2539,13 +2940,22 @@ def test_verify_requires_completed_owner_receipt_and_current_apply_pids(
         )
 
 
-def test_verify_rejects_undeployed_v1_apply_receipt(release_files, monkeypatch):
+@pytest.mark.parametrize(
+    "old_schema",
+    [
+        "pnc_rca_minimal_release_apply_receipt_v1",
+        "pnc_rca_minimal_release_apply_receipt_v2",
+    ],
+)
+def test_verify_rejects_undeployed_apply_receipt(
+    release_files, monkeypatch, old_schema
+):
     store = _configure_verify_fixture(release_files, monkeypatch)
     receipt = json.loads(release_files["apply_receipt"].read_bytes())
-    receipt["schema_version"] = "pnc_rca_minimal_release_apply_receipt_v1"
+    receipt["schema_version"] = old_schema
     _write_json(release_files["apply_receipt"], receipt)
 
-    assert release.RECEIPT_SCHEMA == "pnc_rca_minimal_release_apply_receipt_v2"
+    assert release.RECEIPT_SCHEMA == "pnc_rca_minimal_release_apply_receipt_v3"
     with pytest.raises(
         release.ReleaseError,
         match="apply_receipt_schema_unsupported",
@@ -2563,6 +2973,7 @@ def test_verify_rejects_undeployed_v1_apply_receipt(release_files, monkeypatch):
         "missing_artifacts",
         "artifact_hash",
         "activation_changed",
+        "activation_outcome",
         "resident_profile",
         "single_canary",
         "applied_at",
@@ -2581,6 +2992,8 @@ def test_verify_requires_exact_completed_apply_receipt(
         receipt["artifacts"][0]["after_sha256"] = "0" * 64
     elif tamper == "activation_changed":
         receipt["activation_changed"] = "true"
+    elif tamper == "activation_outcome":
+        receipt["activation_outcome"] = "unknown"
     elif tamper == "resident_profile":
         receipt["resident_profile"]["required"][0]["pid"] += 1
     elif tamper == "single_canary":

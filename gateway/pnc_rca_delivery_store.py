@@ -857,6 +857,7 @@ class RcaDeliveryStore:
         read_only: bool = False,
         ensure_current_rows: bool = True,
         allow_successor_read_only: bool = False,
+        allow_successor_write: bool = False,
     ):
         self.db_path = Path(db_path).expanduser()
         if not isinstance(require_current, bool):
@@ -867,17 +868,32 @@ class RcaDeliveryStore:
             raise TypeError("ensure_current_rows must be true or false")
         if not isinstance(allow_successor_read_only, bool):
             raise TypeError("allow_successor_read_only must be true or false")
+        if not isinstance(allow_successor_write, bool):
+            raise TypeError("allow_successor_write must be true or false")
         if read_only and not require_current:
             raise ValueError("read_only delivery store requires current schema")
         if allow_successor_read_only and not require_current:
             raise ValueError(
                 "successor read-only delivery store requires current schema"
             )
+        if allow_successor_write and not require_current:
+            raise ValueError("successor-write delivery store requires current schema")
+        if allow_successor_write and (read_only or allow_successor_read_only):
+            raise ValueError(
+                "successor-write delivery store cannot also be read-only"
+            )
         self.require_current = require_current
         self.requested_read_only = read_only
         self.read_only = read_only
         self.ensure_current_rows = ensure_current_rows
         self.allow_successor_read_only = allow_successor_read_only
+        self.allow_successor_write = allow_successor_write
+        self._binary_write_schema_version = CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+        self._connection_write_schema_version = (
+            CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+            if allow_successor_write
+            else CONTROL_STORE_SCHEMA_VERSION
+        )
         self._successor_read_only = False
         self._enforce_binary_write_schema = False
         self._schema_probe_snapshot: ControlStoreSchemaSnapshot | None = None
@@ -907,12 +923,20 @@ class RcaDeliveryStore:
                         source_control_schema_version,
                         self._schema_probe_snapshot,
                     ) = RcaControlStore.probe_writable_schema_source(
-                        self.db_path
+                        self.db_path,
+                        expected_write_schema_version=(
+                            self._connection_write_schema_version
+                            if self.allow_successor_write
+                            else None
+                        ),
                     )
                 if (
                     source_control_schema_version
                     == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
-                    and (not require_current or not allow_successor_read_only)
+                    and not (
+                        require_current
+                        and (allow_successor_read_only or allow_successor_write)
+                    )
                 ):
                     raise RuntimeError(
                         "rca_delivery_store_control_schema_not_current"
@@ -921,6 +945,7 @@ class RcaDeliveryStore:
                     source_control_schema_version
                     == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
                     and self._schema_probe_snapshot is None
+                    and not self.allow_successor_write
                 ):
                     self._schema_probe_snapshot = (
                         RcaControlStore.create_schema_probe_snapshot(
@@ -935,6 +960,12 @@ class RcaDeliveryStore:
                         raise RuntimeError(
                             "rca_delivery_store_control_schema_source_changed"
                         )
+                if self.allow_successor_write:
+                    self.read_only = False
+            elif self.allow_successor_write:
+                raise RuntimeError(
+                    "rca_delivery_store_successor_write_schema_required"
+                )
             self._initialize()
             if not require_current:
                 self._observed_delivery_schema_version = (
@@ -958,7 +989,7 @@ class RcaDeliveryStore:
             not self.read_only
             and not source_snapshot_verified
             and self._observed_control_schema_version
-            == CONTROL_STORE_SCHEMA_VERSION
+            == self._connection_write_schema_version
         ):
             conn = self._connect_read_only()
             conn.close()
@@ -1003,7 +1034,7 @@ class RcaDeliveryStore:
         )
         write_enabled = (
             read_supported
-            and control_schema_version == CONTROL_STORE_SCHEMA_VERSION
+            and control_schema_version == self._connection_write_schema_version
             and not self.read_only
         )
         if self._successor_read_only:
@@ -1014,7 +1045,7 @@ class RcaDeliveryStore:
             mode = "current_write"
         return {
             "observed_control_schema_version": control_schema_version,
-            "binary_write_schema_version": CONTROL_STORE_SCHEMA_VERSION,
+            "binary_write_schema_version": self._binary_write_schema_version,
             "mode": mode,
             "read_supported": read_supported,
             "write_enabled": write_enabled,
@@ -1059,7 +1090,10 @@ class RcaDeliveryStore:
             self.read_only
             or not self._enforce_binary_write_schema
             or self._observed_control_schema_version
-            != CONTROL_STORE_SCHEMA_VERSION
+            not in {
+                CONTROL_STORE_SCHEMA_VERSION,
+                CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+            }
         ):
             return
         try:
@@ -1068,8 +1102,15 @@ class RcaDeliveryStore:
             raise RuntimeError(
                 "incompatible_control_store_schema:write_marker"
             ) from exc
-        if observed != CONTROL_STORE_SCHEMA_VERSION:
+        if observed != self._connection_write_schema_version:
             raise RuntimeError("incompatible_control_store_schema:write_marker")
+        if observed == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:
+            try:
+                RcaControlStore._validate_v15_activation_schema_tx(conn)
+            except (RuntimeError, sqlite3.Error) as exc:
+                raise RuntimeError(
+                    "incompatible_control_store_schema:write_marker"
+                ) from exc
 
     def _connect(self) -> sqlite3.Connection:
         if self._successor_read_only:
@@ -1105,12 +1146,15 @@ class RcaDeliveryStore:
             if (
                 self._enforce_binary_write_schema
                 and self._observed_control_schema_version
-                == CONTROL_STORE_SCHEMA_VERSION
+                == self._connection_write_schema_version
             ):
                 try:
                     conn.execute("BEGIN")
-                    RcaControlStore._install_v14_connection_write_guards_tx(
+                    RcaControlStore._install_connection_write_guards_tx(
                         conn,
+                        expected_schema_version=(
+                            self._connection_write_schema_version
+                        ),
                         require_exact_schema_cookie=self.require_current,
                     )
                     conn.commit()
@@ -1157,25 +1201,21 @@ class RcaDeliveryStore:
                 raise
         return conn
 
-    @staticmethod
-    def _validate_current_v14_activation_binding_tx(
+    def _validate_current_activation_binding_tx(
+        self,
         conn: sqlite3.Connection,
     ) -> sqlite3.Row:
-        """Fail provider writes closed on current v14 epoch/audit drift.
-
-        This is a writer-only fence; neutral successor reads use the shared
-        schema-versioned activation helpers instead.
-        """
+        """Fail provider writes closed on current epoch/audit drift."""
 
         epoch = RcaControlStore._current_activation_epoch_unchecked_tx(conn)
         if epoch is None:
             raise RuntimeError("external_write_fence_epoch_not_current")
         try:
-            RcaControlStore._v14_compat_activation_transition_binding_tx(
+            RcaControlStore.validate_current_activation_binding_tx(
                 conn,
-                epoch=epoch,
+                schema_version=self._connection_write_schema_version,
             )
-        except ActivationEpochError as exc:
+        except (ActivationEpochError, RuntimeError) as exc:
             raise RuntimeError("external_write_fence_epoch_not_current") from exc
         return epoch
 
@@ -1194,7 +1234,7 @@ class RcaDeliveryStore:
         conn = self._connect_read_only()
         try:
             conn.execute("BEGIN")
-            self._validate_current_v14_activation_binding_tx(conn)
+            self._validate_current_activation_binding_tx(conn)
             row = conn.execute(
                 """
                 SELECT epoch.epoch_id, epoch.state, epoch.is_current,
@@ -1306,7 +1346,7 @@ class RcaDeliveryStore:
         conn = self._connect_read_only()
         try:
             conn.execute("BEGIN")
-            self._validate_current_v14_activation_binding_tx(conn)
+            self._validate_current_activation_binding_tx(conn)
             row = conn.execute(
                 """
                 SELECT outbox.*,
@@ -1532,7 +1572,7 @@ class RcaDeliveryStore:
         conn = self._connect_read_only()
         try:
             conn.execute("BEGIN")
-            self._validate_current_v14_activation_binding_tx(conn)
+            self._validate_current_activation_binding_tx(conn)
             authority = self._owner_authorized_rerun_authority_tx(
                 conn,
                 business_key=business_key,
@@ -2094,12 +2134,19 @@ class RcaDeliveryStore:
                 "rca_delivery_store_control_schema_not_current"
             )
         if control_marker_value == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:
-            if not self.require_current or not self.allow_successor_read_only:
+            if not self.require_current:
                 raise RuntimeError(
                     "rca_delivery_store_control_schema_not_current"
                 )
-            self._successor_read_only = True
-            self.read_only = True
+            if self.allow_successor_write and not self.read_only:
+                pass
+            elif self.allow_successor_read_only:
+                self._successor_read_only = True
+                self.read_only = True
+            else:
+                raise RuntimeError(
+                    "rca_delivery_store_control_schema_not_current"
+                )
         if self.require_current:
             if marker_value != DELIVERY_STORE_SCHEMA_VERSION:
                 raise RuntimeError("rca_delivery_store_schema_not_current")
@@ -2432,6 +2479,9 @@ class RcaDeliveryStore:
         self._ensure_card_patch_circuit_row_at_path(
             self.db_path,
             busy_timeout_ms=self.busy_timeout_ms,
+            expected_control_schema_version=(
+                self._connection_write_schema_version
+            ),
         )
         self._validate_runtime_fences()
 
@@ -2441,7 +2491,13 @@ class RcaDeliveryStore:
         db_path: str | Path,
         *,
         busy_timeout_ms: int,
+        expected_control_schema_version: str,
     ) -> None:
+        if expected_control_schema_version not in {
+            CONTROL_STORE_SCHEMA_VERSION,
+            CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        }:
+            raise ValueError("delivery_store_expected_control_schema_invalid")
         path = Path(db_path).expanduser()
         for suffix in (".pnc-rca-maintenance", ".pnc-rca-tombstone"):
             try:
@@ -2482,10 +2538,12 @@ class RcaDeliveryStore:
                 raise RuntimeError(
                     "incompatible_control_store_schema:write_marker"
                 ) from exc
-            if control_schema_version != CONTROL_STORE_SCHEMA_VERSION:
+            if control_schema_version != expected_control_schema_version:
                 raise RuntimeError(
                     "incompatible_control_store_schema:write_marker"
                 )
+            if control_schema_version == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:
+                RcaControlStore._validate_v15_activation_schema_tx(conn)
             marker = conn.execute(
                 "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
             ).fetchone()
@@ -9634,7 +9692,7 @@ class RcaDeliveryStore:
         """Return the exact circuit and streak state used by a reset plan."""
         if effect_kind not in DELIVERY_EFFECT_KINDS:
             raise ValueError("unsupported delivery circuit")
-        conn = self._connect()
+        conn = self._connect_read_only()
         try:
             return self._delivery_circuit_reset_state_in_transaction(
                 conn,
@@ -10029,7 +10087,7 @@ class RcaDeliveryStore:
             raise ValueError("delivery_circuit_reset_id_invalid")
         if effect_kind is not None and effect_kind not in DELIVERY_EFFECT_KINDS:
             raise ValueError("unsupported delivery circuit")
-        conn = self._connect()
+        conn = self._connect_read_only()
         try:
             row = conn.execute(
                 "SELECT value FROM control_meta WHERE key = ?",
@@ -10173,9 +10231,15 @@ class RcaDeliveryStore:
         now: datetime | None = None,
         busy_timeout_ms: int = 5000,
         activation_required: bool = False,
+        expected_control_schema_version: str = CONTROL_STORE_SCHEMA_VERSION,
     ) -> DeliveryBackpressureSnapshot:
         """Read the delivery backlog and circuit from one live read transaction."""
         cls._validate_activation_required(activation_required)
+        if expected_control_schema_version not in {
+            CONTROL_STORE_SCHEMA_VERSION,
+            CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        }:
+            raise ValueError("delivery_backpressure_control_schema_invalid")
         path = Path(db_path).expanduser()
         if not path.is_file():
             raise RuntimeError("delivery_backpressure_store_unavailable:file_missing")
@@ -10194,7 +10258,7 @@ class RcaDeliveryStore:
                 raise RuntimeError(
                     "delivery_backpressure_contract_invalid:control_schema_version"
                 ) from exc
-            if preflight_schema_version != CONTROL_STORE_SCHEMA_VERSION:
+            if preflight_schema_version != expected_control_schema_version:
                 raise RuntimeError(
                     "delivery_backpressure_contract_invalid:control_schema_version"
                 )
@@ -10218,10 +10282,12 @@ class RcaDeliveryStore:
                 raise RuntimeError(
                     "delivery_backpressure_contract_invalid:control_schema_version"
                 ) from exc
-            if control_schema_version != CONTROL_STORE_SCHEMA_VERSION:
+            if control_schema_version != expected_control_schema_version:
                 raise RuntimeError(
                     "delivery_backpressure_contract_invalid:control_schema_version"
                 )
+            if control_schema_version == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:
+                RcaControlStore._validate_v15_activation_schema_tx(conn)
             marker = conn.execute(
                 "SELECT value FROM rca_delivery_meta WHERE key = 'schema_version'"
             ).fetchone()
@@ -10462,6 +10528,7 @@ class RcaDeliveryStore:
             now=now,
             busy_timeout_ms=self.busy_timeout_ms,
             activation_required=activation_required,
+            expected_control_schema_version=self._connection_write_schema_version,
         )
 
     def preview_dispatchable_effects(

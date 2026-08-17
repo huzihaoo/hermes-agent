@@ -24,6 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from gateway.pnc_rca_control_store import (  # noqa: E402
+    CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
     CONTROL_STORE_SCHEMA_VERSION,
     DEFAULT_OUTBOX_HIGH_WATERMARK,
     MANUAL_TRIGGER_SCHEMA_VERSION,
@@ -1259,8 +1260,27 @@ def _dry_run_database_plan(
                 schema = conn.execute(
                     "SELECT value FROM control_meta WHERE key = 'schema_version'"
                 ).fetchone()
-                if schema is None or str(schema["value"]) != CONTROL_STORE_SCHEMA_VERSION:
+                observed_schema_version = (
+                    "" if schema is None else str(schema["value"])
+                )
+                if observed_schema_version not in {
+                    CONTROL_STORE_SCHEMA_VERSION,
+                    CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+                }:
                     raise BatchRerunError("batch_control_schema_not_current")
+                if (
+                    observed_schema_version
+                    == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+                ):
+                    try:
+                        RcaControlStore.validate_current_activation_binding_tx(
+                            conn,
+                            schema_version=observed_schema_version,
+                        )
+                    except RuntimeError as exc:
+                        raise BatchRerunError(
+                            "batch_control_schema_not_current"
+                        ) from exc
                 quick_check = [
                     str(row[0]) for row in conn.execute("PRAGMA quick_check").fetchall()
                 ]
@@ -1379,7 +1399,7 @@ def _dry_run_database_plan(
     )
     return {
         "path": str(selected),
-        "schema_version": CONTROL_STORE_SCHEMA_VERSION,
+        "schema_version": observed_schema_version,
         "quick_check": "ok",
         "foreign_key_violations": 0,
         "source_snapshot": {
@@ -1572,6 +1592,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             database=database,
             acceptance_axis=acceptance_axis,
         )
+    store = RcaControlStore(
+        Path(args.control_db),
+        require_current=True,
+        allow_successor_write=True,
+    )
     state_path = Path(args.state)
     state = _load_or_create_state(
         state_path,
@@ -1584,7 +1609,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         selected_issue_ids=selected_issue_ids,
         acceptance_axis=acceptance_axis,
     )
-    store = RcaControlStore(Path(args.control_db))
     completed = 0
     submitted = 0
     deferred = 0

@@ -32,7 +32,6 @@ from gateway.pnc_rca_control_store import ActivationEpochError, RcaControlStore
 from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from gateway.pnc_rca_runtime_identity import runtime_identity_is_valid
 from gateway.pnc_rca_write_fence import (
-    MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
     MINIMAL_RELEASE_HOST_REMOTE,
     MINIMAL_RELEASE_NOTE_SCHEMA_VERSION,
     MINIMAL_RELEASE_PRODUCTION_DEFINITION,
@@ -45,7 +44,7 @@ from gateway.pnc_rca_write_fence import (
 
 SCHEMA = "pnc_rca_minimal_release_driver_v1"
 NOTE_SCHEMA = MINIMAL_RELEASE_NOTE_SCHEMA_VERSION
-RECEIPT_SCHEMA = "pnc_rca_minimal_release_apply_receipt_v2"
+RECEIPT_SCHEMA = "pnc_rca_minimal_release_apply_receipt_v3"
 TERMINAL_FAILURE_SCHEMA = "pnc_rca_minimal_release_terminal_failure_v1"
 EXECUTION_READBACK_SCHEMA = "pnc_rca_execution_identity_readback_v1"
 PRODUCTION_DEFINITION = MINIMAL_RELEASE_PRODUCTION_DEFINITION
@@ -80,6 +79,8 @@ SCHEMA_RUNTIME_CAPABILITY_FIELDS = frozenset({
     "lease_acquisition_enabled",
     "external_effect_enabled",
 })
+CONTROL_SCHEMA_V14 = "pnc_rca_control_store_v14"
+CONTROL_SCHEMA_V15 = "pnc_rca_control_store_v15"
 
 # label, release-relative script, HERMES_HOME-relative health, freshness field,
 # health schema. Gateway status has no schema and updated_at is a transition,
@@ -754,9 +755,7 @@ def _bound_binding(note_raw: bytes, note: Mapping[str, Any]) -> dict:
         "expected_control_schema_version": activation[
             "expected_control_schema_version"
         ],
-        "target_control_schema_version": activation[
-            "target_control_schema_version"
-        ],
+        "target_control_schema_version": activation["target_control_schema_version"],
         "epoch_contract_sha256": activation["epoch_contract_sha256"],
         "release_fingerprint_sha256": note["release_fingerprint_sha256"],
         "release_note_sha256": _sha(note_raw),
@@ -818,7 +817,18 @@ def _candidate_inputs(
 
 
 def _open_store(path: Path, read_only: bool) -> RcaControlStore:
-    return RcaControlStore(path, require_current=True, read_only=read_only)
+    if read_only:
+        return RcaControlStore(
+            path,
+            require_current=True,
+            read_only=True,
+            allow_successor_read_only=True,
+        )
+    return RcaControlStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
 
 
 def _open_delivery_store(path: Path) -> RcaDeliveryStore:
@@ -827,10 +837,16 @@ def _open_delivery_store(path: Path) -> RcaDeliveryStore:
         require_current=True,
         read_only=True,
         ensure_current_rows=False,
+        allow_successor_read_only=True,
     )
 
 
-def _schema_runtime_capability(store: Any, *, writable: bool) -> dict[str, Any]:
+def _schema_runtime_capability(
+    store: Any,
+    *,
+    expected_schema_version: str,
+    writable: bool,
+) -> dict[str, Any]:
     try:
         capability = store.schema_runtime_capability()
     except Exception as exc:
@@ -851,13 +867,8 @@ def _schema_runtime_capability(store: Any, *, writable: bool) -> dict[str, Any]:
         )
     ):
         raise ReleaseError("control_schema_capability_invalid")
-    if (
-        capability.get("observed_control_schema_version")
-        != MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
-        or capability.get("binary_write_schema_version")
-        != MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
-    ):
-        raise ReleaseError("control_schema_v14_required")
+    if expected_schema_version not in {CONTROL_SCHEMA_V14, CONTROL_SCHEMA_V15}:
+        raise ReleaseError("control_schema_version_invalid")
     write_flags = tuple(
         capability[field]
         for field in (
@@ -867,19 +878,35 @@ def _schema_runtime_capability(store: Any, *, writable: bool) -> dict[str, Any]:
             "external_effect_enabled",
         )
     )
+    observed = capability.get("observed_control_schema_version")
+    binary = capability.get("binary_write_schema_version")
     if writable:
         if (
-            capability.get("mode") != "current_write"
+            expected_schema_version != CONTROL_SCHEMA_V15
+            or observed != CONTROL_SCHEMA_V15
+            or binary != CONTROL_SCHEMA_V15
+            or capability.get("mode") != "current_write"
             or capability.get("read_supported") is not True
             or write_flags != (True, True, True, True)
         ):
-            raise ReleaseError("control_schema_v14_write_unavailable")
-    elif (
-        capability.get("mode") != "explicit_read_only"
-        or capability.get("read_supported") is not True
-        or write_flags != (False, False, False, False)
-    ):
-        raise ReleaseError("control_schema_v14_read_unavailable")
+            raise ReleaseError("control_schema_v15_write_unavailable")
+    else:
+        expected_binary = CONTROL_SCHEMA_V15
+        expected_mode = (
+            "explicit_read_only"
+            if expected_schema_version == CONTROL_SCHEMA_V14
+            else "successor_read_only"
+        )
+        if (
+            observed != expected_schema_version
+            or binary != expected_binary
+            or capability.get("mode") != expected_mode
+            or capability.get("read_supported") is not True
+            or write_flags != (False, False, False, False)
+        ):
+            raise ReleaseError(
+                f"control_schema_{expected_schema_version.rsplit('_', 1)[-1]}_read_unavailable"
+            )
     return dict(capability)
 
 
@@ -891,7 +918,6 @@ def _activation_expected(binding: Mapping[str, Any]) -> dict[str, str]:
         "config_sha256": binding["config_sha256"],
         "db_logical_identity_sha256": binding["db_logical_identity_sha256"],
         "partition_start_fence_sha256": binding["partition_start_fence_sha256"],
-        "partition_end_fence_sha256": binding["partition_start_fence_sha256"],
     }
 
 
@@ -902,7 +928,6 @@ def _public_epoch(epoch: Mapping[str, Any]) -> dict:
         "config_sha256",
         "db_logical_identity_sha256",
         "partition_start_fence_sha256",
-        "partition_end_fence_sha256",
         "release_fingerprint_sha256",
         "release_note_sha256",
         "updated_at",
@@ -917,10 +942,22 @@ def _store_error(exc: Exception) -> ReleaseError:
     return ReleaseError(code)
 
 
+def _activation_schema_pair(note: Mapping[str, Any]) -> tuple[str, str]:
+    activation = note["activation"]
+    pair = (
+        str(activation.get("expected_control_schema_version") or ""),
+        str(activation.get("target_control_schema_version") or ""),
+    )
+    if pair != (CONTROL_SCHEMA_V14, CONTROL_SCHEMA_V15):
+        raise ReleaseError("activation_schema_transition_invalid")
+    return pair
+
+
 def _activation_plan(
     note: Mapping[str, Any],
     binding: Mapping[str, Any],
     store_factory: StoreFactory,
+    outcome_probe: Callable[..., str] | None = None,
 ) -> dict:
     activation = note["activation"]
     zero = {
@@ -930,19 +967,44 @@ def _activation_plan(
         "total": 0,
     }
     try:
+        expected_schema, target_schema = _activation_schema_pair(note)
         store = store_factory(Path(activation["control_db_path"]), True)
-        capability = _schema_runtime_capability(store, writable=False)
+        raw_capability = store.schema_runtime_capability()
+        observed_schema = (
+            raw_capability.get("observed_control_schema_version")
+            if isinstance(raw_capability, Mapping)
+            else None
+        )
+        allowed_observed = {CONTROL_SCHEMA_V14, CONTROL_SCHEMA_V15}
+        if observed_schema not in allowed_observed:
+            raise ReleaseError("activation_control_schema_changed")
+        capability = _schema_runtime_capability(
+            store,
+            expected_schema_version=str(observed_schema),
+            writable=False,
+        )
         current = store.activation_epoch()
         predecessor_id = str(activation.get("expected_predecessor_epoch_id") or "")
         inflight = zero
-        if current and current.get("epoch_id") == binding["epoch_id"]:
+        if (
+            observed_schema == target_schema
+            and current
+            and current.get("epoch_id") == binding["epoch_id"]
+        ):
             if any(
                 str(current.get(key) or "") != str(value)
                 for key, value in _activation_expected(binding).items()
             ):
                 raise ReleaseError("activation_direct_steady_binding_conflict")
+            if _activation_outcome(note, binding, outcome_probe) != "committed":
+                raise ReleaseError("activation_migration_outcome_unknown")
             change = False
+            transition = "v15_noop"
         else:
+            if observed_schema != expected_schema:
+                raise ReleaseError("activation_migration_outcome_unknown")
+            if not predecessor_id:
+                raise ReleaseError("activation_predecessor_required")
             if current and current.get("state") not in {"aborted", "steady_active"}:
                 raise ReleaseError("activation_current_epoch_exists")
             if (
@@ -975,6 +1037,7 @@ def _activation_plan(
             ):
                 raise ReleaseError("activation_predecessor_inflight_not_drained")
             change = True
+            transition = "v14_to_v15_atomic"
     except ReleaseError:
         raise
     except (ActivationEpochError, RuntimeError, ValueError) as exc:
@@ -982,6 +1045,9 @@ def _activation_plan(
     return {
         "epoch_id": binding["epoch_id"],
         "would_change": change,
+        "transition": transition,
+        "source_control_schema_version": observed_schema,
+        "target_control_schema_version": target_schema,
         "predecessor_inflight": inflight,
         "release_fingerprint_sha256": binding["release_fingerprint_sha256"],
         "release_note_sha256": binding["release_note_sha256"],
@@ -995,30 +1061,57 @@ def _activation_apply(
     binding: Mapping[str, Any],
     plan: Mapping[str, Any],
     store_factory: StoreFactory,
+    migration_apply: Callable[..., Mapping[str, Any]] | None = None,
 ) -> dict:
     activation = note["activation"]
     try:
-        store = store_factory(Path(activation["control_db_path"]), False)
-        _schema_runtime_capability(store, writable=True)
-        current = store.activate_direct_steady_epoch(
-            epoch_id=binding["epoch_id"],
-            release_fingerprint_sha256=binding["release_fingerprint_sha256"],
-            release_note_sha256=binding["release_note_sha256"],
-            config_sha256=binding["config_sha256"],
-            db_logical_identity=binding["db_logical_identity"],
-            partition_start_fence=binding["partition_start_fence"],
-            operator=activation["operator"],
-            reason=activation["reason"],
-            expected_predecessor_epoch_id=str(
+        expected_schema, target_schema = _activation_schema_pair(note)
+        common = {
+            "epoch_id": binding["epoch_id"],
+            "release_fingerprint_sha256": binding["release_fingerprint_sha256"],
+            "release_note_sha256": binding["release_note_sha256"],
+            "config_sha256": binding["config_sha256"],
+            "db_logical_identity": binding["db_logical_identity"],
+            "partition_start_fence": binding["partition_start_fence"],
+            "operator": activation["operator"],
+            "reason": activation["reason"],
+            "expected_predecessor_epoch_id": str(
                 activation.get("expected_predecessor_epoch_id") or ""
             ),
-            expected_predecessor_state=str(
+            "expected_predecessor_state": str(
                 activation.get("expected_predecessor_state") or ""
             ),
-            expected_predecessor_binding_fingerprint=str(
+            "expected_predecessor_binding_fingerprint": str(
                 activation.get("expected_predecessor_binding_fingerprint") or ""
             ),
+            "expected_control_schema_version": expected_schema,
+            "target_control_schema_version": target_schema,
+            "epoch_contract_sha256": activation["epoch_contract_sha256"],
+        }
+        transition = str(plan.get("transition") or "")
+        if transition == "v14_to_v15_atomic":
+            migrate = migration_apply or RcaControlStore.migrate_v14_to_v15_and_activate
+            migrate(Path(activation["control_db_path"]), **common)
+        elif transition != "v15_noop":
+            raise ReleaseError("activation_transition_invalid")
+
+        # This fresh successor-write open is the final gate before residents start.
+        store = store_factory(Path(activation["control_db_path"]), False)
+        _schema_runtime_capability(
+            store,
+            expected_schema_version=CONTROL_SCHEMA_V15,
+            writable=True,
         )
+        current = store.activation_epoch()
+        if (
+            not current
+            or current.get("epoch_id") != binding["epoch_id"]
+            or any(
+                str(current.get(key) or "") != str(value)
+                for key, value in _activation_expected(binding).items()
+            )
+        ):
+            raise ReleaseError("activation_not_steady")
     except (ActivationEpochError, RuntimeError, ValueError) as exc:
         raise _store_error(exc) from exc
     return {
@@ -1031,8 +1124,12 @@ def _activation_status(
     note: Mapping[str, Any], binding: Mapping[str, Any], store_factory: StoreFactory
 ) -> dict:
     try:
-        store = store_factory(Path(note["activation"]["control_db_path"]), True)
-        _schema_runtime_capability(store, writable=False)
+        store = store_factory(Path(note["activation"]["control_db_path"]), False)
+        _schema_runtime_capability(
+            store,
+            expected_schema_version=CONTROL_SCHEMA_V15,
+            writable=True,
+        )
         current = store.activation_epoch()
     except (ActivationEpochError, RuntimeError, ValueError) as exc:
         raise _store_error(exc) from exc
@@ -1046,6 +1143,44 @@ def _activation_status(
     ):
         raise ReleaseError("activation_not_steady")
     return _public_epoch(current)
+
+
+def _activation_outcome(
+    note: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    outcome_probe: Callable[..., str] | None = None,
+) -> str:
+    activation = note["activation"]
+    probe = outcome_probe or RcaControlStore.probe_direct_steady_activation_outcome
+    try:
+        outcome = probe(
+            Path(activation["control_db_path"]),
+            epoch_id=binding["epoch_id"],
+            release_fingerprint_sha256=binding["release_fingerprint_sha256"],
+            release_note_sha256=binding["release_note_sha256"],
+            config_sha256=binding["config_sha256"],
+            db_logical_identity=binding["db_logical_identity"],
+            partition_start_fence=binding["partition_start_fence"],
+            expected_predecessor_epoch_id=str(
+                activation.get("expected_predecessor_epoch_id") or ""
+            ),
+            expected_predecessor_state=str(
+                activation.get("expected_predecessor_state") or ""
+            ),
+            expected_predecessor_binding_fingerprint=str(
+                activation.get("expected_predecessor_binding_fingerprint") or ""
+            ),
+            expected_control_schema_version=activation[
+                "expected_control_schema_version"
+            ],
+            target_control_schema_version=activation["target_control_schema_version"],
+            epoch_contract_sha256=activation["epoch_contract_sha256"],
+        )
+    except Exception:
+        return "unknown"
+    return (
+        outcome if outcome in {"not_committed", "committed", "unknown"} else "unknown"
+    )
 
 
 def _artifact(source: Path, target: Path, before_sha: str, after_sha: str) -> dict:
@@ -1262,9 +1397,7 @@ def _remove_stale_release_lock(path: Path) -> None:
             raise ReleaseError("release_apply_locked")
         descriptor = os.open(
             path,
-            os.O_RDWR
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
         )
         opened = os.fstat(descriptor)
         if _identity(opened) != _identity(before):
@@ -1554,10 +1687,14 @@ def _write_terminal_failure_marker(
         if identity is not None:
             try:
                 observed = path.lstat()
-                if observed.st_size == 0 and (
-                    observed.st_dev,
-                    observed.st_ino,
-                ) == identity:
+                if (
+                    observed.st_size == 0
+                    and (
+                        observed.st_dev,
+                        observed.st_ino,
+                    )
+                    == identity
+                ):
                     path.unlink()
                     _fsync_directory(path.parent)
             except OSError:
@@ -2317,7 +2454,21 @@ def _prepare_control_binding(
     topics = _normalize_partition_topics(partition_topics)
     try:
         store = store_factory(control_db, True)
-        _schema_runtime_capability(store, writable=False)
+        raw_capability = store.schema_runtime_capability()
+        observed_schema = (
+            raw_capability.get("observed_control_schema_version")
+            if isinstance(raw_capability, Mapping)
+            else None
+        )
+        if observed_schema not in {CONTROL_SCHEMA_V14, CONTROL_SCHEMA_V15}:
+            raise ReleaseError("prepare_control_schema_unsupported")
+        _schema_runtime_capability(
+            store,
+            expected_schema_version=str(observed_schema),
+            writable=False,
+        )
+        if observed_schema != CONTROL_SCHEMA_V14:
+            raise ReleaseError("prepare_control_schema_already_v15")
         source = store.control_db_source_snapshot_identity()
         predecessor = store.direct_steady_predecessor()
         fence: dict[str, dict[str, int]] = {}
@@ -2366,9 +2517,11 @@ def _prepare_control_binding(
                 "binding_fingerprint"
             ],
         }
+    if not predecessor_fields["expected_predecessor_epoch_id"]:
+        raise ReleaseError("prepare_predecessor_required")
     return {
-        "expected_control_schema_version": MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
-        "target_control_schema_version": MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+        "expected_control_schema_version": CONTROL_SCHEMA_V14,
+        "target_control_schema_version": CONTROL_SCHEMA_V15,
         "db_logical_identity": dict(logical),
         "partition_start_fence": fence,
         **predecessor_fields,
@@ -2658,16 +2811,14 @@ def prepare_release(
         "partition_start_fence_sha256": _sha(
             _canonical(activation["partition_start_fence"])
         ),
-        "expected_predecessor_epoch_id": activation[
-            "expected_predecessor_epoch_id"
-        ],
+        "expected_predecessor_epoch_id": activation["expected_predecessor_epoch_id"],
         "expected_predecessor_state": activation["expected_predecessor_state"],
         "expected_predecessor_binding_fingerprint": activation[
             "expected_predecessor_binding_fingerprint"
         ],
     }
-    activation_note["epoch_contract_sha256"] = (
-        minimal_release_epoch_contract_sha256(activation_note)
+    activation_note["epoch_contract_sha256"] = minimal_release_epoch_contract_sha256(
+        activation_note
     )
     note = {
         "schema_version": NOTE_SCHEMA,
@@ -2747,6 +2898,7 @@ def build_plan(
     home: Path,
     runner: Runner = _run,
     store_factory: StoreFactory = _open_store,
+    outcome_probe: Callable[..., str] | None = None,
 ) -> dict:
     home = _absolute(home, "hermes_home_invalid")
     release_note = _absolute(release_note, "release_note_path_invalid")
@@ -2775,7 +2927,12 @@ def build_plan(
         "gitlab": gitlab_readback(note, runner),
         "runtime": runtime_readback(note, runner),
         "artifacts": artifacts,
-        "activation": _activation_plan(note, binding, store_factory),
+        "activation": _activation_plan(
+            note,
+            binding,
+            store_factory,
+            outcome_probe,
+        ),
         "resident_profile": _profile_snapshot(runner),
         "single_canary": {
             "issue_id": note["canary"]["issue_id"],
@@ -2966,8 +3123,7 @@ def _validate_receipt_profile(
         except (TypeError, ValueError) as exc:
             raise ReleaseError("apply_receipt_resident_mismatch") from exc
     if any(
-        not isinstance(item, Mapping)
-        or set(item) != {"label", "loaded", "pid"}
+        not isinstance(item, Mapping) or set(item) != {"label", "loaded", "pid"}
         for item in disabled
     ):
         raise ReleaseError("apply_receipt_resident_mismatch")
@@ -3008,6 +3164,7 @@ def _validate_completed_apply_receipt(
         "artifacts",
         "activation",
         "activation_changed",
+        "activation_outcome",
         "resident_profile",
         "resident_transition",
         "single_canary",
@@ -3034,6 +3191,7 @@ def _validate_completed_apply_receipt(
         or receipt.get("live_projection") != live_projection
         or receipt.get("activation") != activation
         or not isinstance(receipt.get("activation_changed"), bool)
+        or receipt.get("activation_outcome") != "committed"
         or receipt.get("single_canary") != expected_canary
         or isinstance(apply_pid, bool)
         or not isinstance(apply_pid, int)
@@ -3081,8 +3239,7 @@ def _validate_completed_apply_receipt(
         before = item.get("before_sha256")
         changed = item.get("changed")
         if (
-            set(item)
-            != {"target", "before_sha256", "after_sha256", "changed"}
+            set(item) != {"target", "before_sha256", "after_sha256", "changed"}
             or (before != "ABSENT" and not isinstance(before, str))
             or (
                 isinstance(before, str)
@@ -3112,6 +3269,8 @@ def apply_release(
     runner: Runner = _run,
     process_factory: ProcessFactory = psutil.Process,
     store_factory: StoreFactory = _open_store,
+    migration_apply: Callable[..., Mapping[str, Any]] | None = None,
+    outcome_probe: Callable[..., str] | None = None,
     restart_timeout: float = 60,
 ) -> dict:
     release_note = _absolute(release_note, "release_note_path_invalid")
@@ -3145,6 +3304,8 @@ def apply_release(
     activation_attempted = False
     activation_committed = False
     activation_outcome_known = True
+    activation_outcome = "not_committed"
+    binding: dict[str, Any] | None = None
     artifacts_restored = False
     retain_staged = False
     staged_cleaned = False
@@ -3166,6 +3327,11 @@ def apply_release(
                 "path": str(release_note),
                 "sha256": note_sha,
             },
+            "activation_attempted": False,
+            "activation_committed": False,
+            "activation_outcome_known": False,
+            "activation_outcome": "unknown",
+            "rollback_ceiling": "operator_adjudication_required",
         }
         receipt_handle = _reserve_apply_receipt(receipt, started)
         signal_handlers = _install_apply_signal_handlers()
@@ -3178,6 +3344,7 @@ def apply_release(
             home=home,
             runner=runner,
             store_factory=store_factory,
+            outcome_probe=outcome_probe,
         )
         if plan["release_note"]["sha256"] != note_sha:
             raise ReleaseError("release_note_changed")
@@ -3190,14 +3357,12 @@ def apply_release(
         if before_effect_runtime != plan["runtime"]:
             raise ReleaseError("runtime_changed_during_apply")
         _require_release_note_sha(release_note, note_sha)
-        _write_reserved_receipt(
-            receipt_handle,
-            {
-                **started,
-                "gitlab": before_effect_gitlab,
-                "runtime": before_effect_runtime,
-            },
-        )
+        started = {
+            **started,
+            "gitlab": before_effect_gitlab,
+            "runtime": before_effect_runtime,
+        }
+        _write_reserved_receipt(receipt_handle, started)
         effect_started = True
         quiesce = _quiesce_residents(runner)
         _require_release_note_sha(release_note, note_sha)
@@ -3208,22 +3373,34 @@ def apply_release(
         binding = _bound_binding(note_raw, note)
         activation_attempted = True
         activation_outcome_known = False
-        try:
-            activation_apply = _activation_apply(
-                note, binding, plan["activation"], store_factory
-            )
-        except BaseException:
-            try:
-                _activation_status(note, binding, store_factory)
-            except ReleaseError as status_exc:
-                if status_exc.code == "activation_not_steady":
-                    activation_outcome_known = True
-            else:
-                activation_committed = True
-                activation_outcome_known = True
-            raise
+        activation_outcome = "unknown"
+        started = {
+            **started,
+            "activation_attempted": True,
+            "activation_committed": False,
+            "activation_outcome_known": False,
+            "activation_outcome": "unknown",
+            "rollback_ceiling": "operator_adjudication_required",
+        }
+        _write_reserved_receipt(receipt_handle, started)
+        activation_apply = _activation_apply(
+            note,
+            binding,
+            plan["activation"],
+            store_factory,
+            migration_apply,
+        )
         activation_committed = True
         activation_outcome_known = True
+        activation_outcome = "committed"
+        started = {
+            **started,
+            "activation_committed": True,
+            "activation_outcome_known": True,
+            "activation_outcome": "committed",
+            "rollback_ceiling": "successor_read_only_or_forward_fix",
+        }
+        _write_reserved_receipt(receipt_handle, started)
         activation = _activation_status(note, binding, store_factory)
         if activation_apply["current_epoch"] != activation:
             raise ReleaseError("activation_changed_during_apply")
@@ -3283,6 +3460,7 @@ def apply_release(
             "artifacts": installs,
             "activation": closeout_activation,
             "activation_changed": activation_apply["changed"],
+            "activation_outcome": activation_outcome,
             "resident_profile": closeout_residents,
             "resident_transition": resident_transition,
             "single_canary": plan["single_canary"],
@@ -3291,17 +3469,43 @@ def apply_release(
         return result
     except BaseException as exc:
         _ignore_apply_signals(signal_handlers)
+        if activation_attempted and binding is not None:
+            activation_outcome = _activation_outcome(note, binding, outcome_probe)
+            activation_committed = activation_outcome == "committed"
+            activation_outcome_known = activation_outcome != "unknown"
         if receipt_handle is not None:
+            if activation_attempted:
+                started = {
+                    **started,
+                    "activation_attempted": True,
+                    "activation_committed": activation_committed,
+                    "activation_outcome_known": activation_outcome_known,
+                    "activation_outcome": activation_outcome,
+                    "rollback_ceiling": {
+                        "not_committed": "artifact_restore_permitted",
+                        "committed": "successor_read_only_or_forward_fix",
+                        "unknown": "operator_adjudication_required",
+                    }[activation_outcome],
+                }
+                try:
+                    _write_reserved_receipt(receipt_handle, started)
+                except ReleaseError:
+                    # The previously fsynced unknown checkpoint remains fail-closed;
+                    # resident stop and terminal receipt handling still take priority.
+                    pass
             stop = (
                 {"attempted": True, **_stop_all_residents(runner)}
                 if effect_started
-                else {"attempted": False, "all_stopped": None, "observed": [], "errors": []}
+                else {
+                    "attempted": False,
+                    "all_stopped": None,
+                    "observed": [],
+                    "errors": [],
+                }
             )
             rollback_error = ""
             artifacts_mutated = any(item.get("installed") for item in staged)
-            rollback_safe = not activation_attempted or (
-                activation_outcome_known and not activation_committed
-            )
+            rollback_safe = activation_outcome == "not_committed"
             if artifacts_mutated and rollback_safe:
                 if stop["all_stopped"] is True:
                     try:
@@ -3337,11 +3541,19 @@ def apply_release(
                     "sha256": _sha(note_raw),
                 },
                 "error_code": (
-                    exc.code if isinstance(exc, ReleaseError) else "apply_internal_error"
+                    exc.code
+                    if isinstance(exc, ReleaseError)
+                    else "apply_internal_error"
                 ),
                 "activation_attempted": activation_attempted,
                 "activation_committed": activation_committed,
                 "activation_outcome_known": activation_outcome_known,
+                "activation_outcome": activation_outcome,
+                "rollback_ceiling": {
+                    "not_committed": "artifact_restore_permitted",
+                    "committed": "successor_read_only_or_forward_fix",
+                    "unknown": "operator_adjudication_required",
+                }[activation_outcome],
                 "effect_started": effect_started,
                 "artifacts_installed": artifacts_installed,
                 "artifacts_mutated": artifacts_mutated,

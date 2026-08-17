@@ -30,11 +30,16 @@ from tests.gateway.test_pnc_rca_delivery_store import (
     _delivery,
     _insert_subscription,
     _physical_v15_delivery_fixture,
+    _policy,
+    _record,
     _sqlite_storage_identity,
-    _switch_activation_epoch,
 )
 from tests.gateway.test_pnc_rca_w3_snapshot import _runtime_authority
 from tests.gateway.test_pnc_rca_write_fence import _release_note
+from tests.gateway.test_pnc_rca_control_store import (
+    _direct_steady_contract,
+    _migrate_v14_fixture_to_v15,
+)
 
 
 def _config_env(tmp_path) -> dict[str, str]:
@@ -1323,8 +1328,20 @@ def test_enabled_resident_without_epoch_exits_before_collector_creation(
         _config_env(tmp_path),
         hermes_home=tmp_path,
     )
-    control = RcaControlStore(config.control_db_path)
-    delivery = RcaDeliveryStore(config.control_db_path)
+    path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    assert path == config.control_db_path
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs "
+            "SET state = 'retired', is_current = 0, "
+            "retired_at = COALESCE(retired_at, updated_at) "
+            "WHERE is_current = 1"
+        )
+    delivery = RcaDeliveryStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
     constructed = False
 
     def unexpected_collector(*_args, **_kwargs):
@@ -1349,7 +1366,7 @@ def test_enabled_resident_without_epoch_exits_before_collector_creation(
 def _successor_read_only_capability() -> dict[str, object]:
     return {
         "observed_control_schema_version": "pnc_rca_control_store_v15",
-        "binary_write_schema_version": "pnc_rca_control_store_v14",
+        "binary_write_schema_version": "pnc_rca_control_store_v15",
         "mode": "successor_read_only",
         "read_supported": True,
         "write_enabled": False,
@@ -1419,7 +1436,8 @@ def test_successor_read_only_collector_writes_health_without_work_or_probes(
     assert calls[0][0] == "store"
     assert calls[0][1].get("read_only", False) is False
     assert calls[0][1]["ensure_current_rows"] is False
-    assert calls[0][1]["allow_successor_read_only"] is True
+    assert calls[0][1].get("allow_successor_read_only", False) is False
+    assert calls[0][1]["allow_successor_write"] is True
     assert calls[1] == (
         "health",
         {"activation_required": config.activation_required},
@@ -1447,7 +1465,7 @@ def test_successor_read_only_collector_writes_health_without_work_or_probes(
     assert observed["liveness_ok"] is True
 
 
-def test_real_v15_collector_preserves_db_wal_shm_without_work_or_vm_probe(
+def test_real_v15_collector_dry_run_preserves_db_wal_shm_without_work_or_vm_probe(
     tmp_path,
     monkeypatch,
 ):
@@ -1491,21 +1509,13 @@ def test_real_v15_collector_preserves_db_wal_shm_without_work_or_vm_probe(
     )
 
     try:
-        assert collector.main(["--once"]) == 0
+        assert collector.main(["--dry-run"]) == 2
         after = _sqlite_storage_identity(path)
         assert after["db"] == before["db"]
         assert after["-wal"] == before["-wal"]
         assert (after["-shm"] is None) is (before["-shm"] is None)
     finally:
         wal_writer.close()
-
-    payload = json.loads(config.health_path.read_text(encoding="utf-8"))
-    assert payload["mode"] == "successor_read_only"
-    assert payload["ok"] is False
-    assert payload["process_healthy"] is True
-    assert payload["ready"] is False
-    assert payload["processing"] is False
-
 
 @pytest.mark.parametrize("mode", ["check_config", "dry_run"])
 def test_successor_read_only_collector_diagnostics_do_not_probe_or_preview(
@@ -1563,9 +1573,15 @@ def test_successor_read_only_collector_diagnostics_do_not_probe_or_preview(
     assert "preview" not in calls
     [store_call] = calls
     assert store_call[0] == "store"
-    assert store_call[1]["read_only"] is True
     assert store_call[1]["ensure_current_rows"] is False
-    assert store_call[1]["allow_successor_read_only"] is True
+    if mode == "check_config":
+        assert store_call[1].get("read_only", False) is False
+        assert store_call[1].get("allow_successor_read_only", False) is False
+        assert store_call[1]["allow_successor_write"] is True
+    else:
+        assert store_call[1]["read_only"] is True
+        assert store_call[1]["allow_successor_read_only"] is True
+        assert store_call[1]["allow_successor_write"] is False
 
 
 def test_disabled_collector_check_config_does_not_probe_existing_control_db(
@@ -1612,6 +1628,14 @@ def test_enabled_startup_locks_minimal_release_before_writable_collector(
     _bind_activation_execution(control, result, state="steady_active")
     RcaDeliveryStore(control.db_path)
     _bind_minimal_release(control, fixture)
+    migration = _migrate_v14_fixture_to_v15(
+        control.db_path,
+        successor_epoch_id=fixture.note["activation"]["epoch_id"],
+        successor_release_fingerprint_sha256=fixture.fingerprint,
+        successor_release_note_sha256=fixture.epoch["release_note_sha256"],
+        successor_config_sha256=fixture.env_sha256,
+    )
+    fixture.epoch["epoch_id"] = migration["successor_epoch_id"]
     _set_live_release_environment(monkeypatch, fixture)
     wal_writer = sqlite3.connect(control.db_path)
     assert wal_writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
@@ -1705,8 +1729,26 @@ def test_collector_epoch_switch_rejects_batch_before_backfill_or_claim(
     fixture = _release_note(tmp_path)
     control, result = _control(tmp_path, db_path=fixture.control_db_path)
     _bind_activation_execution(control, result, state="steady_active")
-    store = RcaDeliveryStore(control.db_path)
+    RcaDeliveryStore(control.db_path)
     _bind_minimal_release(control, fixture)
+    migration = _migrate_v14_fixture_to_v15(
+        control.db_path,
+        successor_epoch_id=fixture.note["activation"]["epoch_id"],
+        successor_release_fingerprint_sha256=fixture.fingerprint,
+        successor_release_note_sha256=fixture.epoch["release_note_sha256"],
+        successor_config_sha256=fixture.env_sha256,
+    )
+    fixture.epoch["epoch_id"] = migration["successor_epoch_id"]
+    control = RcaControlStore(
+        control.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    store = RcaDeliveryStore(
+        control.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
     _set_live_release_environment(monkeypatch, fixture)
     env = _config_env(tmp_path)
     base = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
@@ -1736,11 +1778,33 @@ def test_collector_epoch_switch_rejects_batch_before_backfill_or_claim(
         config=config,
         status_reader=lambda *_args: provider_calls.append("status"),
     )
-    assert instance._validate_runtime_release()["epoch_id"] == "delivery-epoch-1"
-    _switch_activation_epoch(
-        control,
-        old_epoch="delivery-epoch-1",
-        new_epoch="delivery-epoch-2",
+    assert instance._validate_runtime_release()["epoch_id"] == (
+        migration["successor_epoch_id"]
+    )
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    record = _record()
+    progress = control.partition_progress(
+        topic=record.topic,
+        partitions=(record.partition,),
+    )
+    successor = _direct_steady_contract(
+        predecessor=predecessor,
+        epoch_id="delivery-epoch-2",
+        expected_schema="pnc_rca_control_store_v15",
+        target_schema="pnc_rca_control_store_v15",
+        release_fingerprint_sha256="d" * 64,
+        release_note_sha256="e" * 64,
+        config_sha256="f" * 64,
+        partition_start_fence={
+            record.topic: {str(record.partition): progress[record.partition]}
+        },
+    )
+    control.activate_direct_steady_epoch(
+        **successor,
+        operator="collector-test",
+        reason="simulate an exact v15 release epoch switch",
+        now=NOW + timedelta(seconds=1),
     )
     monkeypatch.setattr(
         store,
@@ -2002,6 +2066,54 @@ def _remote_event_blocker():
     }
 
 
+def _v15_completed_control(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    record = _record()
+    seed = RcaControlStore(path)
+    seed.activate_direct_steady_epoch(
+        epoch_id="delivery-epoch-1",
+        release_fingerprint_sha256="a" * 64,
+        release_note_sha256="b" * 64,
+        config_sha256="c" * 64,
+        db_logical_identity={"database": "delivery-test"},
+        partition_start_fence={record.topic: {str(record.partition): 0}},
+        operator="delivery-test",
+        reason="activate v14 predecessor before collector cutover fixture",
+        now=NOW,
+    )
+    RcaDeliveryStore(path)
+    _migrate_v14_fixture_to_v15(
+        path,
+        successor_epoch_id="delivery-epoch-v15",
+    )
+    control = RcaControlStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    result = control.ingest_record(
+        record,
+        policy=_policy(),
+        submit_enabled=True,
+        activation_required=True,
+    )
+    claim = control.claim_outbox(lease_owner="submission-worker", now=NOW)
+    assert claim is not None
+    control.complete_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        result={
+            "success": True,
+            "submission_key": result.submission_key,
+            "task_id": result.submission_key,
+            "task_state": "submitted",
+            "deduped": False,
+        },
+        now=NOW,
+    )
+    return control, result
+
+
 def _real_terminal_collector(
     tmp_path,
     *,
@@ -2011,11 +2123,15 @@ def _real_terminal_collector(
     failure_receipt_reader=None,
     infra_remediation_runner=None,
 ):
-    _control(tmp_path)
+    control, _result = _v15_completed_control(tmp_path)
     env = _config_env(tmp_path)
     config = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
     instance = collector.DeliveryCollector(
-        store=RcaDeliveryStore(tmp_path / "control.sqlite3"),
+        store=RcaDeliveryStore(
+            tmp_path / "control.sqlite3",
+            require_current=True,
+            allow_successor_write=True,
+        ),
         config=config,
         status_reader=status_reader
         or (
@@ -2038,6 +2154,7 @@ def _real_terminal_collector(
             }
         ),
         infra_remediation_runner=infra_remediation_runner,
+        control_store=control,
         now=lambda: clock[0],
         lease_owner="taxonomy-real-path",
     )

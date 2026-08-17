@@ -89,7 +89,7 @@ Host 生产发布只有一条权威链路：
 GitLab exact branch/tag/commit/tree
   + owner-only minimal release note
   + immutable Host/worker/pipeline runtime identity
-  + direct steady ControlStore activation
+  + atomic ControlStore v14-to-v15 migration and steady successor
   + operator_issue_only_v1 restart/readback
   + one transport canary
 ```
@@ -109,14 +109,14 @@ Minimal release note 必须固定：
 - Host GitLab branch、tag、commit、tree 和 tag object；
 - immutable runtime 绝对路径；
 - live manifest 与 env SHA-256；
-- direct steady epoch、ControlStore 和 release note 内嵌 activation binding；
+- v14 predecessor、target v15 schema、ControlStore identity、partition fence 和 release note 内嵌 epoch contract；
 - `operator_issue_only_v1` resident profile；
 - 唯一 canary issue 和 state path。
 
 发布由 `scripts/pnc_rca_minimal_release.py` 执行：
 
-1. `plan` 只读验证 GitLab refs、release note、候选 manifest/env、immutable runtime、当前 epoch 和 resident 前态。
-2. `apply` 以 exact hash 安装 manifest/env，通过 `RcaControlStore.activate_direct_steady_epoch` 切换 epoch，并重启/读回 resident。
+1. `plan` 只读验证 GitLab refs、release note、候选 manifest/env、immutable runtime、exact v14 predecessor/audit/inflight/fence 和 resident 前态。
+2. `apply` 先停止六个 resident，以 exact hash 安装 manifest/env，再通过 `RcaControlStore.migrate_v14_to_v15_and_activate` 在一个事务内重建 activation schema、CAS marker 并激活唯一 v15 steady successor；只有 outcome 独立读回为 `committed` 后才重启四个 required resident。
 3. 单独提交一个 `--acceptance-axis transport` 的 operator issue-only canary。发布工具自身不创建额外业务任务。
 4. `verify` 必须读取本次 completed apply receipt，并同时通过 GitLab/runtime identity、live projection、steady epoch、resident PID/readback 和单 canary。
 
@@ -136,7 +136,7 @@ Resident 验收必须读取新 PID、实际 cwd/entrypoint、runtime identity �
 
 Canary 的 transport 轴要求非空正式 comment ID、exact 字段集合 `field_8c912e`/`field_9193cb`，并且只接受官方写后读回来源 `read_after_write` 或 `read_after_recovery_write`。Causal attribution 作为同一 state 中的独立诊断结果呈现，但不阻塞 Host transport release；归因能力验收由其业务负责人独立推进。
 
-旧多阶段发布工具、中间证明文件和容量爬坡发布流程已经退役，不得作为旁路恢复。需要回滚时，使用预先审定的 predecessor release note、immutable runtime 和同一个 `plan/apply/verify` 流程；禁止原地改 production runtime、手工拼绑定或直接写 SQLite。
+旧多阶段发布工具、中间证明文件和容量爬坡发布流程已经退役，不得作为旁路恢复。v15 迁移提交前，只有 outcome=`not_committed` 才允许恢复 artifact；提交后只允许 successor-read-only 或 forward fix，outcome=`unknown` 必须保持所有 resident 停止并人工裁决。禁止原地改 production runtime、手工拼绑定或直接写 SQLite。当前 minimal driver 是一次性 v14-to-v15 cutover driver；后续 v15 release 需要另行审定的新合同，不能复用本次 note 创建新 epoch。
 
 ## 7. 生产验收
 

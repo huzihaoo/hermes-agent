@@ -14,6 +14,7 @@ from gateway.pnc_rca_runtime_identity import RCA_RUNTIME_RELATIVE_FILES
 from gateway.pnc_rca_runtime_identity import canonical_json_sha256
 from scripts import pnc_rca_outbox_dispatcher as dispatcher
 from tests.gateway.test_pnc_rca_control_store import (
+    _migrate_v14_fixture_to_v15,
     _manual_request,
     _policy,
     _profile_snapshot_policy,
@@ -25,6 +26,16 @@ from tests.gateway.test_pnc_rca_delivery_store import (
     _physical_v15_delivery_fixture,
     _sqlite_storage_identity,
 )
+
+
+def _v15_control_store(path: Path) -> RcaControlStore:
+    _steady_control_store(path)
+    _migrate_v14_fixture_to_v15(path)
+    return RcaControlStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
 
 
 def test_storage_admission_uses_isolated_production_runtime():
@@ -355,7 +366,20 @@ def test_enabled_resident_without_epoch_exits_before_dispatcher_creation(
         _config_env(tmp_path, enabled=True),
         hermes_home=tmp_path,
     )
-    store = RcaControlStore(config.control_db_path)
+    path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    assert path == config.control_db_path
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs "
+            "SET state = 'retired', is_current = 0, "
+            "retired_at = COALESCE(retired_at, updated_at) "
+            "WHERE is_current = 1"
+        )
+    store = RcaControlStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
     constructed = False
 
     def unexpected_dispatcher(*_args, **_kwargs):
@@ -387,6 +411,7 @@ def test_enabled_startup_uses_live_current_store_with_active_wal(
         hermes_home=tmp_path,
     )
     _steady_control_store(config.control_db_path)
+    _migrate_v14_fixture_to_v15(config.control_db_path)
     store_calls = []
     real_store = dispatcher.RcaControlStore
 
@@ -447,7 +472,8 @@ def test_enabled_startup_uses_live_current_store_with_active_wal(
         {
             "require_current": True,
             "read_only": False,
-            "allow_successor_read_only": True,
+            "allow_successor_read_only": False,
+            "allow_successor_write": True,
         }
     ]
 
@@ -455,7 +481,7 @@ def test_enabled_startup_uses_live_current_store_with_active_wal(
 def _successor_read_only_capability() -> dict[str, object]:
     return {
         "observed_control_schema_version": "pnc_rca_control_store_v15",
-        "binary_write_schema_version": "pnc_rca_control_store_v14",
+        "binary_write_schema_version": "pnc_rca_control_store_v15",
         "mode": "successor_read_only",
         "read_supported": True,
         "write_enabled": False,
@@ -514,7 +540,8 @@ def test_successor_read_only_resident_writes_fresh_quiescent_health_only(
 
     [store_call, health_call] = calls
     assert store_call[0] == "store"
-    assert store_call[1]["allow_successor_read_only"] is True
+    assert store_call[1]["allow_successor_read_only"] is False
+    assert store_call[1]["allow_successor_write"] is True
     assert health_call == "health"
     payload = json.loads(config.health_path.read_text(encoding="utf-8"))
     assert payload["mode"] == "successor_read_only"
@@ -533,7 +560,7 @@ def test_successor_read_only_resident_writes_fresh_quiescent_health_only(
     assert observed["liveness_ok"] is True
 
 
-def test_real_v15_outbox_resident_preserves_db_wal_shm_and_does_no_work(
+def test_real_v15_outbox_dry_run_preserves_db_wal_shm_and_does_no_work(
     tmp_path,
     monkeypatch,
 ):
@@ -573,21 +600,13 @@ def test_real_v15_outbox_resident_preserves_db_wal_shm_and_does_no_work(
     monkeypatch.setattr(dispatcher.signal, "signal", lambda *_args: None)
 
     try:
-        assert dispatcher.main(["--once"]) == 0
+        assert dispatcher.main(["--dry-run"]) == 2
         after = _sqlite_storage_identity(path)
         assert after["db"] == before["db"]
         assert after["-wal"] == before["-wal"]
         assert (after["-shm"] is None) is (before["-shm"] is None)
     finally:
         wal_writer.close()
-
-    payload = json.loads(config.health_path.read_text(encoding="utf-8"))
-    assert payload["mode"] == "successor_read_only"
-    assert payload["ok"] is False
-    assert payload["process_healthy"] is True
-    assert payload["ready"] is False
-    assert payload["processing"] is False
-
 
 @pytest.mark.parametrize("mode", ["check_config", "dry_run"])
 def test_successor_read_only_operator_modes_are_structured_red_without_work(
@@ -635,8 +654,14 @@ def test_successor_read_only_operator_modes_are_structured_red_without_work(
     assert "preview" not in calls
     [store_call] = calls
     assert store_call[0] == "store"
-    assert store_call[1]["read_only"] is True
-    assert store_call[1]["allow_successor_read_only"] is True
+    if mode == "check_config":
+        assert store_call[1].get("read_only", False) is False
+        assert store_call[1].get("allow_successor_read_only", False) is False
+        assert store_call[1]["allow_successor_write"] is True
+    else:
+        assert store_call[1]["read_only"] is True
+        assert store_call[1]["allow_successor_read_only"] is True
+        assert store_call[1]["allow_successor_write"] is False
 
 
 def test_disabled_check_config_does_not_probe_existing_control_db(
@@ -688,7 +713,7 @@ def test_clear_circuit_plan_does_not_mutate_or_create_receipt(
     config = dispatcher.DispatcherConfig.from_env(
         _config_env(tmp_path), hermes_home=tmp_path
     )
-    store = RcaControlStore(config.control_db_path)
+    store = _v15_control_store(config.control_db_path)
     store.open_dispatcher_circuit(
         reason_code="snapshot_stale", reason_detail="offline test"
     )
@@ -720,7 +745,7 @@ def test_clear_circuit_apply_writes_receipt_and_db_audit(tmp_path, monkeypatch, 
     config = dispatcher.DispatcherConfig.from_env(
         _config_env(tmp_path), hermes_home=tmp_path
     )
-    store = RcaControlStore(config.control_db_path)
+    store = _v15_control_store(config.control_db_path)
     store.open_dispatcher_circuit(
         reason_code="snapshot_stale", reason_detail="offline test"
     )
@@ -767,7 +792,7 @@ def test_clear_circuit_duplicate_receipt_is_rejected_before_mutation(
     config = dispatcher.DispatcherConfig.from_env(
         _config_env(tmp_path), hermes_home=tmp_path
     )
-    store = RcaControlStore(config.control_db_path)
+    store = _v15_control_store(config.control_db_path)
     store.open_dispatcher_circuit(reason_code="snapshot_stale")
     receipt = tmp_path / "reset.json"
     _patch_reset_cli(monkeypatch, config)
@@ -798,7 +823,7 @@ def test_clear_circuit_closed_state_fails_closed_without_plan_success(
     config = dispatcher.DispatcherConfig.from_env(
         _config_env(tmp_path), hermes_home=tmp_path
     )
-    store = RcaControlStore(config.control_db_path)
+    store = _v15_control_store(config.control_db_path)
     _patch_reset_cli(monkeypatch, config)
 
     assert (
@@ -821,7 +846,7 @@ def test_clear_circuit_receipt_materialization_failure_reports_recovery(
     config = dispatcher.DispatcherConfig.from_env(
         _config_env(tmp_path), hermes_home=tmp_path
     )
-    store = RcaControlStore(config.control_db_path)
+    store = _v15_control_store(config.control_db_path)
     store.open_dispatcher_circuit(reason_code="snapshot_stale")
     receipt = tmp_path / "reset.json"
     _patch_reset_cli(monkeypatch, config)
@@ -874,7 +899,7 @@ def test_clear_circuit_rejects_relative_receipt_before_mutation(
     config = dispatcher.DispatcherConfig.from_env(
         _config_env(tmp_path), hermes_home=tmp_path
     )
-    store = RcaControlStore(config.control_db_path)
+    store = _v15_control_store(config.control_db_path)
     store.open_dispatcher_circuit(reason_code="snapshot_stale")
     _patch_reset_cli(monkeypatch, config)
 

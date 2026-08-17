@@ -8,6 +8,7 @@ import pytest
 
 from gateway.pnc_rca_write_fence import (
     ExternalWriteFenceError,
+    MINIMAL_RELEASE_CONTROL_SCHEMA_V14,
     MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
     MINIMAL_RELEASE_HOST_REMOTE,
     MINIMAL_RELEASE_NOTE_SCHEMA_VERSION,
@@ -113,7 +114,7 @@ def _release_note(tmp_path):
         "control_db_path": str(control_db_path),
         "operator": "owner:test",
         "reason": "resident release binding test",
-        "expected_control_schema_version": MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+        "expected_control_schema_version": MINIMAL_RELEASE_CONTROL_SCHEMA_V14,
         "target_control_schema_version": MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
         "expected_predecessor_epoch_id": "",
         "expected_predecessor_state": "",
@@ -205,7 +206,7 @@ def test_resident_release_note_binds_epoch_runtime_and_manifest(tmp_path):
     }
 
 
-@pytest.mark.parametrize("change", ["missing_field", "contract_hash", "v15_target"])
+@pytest.mark.parametrize("change", ["missing_field", "contract_hash", "invalid_pair"])
 def test_resident_release_note_rejects_invalid_v2_activation_contract(
     tmp_path, change
 ):
@@ -216,7 +217,9 @@ def test_resident_release_note_rejects_invalid_v2_activation_contract(
     elif change == "contract_hash":
         activation["epoch_contract_sha256"] = "d" * 64
     else:
-        activation["target_control_schema_version"] = "pnc_rca_control_store_v15"
+        activation["target_control_schema_version"] = (
+            MINIMAL_RELEASE_CONTROL_SCHEMA_V14
+        )
         activation["epoch_contract_sha256"] = minimal_release_epoch_contract_sha256(
             activation
         )
@@ -397,7 +400,7 @@ def test_bound_resident_release_rejects_startup_binding_drift(tmp_path, drift):
     assert exc.value.code == "resident_release_binding_changed"
 
 
-def test_bound_resident_release_rejects_v15_store_before_epoch_read(tmp_path):
+def test_bound_resident_release_rejects_v14_store_before_epoch_read(tmp_path):
     fixture = _release_note(tmp_path)
 
     class Store:
@@ -408,7 +411,7 @@ def test_bound_resident_release_rejects_v15_store_before_epoch_read(tmp_path):
 
         def schema_runtime_capability(self):
             return _schema_runtime_capability(
-                observed="pnc_rca_control_store_v15",
+                observed=MINIMAL_RELEASE_CONTROL_SCHEMA_V14,
                 binary_write=MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
             )
 
@@ -428,7 +431,7 @@ def test_bound_resident_release_rejects_v15_store_before_epoch_read(tmp_path):
             live_env_path=fixture.env_path,
         )
 
-    assert exc.value.code == "resident_control_schema_not_v14"
+    assert exc.value.code == "resident_control_schema_not_v15"
     assert store.activation_reads == 0
 
 

@@ -502,7 +502,13 @@ def _claimed_effect(tmp_path):
     return store, effect
 
 
-def _canonical_canary(tmp_path, *, owner_authorized=True, leave_claimed=False):
+def _canonical_canary(
+    tmp_path,
+    *,
+    owner_authorized=True,
+    leave_claimed=False,
+    successor_write=False,
+):
     batch_id = "canary-r15aw-7041712812-20260817"
     issue_id = "7041712812"
     epoch_id = "delivery-test-steady"
@@ -552,6 +558,23 @@ def _canonical_canary(tmp_path, *, owner_authorized=True, leave_claimed=False):
             control, old_epoch=prior_epoch_id, new_epoch=epoch_id
         )
         current = NOW + timedelta(seconds=2)
+    if successor_write:
+        from tests.gateway.test_pnc_rca_control_store import (
+            _migrate_v14_fixture_to_v15,
+        )
+
+        RcaDeliveryStore(control.db_path)
+        migration = _migrate_v14_fixture_to_v15(
+            control.db_path,
+            successor_epoch_id="delivery-test-v15-steady",
+        )
+        epoch_id = migration["successor_epoch_id"]
+        control = RcaControlStore(
+            control.db_path,
+            require_current=True,
+            allow_successor_write=True,
+        )
+    if owner_authorized:
         authority = build_historical_epoch_rerun_authority(
             batch_id=batch_id,
             queue_sha256="1" * 64,
@@ -614,7 +637,15 @@ def _canonical_canary(tmp_path, *, owner_authorized=True, leave_claimed=False):
         },
         now=current,
     )
-    store = RcaDeliveryStore(control.db_path)
+    store = (
+        RcaDeliveryStore(
+            control.db_path,
+            require_current=True,
+            allow_successor_write=True,
+        )
+        if successor_write
+        else RcaDeliveryStore(control.db_path)
+    )
     assert store.backfill_completed_submissions(
         now=current, activation_required=True
     ) == 1
@@ -758,7 +789,7 @@ def test_canonical_canary_readback_projects_settled_db_evidence(tmp_path):
     assert readback["required_effects"][0]["write_phase"] == "settled"
 
 
-def test_terminal_rerun_provider_rejects_hidden_v14_tamper_before_call(
+def test_terminal_rerun_provider_rejects_v15_audit_tamper_before_call(
     tmp_path,
     monkeypatch,
 ):
@@ -770,7 +801,11 @@ def test_terminal_rerun_provider_rejects_hidden_v14_tamper_before_call(
     from gateway.pnc_rca_write_fence import ExternalWriteFenceError
     from scripts import pnc_rca_delivery_dispatcher as dispatcher_module
 
-    data = _canonical_canary(tmp_path, leave_claimed=True)
+    data = _canonical_canary(
+        tmp_path,
+        leave_claimed=True,
+        successor_write=True,
+    )
     effect = data["effect"]
     binding = data["store"].validate_terminal_rerun_external_write_binding(
         effect_key=effect.effect_key,
@@ -831,8 +866,13 @@ def test_terminal_rerun_provider_rejects_hidden_v14_tamper_before_call(
     )
     with sqlite3.connect(data["control"].db_path) as conn:
         conn.execute(
-            "UPDATE rca_activation_epochs "
-            "SET preauthorization_fingerprint = ? WHERE is_current = 1",
+            "UPDATE rca_activation_transition_audit "
+            "SET binding_fingerprint = ? WHERE audit_id = ("
+            "SELECT MAX(audit.audit_id) "
+            "FROM rca_activation_transition_audit AS audit "
+            "JOIN rca_activation_epochs AS epoch "
+            "ON epoch.epoch_id = audit.epoch_id WHERE epoch.is_current = 1"
+            ")",
             ("f" * 64,),
         )
 
@@ -2131,7 +2171,7 @@ def test_nminus1_v15_control_schema_opens_delivery_store_read_only(
     )
     assert v14_store.schema_runtime_capability() == {
         "observed_control_schema_version": CONTROL_STORE_SCHEMA_VERSION,
-        "binary_write_schema_version": CONTROL_STORE_SCHEMA_VERSION,
+        "binary_write_schema_version": CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
         "mode": "current_write",
         "read_supported": True,
         "write_enabled": True,
@@ -2251,7 +2291,7 @@ def test_nminus1_v15_control_schema_opens_delivery_store_read_only(
     )
     assert store.schema_runtime_capability() == {
         "observed_control_schema_version": CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
-        "binary_write_schema_version": CONTROL_STORE_SCHEMA_VERSION,
+        "binary_write_schema_version": CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
         "mode": "successor_read_only",
         "read_supported": True,
         "write_enabled": False,
@@ -2337,6 +2377,58 @@ def test_nminus1_v15_activation_health_is_binding_valid_but_processing_disabled(
     assert health["activation"]["binding_valid"] is True
     assert health["activation"]["production_ready"] is False
     assert health["activation"]["processing_enabled"] is False
+
+
+def test_r15ay_v15_delivery_writer_is_explicit_and_audit_bound(tmp_path):
+    path, migration = _physical_v15_delivery_fixture(tmp_path)
+
+    store = RcaDeliveryStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    assert store.schema_runtime_capability() == {
+        "observed_control_schema_version": CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        "binary_write_schema_version": CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        "mode": "current_write",
+        "read_supported": True,
+        "write_enabled": True,
+        "work_admission_enabled": True,
+        "lease_acquisition_enabled": True,
+        "external_effect_enabled": True,
+    }
+    assert store.activation_epoch()["epoch_id"] == migration["successor_epoch_id"]
+
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        epoch = store._validate_current_activation_binding_tx(conn)
+        assert str(epoch["epoch_id"]) == migration["successor_epoch_id"]
+        conn.execute(
+            "UPDATE rca_delivery_meta SET value = value "
+            "WHERE key = 'schema_version'"
+        )
+        conn.rollback()
+    finally:
+        conn.close()
+
+    with sqlite3.connect(path) as tamper:
+        tamper.execute(
+            "UPDATE rca_activation_transition_audit "
+            "SET binding_fingerprint = ? WHERE epoch_id = ?",
+            ("f" * 64, migration["successor_epoch_id"]),
+        )
+    conn = store._connect_read_only()
+    try:
+        conn.execute("BEGIN")
+        with pytest.raises(
+            RuntimeError,
+            match="external_write_fence_epoch_not_current",
+        ):
+            store._validate_current_activation_binding_tx(conn)
+        conn.rollback()
+    finally:
+        conn.close()
 
 
 def test_nminus1_v15_delivery_writers_and_external_fences_are_denied_without_mutation(
@@ -2492,8 +2584,10 @@ def test_current_constructor_rejects_control_marker_drift_before_circuit_insert(
         db_path,
         *,
         busy_timeout_ms,
+        expected_control_schema_version,
     ):
         del cls
+        assert expected_control_schema_version == CONTROL_STORE_SCHEMA_VERSION
         writer = sqlite3.connect(db_path, isolation_level=None)
         assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
         writer.execute("PRAGMA wal_autocheckpoint=0")
@@ -2510,7 +2604,11 @@ def test_current_constructor_rejects_control_marker_drift_before_circuit_insert(
         writer.commit()
         keepers.append(writer)
         drift_identity.update(_sqlite_storage_identity(Path(db_path)))
-        return original_ensure(db_path, busy_timeout_ms=busy_timeout_ms)
+        return original_ensure(
+            db_path,
+            busy_timeout_ms=busy_timeout_ms,
+            expected_control_schema_version=expected_control_schema_version,
+        )
 
     monkeypatch.setattr(
         RcaDeliveryStore,
@@ -3188,12 +3286,21 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
     epoch = _activate_direct_steady(
         control, start_offset=20, now=provider_now
     )
-    with sqlite3.connect(control.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_activation_epochs SET state='steady_active' "
-            "WHERE epoch_id=? AND is_current=1",
-            (epoch["epoch_id"],),
-        )
+    assert epoch["state"] == "steady_active"
+    RcaDeliveryStore(control.db_path)
+    from tests.gateway.test_pnc_rca_control_store import (
+        _migrate_v14_fixture_to_v15,
+    )
+
+    _migrate_v14_fixture_to_v15(
+        control.db_path,
+        successor_epoch_id="profile-terminal-v15-steady",
+    )
+    control = RcaControlStore(
+        control.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
     policy, record = _real_g1q3_profile_snapshot(20, "7019637554")
     result = control.ingest_record(
         record,
@@ -3214,7 +3321,11 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
         error_detail="profile provider claim fixture",
         now=provider_now + timedelta(seconds=1),
     )
-    store = RcaDeliveryStore(control.db_path)
+    store = RcaDeliveryStore(
+        control.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
     assert store.backfill_completed_submissions(
         now=provider_now + timedelta(seconds=2),
         activation_required=True,
@@ -3278,15 +3389,24 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
         )
     )
     with sqlite3.connect(control.db_path) as conn:
-        original_hidden_fingerprint = str(
+        original_binding_fingerprint = str(
             conn.execute(
-                "SELECT preauthorization_fingerprint "
-                "FROM rca_activation_epochs WHERE is_current = 1"
+                "SELECT audit.binding_fingerprint "
+                "FROM rca_activation_transition_audit AS audit "
+                "JOIN rca_activation_epochs AS epoch "
+                "ON epoch.epoch_id = audit.epoch_id "
+                "WHERE epoch.is_current = 1 "
+                "ORDER BY audit.audit_id DESC LIMIT 1"
             ).fetchone()[0]
         )
         conn.execute(
-            "UPDATE rca_activation_epochs "
-            "SET preauthorization_fingerprint = ? WHERE is_current = 1",
+            "UPDATE rca_activation_transition_audit "
+            "SET binding_fingerprint = ? WHERE audit_id = ("
+            "SELECT MAX(audit.audit_id) "
+            "FROM rca_activation_transition_audit AS audit "
+            "JOIN rca_activation_epochs AS epoch "
+            "ON epoch.epoch_id = audit.epoch_id WHERE epoch.is_current = 1"
+            ")",
             ("f" * 64,),
         )
     try:
@@ -3303,9 +3423,14 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
     finally:
         with sqlite3.connect(control.db_path) as conn:
             conn.execute(
-                "UPDATE rca_activation_epochs "
-                "SET preauthorization_fingerprint = ? WHERE is_current = 1",
-                (original_hidden_fingerprint,),
+                "UPDATE rca_activation_transition_audit "
+                "SET binding_fingerprint = ? WHERE audit_id = ("
+                "SELECT MAX(audit.audit_id) "
+                "FROM rca_activation_transition_audit AS audit "
+                "JOIN rca_activation_epochs AS epoch "
+                "ON epoch.epoch_id = audit.epoch_id WHERE epoch.is_current = 1"
+                ")",
+                (original_binding_fingerprint,),
             )
     assert provider_calls == []
     with sqlite3.connect(control.db_path) as conn:
@@ -3440,9 +3565,11 @@ def test_profile_terminal_provider_claim_rechecks_lease_target_and_epoch(tmp_pat
         )
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
-            "UPDATE rca_activation_epochs SET state='aborted' "
+            "UPDATE rca_activation_epochs "
+            "SET state='retired', is_current=0, "
+            "retired_at=COALESCE(retired_at, updated_at) "
             "WHERE epoch_id=? AND is_current=1",
-            (epoch["epoch_id"],),
+            (binding["epoch_id"],),
         )
     with pytest.raises(
         ExternalWriteFenceError,

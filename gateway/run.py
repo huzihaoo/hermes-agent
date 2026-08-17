@@ -2519,6 +2519,7 @@ def _admit_g1q3_manual_trigger(
         store = RcaControlStore(
             _g1q3_rca_control_db_path(),
             require_current=True,
+            allow_successor_write=True,
         )
     except (OSError, RuntimeError, sqlite3.Error) as exc:
         raise ManualRcaAdmissionError("manual_control_store_unavailable") from exc

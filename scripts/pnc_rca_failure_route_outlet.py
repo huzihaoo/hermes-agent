@@ -1185,8 +1185,13 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        outlet = FailureRouteOutlet(
+        route_store = RcaDeliveryStore(
             args.delivery_db,
+            require_current=True,
+            allow_successor_write=True,
+        )
+        outlet = FailureRouteOutlet(
+            route_store,
             args.outlet_root,
             lease_owner=args.lease_owner,
         )

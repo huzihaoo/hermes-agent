@@ -400,7 +400,11 @@ def _canonical_store():
     from gateway.pnc_rca_control_store import RcaControlStore
     from gateway.run import _g1q3_rca_control_db_path
 
-    return RcaControlStore(_g1q3_rca_control_db_path(), require_current=True)
+    return RcaControlStore(
+        _g1q3_rca_control_db_path(),
+        require_current=True,
+        allow_successor_write=True,
+    )
 
 
 def write_fence_claim_for_submission(
@@ -516,6 +520,7 @@ def _profile_terminal_effect_binding(
             store.db_path,
             require_current=True,
             ensure_current_rows=False,
+            allow_successor_write=True,
         )
         live = delivery_store.validate_profile_terminal_external_write_binding(
             effect_key=authority.get("effect_key"),
@@ -583,6 +588,7 @@ def _terminal_rerun_effect_binding(
             store.db_path,
             require_current=True,
             ensure_current_rows=False,
+            allow_successor_write=True,
         )
         live = delivery_store.validate_terminal_rerun_external_write_binding(
             effect_key=authority.get("effect_key"),

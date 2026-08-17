@@ -141,7 +141,9 @@ def _handle_owner_review_message(
         )
         try:
             adjudication_store = RcaDeliveryStore(
-                control_db_path, require_current=True
+                control_db_path,
+                require_current=True,
+                allow_successor_write=True,
             )
             adjudication_result = adjudication_store.record_conclusion_adjudication(
                 work_item_id=issue_id,
@@ -245,7 +247,11 @@ def _handle_review_queue(*, hermes_home: Path) -> OwnerReviewResult:
         / "control.sqlite3"
     )
     try:
-        store = RcaDeliveryStore(control_db_path, require_current=True)
+        store = RcaDeliveryStore(
+            control_db_path,
+            require_current=True,
+            allow_successor_write=True,
+        )
         items = store.list_conclusion_review_queue(limit=10)
     except Exception as exc:
         return OwnerReviewResult(
@@ -368,7 +374,11 @@ def resolve_candidate_conclusion_review(
         / "control.sqlite3"
     )
     now = datetime.now(timezone.utc)
-    store = RcaDeliveryStore(control_db_path, require_current=True)
+    store = RcaDeliveryStore(
+        control_db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
     normalized_reason = str(reason or "").strip()
     normalized_source = _source_record(event)
     if candidate_bindings is None:

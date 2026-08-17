@@ -36,7 +36,13 @@ RESIDENT_ACTIVATION_EPOCH_STATES = frozenset({"steady_active"})
 RESIDENT_INGRESS_OPEN_STATES = RESIDENT_ACTIVATION_EPOCH_STATES
 RESIDENT_EXTERNAL_WRITE_STATES = RESIDENT_ACTIVATION_EPOCH_STATES
 MINIMAL_RELEASE_NOTE_SCHEMA_VERSION = "pnc_rca_minimal_release_note_v2"
-MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION = "pnc_rca_control_store_v14"
+MINIMAL_RELEASE_CONTROL_SCHEMA_V14 = "pnc_rca_control_store_v14"
+MINIMAL_RELEASE_CONTROL_SCHEMA_V15 = "pnc_rca_control_store_v15"
+MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION = MINIMAL_RELEASE_CONTROL_SCHEMA_V15
+MINIMAL_RELEASE_CONTROL_SCHEMA_TRANSITIONS = frozenset({
+    (MINIMAL_RELEASE_CONTROL_SCHEMA_V14, MINIMAL_RELEASE_CONTROL_SCHEMA_V15),
+    (MINIMAL_RELEASE_CONTROL_SCHEMA_V15, MINIMAL_RELEASE_CONTROL_SCHEMA_V15),
+})
 MINIMAL_RELEASE_EPOCH_CONTRACT_SCHEMA_VERSION = (
     "pnc_rca_minimal_release_epoch_contract_v1"
 )
@@ -231,10 +237,11 @@ def validate_minimal_release_activation_contract(value: object) -> dict[str, Any
             "minimal_release_note_contract_invalid"
         ) from exc
     if (
-        activation.get("expected_control_schema_version")
-        != MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
-        or activation.get("target_control_schema_version")
-        != MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
+        (
+            activation.get("expected_control_schema_version"),
+            activation.get("target_control_schema_version"),
+        )
+        not in MINIMAL_RELEASE_CONTROL_SCHEMA_TRANSITIONS
         or not isinstance(db_identity, Mapping)
         or not db_identity
         or len(db_identity_raw) > 4096
@@ -289,7 +296,7 @@ def _require_resident_control_schema(store: Any) -> dict[str, Any]:
         or capability.get("binary_write_schema_version")
         != MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION
     ):
-        raise ExternalWriteFenceError("resident_control_schema_not_v14")
+        raise ExternalWriteFenceError("resident_control_schema_not_v15")
     write_flags = tuple(
         capability[field]
         for field in (
@@ -1366,6 +1373,9 @@ def issue_snapshot_write_fence(
 
 __all__ = [
     "ExternalWriteFenceError",
+    "MINIMAL_RELEASE_CONTROL_SCHEMA_TRANSITIONS",
+    "MINIMAL_RELEASE_CONTROL_SCHEMA_V14",
+    "MINIMAL_RELEASE_CONTROL_SCHEMA_V15",
     "MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION",
     "MINIMAL_RELEASE_EPOCH_CONTRACT_SCHEMA_VERSION",
     "MINIMAL_RELEASE_HOST_REMOTE",

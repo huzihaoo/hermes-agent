@@ -28,7 +28,7 @@ git@git.minieye.tech:planning_algo/hermes.git
 exact GitLab branch/tag/commit/tree
 + owner-only minimal release note
 + immutable runtime
-+ direct steady ControlStore epoch
++ atomic ControlStore v14-to-v15 cutover and steady successor
 + four-face restart/readback
 + one transport canary
 ```
@@ -83,7 +83,7 @@ cd "$REPO_ROOT"
   --env-output "$ENV_SOURCE"
 ```
 
-`prepare` 不接收 commit/tree/tag object、report SHA、partition offset 或 candidate hash。它从 GitLab exact branch/tag 派生三面 commit/tree/tag object，通过固定的 `~/.local/bin/ssh-mini-agent` 只读稳定 VM report manifest 并绑定原始 SHA，从只读 ControlStore snapshot 派生数据库 identity、predecessor 和 partition fence，再从当前 live env/manifest 模板生成候选投影。`operator_issue_only_v1` 默认不启用 Kafka，因此 fence 可以为空；只有明确启用 Kafka 的后续 profile 才传 `--partition-topic TOPIC=PARTITION`。发布前会再次读回 GitLab、Host runtime 和 report manifest；任一漂移时不创建输出。
+`prepare` 不接收 commit/tree/tag object、report SHA、partition offset 或 candidate hash。它从 GitLab exact branch/tag 派生三面 commit/tree/tag object，通过固定的 `~/.local/bin/ssh-mini-agent` 只读稳定 VM report manifest 并绑定原始 SHA，从只读 ControlStore snapshot 派生数据库 identity、v14 predecessor、partition fence 和 v14-to-v15 epoch contract，再从当前 live env/manifest 模板生成候选投影。`operator_issue_only_v1` 默认不启用 Kafka，因此 fence 可以为空；只有明确启用 Kafka 的后续 profile 才传 `--partition-topic TOPIC=PARTITION`。发布前会再次读回 GitLab、Host runtime 和 report manifest；任一漂移时不创建输出。当前 driver 只生成 exact v14-to-v15 cutover note；已有 v15 只允许同一 successor 的幂等读回，不能用它创建另一个 v15 epoch。
 
 三个输出使用 `0600`、`O_EXCL` 和 fsync；任一输出已存在时拒绝覆盖。`prepare` 的 `templates` 给出 plan 所需的 live expected SHA，`outputs` 给出 candidate SHA：
 
@@ -113,7 +113,7 @@ Plan 必须同时证明：
 - commit/tree 与 immutable Host runtime 完全一致且 tree clean；
 - worker、pipeline、report service identity 完整；
 - manifest/env 字节与 note projection 一致；
-- current/predecessor epoch 允许一次 direct steady 切换；
+- current v14 predecessor、transition audit、零 inflight 和 partition fence 精确匹配 note 中的 v14-to-v15 epoch contract；
 - resident 当前状态可读。
 
 任一项不一致时修正源输入或 release note 后重新 plan，不修改 production runtime 来迎合 note。
@@ -133,7 +133,9 @@ Apply 是生产变更，只能由明确操作者在 plan 输入未变化后执�
   --receipt "$APPLY_RECEIPT"
 ```
 
-Apply 在同一个 release lock 下执行完整切换：先写 `started` receipt，再停止六个 resident；持久 enable 四个 required resident、disable Kafka consumer 与 completion relay并读回；随后以 exact expected hash 安装 live manifest/env、原子切换 direct steady epoch、启动四个 required resident；最后再次读回 GitLab/runtime/live projection/epoch/PID/cwd/entrypoint/health/release binding，原 inode 收敛为 completed receipt。任一步失败都保持六面全停并写 failed receipt；activation 前失败恢复 manifest/env，activation 后不伪造 epoch 回滚，只允许修复后 forward apply。
+Apply 在同一个 release lock 下执行完整切换：先以 `activation_outcome=unknown` 写并 fsync `started` receipt，再停止六个 resident；持久 enable 四个 required resident、disable Kafka consumer 与 completion relay并读回；随后以 exact expected hash 安装 live manifest/env，并在一个 SQLite `BEGIN IMMEDIATE` 事务内校验 v14 predecessor/audit/inflight/fence、重建 v15 activation schema、激活唯一 steady successor，最后才 CAS schema marker。迁移 outcome 会立即 checkpoint 到同一个 receipt inode；只有独立探针证明 `committed` 后才启动四个 required resident。最后再次读回 GitLab/runtime/live projection/v15 epoch/PID/cwd/entrypoint/health/release binding，原 inode 收敛为 completed receipt。
+
+失败语义按迁移 outcome 分层：`not_committed` 才允许恢复 manifest/env；`committed` 必须保留 v15 artifact、保持六面全停并走 successor-read-only 或 forward fix；`unknown` 同样保持 artifact 和六面全停，必须人工裁决，禁止猜测并回滚 SQLite。任何路径都不伪造 epoch 回滚。迁移提交后，旧 v14 writer binary 不再是自动回滚目标。
 
 `operator_issue_only_v1` 要求运行：
 
@@ -232,15 +234,15 @@ RCA resident 的生存和版本证据只由 `pnc_rca_minimal_release.py` 的 rea
 
 生产机上的历史 label、plist 和 `runtime/governance-tools/watcher-staleness-watchdog.sh` 不随候选代码删除。只有在新 release 的 completed apply receipt、resident readback 和 transport canary 全部通过后，才能在单独的生产审批中执行 `launchctl bootout` 和 live 文件退役；随后至少跨过两个旧 `StartInterval` 窗口，确认旧日志不再增长，并再次运行 minimal `verify`。候选代码审查、测试或 GitLab push 均不得执行这些 live 动作。
 
-## 10. 回滚
+## 10. 失败恢复与回滚上限
 
-回滚也使用同一个最小流程：
+先读取 apply receipt 的 `activation_outcome` 和 `rollback_ceiling`，不得只根据 CLI 退出码判断：
 
-1. 选择已审定的 predecessor GitLab tag/commit/tree 和 immutable runtime。
-2. 使用预先准备的 predecessor release note、manifest/env 与新的 direct steady epoch。
-3. 重新执行 `plan`、明确生产 apply、四面 restart/readback、一个 transport canary 和 `verify`。
+1. `not_committed / artifact_restore_permitted`：确认独立 outcome probe 仍证明完整 v14 preimage 后，才允许恢复本次 manifest/env preimage。
+2. `committed / successor_read_only_or_forward_fix`：保留 v15 DB 和 candidate artifact，保持六个 resident 全停；修复 v15 binary 后执行 forward apply 和完整 readback，禁止启动 v14 writer。
+3. `unknown / operator_adjudication_required`：保持六个 resident 全停且不替换 artifact，由操作者使用同一 note 的只读 outcome probe 裁决；不得把 unknown 当作 not committed。
 
-禁止原地修改当前 runtime、手工拼 binding、复活旧 epoch、直接改 SQLite 或绕过 canary。历史任务和 delivery effect 保持不可变；确需业务重试时创建新 generation。
+当前 driver 不提供 v15-to-v14 schema 回滚，也不允许用同一 note 创建另一个 v15 epoch。未来 v15 release 或回滚必须使用另行审定的 v15-aware 合同。禁止原地修改 runtime、手工拼 binding、复活旧 epoch、直接改 SQLite 或绕过 canary。历史任务和 delivery effect 保持不可变；确需业务重试时创建新 generation。
 
 ## 11. 定向验证
 

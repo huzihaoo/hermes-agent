@@ -45,6 +45,10 @@ from scripts.pnc_rca_conclusion_adjudication_audit import (
     EXPECTED_DELIVERY_STORE_SCHEMA_VERSION,
     audit_conclusion_adjudications,
 )
+from tests.gateway.test_pnc_rca_control_store import (
+    _direct_steady_contract,
+    _migration_apply_kwargs,
+)
 
 
 # These hand-built delivery rows model the pre-W5 historical corpus.  New
@@ -62,6 +66,7 @@ def _seed_published_conclusion(
     submission_key: str | None = None,
     business_key: str | None = None,
     generation: int = 7,
+    successor_write: bool = False,
 ) -> RcaDeliveryStore:
     if store is None:
         db_path = tmp_path / "control.sqlite3"
@@ -77,7 +82,27 @@ def _seed_published_conclusion(
             reason="activate steady conclusion adjudication test runtime",
             now=NOW,
         )
-        store = RcaDeliveryStore(db_path)
+        if successor_write:
+            RcaDeliveryStore(db_path)
+            predecessor = control.direct_steady_predecessor()
+            assert predecessor is not None
+            contract = _direct_steady_contract(
+                predecessor=predecessor,
+                epoch_id="epoch-owner-review-v15",
+            )
+            RcaControlStore.migrate_v14_to_v15_and_activate(
+                db_path,
+                **_migration_apply_kwargs(contract),
+            )
+            store = RcaDeliveryStore(
+                db_path,
+                require_current=True,
+                allow_successor_write=True,
+            )
+        else:
+            store = RcaDeliveryStore(db_path)
+    else:
+        assert successor_write is False
     current = NOW.isoformat()
     delivery_id = "g1q3-rca-delivery-v1-" + "2" * 64
     submission_key = submission_key or ("g1q3-rca-s1-" + "3" * 64)
@@ -840,7 +865,7 @@ def test_owner_group_batch_recognition_closes_five_item_queue(
         / "feishu_issue_kafka_rca"
     )
     control_dir.mkdir(parents=True)
-    store = _seed_published_conclusion(control_dir)
+    store = _seed_published_conclusion(control_dir, successor_write=True)
     issue_ids = (ISSUE_ID, "7054691975", "7054691976", "7054691977", "7054691978")
     for issue_id in issue_ids[1:]:
         _add_published_conclusion(store, issue_id)
@@ -899,7 +924,7 @@ def test_owner_group_correction_alias_reuses_medium_only_retraction(
         / "feishu_issue_kafka_rca"
     )
     control_dir.mkdir(parents=True)
-    store = _seed_published_conclusion(control_dir)
+    store = _seed_published_conclusion(control_dir, successor_write=True)
     monkeypatch.setenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", "ou_owner")
 
     result = handle_owner_review_message(
@@ -2326,7 +2351,7 @@ def test_owner_review_retract_command_uses_shared_adjudication_entrypoint(
         tmp_path / "runtime" / "pnc_agent" / "feishu_issue_kafka_rca"
     )
     db_parent.mkdir(parents=True)
-    store = _seed_published_conclusion(db_parent)
+    store = _seed_published_conclusion(db_parent, successor_write=True)
     monkeypatch.setenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", "ou_owner")
     event = MessageEvent(
         text=f"rca 撤回 {ISSUE_ID} evaluator 归属有误",
@@ -2906,7 +2931,7 @@ def test_owner_command_failure_after_enqueue_is_consumed_not_fallen_through(
         tmp_path / "runtime" / "pnc_agent" / "feishu_issue_kafka_rca"
     )
     db_parent.mkdir(parents=True)
-    store = _seed_published_conclusion(db_parent)
+    store = _seed_published_conclusion(db_parent, successor_write=True)
     monkeypatch.setenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", "ou_owner")
 
     def injected_ledger_failure(**_kwargs):
@@ -2952,7 +2977,7 @@ def test_owner_command_retry_repairs_postcommit_artifacts_once(
         tmp_path / "runtime" / "pnc_agent" / "feishu_issue_kafka_rca"
     )
     db_parent.mkdir(parents=True)
-    store = _seed_published_conclusion(db_parent)
+    store = _seed_published_conclusion(db_parent, successor_write=True)
     monkeypatch.setenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", "ou_owner")
     real_write_sidecar = owner_review_module._write_business_state_sidecar
     calls = 0

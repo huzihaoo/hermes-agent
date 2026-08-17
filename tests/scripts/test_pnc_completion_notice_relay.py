@@ -12,6 +12,10 @@ from gateway.record_only import runtime
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from scripts import pnc_completion_notice_relay
 from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path, foxglove_url
+from tests.gateway.test_pnc_rca_delivery_store import (
+    _physical_v15_delivery_fixture,
+    _sqlite_storage_identity,
+)
 
 
 def _write_sidecar(tmp_path, task_id="task-1", *, send_status="pending"):
@@ -358,8 +362,8 @@ def test_fenced_one_shot_relay_never_uses_send_message_tool(monkeypatch):
 
 def _relay_current_write_capability():
     return {
-        "observed_control_schema_version": "pnc_rca_control_store_v14",
-        "binary_write_schema_version": "pnc_rca_control_store_v14",
+        "observed_control_schema_version": "pnc_rca_control_store_v15",
+        "binary_write_schema_version": "pnc_rca_control_store_v15",
         "mode": "current_write",
         "read_supported": True,
         "write_enabled": True,
@@ -447,11 +451,11 @@ def test_relay_live_fence_binding_requires_direct_steady_epoch(
         {**_relay_current_write_capability(), "unknown": True},
         {
             **_relay_current_write_capability(),
-            "observed_control_schema_version": "pnc_rca_control_store_v15",
+            "observed_control_schema_version": "pnc_rca_control_store_v14",
         },
         {
             **_relay_current_write_capability(),
-            "binary_write_schema_version": "pnc_rca_control_store_v15",
+            "binary_write_schema_version": "pnc_rca_control_store_v14",
         },
         {**_relay_current_write_capability(), "mode": "successor_read_only"},
         {**_relay_current_write_capability(), "read_supported": 1},
@@ -534,6 +538,61 @@ def test_relay_capability_rejects_partial_unknown_v15_and_type_pollution_before_
     assert binding_calls == []
     assert fence_calls == []
     assert provider_calls == []
+
+
+def test_real_v15_completion_relay_main_is_structured_red_before_mutation_or_provider(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    db_path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    sidecar = _write_sidecar(tmp_path, "g1q3-rca-v15-relay-red")
+    before_db = _sqlite_storage_identity(db_path)
+    before_sidecar = sidecar.read_bytes()
+
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "_relay_control_db_path",
+        lambda: db_path,
+    )
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "relay_pending_notices",
+        lambda **_kwargs: pytest.fail("relay scan must remain blocked on v15"),
+    )
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "watch_pending_notices",
+        lambda **_kwargs: pytest.fail("relay watch must remain blocked on v15"),
+    )
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "FeishuHotSender",
+        lambda *_args, **_kwargs: pytest.fail(
+            "provider construction must remain blocked on v15"
+        ),
+    )
+
+    assert pnc_completion_notice_relay.main([
+        "--send",
+        "--json",
+        "--no-lock",
+        "--task-id",
+        "g1q3-rca-v15-relay-red",
+    ]) == 2
+
+    result = json.loads(capsys.readouterr().out)
+    assert result == {
+        "candidate_count": 0,
+        "dry_run": False,
+        "error": "external_write_fence_schema_read_only",
+        "errors": ["external_write_fence_schema_read_only"],
+        "ok": False,
+        "rows": [],
+        "sent_count": 0,
+    }
+    assert _sqlite_storage_identity(db_path) == before_db
+    assert sidecar.read_bytes() == before_sidecar
 
 
 def test_l4_sealed_clock_and_business_timestamp_format_are_idempotent(monkeypatch):

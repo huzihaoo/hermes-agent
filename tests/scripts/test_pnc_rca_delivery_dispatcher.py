@@ -71,8 +71,9 @@ from tests.gateway.test_pnc_rca_delivery_store import (
     _current_epoch_valid_w3_quarantined_control,
     _insert_subscription,
     _physical_v15_delivery_fixture,
+    _policy,
+    _record,
     _sqlite_storage_identity,
-    _switch_activation_epoch,
 )
 from tests.gateway.test_pnc_rca_delivery_contract import (
     _add_structural_candidate,
@@ -80,6 +81,7 @@ from tests.gateway.test_pnc_rca_delivery_contract import (
     _consumer_capability,
     _focus_payload,
 )
+from tests.gateway.test_pnc_rca_control_store import _migrate_v14_fixture_to_v15
 from tests.gateway.test_pnc_rca_write_fence import _release_note
 from gateway.pnc_rca_issue_focus import ANALYSIS_INSUFFICIENT_STATEMENT
 
@@ -140,6 +142,167 @@ def _set_live_release_environment(monkeypatch, fixture):
     monkeypatch.setenv("PNC_LIVE_RUNTIME_COMMIT", fixture.runtime_commit)
     monkeypatch.setenv("PNC_LIVE_RUNTIME_TREE", fixture.runtime_tree)
     monkeypatch.setenv("PNC_LIVE_MANIFEST_SHA256", fixture.manifest_sha256)
+
+
+def _open_v15_delivery_store(db_path):
+    return RcaDeliveryStore(
+        db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+
+
+def _migrate_delivery_fixture_store(store):
+    _migrate_v14_fixture_to_v15(store.db_path)
+    return _open_v15_delivery_store(store.db_path)
+
+
+def _new_v15_delivery_store(db_path):
+    control = RcaControlStore(db_path)
+    _activate_direct_steady(control)
+    legacy_store = RcaDeliveryStore(db_path)
+    return _migrate_delivery_fixture_store(legacy_store)
+
+
+def _control_v15(
+    tmp_path,
+    *,
+    completed: bool = True,
+    offset: int = 10,
+    issue_id: int = 7041712812,
+):
+    path = tmp_path / "control.sqlite3"
+    legacy_control = RcaControlStore(path)
+    _activate_direct_steady(legacy_control)
+    RcaDeliveryStore(path)
+    _migrate_v14_fixture_to_v15(
+        path,
+        successor_epoch_id="delivery-epoch-v15",
+    )
+    control = RcaControlStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    result = control.ingest_record(
+        _record(offset=offset, issue_id=issue_id),
+        policy=_policy(),
+        submit_enabled=True,
+        activation_required=True,
+    )
+    if completed:
+        claim = control.claim_outbox(lease_owner="submission-worker", now=NOW)
+        assert claim is not None
+        control.complete_outbox(
+            outbox_id=claim.outbox_id,
+            lease_token=claim.lease_token,
+            result={
+                "success": True,
+                "submission_key": result.submission_key,
+                "task_id": result.submission_key,
+                "task_state": "submitted",
+                "deduped": False,
+            },
+            now=NOW,
+        )
+    return control, result
+
+
+def _switch_v15_activation_epoch(control, *, old_epoch, new_epoch):
+    switched_at = (NOW + timedelta(seconds=1)).isoformat()
+    with sqlite3.connect(control.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT * FROM rca_activation_epochs "
+            "WHERE epoch_id = ? AND is_current = 1",
+            (old_epoch,),
+        ).fetchone()
+        assert current is not None
+        retired = conn.execute(
+            "UPDATE rca_activation_epochs SET state = 'retired', is_current = 0, "
+            "updated_at = ?, retired_at = ? "
+            "WHERE epoch_id = ? AND state = 'steady_active' AND is_current = 1",
+            (switched_at, switched_at, old_epoch),
+        )
+        assert retired.rowcount == 1
+        retired_epoch = conn.execute(
+            "SELECT * FROM rca_activation_epochs WHERE epoch_id = ?",
+            (old_epoch,),
+        ).fetchone()
+        assert retired_epoch is not None
+        RcaControlStore._insert_activation_transition_audit_tx(
+            conn,
+            epoch=retired_epoch,
+            from_state="steady_active",
+            to_state="retired",
+            operator="dispatcher-test",
+            reason="simulate a v15 release epoch switch",
+            transitioned_at=switched_at,
+            schema_version="pnc_rca_control_store_v15",
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_activation_epochs(
+                epoch_id, state, is_current,
+                release_fingerprint_sha256, release_note_sha256,
+                config_sha256, db_logical_identity_json,
+                db_logical_identity_sha256, partition_start_fence_json,
+                partition_start_fence_sha256, created_at, updated_at,
+                activated_at, retired_at
+            ) VALUES (?, 'steady_active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                new_epoch,
+                "d" * 64,
+                "e" * 64,
+                "f" * 64,
+                current["db_logical_identity_json"],
+                current["db_logical_identity_sha256"],
+                current["partition_start_fence_json"],
+                current["partition_start_fence_sha256"],
+                switched_at,
+                switched_at,
+                switched_at,
+            ),
+        )
+        successor = conn.execute(
+            "SELECT * FROM rca_activation_epochs "
+            "WHERE epoch_id = ? AND is_current = 1",
+            (new_epoch,),
+        ).fetchone()
+        assert successor is not None
+        RcaControlStore._insert_activation_transition_audit_tx(
+            conn,
+            epoch=successor,
+            from_state="direct_release",
+            to_state="steady_active",
+            operator="dispatcher-test",
+            reason="simulate a v15 release epoch switch",
+            transitioned_at=switched_at,
+            schema_version="pnc_rca_control_store_v15",
+        )
+        RcaControlStore._validate_current_activation_binding_tx(
+            conn,
+            schema_version="pnc_rca_control_store_v15",
+        )
+        conn.commit()
+
+
+def _dispatcher_fixture_store(db_path):
+    path = Path(db_path)
+    if path.is_file():
+        uri = f"{path.resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as conn:
+            row = conn.execute(
+                "SELECT value FROM control_meta WHERE key = 'schema_version'"
+            ).fetchone()
+        if row is not None and row[0] == "pnc_rca_control_store_v15":
+            return _open_v15_delivery_store(path)
+    return RcaDeliveryStore(path)
+
+
 REAL_G1Q3_PROJECT_KEY = "68ef617fb371dc80a10641f7"
 REAL_G1Q3_PROJECT_SIMPLE_NAME = "t03o4q"
 
@@ -249,8 +412,14 @@ def test_enabled_resident_without_epoch_exits_before_provider_creation(
     capsys,
 ):
     config = _config(tmp_path, enabled=True)
-    control = RcaControlStore(config.control_db_path)
-    delivery = RcaDeliveryStore(config.control_db_path)
+    path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    delivery = _open_v15_delivery_store(path)
+    with sqlite3.connect(path) as conn:
+        retired = conn.execute(
+            "UPDATE rca_activation_epochs SET state = 'retired', is_current = 0, "
+            "retired_at = updated_at WHERE is_current = 1"
+        )
+    assert retired.rowcount == 1
     provider_created = False
 
     def unexpected_provider(*_args, **_kwargs):
@@ -279,7 +448,7 @@ def test_enabled_resident_without_epoch_exits_before_provider_creation(
 def _successor_read_only_capability() -> dict[str, object]:
     return {
         "observed_control_schema_version": "pnc_rca_control_store_v15",
-        "binary_write_schema_version": "pnc_rca_control_store_v14",
+        "binary_write_schema_version": "pnc_rca_control_store_v15",
         "mode": "successor_read_only",
         "read_supported": True,
         "write_enabled": False,
@@ -353,7 +522,8 @@ def test_successor_read_only_dispatcher_writes_health_without_provider_or_claim(
     assert calls[0][0] == "store"
     assert calls[0][1].get("read_only", False) is False
     assert calls[0][1]["ensure_current_rows"] is False
-    assert calls[0][1]["allow_successor_read_only"] is True
+    assert calls[0][1].get("allow_successor_read_only", False) is False
+    assert calls[0][1]["allow_successor_write"] is True
     assert calls[1] == (
         "health",
         {"activation_required": config.activation_required},
@@ -377,7 +547,7 @@ def test_successor_read_only_dispatcher_writes_health_without_provider_or_claim(
     assert observed["liveness_ok"] is True
 
 
-def test_real_v15_dispatcher_preserves_db_wal_shm_without_provider_or_claim(
+def test_real_v15_dispatcher_dry_run_preserves_db_wal_shm_without_provider_or_claim(
     tmp_path,
     monkeypatch,
 ):
@@ -425,21 +595,13 @@ def test_real_v15_dispatcher_preserves_db_wal_shm_without_provider_or_claim(
     )
 
     try:
-        assert dispatcher_module.main(["--once"]) == 0
+        assert dispatcher_module.main(["--dry-run"]) == 2
         after = _sqlite_storage_identity(path)
         assert after["db"] == before["db"]
         assert after["-wal"] == before["-wal"]
         assert (after["-shm"] is None) is (before["-shm"] is None)
     finally:
         wal_writer.close()
-
-    payload = json.loads(config.health_path.read_text(encoding="utf-8"))
-    assert payload["mode"] == "successor_read_only"
-    assert payload["ok"] is False
-    assert payload["process_healthy"] is True
-    assert payload["ready"] is False
-    assert payload["processing"] is False
-
 
 @pytest.mark.parametrize("mode", ["check_config", "dry_run"])
 def test_successor_read_only_dispatcher_diagnostics_do_not_create_provider(
@@ -496,9 +658,15 @@ def test_successor_read_only_dispatcher_diagnostics_do_not_create_provider(
     assert "preview" not in calls
     [store_call] = calls
     assert store_call[0] == "store"
-    assert store_call[1]["read_only"] is True
     assert store_call[1]["ensure_current_rows"] is False
-    assert store_call[1]["allow_successor_read_only"] is True
+    if mode == "check_config":
+        assert store_call[1].get("read_only", False) is False
+        assert store_call[1].get("allow_successor_read_only", False) is False
+        assert store_call[1]["allow_successor_write"] is True
+    else:
+        assert store_call[1]["read_only"] is True
+        assert store_call[1]["allow_successor_read_only"] is True
+        assert store_call[1]["allow_successor_write"] is False
 
 
 def test_disabled_dispatcher_check_config_does_not_probe_existing_control_db(
@@ -535,6 +703,14 @@ def test_enabled_startup_locks_minimal_release_before_writable_store_and_provide
     _bind_activation_execution(control, result, state="steady_active")
     RcaDeliveryStore(control.db_path)
     _bind_minimal_release(control, fixture)
+    migration = _migrate_v14_fixture_to_v15(
+        control.db_path,
+        successor_epoch_id=fixture.note["activation"]["epoch_id"],
+        successor_release_fingerprint_sha256=fixture.fingerprint,
+        successor_release_note_sha256=fixture.epoch["release_note_sha256"],
+        successor_config_sha256=fixture.env_sha256,
+    )
+    fixture.epoch["epoch_id"] = migration["successor_epoch_id"]
     _set_live_release_environment(monkeypatch, fixture)
     wal_writer = sqlite3.connect(control.db_path)
     assert wal_writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
@@ -658,8 +834,22 @@ def test_dispatcher_epoch_switch_rejects_claim_and_provider_boundaries(
     fixture = _release_note(tmp_path)
     control, result = _control(tmp_path, db_path=fixture.control_db_path)
     _bind_activation_execution(control, result, state="steady_active")
-    store = RcaDeliveryStore(control.db_path)
+    RcaDeliveryStore(control.db_path)
     _bind_minimal_release(control, fixture)
+    migration = _migrate_v14_fixture_to_v15(
+        control.db_path,
+        successor_epoch_id=fixture.note["activation"]["epoch_id"],
+        successor_release_fingerprint_sha256=fixture.fingerprint,
+        successor_release_note_sha256=fixture.epoch["release_note_sha256"],
+        successor_config_sha256=fixture.env_sha256,
+    )
+    fixture.epoch["epoch_id"] = migration["successor_epoch_id"]
+    control = RcaControlStore(
+        control.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    store = _open_v15_delivery_store(control.db_path)
     _set_live_release_environment(monkeypatch, fixture)
     binding = dispatcher_module.validate_bound_resident_release(
         store,
@@ -697,10 +887,12 @@ def test_dispatcher_epoch_switch_rejects_claim_and_provider_boundaries(
         report_verifier=provider,
         now=lambda: NOW,
     )
-    assert dispatcher._validate_runtime_release()["epoch_id"] == "delivery-epoch-1"
-    _switch_activation_epoch(
+    assert dispatcher._validate_runtime_release()["epoch_id"] == fixture.epoch[
+        "epoch_id"
+    ]
+    _switch_v15_activation_epoch(
         control,
-        old_epoch="delivery-epoch-1",
+        old_epoch=fixture.epoch["epoch_id"],
         new_epoch="delivery-epoch-2",
     )
     if boundary == "claim":
@@ -931,8 +1123,7 @@ def test_clear_circuit_cli_plans_then_applies_without_claiming_effects(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="operator_test_open",
@@ -1012,8 +1203,7 @@ def test_clear_circuit_rejects_binding_drift_before_mutation(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="operator_test_open",
@@ -1069,8 +1259,7 @@ def test_clear_circuit_rejects_config_drift_before_mutation(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="operator_test_open",
@@ -1125,8 +1314,7 @@ def test_clear_circuit_rejects_exact_before_state_drift(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="first-open",
@@ -1182,8 +1370,7 @@ def test_clear_circuit_rejects_destination_drift_from_reviewed_plan(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="operator_test_open",
@@ -1234,8 +1421,7 @@ def test_clear_circuit_parent_swap_is_rejected_before_receipt_write(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="operator_test_open",
@@ -1319,8 +1505,7 @@ def test_clear_circuit_receipt_materialization_failure_is_recoverable(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="operator_test_open",
@@ -1403,8 +1588,7 @@ def test_clear_circuit_requires_governed_inputs_and_leaves_open_state(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="operator_test_open",
@@ -1424,8 +1608,7 @@ def test_reset_plan_and_missing_recovery_are_read_only_without_card_row(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="operator_test_open",
@@ -1548,7 +1731,7 @@ def _collector(
         hermes_home=tmp_path,
     )
     return DeliveryCollector(
-        store=RcaDeliveryStore(tmp_path / "control.sqlite3"),
+        store=_dispatcher_fixture_store(tmp_path / "control.sqlite3"),
         config=config,
         status_reader=status_reader
         or (
@@ -1579,13 +1762,18 @@ def _collector(
 
 
 def _seed(tmp_path, *, bundle_payload=None):
-    control, result = _control(tmp_path)
+    control, result = _control_v15(tmp_path)
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
             "UPDATE business_triggers SET created_at = ? WHERE submission_key = ?",
             (NOW.isoformat(), result.submission_key),
         )
-    _bind_activation_execution(control, result, state="steady_active")
+    _bind_activation_execution(
+        control,
+        result,
+        epoch_id="delivery-epoch-v15",
+        state="steady_active",
+    )
     collector = _collector(
         tmp_path,
         bundle_reader=(
@@ -1597,15 +1785,20 @@ def _seed(tmp_path, *, bundle_payload=None):
 
 
 def _seed_with_thread_subscription(tmp_path, *, bundle_payload=None):
-    control, result = _control(tmp_path)
+    control, result = _control_v15(tmp_path)
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
             "UPDATE business_triggers SET created_at = ? WHERE submission_key = ?",
             (NOW.isoformat(), result.submission_key),
         )
-    _bind_activation_execution(control, result, state="steady_active")
+    _bind_activation_execution(
+        control,
+        result,
+        epoch_id="delivery-epoch-v15",
+        state="steady_active",
+    )
     trigger = control.list_rows("business_triggers")[0]
-    store = RcaDeliveryStore(tmp_path / "control.sqlite3")
+    store = _dispatcher_fixture_store(tmp_path / "control.sqlite3")
     _insert_subscription(
         store,
         SimpleNamespace(
@@ -1635,14 +1828,19 @@ def _seed_terminal(tmp_path, *, with_thread: bool = False):
     rows that were already materialized before that policy existed, without
     asserting that the current collector may create them.
     """
-    control, result = _control(tmp_path)
+    control, result = _control_v15(tmp_path)
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
             "UPDATE business_triggers SET created_at = ? WHERE submission_key = ?",
             (NOW.isoformat(), result.submission_key),
         )
-    _bind_activation_execution(control, result, state="steady_active")
-    store = RcaDeliveryStore(tmp_path / "control.sqlite3")
+    _bind_activation_execution(
+        control,
+        result,
+        epoch_id="delivery-epoch-v15",
+        state="steady_active",
+    )
+    store = _dispatcher_fixture_store(tmp_path / "control.sqlite3")
     if with_thread:
         trigger = control.list_rows("business_triggers")[0]
         _insert_subscription(
@@ -1683,8 +1881,19 @@ def _seed_profile_terminal(tmp_path, *, split_project_identity: bool = False):
         _profile_snapshot_record,
     )
 
-    control = RcaControlStore(tmp_path / "control.sqlite3")
-    _activate_direct_steady(control, start_offset=20)
+    path = tmp_path / "control.sqlite3"
+    legacy_control = RcaControlStore(path)
+    _activate_direct_steady(legacy_control, start_offset=20)
+    RcaDeliveryStore(path)
+    _migrate_v14_fixture_to_v15(
+        path,
+        successor_epoch_id="profile-delivery-epoch-v15",
+    )
+    control = RcaControlStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
     policy = _profile_snapshot_policy()
     record = _profile_snapshot_record(20, "7019637554")
     if split_project_identity:
@@ -1724,7 +1933,7 @@ def _seed_profile_terminal(tmp_path, *, split_project_identity: bool = False):
         error_detail="matched profile input adapter is not ready",
         now=NOW + timedelta(seconds=1),
     )
-    store = RcaDeliveryStore(control.db_path)
+    store = _open_v15_delivery_store(control.db_path)
     assert store.backfill_completed_submissions(
         now=NOW + timedelta(seconds=2),
         activation_required=True,
@@ -1936,7 +2145,7 @@ def _dispatcher(
     lease_owner="delivery-dispatcher-test",
     lease_renew_interval_seconds=None,
 ):
-    store = RcaDeliveryStore(tmp_path / "control.sqlite3")
+    store = _dispatcher_fixture_store(tmp_path / "control.sqlite3")
     remote = remote or Remote()
     clock = clock or Clock()
     return (
@@ -3711,14 +3920,19 @@ def test_write_boundary_rechecks_newer_settled_terminal_field_effect(tmp_path):
 
 
 def test_terminal_v2_epoch_switch_blocks_field_write_and_comment(tmp_path):
-    control, result = _control(tmp_path)
-    _bind_activation_execution(control, result, state="steady_active")
+    control, result = _control_v15(tmp_path)
+    _bind_activation_execution(
+        control,
+        result,
+        epoch_id="delivery-epoch-v15",
+        state="steady_active",
+    )
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
             "UPDATE business_triggers SET created_at = ? WHERE submission_key = ?",
             (NOW.isoformat(), result.submission_key),
         )
-    store = RcaDeliveryStore(control.db_path)
+    store = _open_v15_delivery_store(control.db_path)
     assert store.backfill_completed_submissions(now=NOW) == 1
     watch = store.claim_due_watch(lease_owner="activation-collector", now=NOW)
     assert watch is not None
@@ -3739,9 +3953,9 @@ def test_terminal_v2_epoch_switch_blocks_field_write_and_comment(tmp_path):
             result = super().list_comments(project_key, work_item_id)
             if not self.switched:
                 self.switched = True
-                _switch_activation_epoch(
+                _switch_v15_activation_epoch(
                     control,
-                    old_epoch="delivery-epoch-1",
+                    old_epoch="delivery-epoch-v15",
                     new_epoch="delivery-epoch-2",
                 )
             return result
@@ -4463,7 +4677,7 @@ def test_foxglove_delivery_verifies_only_primary_html_artifact(
     def verifier(url, size, sha256):
         clock.current += timedelta(seconds=80)
         contender_claims.append(
-            RcaDeliveryStore(store.db_path).claim_due_effect(
+            _open_v15_delivery_store(store.db_path).claim_due_effect(
                 lease_owner="worker-2",
                 lease_seconds=90,
                 now=clock.current,
@@ -4536,7 +4750,7 @@ def test_effect_lease_keeper_fences_contender_past_original_lease(
             assert lease_expires_at >= NOW + timedelta(seconds=170)
 
             clock.current = NOW + timedelta(seconds=91)
-            contender = RcaDeliveryStore(store.db_path).claim_due_effect(
+            contender = _open_v15_delivery_store(store.db_path).claim_due_effect(
                 lease_owner="worker-2",
                 lease_seconds=90,
                 now=clock.current,
@@ -4712,7 +4926,7 @@ def test_concurrent_effect_claim_has_exactly_one_winner(tmp_path):
     store = _seed(tmp_path)
 
     def claim(index):
-        return RcaDeliveryStore(store.db_path).claim_due_effect(
+        return _open_v15_delivery_store(store.db_path).claim_due_effect(
             lease_owner=f"worker-{index}", now=NOW
         )
 

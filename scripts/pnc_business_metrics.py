@@ -65,6 +65,7 @@ SUPPORTED_CONTROL_STORE_SCHEMA_VERSIONS = frozenset({
     "pnc_rca_control_store_v12",
     "pnc_rca_control_store_v13",
     "pnc_rca_control_store_v14",
+    "pnc_rca_control_store_v15",
 })
 SUPPORTED_DELIVERY_STORE_SCHEMA_VERSIONS = frozenset({
     DELIVERY_STORE_SCHEMA_VERSION,
@@ -1474,7 +1475,7 @@ def _validate_sqlite_schema(conn: sqlite3.Connection) -> None:
     ):
         raise MetricsValidationError(
             "metrics_control_db_schema_mismatch",
-            "supported control v11/v12/v13 and delivery v9 markers are required",
+            "supported control v11-v15 and delivery v9/v11/v12 markers are required",
         )
     triggers = {
         str(row[0])

@@ -4354,6 +4354,7 @@ class DeliveryDispatcher:
         control_store = RcaControlStore(
             self.config.control_db_path,
             require_current=True,
+            allow_successor_write=True,
         )
         binding = control_store.manual_external_write_admission_for_effect(
             business_key=claim.business_key,
@@ -6601,9 +6602,8 @@ def main(argv: list[str] | None = None) -> int:
                 check_store = RcaDeliveryStore(
                     config.control_db_path,
                     require_current=True,
-                    read_only=True,
                     ensure_current_rows=False,
-                    allow_successor_read_only=True,
+                    allow_successor_write=True,
                 )
                 capability = _schema_runtime_capability(check_store)
                 if capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
@@ -6688,7 +6688,7 @@ def main(argv: list[str] | None = None) -> int:
                 config.control_db_path,
                 require_current=True,
                 ensure_current_rows=False,
-                allow_successor_read_only=True,
+                allow_successor_write=True,
             )
             gate_capability = _schema_runtime_capability(gate_store)
             if gate_capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
@@ -6741,7 +6741,12 @@ def main(argv: list[str] | None = None) -> int:
                 require_current=True,
                 read_only=(reset_mode and not args.apply) or args.dry_run,
                 ensure_current_rows=not reset_mode and not args.dry_run,
-                allow_successor_read_only=True,
+                allow_successor_read_only=(
+                    (reset_mode and not args.apply) or args.dry_run
+                ),
+                allow_successor_write=not (
+                    (reset_mode and not args.apply) or args.dry_run
+                ),
             )
             capability = _schema_runtime_capability(store)
         except (OSError, RuntimeError, sqlite3.Error) as exc:
@@ -6753,33 +6758,25 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
     if capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
-        if args.dry_run or reset_mode:
-            operation = (
-                "dry_run"
-                if args.dry_run
-                else (
-                    "materialize_reset"
-                    if args.materialize_reset
-                    else "clear_circuit"
-                )
-            )
+        if args.dry_run:
             print(
                 json.dumps(
                     _successor_read_only_diagnostic(
                         config,
                         capability,
-                        operation=operation,
+                        operation="dry_run",
                     ),
                     ensure_ascii=False,
                 )
             )
             return 2
-        return run_successor_read_only_loop(
-            config,
-            store,
-            capability,
-            once=args.once,
-        )
+        if not reset_mode:
+            return run_successor_read_only_loop(
+                config,
+                store,
+                capability,
+                once=args.once,
+            )
     if args.clear_circuit or args.materialize_reset:
         try:
             return _run_circuit_reset_command(

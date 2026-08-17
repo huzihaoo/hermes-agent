@@ -5009,6 +5009,46 @@ def _require_relay_current_write_capability(value: object) -> None:
         raise ExternalWriteFenceError("external_write_fence_schema_read_only")
 
 
+def _require_relay_startup_write_capability(
+    *,
+    store_factory: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Fail before scanning or provider construction when relay writes are disabled."""
+
+    if store_factory is None:
+        from gateway.pnc_rca_delivery_store import RcaDeliveryStore
+
+        store_factory = RcaDeliveryStore
+    try:
+        store = store_factory(
+            _relay_control_db_path(),
+            require_current=True,
+            ensure_current_rows=False,
+            allow_successor_read_only=True,
+        )
+        capability = store.schema_runtime_capability()
+        _require_relay_current_write_capability(capability)
+        return dict(capability)
+    except ExternalWriteFenceError:
+        raise
+    except (OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as exc:
+        raise ExternalWriteFenceError(
+            "external_write_fence_epoch_not_current"
+        ) from exc
+
+
+def _relay_startup_denied_result(*, send: bool, code: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "dry_run": not send,
+        "candidate_count": 0,
+        "sent_count": 0,
+        "rows": [],
+        "errors": [code],
+        "error": code,
+    }
+
+
 def _fenced_task_senders(
     task_id: str,
     send_func: Callable[[dict[str, Any]], str] | None,
@@ -5649,6 +5689,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"- {row['task_id']} ({row['kind']}/{row['state']})")
         return 0
     def _run_once_or_watch() -> dict[str, Any]:
+        if args.send or args.watch:
+            _require_relay_startup_write_capability()
         if args.watch:
             return watch_pending_notices(
                 task_ids=args.task_id,
@@ -5664,11 +5706,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         return relay_pending_notices(task_ids=args.task_id, send=args.send, limit=args.limit, retry_failed_after_seconds=max(0, args.retry_failed_after), max_attempts=max(1, args.max_attempts), max_card_fallbacks_per_loop=max(0, args.max_card_fallbacks_per_loop))
 
-    if args.no_lock:
-        result = _run_once_or_watch()
-    else:
-        with SingleRunLock(get_hermes_home() / "locks" / "pnc-completion-notice-relay.lock") as lock:
-            result = _run_once_or_watch() if lock.acquired else _skipped_locked_result(send=args.send)
+    try:
+        if args.no_lock:
+            result = _run_once_or_watch()
+        else:
+            with SingleRunLock(get_hermes_home() / "locks" / "pnc-completion-notice-relay.lock") as lock:
+                result = _run_once_or_watch() if lock.acquired else _skipped_locked_result(send=args.send)
+    except ExternalWriteFenceError as exc:
+        result = _relay_startup_denied_result(send=args.send, code=exc.code)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     else:

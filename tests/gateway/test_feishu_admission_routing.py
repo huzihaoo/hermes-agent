@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 from collections import OrderedDict
@@ -32,6 +33,15 @@ from gateway.pnc_rca_provider_fence import (
     build_historical_epoch_provider_claim,
     build_manual_provider_write_claim,
 )
+from gateway.pnc_rca_control_store import (
+    CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+    CONTROL_STORE_SCHEMA_VERSION,
+    MANUAL_TRIGGER_SCHEMA_VERSION,
+    ManualRcaTriggerRequest,
+    RcaControlStore,
+)
+from gateway.pnc_rca_kafka_contract import WorkflowEventPolicy
+from gateway.pnc_rca_write_fence import minimal_release_epoch_contract_sha256
 from gateway.pnc_group_binding import G1Q3_RCA_MANUAL_GROUP_IDS
 from gateway.session import SessionSource
 
@@ -116,6 +126,161 @@ def _manual_admission_result() -> dict[str, object]:
         "state": "pending",
         "reason": "manual_explicit_issue_action",
     }
+
+
+def _canonical_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _v15_manual_control_store(path):
+    predecessor_store = RcaControlStore(path)
+    predecessor_store.activate_direct_steady_epoch(
+        epoch_id="feishu-manual-v14",
+        release_fingerprint_sha256="1" * 64,
+        release_note_sha256="2" * 64,
+        config_sha256="3" * 64,
+        db_logical_identity={"database": "feishu-manual-v14"},
+        partition_start_fence={},
+        operator="feishu-adapter-test",
+        reason="seed exact v14 predecessor",
+    )
+    predecessor = predecessor_store.direct_steady_predecessor()
+    assert predecessor is not None
+    db_identity = {"database": "feishu-manual-v15"}
+    partition_fence = {}
+    activation_contract = {
+        "expected_control_schema_version": CONTROL_STORE_SCHEMA_VERSION,
+        "target_control_schema_version": CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        "expected_predecessor_epoch_id": predecessor["epoch_id"],
+        "expected_predecessor_state": predecessor["state"],
+        "expected_predecessor_binding_fingerprint": predecessor["binding_fingerprint"],
+        "db_logical_identity": db_identity,
+        "db_logical_identity_sha256": _canonical_sha256(db_identity),
+        "partition_start_fence": partition_fence,
+        "partition_start_fence_sha256": _canonical_sha256(partition_fence),
+    }
+    RcaControlStore.migrate_v14_to_v15_and_activate(
+        path,
+        epoch_id="feishu-manual-v15",
+        release_fingerprint_sha256="4" * 64,
+        release_note_sha256="5" * 64,
+        config_sha256="6" * 64,
+        db_logical_identity=db_identity,
+        partition_start_fence=partition_fence,
+        operator="feishu-adapter-test",
+        reason="migrate manual admission fixture to exact v15",
+        expected_predecessor_epoch_id=predecessor["epoch_id"],
+        expected_predecessor_state=predecessor["state"],
+        expected_predecessor_binding_fingerprint=predecessor["binding_fingerprint"],
+        expected_control_schema_version=CONTROL_STORE_SCHEMA_VERSION,
+        target_control_schema_version=CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        epoch_contract_sha256=minimal_release_epoch_contract_sha256(
+            activation_contract
+        ),
+    )
+    return RcaControlStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+
+
+def _admit_v15_manual_trigger(store: RcaControlStore) -> dict[str, object]:
+    result = store.admit_manual_trigger(
+        ManualRcaTriggerRequest(
+            schema_version=MANUAL_TRIGGER_SCHEMA_VERSION,
+            issue_url=("https://project.feishu.cn/g1q3/issue/detail/7013527412"),
+            mode="run_or_join",
+            reason="manual_explicit_issue_action",
+            platform="feishu",
+            chat_id=G1Q3_RCA_GROUP_ID,
+            thread_id="topic:om_safe_off",
+            message_id="om_safe_off",
+            requester_id="ou_user",
+        ),
+        allowed_chat_ids={G1Q3_RCA_GROUP_ID},
+        submit_enabled=True,
+        operator_authorized=True,
+        active_policy=WorkflowEventPolicy(
+            topic="feishu-project-workflow-event",
+            policy_version="feishu-manual-v15-test",
+            project_keys=frozenset({"project-key"}),
+            project_simple_names=frozenset({"g1q3"}),
+            work_item_type_keys=frozenset({"problem-type"}),
+            snapshot_patterns=frozenset({"State"}),
+            snapshot_sub_stages=frozenset({"OPEN"}),
+        ),
+        outbox_high_watermark=7,
+        activation_required=True,
+    )
+    return result.to_dict()
+
+
+def test_manual_activation_epoch_reads_exact_v15_writer(
+    tmp_path,
+    monkeypatch,
+):
+    control_path = tmp_path / "control.sqlite3"
+    _v15_manual_control_store(control_path)
+    monkeypatch.setenv("HERMES_RCA_KAFKA_CONTROL_DB_PATH", str(control_path))
+
+    epoch = feishu_adapter_module._require_current_rca_manual_activation_epoch()
+
+    assert epoch["epoch_id"] == "feishu-manual-v15"
+    assert epoch["state"] == "steady_active"
+    assert epoch["release_fingerprint_sha256"] == "4" * 64
+
+
+def test_manual_admission_revalidation_reads_exact_v15_writer(
+    tmp_path,
+    monkeypatch,
+):
+    control_path = tmp_path / "control.sqlite3"
+    store = _v15_manual_control_store(control_path)
+    admission = _admit_v15_manual_trigger(store)
+    monkeypatch.setenv("HERMES_RCA_KAFKA_CONTROL_DB_PATH", str(control_path))
+
+    live = feishu_adapter_module._require_current_rca_manual_admission(
+        admission,
+        _manual_source_identity(),
+    )
+
+    assert live["epoch_id"] == "feishu-manual-v15"
+    assert live["state"] == "steady_active"
+    assert live["decision"] == "admit"
+    assert live["submission_key"] == admission["submission_key"]
+    assert live["source_id"] == admission["source_id"]
+
+
+def test_manual_v15_helpers_reject_exact_v14_control_store(
+    tmp_path,
+    monkeypatch,
+):
+    control_path = tmp_path / "control.sqlite3"
+    RcaControlStore(control_path)
+    monkeypatch.setenv("HERMES_RCA_KAFKA_CONTROL_DB_PATH", str(control_path))
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:write_marker",
+    ):
+        feishu_adapter_module._require_current_rca_manual_activation_epoch()
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:write_marker",
+    ):
+        feishu_adapter_module._require_current_rca_manual_admission(
+            _manual_admission_result(),
+            _manual_source_identity(),
+        )
 
 
 def _manual_route_metadata(*, authorized: bool) -> dict[str, object]:
@@ -221,7 +386,7 @@ def test_historical_provider_claim_rechecks_exact_target_and_epoch(monkeypatch):
         epoch_id = "epoch-gray-1"
 
         def activation_epoch(self):
-            return {"epoch_id": self.epoch_id, "state": "bounded_active"}
+            return {"epoch_id": self.epoch_id, "state": "steady_active"}
 
     store = Store()
     monkeypatch.setattr(provider_fence_module, "_canonical_store", lambda: store)

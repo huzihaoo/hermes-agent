@@ -92,9 +92,12 @@ def test_provider_revalidation_uses_live_current_store_with_active_wal(
     monkeypatch,
     kind,
 ):
-    path = tmp_path / kind / "control.sqlite3"
-    control = RcaControlStore(path)
-    RcaDeliveryStore(path)
+    path, _migration = _physical_v15_delivery_fixture(tmp_path / kind)
+    control = RcaControlStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
     live, claim, validation_method = _provider_binding(kind)
     validations = []
 
@@ -112,7 +115,7 @@ def test_provider_revalidation_uses_live_current_store_with_active_wal(
         "create_schema_probe_snapshot",
         classmethod(
             lambda _cls, *_args, **_kwargs: pytest.fail(
-                "provider revalidation must not raw-copy a current v14 store"
+                "provider revalidation must not raw-copy a current v15 store"
             )
         ),
     )
@@ -153,18 +156,20 @@ def test_provider_revalidation_uses_live_current_store_with_active_wal(
         ("terminal_rerun", "external_write_fence_identity_mismatch"),
     ],
 )
-def test_provider_revalidation_rejects_v15_before_validation_or_external_write(
+def test_provider_revalidation_rejects_v14_before_validation_or_external_write(
     tmp_path,
     monkeypatch,
     kind,
     error_code,
 ):
-    path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    path = tmp_path / "control.sqlite3"
+    RcaControlStore(path)
+    RcaDeliveryStore(path)
     _live, claim, validation_method = _provider_binding(kind)
     monkeypatch.setattr(
         RcaDeliveryStore,
         validation_method,
-        lambda *_args, **_kwargs: pytest.fail("v15 business binding was evaluated"),
+        lambda *_args, **_kwargs: pytest.fail("v14 business binding was evaluated"),
     )
     monkeypatch.setattr(
         provider_fence,
@@ -188,4 +193,7 @@ def test_provider_revalidation_rejects_v15_before_validation_or_external_write(
 
     assert exc.value.code == error_code
     assert external_calls == []
-    assert _sqlite_storage_identity(path) == before
+    after = _sqlite_storage_identity(path)
+    assert after["db"] == before["db"]
+    assert after["-wal"] == before["-wal"]
+    assert (after["-shm"] is None) is (before["-shm"] is None)

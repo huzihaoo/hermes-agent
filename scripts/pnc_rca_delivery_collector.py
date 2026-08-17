@@ -3723,7 +3723,9 @@ class DeliveryCollector:
     def _control_store(self) -> RcaControlStore:
         if self.control_store is None:
             self.control_store = RcaControlStore(
-                self.config.control_db_path, require_current=True
+                self.config.control_db_path,
+                require_current=True,
+                allow_successor_write=True,
             )
         return self.control_store
 
@@ -4336,9 +4338,8 @@ def main(argv: list[str] | None = None) -> int:
                 check_store = RcaDeliveryStore(
                     config.control_db_path,
                     require_current=True,
-                    read_only=True,
                     ensure_current_rows=False,
-                    allow_successor_read_only=True,
+                    allow_successor_write=True,
                 )
                 capability = _schema_runtime_capability(check_store)
                 if capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
@@ -4371,9 +4372,8 @@ def main(argv: list[str] | None = None) -> int:
                     check_store = RcaDeliveryStore(
                         config.control_db_path,
                         require_current=True,
-                        read_only=True,
                         ensure_current_rows=False,
-                        allow_successor_read_only=True,
+                        allow_successor_write=True,
                     )
                 release_binding = validate_bound_resident_release(
                     check_store,
@@ -4459,7 +4459,7 @@ def main(argv: list[str] | None = None) -> int:
                 config.control_db_path,
                 require_current=True,
                 ensure_current_rows=False,
-                allow_successor_read_only=True,
+                allow_successor_write=True,
             )
             gate_capability = _schema_runtime_capability(gate_store)
             if gate_capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
@@ -4512,7 +4512,8 @@ def main(argv: list[str] | None = None) -> int:
                 require_current=True,
                 read_only=args.dry_run,
                 ensure_current_rows=not args.dry_run,
-                allow_successor_read_only=True,
+                allow_successor_read_only=args.dry_run,
+                allow_successor_write=not args.dry_run,
             )
             capability = _schema_runtime_capability(store)
         except (OSError, RuntimeError, sqlite3.Error) as exc:

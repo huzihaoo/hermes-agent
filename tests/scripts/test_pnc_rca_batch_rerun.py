@@ -14,6 +14,13 @@ from gateway.pnc_rca_abstention_projection import (
     project_gate_a_report,
 )
 from gateway.pnc_rca_issue_focus import ANALYSIS_INSUFFICIENT_STATEMENT
+from gateway.pnc_rca_control_store import (
+    CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+    RcaControlStore,
+)
+from gateway.pnc_rca_delivery_store import RcaDeliveryStore
+from gateway.pnc_rca_kafka_contract import WorkflowEventPolicy
+from gateway.pnc_rca_write_fence import minimal_release_epoch_contract_sha256
 from scripts import pnc_rca_batch_rerun as batch_rerun
 from scripts.pnc_rca_batch_rerun import (
     ACCEPTANCE_AXES,
@@ -966,7 +973,9 @@ def test_dry_run_without_owner_receipt_is_read_only_and_not_authorized(
     monkeypatch.setattr(
         batch_rerun,
         "RcaControlStore",
-        lambda _path: pytest.fail("dry-run opened the writable control store"),
+        lambda *_args, **_kwargs: pytest.fail(
+            "dry-run opened the writable control store"
+        ),
     )
 
     result = batch_rerun.run(args)
@@ -1113,6 +1122,123 @@ def test_dry_run_uses_consistent_backup_during_active_wal_mutation(
     assert result["database"]["preconditions"]["matched"] == 1
 
 
+def test_dry_run_accepts_real_v15_without_mutating_source_or_state(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = _write_v15_control_db_with_active_policy(tmp_path)
+    writer = sqlite3.connect(db_path)
+    assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    writer.execute("UPDATE control_meta SET value = value WHERE key = 'schema_version'")
+    writer.commit()
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(
+        json.dumps(
+            _queue_value(current_submission_key="", current_generation=0),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    args = _run_args(tmp_path, queue_path, tmp_path / "unused-owner.json")
+    args.control_db = str(db_path)
+    args.owner_receipt = None
+    args.dry_run = True
+    before = {
+        path.name: _file_state(path)
+        for path in (
+            db_path,
+            db_path.with_name(f"{db_path.name}-wal"),
+            db_path.with_name(f"{db_path.name}-shm"),
+        )
+    }
+    monkeypatch.setattr(
+        batch_rerun,
+        "_runtime_identity",
+        lambda: ("a" * 40, "b" * 40),
+    )
+    monkeypatch.setattr(
+        RcaControlStore,
+        "__init__",
+        lambda *_args, **_kwargs: pytest.fail(
+            "v15 dry-run constructed a control store"
+        ),
+    )
+
+    try:
+        result = batch_rerun.run(args)
+        after = {
+            path.name: _file_state(path)
+            for path in (
+                db_path,
+                db_path.with_name(f"{db_path.name}-wal"),
+                db_path.with_name(f"{db_path.name}-shm"),
+            )
+        }
+    finally:
+        writer.close()
+
+    assert result["database"]["schema_version"] == (
+        CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+    )
+    assert result["database"]["activation"]["ready"] is True
+    assert result["execution_authorized"] is False
+    assert (tmp_path / "state.json").exists() is False
+    assert after[db_path.name] == before[db_path.name]
+    assert after[f"{db_path.name}-wal"] == before[f"{db_path.name}-wal"]
+    assert {
+        key: value
+        for key, value in after[f"{db_path.name}-shm"].items()
+        if key != "sha256"
+    } == {
+        key: value
+        for key, value in before[f"{db_path.name}-shm"].items()
+        if key != "sha256"
+    }
+
+
+def test_dry_run_rejects_tampered_v15_activation_binding(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = _write_v15_control_db_with_active_policy(tmp_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_transition_audit "
+            "SET binding_fingerprint = ? "
+            "WHERE audit_id = ("
+            "SELECT MAX(audit_id) FROM rca_activation_transition_audit"
+            ")",
+            ("9" * 64,),
+        )
+    queue_path = tmp_path / "queue.json"
+    queue_path.write_text(
+        json.dumps(
+            _queue_value(current_submission_key="", current_generation=0),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    args = _run_args(tmp_path, queue_path, tmp_path / "unused-owner.json")
+    args.control_db = str(db_path)
+    args.owner_receipt = None
+    args.dry_run = True
+    before = db_path.read_bytes()
+    monkeypatch.setattr(
+        batch_rerun,
+        "_runtime_identity",
+        lambda: ("a" * 40, "b" * 40),
+    )
+
+    with pytest.raises(
+        BatchRerunError,
+        match="batch_control_schema_not_current",
+    ):
+        batch_rerun.run(args)
+
+    assert db_path.read_bytes() == before
+    assert (tmp_path / "state.json").exists() is False
+
+
 def test_dry_run_rejects_a_provided_invalid_owner_receipt_before_db(
     tmp_path, monkeypatch
 ):
@@ -1222,6 +1348,159 @@ def _write_run_inputs(tmp_path, queue):
     return queue_path, owner_path
 
 
+def _canonical_sha256(value):
+    raw = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _write_v15_control_db_with_active_policy(tmp_path):
+    db_path = tmp_path / "control.sqlite3"
+    legacy = RcaControlStore(db_path)
+    RcaDeliveryStore(db_path)
+    legacy.activate_direct_steady_epoch(
+        epoch_id="rca-batch-v14",
+        release_fingerprint_sha256="1" * 64,
+        release_note_sha256="2" * 64,
+        config_sha256="3" * 64,
+        db_logical_identity={"database": "batch-v14"},
+        partition_start_fence={},
+        operator="batch-test",
+        reason="seed exact v14 predecessor",
+    )
+    predecessor = legacy.direct_steady_predecessor()
+    assert predecessor is not None
+    db_identity = {"database": "batch-v15"}
+    partition_fence = {}
+    activation = {
+        "expected_control_schema_version": CONTROL_STORE_SCHEMA_VERSION,
+        "target_control_schema_version": CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        "expected_predecessor_epoch_id": predecessor["epoch_id"],
+        "expected_predecessor_state": predecessor["state"],
+        "expected_predecessor_binding_fingerprint": predecessor[
+            "binding_fingerprint"
+        ],
+        "db_logical_identity": db_identity,
+        "db_logical_identity_sha256": _canonical_sha256(db_identity),
+        "partition_start_fence": partition_fence,
+        "partition_start_fence_sha256": _canonical_sha256(partition_fence),
+    }
+    RcaControlStore.migrate_v14_to_v15_and_activate(
+        db_path,
+        epoch_id="rca-batch-v15",
+        release_fingerprint_sha256="4" * 64,
+        release_note_sha256="5" * 64,
+        config_sha256="6" * 64,
+        db_logical_identity=db_identity,
+        partition_start_fence=partition_fence,
+        operator="batch-test",
+        reason="migrate batch test to exact v15",
+        expected_predecessor_epoch_id=predecessor["epoch_id"],
+        expected_predecessor_state=predecessor["state"],
+        expected_predecessor_binding_fingerprint=predecessor[
+            "binding_fingerprint"
+        ],
+        expected_control_schema_version=CONTROL_STORE_SCHEMA_VERSION,
+        target_control_schema_version=CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        epoch_contract_sha256=minimal_release_epoch_contract_sha256(activation),
+    )
+    RcaDeliveryStore(
+        db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    writer = RcaControlStore(
+        db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    policy = WorkflowEventPolicy(
+        topic="feishu-project-workflow-event",
+        policy_version="batch-test-v1",
+        project_keys=frozenset({"t03o4q"}),
+        project_simple_names=frozenset({"t03o4q"}),
+        work_item_type_keys=frozenset({"issue"}),
+        snapshot_patterns=frozenset({"State"}),
+        snapshot_sub_stages=frozenset({"OPEN"}),
+    )
+    writer.admit_manual_trigger(
+        _request(
+            batch_id="policy-seed",
+            issue_id="7048803417",
+            request_index=1,
+            requester_id="automation:rca-batch-rerun",
+        ),
+        allowed_chat_ids=set(),
+        submit_enabled=True,
+        operator_authorized=True,
+        active_policy=policy,
+        activation_required=True,
+    )
+    return db_path
+
+
+def test_live_v14_store_fails_closed_before_batch_state_creation(
+    tmp_path, monkeypatch
+):
+    queue_path, owner_path = _write_run_inputs(
+        tmp_path,
+        _queue_value(current_submission_key="", current_generation=0),
+    )
+    db_path = tmp_path / "control.sqlite3"
+    RcaControlStore(db_path)
+    before = db_path.read_bytes()
+    args = _run_args(tmp_path, queue_path, owner_path)
+    args.control_db = str(db_path)
+    monkeypatch.setattr(
+        batch_rerun, "_runtime_identity", lambda: ("a" * 40, "b" * 40)
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:write_marker",
+    ):
+        batch_rerun.run(args)
+
+    assert (tmp_path / "state.json").exists() is False
+    assert db_path.read_bytes() == before
+
+
+def test_live_v15_store_submits_initial_generation(tmp_path, monkeypatch):
+    db_path = _write_v15_control_db_with_active_policy(tmp_path)
+    queue_path, owner_path = _write_run_inputs(
+        tmp_path,
+        _queue_value(current_submission_key="", current_generation=0),
+    )
+    args = _run_args(tmp_path, queue_path, owner_path)
+    args.control_db = str(db_path)
+    args.submit_all = True
+    monkeypatch.setattr(
+        batch_rerun, "_runtime_identity", lambda: ("a" * 40, "b" * 40)
+    )
+
+    result = batch_rerun.run(args)
+
+    assert result["status"] == "submitted_all"
+    assert result["summary"] == {"accepted": 0, "submitted": 1, "total": 1}
+    writer = RcaControlStore(
+        db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    [trigger] = [
+        row
+        for row in writer.list_rows("business_triggers")
+        if row["work_item_id"] == "7048803418"
+    ]
+    assert trigger["generation"] == 1
+    assert writer.schema_runtime_capability()["work_admission_enabled"] is True
+
+
 def test_run_creates_initial_generation_for_exact_absent_item(tmp_path, monkeypatch):
     queue_path, owner_path = _write_run_inputs(
         tmp_path,
@@ -1235,8 +1514,9 @@ def test_run_creates_initial_generation_for_exact_absent_item(tmp_path, monkeypa
     }
 
     class FakeStore:
-        def __init__(self, _path):
-            pass
+        def __init__(self, _path, *, require_current, allow_successor_write):
+            assert require_current is True
+            assert allow_successor_write is True
 
         def admit_manual_trigger(self, _request, **kwargs):
             nonlocal admitted
@@ -1288,8 +1568,9 @@ def test_submit_all_admits_historical_generation_without_waiting_for_delivery(
     admitted = False
 
     class FakeStore:
-        def __init__(self, _path):
-            pass
+        def __init__(self, _path, *, require_current, allow_successor_write):
+            assert require_current is True
+            assert allow_successor_write is True
 
         def admit_manual_trigger(self, _request, **kwargs):
             nonlocal admitted
@@ -1356,8 +1637,9 @@ def test_submit_all_refreshes_tracked_terminal_and_retries_without_waiting(
     admissions = []
 
     class FakeStore:
-        def __init__(self, _path):
-            pass
+        def __init__(self, _path, *, require_current, allow_successor_write):
+            assert require_current is True
+            assert allow_successor_write is True
 
         def admit_manual_trigger(self, _request, **kwargs):
             assert kwargs.get("silent_terminal_rerun_authority") is not None
@@ -1424,8 +1706,9 @@ def test_submit_all_defers_unavailable_authority_and_continues(tmp_path, monkeyp
     }
 
     class FakeStore:
-        def __init__(self, _path):
-            pass
+        def __init__(self, _path, *, require_current, allow_successor_write):
+            assert require_current is True
+            assert allow_successor_write is True
 
         def admit_manual_trigger(self, *_args, **_kwargs):
             pytest.fail("unavailable authority reached admission")
@@ -1499,8 +1782,9 @@ def test_submit_all_defers_silent_authority_rejected_by_store(tmp_path, monkeypa
     }
 
     class FakeStore:
-        def __init__(self, _path):
-            pass
+        def __init__(self, _path, *, require_current, allow_successor_write):
+            assert require_current is True
+            assert allow_successor_write is True
 
         def admit_manual_trigger(self, *_args, **_kwargs):
             raise batch_rerun.ManualRcaAdmissionError(
@@ -1554,8 +1838,9 @@ def test_run_refreshes_existing_success_instead_of_skipping_it(tmp_path, monkeyp
     admitted = False
 
     class FakeStore:
-        def __init__(self, _path):
-            pass
+        def __init__(self, _path, *, require_current, allow_successor_write):
+            assert require_current is True
+            assert allow_successor_write is True
 
         def admit_manual_trigger(self, _request, **kwargs):
             nonlocal admitted
@@ -1624,8 +1909,9 @@ def test_run_retries_failed_state_after_noncausal_field_readback(
     }
 
     class FakeStore:
-        def __init__(self, _path):
-            pass
+        def __init__(self, _path, *, require_current, allow_successor_write):
+            assert require_current is True
+            assert allow_successor_write is True
 
         def admit_manual_trigger(self, _request, **kwargs):
             nonlocal admitted
