@@ -862,6 +862,119 @@ def _call_meegle_with_deadline(
     return result
 
 
+_MEEGLE_FIELD_PAGE_LIMIT = 12
+
+
+class _MeegleFieldPaginationError(ValueError):
+    pass
+
+
+def _read_complete_meegle_workitem_payload(
+    *, runner: MeegleRunner, project_key: str, work_item_id: str,
+    deadline_monotonic: float | None,
+) -> Any:
+    token = ""
+    seen_tokens: set[str] = set()
+    expected_total: int | None = None
+    first_payload: Any = None
+    first_item: dict[str, Any] | None = None
+    merged_fields: list[dict[str, Any]] = []
+    fields_by_key: dict[str, dict[str, Any]] = {}
+
+    for page_index in range(_MEEGLE_FIELD_PAGE_LIMIT):
+        args = [
+            "workitem", "get", "--project-key", project_key,
+            "--work-item-id", work_item_id, "--fields", "_all",
+            "--format", "json",
+        ]
+        if token:
+            args.extend(["--page-token", token])
+        rc, out, err = _call_meegle_with_deadline(
+            runner, args, deadline_monotonic=deadline_monotonic
+        )
+        if rc != 0:
+            raise _MeegleFieldPaginationError(str(err or out or "CLI failed")[:160])
+        try:
+            payload = json.loads(str(out or "").strip())
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise _MeegleFieldPaginationError("invalid work item JSON") from exc
+        item = _unwrap_data_payload(payload)
+        if not isinstance(item, dict):
+            raise _MeegleFieldPaginationError("work item page must be an object")
+
+        if "pagination" not in item:
+            if page_index or "work_item_fields" in item or not isinstance(
+                item.get("fields"), Mapping
+            ):
+                raise _MeegleFieldPaginationError("unproven unpaginated field set")
+            ids = {
+                str(value).strip()
+                for value in (item.get("work_item_id"), item.get("id"))
+                if str(value or "").strip()
+            }
+            if ids and ids != {work_item_id}:
+                raise _MeegleFieldPaginationError("work item identity mismatch")
+            return payload
+
+        pagination = item.get("pagination")
+        fields = item.get("work_item_fields")
+        if not isinstance(pagination, Mapping):
+            raise _MeegleFieldPaginationError("pagination must be an object")
+        if not isinstance(fields, list) or any(
+            not isinstance(field, Mapping) for field in fields
+        ):
+            raise _MeegleFieldPaginationError("work_item_fields must be objects")
+        ids = {
+            str(value).strip()
+            for parent in (item, item.get("work_item_attribute"), item.get("work_item_info"))
+            if isinstance(parent, Mapping)
+            for value in (parent.get("work_item_id"), parent.get("id"))
+            if str(value or "").strip()
+        }
+        if ids != {work_item_id}:
+            raise _MeegleFieldPaginationError("work item identity mismatch")
+        has_more = pagination.get("has_more")
+        if type(has_more) is not bool:
+            raise _MeegleFieldPaginationError("pagination.has_more must be boolean")
+        if "total" in pagination:
+            total = pagination["total"]
+            if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+                raise _MeegleFieldPaginationError("pagination.total must be an integer")
+            if expected_total is not None and total != expected_total:
+                raise _MeegleFieldPaginationError("pagination.total changed")
+            expected_total = total
+
+        if first_payload is None:
+            first_payload, first_item = payload, item
+        for raw_field in fields:
+            field = dict(raw_field)
+            key = str(field.get("key") or field.get("field_key") or "").strip()
+            if key and key in fields_by_key:
+                if fields_by_key[key] != field:
+                    raise _MeegleFieldPaginationError("conflicting duplicate field key")
+                continue
+            if key:
+                fields_by_key[key] = field
+            merged_fields.append(field)
+
+        next_token = pagination.get("next_page_token")
+        if not has_more:
+            if next_token not in (None, ""):
+                raise _MeegleFieldPaginationError("closed page carried a token")
+            assert first_item is not None
+            first_item["work_item_fields"] = merged_fields
+            first_item.pop("pagination", None)
+            return first_payload
+        if not isinstance(next_token, str) or not next_token.strip():
+            raise _MeegleFieldPaginationError("open page omitted its token")
+        if next_token != next_token.strip() or next_token == token or next_token in seen_tokens:
+            raise _MeegleFieldPaginationError("pagination token did not advance")
+        seen_tokens.add(next_token)
+        token = next_token
+
+    raise _MeegleFieldPaginationError("work item pagination exceeded 12 pages")
+
+
 def fetch_g1q3_issue_context_result_via_meegle(
     *,
     project_key: str,
@@ -914,25 +1027,22 @@ def fetch_g1q3_issue_context_result_via_meegle(
         )
 
     workitem_payload: Any = {}
+    field_read_complete = False
     comments_payload: Any = {}
     try:
-        rc, out, err = _call_meegle_with_deadline(
-            runner,
-            [
-                "workitem", "get", "--project-key", project,
-                "--work-item-id", issue_id, "--fields", "_all",
-                "--format", "json",
-            ],
+        workitem_payload = _read_complete_meegle_workitem_payload(
+            runner=runner,
+            project_key=project,
+            work_item_id=issue_id,
             deadline_monotonic=deadline_monotonic,
         )
-        if rc != 0:
-            errors.append({"tool": "meegle workitem get", "error_class": "CLIError", "message": (err or out)[:200]})
-        else:
-            workitem_payload = _json_from_cli_stdout(out)
-    except (subprocess.TimeoutExpired, TimeoutError):
-        errors.append(_timeout_error("meegle workitem get"))
+        field_read_complete = True
     except Exception as exc:
-        errors.append({"tool": "meegle workitem get", "error_class": type(exc).__name__, "message": str(exc)[:200]})
+        errors.append({
+            "tool": "meegle workitem get",
+            "error_class": "PaginationError",
+            "message": f"{type(exc).__name__}: {exc}"[:200],
+        })
 
     try:
         rc, out, err = _call_meegle_with_deadline(
@@ -951,6 +1061,9 @@ def fetch_g1q3_issue_context_result_via_meegle(
         errors.append(_timeout_error("meegle comment list"))
     except Exception as exc:
         errors.append({"tool": "meegle comment list", "error_class": type(exc).__name__, "message": str(exc)[:200]})
+
+    if not field_read_complete:
+        comments_payload = {}
 
     work_item_brief = _normalize_meegle_workitem_payload(
         workitem_payload, work_item_id=issue_id
@@ -1185,6 +1298,17 @@ def compact_g1q3_issue_context(
     )
 
 
+def _mcp_brief_has_pdcl_data_address(work_item_brief: Any) -> bool:
+    fields = work_item_brief.get("work_item_fields") if isinstance(work_item_brief, Mapping) else []
+    for field in fields if isinstance(fields, list) else []:
+        if isinstance(field, Mapping) and (
+            str(field.get("key") or "").strip() == "field_93aa63"
+            or str(field.get("name") or "").strip() == "问题数据地址_PDCL"
+        ):
+            return bool(compact_value(field.get("value")))
+    return False
+
+
 def fetch_g1q3_issue_context_result_via_mcp(
     *,
     project_key: str,
@@ -1193,6 +1317,7 @@ def fetch_g1q3_issue_context_result_via_mcp(
     now_ms: int | None = None,
     deadline_monotonic: float | None = None,
     tool_timeout_seconds: float = G1Q3_ISSUE_MCP_CALL_TIMEOUT_SECONDS,
+    require_pdcl_data_address: bool = False,
 ) -> G1Q3IssueReadResult:
     """Best-effort read through Hermes MCP Feishu Project tools.
 
@@ -1296,6 +1421,24 @@ def fetch_g1q3_issue_context_result_via_mcp(
             ),
         })
 
+    if require_pdcl_data_address and not _mcp_brief_has_pdcl_data_address(brief_payload):
+        brief_tool = "mcp_feishu_project_get_workitem_brief"
+        if not any(item.get("tool") == brief_tool for item in errors):
+            errors.append({
+                "tool": brief_tool,
+                "error_class": "FieldSetCompletenessUnproven",
+            })
+        return G1Q3IssueReadResult(
+            status="read_failed",
+            blocker={
+                "kind": "host_mcp_preread_completeness_unproven",
+                "message": "MCP brief 未直接返回非空 问题数据地址_PDCL，不能据此判定字段缺失",
+                "retryable": True,
+                "failed_tools": [item["tool"] for item in errors],
+            },
+            errors=errors,
+        )
+
     comments = comments_payload.get("comments") if isinstance(comments_payload, dict) else comments_payload
     context_text = compact_rca_issue_context(
         work_item_brief=brief_payload if isinstance(brief_payload, dict) else {},
@@ -1387,6 +1530,12 @@ def fetch_g1q3_issue_context_result(
     if meegle_result.context_text:
         return meegle_result
 
+    if any(
+        item.get("error_class") == "PaginationError"
+        for item in (meegle_result.errors or [])
+    ):
+        return meegle_result
+
     auto_degrade_enabled = os.getenv("HERMES_G1Q3_MCP_AUTODEGRADE", "1").strip().lower() not in {"0", "false", "no", "off"}
     meegle_source_down = meegle_result.status == "read_failed"
     auto_degrade = auto_degrade_enabled and meegle_source_down and not use_mcp_fallback
@@ -1405,6 +1554,7 @@ def fetch_g1q3_issue_context_result(
             now_ms=now_ms,
             deadline_monotonic=deadline_monotonic,
             tool_timeout_seconds=mcp_call_timeout_seconds,
+            require_pdcl_data_address=True,
         )
         if mcp_result.context_text:
             combined_errors = [*(meegle_result.errors or []), *(mcp_result.errors or [])] or None

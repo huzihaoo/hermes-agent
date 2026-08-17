@@ -635,9 +635,9 @@ def test_compact_issue_context_keeps_real_partial_read_when_only_title_present()
     assert "title: LCC-弯道LCC异常退出" in context
 
 
-def test_meegle_workitem_id_only_payload_is_read_empty_not_fields_extracted():
+def test_meegle_workitem_id_only_payload_is_read_failed_not_fields_extracted():
     # Authenticated read whose payload carries only the work_item_id must be
-    # classified read_empty (a non-PDCL, retryable preread blocker), NOT
+    # classified read_failed (a non-PDCL, retryable preread blocker), NOT
     # fields_extracted -> spurious issue_field_missing_pdcl_download_cmd.
     def empty_meegle(args):
         if args[:2] == ["auth", "status"]:
@@ -655,9 +655,9 @@ def test_meegle_workitem_id_only_payload_is_read_empty_not_fields_extracted():
     )
 
     assert result.context_text == ""
-    assert result.status == "read_empty"
+    assert result.status == "read_failed"
     assert result.source_quality == "unavailable"
-    assert result.blocker["kind"] == "host_meegle_preread_empty"
+    assert result.blocker["kind"] == "host_meegle_preread_failed"
     assert "问题数据地址_PDCL" not in result.blocker["message"]
 
 
@@ -981,7 +981,7 @@ def test_meegle_auto_degrade_can_be_disabled_by_env(monkeypatch):
     assert mcp_calls == []
 
 
-def test_meegle_read_empty_does_not_auto_degrade(monkeypatch):
+def test_meegle_non_object_read_does_not_auto_degrade(monkeypatch):
     monkeypatch.delenv("HERMES_G1Q3_MCP_FALLBACK", raising=False)
     monkeypatch.delenv("HERMES_G1Q3_MCP_AUTODEGRADE", raising=False)
     mcp_calls = []
@@ -1002,7 +1002,7 @@ def test_meegle_read_empty_does_not_auto_degrade(monkeypatch):
         meegle_runner=empty_meegle,
     )
 
-    assert result.status == "read_empty"
+    assert result.status == "read_failed"
     assert mcp_calls == []
 
 
