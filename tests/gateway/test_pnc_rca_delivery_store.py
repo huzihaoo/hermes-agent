@@ -2397,7 +2397,9 @@ def test_r15ay_v15_delivery_writer_is_explicit_and_audit_bound(tmp_path):
         "lease_acquisition_enabled": True,
         "external_effect_enabled": True,
     }
-    assert store.activation_epoch()["epoch_id"] == migration["successor_epoch_id"]
+    activation = store.activation_epoch()
+    assert activation is not None
+    assert activation["epoch_id"] == migration["successor_epoch_id"]
 
     conn = store._connect()
     try:

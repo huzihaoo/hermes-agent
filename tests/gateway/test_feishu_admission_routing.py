@@ -232,7 +232,10 @@ def test_manual_activation_epoch_reads_exact_v15_writer(
     _v15_manual_control_store(control_path)
     monkeypatch.setenv("HERMES_RCA_KAFKA_CONTROL_DB_PATH", str(control_path))
 
-    epoch = feishu_adapter_module._require_current_rca_manual_activation_epoch()
+    require_epoch = getattr(
+        feishu_adapter_module, "_require_current_rca_manual_activation_epoch"
+    )
+    epoch = require_epoch()
 
     assert epoch["epoch_id"] == "feishu-manual-v15"
     assert epoch["state"] == "steady_active"
@@ -248,7 +251,10 @@ def test_manual_admission_revalidation_reads_exact_v15_writer(
     admission = _admit_v15_manual_trigger(store)
     monkeypatch.setenv("HERMES_RCA_KAFKA_CONTROL_DB_PATH", str(control_path))
 
-    live = feishu_adapter_module._require_current_rca_manual_admission(
+    require_admission = getattr(
+        feishu_adapter_module, "_require_current_rca_manual_admission"
+    )
+    live = require_admission(
         admission,
         _manual_source_identity(),
     )
@@ -272,12 +278,14 @@ def test_manual_v15_helpers_reject_exact_v14_control_store(
         RuntimeError,
         match="incompatible_control_store_schema:write_marker",
     ):
-        feishu_adapter_module._require_current_rca_manual_activation_epoch()
+        getattr(
+            feishu_adapter_module, "_require_current_rca_manual_activation_epoch"
+        )()
     with pytest.raises(
         RuntimeError,
         match="incompatible_control_store_schema:write_marker",
     ):
-        feishu_adapter_module._require_current_rca_manual_admission(
+        getattr(feishu_adapter_module, "_require_current_rca_manual_admission")(
             _manual_admission_result(),
             _manual_source_identity(),
         )

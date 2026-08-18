@@ -1066,7 +1066,7 @@ def _activation_apply(
     activation = note["activation"]
     try:
         expected_schema, target_schema = _activation_schema_pair(note)
-        common = {
+        common: dict[str, Any] = {
             "epoch_id": binding["epoch_id"],
             "release_fingerprint_sha256": binding["release_fingerprint_sha256"],
             "release_note_sha256": binding["release_note_sha256"],
@@ -1090,7 +1090,9 @@ def _activation_apply(
         }
         transition = str(plan.get("transition") or "")
         if transition == "v14_to_v15_atomic":
-            migrate = migration_apply or RcaControlStore.migrate_v14_to_v15_and_activate
+            migrate: Callable[..., Mapping[str, Any]] = (
+                migration_apply or RcaControlStore.migrate_v14_to_v15_and_activate
+            )
             migrate(Path(activation["control_db_path"]), **common)
         elif transition != "v15_noop":
             raise ReleaseError("activation_transition_invalid")
