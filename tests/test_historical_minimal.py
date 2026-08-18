@@ -160,7 +160,7 @@ def fixed_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "requirements_contract_hash": "04" * 32,
         "evaluator_fingerprints": fingerprints,
         "evaluator_fingerprints_sha256": admission.sha256_value(fingerprints),
-        "evaluator_version": "final-successor-fixture",
+        "evaluator_version": "git-" + ("a" * 40),
         "suite_receipt_path": str(receipts["suite"][0]),
         "suite_receipt_sha256": receipts["suite"][1],
         "w17_receipt_path": str(receipts["w17"][0]),
@@ -171,6 +171,7 @@ def fixed_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 def test_plan_and_argv_are_exact_and_server_fixed(tmp_path: Path) -> None:
     value = plan()
     assert value.plan_bytes == admission.canonical_bytes(value.plan) + b"\n"
+    assert value.plan["evaluator_version"] == "git-" + value.request["remote_commit"]
     assert set(value.plan) == {
         "attempt_id", "budgets", "canonical_input", "evaluator_fingerprints",
         "evaluator_fingerprints_sha256", "evaluator_version", "execution_policy",
@@ -221,7 +222,9 @@ def test_plan_and_argv_are_exact_and_server_fixed(tmp_path: Path) -> None:
     assert verify[3:6] == ["verify", "--run-root", str(value.task_root)]
 
 
-def test_request_rejects_operator_controls_and_wrong_hash() -> None:
+def test_request_rejects_operator_controls_and_wrong_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     value = {**request(), "command": "operator-selected"}
     with pytest.raises(admission.RcaProdAdmissionError, match="request_schema_invalid"):
         admission.build_historical_full_rerun_plan(
@@ -243,6 +246,13 @@ def test_request_rejects_operator_controls_and_wrong_hash() -> None:
         admission.build_historical_full_rerun_plan(
             wrong_successor,
             expected_request_sha256=admission.sha256_value(wrong_successor),
+        )
+    wrong_evaluator = dict(admission.HISTORICAL_SUCCESSOR_RELEASE or {})
+    wrong_evaluator["evaluator_version"] = "g1q3_rca_evaluator_scope_v6"
+    monkeypatch.setattr(admission, "HISTORICAL_SUCCESSOR_RELEASE", wrong_evaluator)
+    with pytest.raises(admission.RcaProdAdmissionError, match="successor_release_invalid"):
+        admission.build_historical_full_rerun_plan(
+            request(), expected_request_sha256=admission.sha256_value(request())
         )
 
 

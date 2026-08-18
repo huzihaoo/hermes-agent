@@ -162,7 +162,7 @@ HISTORICAL_SUCCESSOR_RELEASE: Mapping[str, Any] | None = {
         "g1q3_rca/signal_registry.py": "ffd0a796c027df1d81e30a1727eea1d37ccfcd0c5b88a806a201a0c8f3d54f17",
     },
     "evaluator_fingerprints_sha256": "e492eaa8afd9348990cb2de265575211ff248fdebacd0fff72b2f7bafe7f18c0",
-    "evaluator_version": "g1q3_rca_evaluator_scope_v6",
+    "evaluator_version": "git-a64fa62b813ad6af0cb77537ba9b78e8c9defd11",
     "suite_receipt_path": "/mnt/tmp/g1q3-successor-full-v5-run3-20260818/suite-receipt.json",
     "suite_receipt_sha256": "829cbf498f9d141f3548afba818504fb8e1d37fe80897161aba8bf5a73f32e11",
     "w17_receipt_path": "/mnt/tmp/g1q3-successor-full-v5-run3-20260818/w17-receipt.json",
@@ -823,6 +823,7 @@ def _historical_successor_release() -> Mapping[str, Any]:
         )
         or not isinstance(value.get("evaluator_version"), str)
         or not value["evaluator_version"]
+        or value["evaluator_version"] != "git-%s" % value.get("source_commit")
         or sha256_value(fingerprints) != value.get("evaluator_fingerprints_sha256")
     ):
         raise RcaProdAdmissionError("rca_historical_successor_release_invalid", retryable=False)
