@@ -86,10 +86,6 @@ SERVICE_TARGETS = {
         "governance_tool",
         "hermes_provider_failure_audit.py",
     ),
-    "local.pnc.release-freshness-gate": (
-        "runtime_script",
-        "scripts/pnc_rca_release_freshness_gate.py",
-    ),
     "local.pnc.safe-worktree-remove": (
         "governance_tool",
         "hermes_safe_worktree_remove.py",
@@ -128,7 +124,14 @@ PNC_RESIDENT_LABELS = (
     "local.pnc.task-dashboard.viewer",
 )
 
-SIGNED_RCA_ENV_LABELS = frozenset({
+REQUIRED_RCA_RESIDENT_LABELS = frozenset({
+    "ai.hermes.gateway",
+    "local.pnc.rca-outbox-dispatcher",
+    "local.pnc.rca-delivery-collector",
+    "local.pnc.rca-delivery-dispatcher",
+})
+
+OUTBOUND_MODE_RESET_LABELS = frozenset({
     "local.pnc.rca-delivery-collector",
     "local.pnc.rca-delivery-dispatcher",
 })
@@ -461,13 +464,14 @@ def _exec_environment(resolved: dict[str, str], hermes_home: Path) -> dict[str, 
         "PYTHONPATH",
     ):
         environment.pop(key, None)
-    if resolved["service_label"] in SIGNED_RCA_ENV_LABELS:
+    service_label = resolved["service_label"]
+    if service_label in REQUIRED_RCA_RESIDENT_LABELS:
         for key in tuple(environment):
-            if (
-                key in {"HERMES_OUTBOUND_MODE", "PNC_FOXGLOVE_RENDER_HOST"}
-                or key.startswith("HERMES_RCA_")
-            ):
+            if key.startswith("HERMES_RCA_"):
                 environment.pop(key, None)
+    if service_label in OUTBOUND_MODE_RESET_LABELS:
+        environment.pop("HERMES_OUTBOUND_MODE", None)
+        environment.pop("PNC_FOXGLOVE_RENDER_HOST", None)
     environment.update({
         "HERMES_HOME": str(hermes_home),
         "PATH": ":".join(str(path) for path in stable_paths),

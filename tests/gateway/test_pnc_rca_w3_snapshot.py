@@ -21,7 +21,6 @@ from gateway.pnc_rca_control_store import (
     RcaControlStore,
     RecordConflictError,
     RecordProcessingBlockedError,
-    ShadowPromotionError,
     W3_AUTOMATIC_OBSERVATION_SNAPSHOT_MISMATCH_REASON,
     W3_KAFKA_OBSERVATION_JOIN_REASON,
     W3_LEGACY_PARENT_SNAPSHOT_MISSING_REASON,
@@ -71,6 +70,26 @@ MANUAL_PAYLOAD_AUTHORITY = "b" * 64
 BASE_URL = "https://project.feishu.cn/g1q3/issue/detail/7041712812"
 OBSERVED_AT = "2026-07-25T10:00:00+00:00"
 TITLE_AUTHORITY = canonical_ticket_title_sha256("ACC braking issue")
+STEADY_EPOCH_ID = "epoch-w3-test"
+
+
+def _activate_steady(store: RcaControlStore) -> RcaControlStore:
+    if store.activation_epoch() is None:
+        store.activate_direct_steady_epoch(
+            epoch_id=STEADY_EPOCH_ID,
+            release_fingerprint_sha256="1" * 64,
+            release_note_sha256="2" * 64,
+            config_sha256="3" * 64,
+            db_logical_identity={"database": "w3-control-test"},
+            partition_start_fence={"topic": {"0": 0}},
+            operator="w3-test",
+            reason="activate steady W3 test runtime",
+        )
+    return store
+
+
+def _steady_control_store(path) -> RcaControlStore:
+    return _activate_steady(RcaControlStore(path))
 
 
 def _policy(name: str, value=None):
@@ -303,6 +322,17 @@ def _execution_admission():
     }
 
 
+def _steady_execution_admission(*, ledger_id=1):
+    return {
+        "activation_epoch_id": STEADY_EPOCH_ID,
+        "activation_ledger_id": ledger_id,
+        "decision": "admit",
+        "reason": "activation_steady_active",
+        "state": "steady_active",
+        "legacy_unconfigured": False,
+    }
+
+
 def _admission_and_context(*, trigger_kind="issue_created", generation=None):
     admission = build_rca_admission(
         **BASE,
@@ -332,7 +362,7 @@ def _snapshot(*, trigger_kind="issue_created"):
     return request, build_admission_snapshot(
         request=request,
         admission=admission,
-        execution_admission=_execution_admission(),
+        execution_admission=_steady_execution_admission(),
     )
 
 
@@ -352,7 +382,7 @@ def _rerun_snapshot():
     return request, build_admission_snapshot(
         request=request,
         admission=admission,
-        execution_admission=_execution_admission(),
+        execution_admission=_steady_execution_admission(),
         expected_generation_authorization_evidence_sha256=AUTHORITY_A,
     )
 
@@ -2070,6 +2100,7 @@ def _seed_control_source(
     source_metadata,
     binding_action,
 ):
+    _activate_steady(store)
     conn = store._connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -2103,6 +2134,9 @@ def _seed_control_source(
                 ),
             )
             manual_values = ("", "", "", "", "")
+            activation_source_kind = "kafka"
+            activation_source_identity = {"event_uid": event_uid}
+            activation_entrypoint = "kafka_ingest"
         else:
             source_dedupe_key = f"w3-test:{source_id}"
             kafka_event_uid = None
@@ -2116,6 +2150,33 @@ def _seed_control_source(
                     "message_id",
                     "requester_id",
                 )
+            )
+            activation_source_kind = "manual"
+            activation_chat_id = source_metadata["chat_id"]
+            activation_thread_id = source_metadata["thread_id"]
+            if source_metadata["platform"] == "operator":
+                activation_chat_id = "operator"
+                activation_thread_id = "operator:issue-only"
+            activation_source_identity = {
+                "chat_id": activation_chat_id,
+                "requester_id": source_metadata["requester_id"],
+                "message_id": source_metadata["message_id"],
+                "thread_id": activation_thread_id,
+                "issue_url": snapshot.canonical_request.ticket["issue_url"],
+                "mode": source_metadata["mode"],
+            }
+            activation_entrypoint = "manual_admit"
+        if binding_action == "create":
+            store.adjudicate_activation_tx(
+                conn,
+                entrypoint=activation_entrypoint,
+                source_kind=activation_source_kind,
+                source_identity=activation_source_identity,
+                business_key=snapshot.resolved_admission["business_key"],
+                submission_key=snapshot.resolved_admission["submission_key"],
+                generation=generation,
+                new_execution=True,
+                ingress_epoch_id=STEADY_EPOCH_ID,
             )
         conn.execute(
             """
@@ -2243,7 +2304,7 @@ def _persist_snapshot_source_tx(
 
 
 def test_control_store_tx_persistence_requires_caller_transaction(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     _request, snapshot = _snapshot()
     metadata = _kafka_metadata()
     envelope = build_snapshot_source_envelope(
@@ -2276,7 +2337,7 @@ def test_control_store_tx_persistence_requires_caller_transaction(tmp_path):
 
 
 def test_control_store_tx_persistence_obeys_caller_rollback(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     _request, snapshot = _snapshot()
     metadata = _kafka_metadata()
     envelope = build_snapshot_source_envelope(
@@ -2320,7 +2381,7 @@ def test_control_store_tx_persistence_obeys_caller_rollback(tmp_path):
 
 
 def test_control_store_tx_persistence_obeys_caller_commit(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     _request, snapshot = _snapshot()
     metadata = _kafka_metadata()
     envelope = build_snapshot_source_envelope(
@@ -2362,7 +2423,7 @@ def test_control_store_tx_persistence_obeys_caller_commit(tmp_path):
 def test_control_store_public_persistence_rolls_back_after_tx_helper_fault(
     tmp_path, monkeypatch
 ):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     _request, snapshot = _snapshot()
     metadata = _kafka_metadata()
     envelope = build_snapshot_source_envelope(
@@ -2402,13 +2463,13 @@ def test_control_store_public_persistence_rolls_back_after_tx_helper_fault(
     assert store.list_rows("rca_snapshot_source_envelopes") == []
 
 
-def test_kafka_entrypoint_persists_w3_shadow_in_classification_transaction(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+def test_kafka_entrypoint_persists_w3_steady_admission_atomically(tmp_path):
+    store = _steady_control_store(tmp_path / "control.sqlite3")
 
     result = store.ingest_record(
         _kafka_record(),
         policy=_kafka_policy(),
-        submit_enabled=False,
+        submit_enabled=True,
         snapshot_authority=_runtime_authority(),
     )
 
@@ -2421,15 +2482,15 @@ def test_kafka_entrypoint_persists_w3_shadow_in_classification_transaction(tmp_p
     [envelope] = store.list_rows("rca_snapshot_source_envelopes")
     inbox = store.get_inbox(result.event_uid)
 
-    assert trigger["state"] == outbox["status"] == "shadow"
+    assert trigger["state"] == outbox["status"] == "pending"
     assert binding["role"] == "origin"
     assert binding["source_id"] == source["source_id"]
     assert snapshot["business_key"] == trigger["business_key"] == result.business_key
     assert snapshot["submission_key"] == outbox["submission_key"]
     assert snapshot["generation"] == trigger["generation"] == result.generation
-    assert snapshot["execution_decision"] == "shadow"
-    assert snapshot["execution_state"] == "unconfigured"
-    assert envelope["decision"] == "shadow"
+    assert snapshot["execution_decision"] == "admit"
+    assert snapshot["execution_state"] == "steady_active"
+    assert envelope["decision"] == "admit"
     assert envelope["binding_action"] == "create"
     assert envelope["source_id"] == source["source_id"]
     assert envelope["snapshot_sha256"] == snapshot["snapshot_sha256"]
@@ -2440,7 +2501,7 @@ def test_kafka_entrypoint_persists_w3_shadow_in_classification_transaction(tmp_p
 def test_kafka_entrypoint_w3_late_fault_rolls_back_classification_only(
     tmp_path, monkeypatch
 ):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     original = store.persist_admission_snapshot_source_tx
 
     def fail_after_write(conn, **kwargs):
@@ -2453,7 +2514,7 @@ def test_kafka_entrypoint_w3_late_fault_rolls_back_classification_only(
         store.ingest_record(
             record,
             policy=_kafka_policy(),
-            submit_enabled=False,
+            submit_enabled=True,
             snapshot_authority=_runtime_authority(),
         )
 
@@ -2478,11 +2539,11 @@ def test_kafka_entrypoint_w3_late_fault_rolls_back_classification_only(
 
 
 def test_kafka_entrypoint_exact_replay_does_not_rewrite_w3_authority(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     record = _kafka_record()
     kwargs = {
         "policy": _kafka_policy(),
-        "submit_enabled": False,
+        "submit_enabled": True,
         "snapshot_authority": _runtime_authority(),
     }
 
@@ -2504,295 +2565,10 @@ def test_kafka_entrypoint_exact_replay_does_not_rewrite_w3_authority(tmp_path):
     assert before == {table: store.list_rows(table) for table in before}
 
 
-def test_kafka_w3_profile_change_joins_snapshot_without_creating_generation_two(
-    tmp_path,
-    monkeypatch,
-):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
-    policy = WorkflowEventPolicy(
-        topic="topic",
-        policy_version="issue-profile-snapshot-v1",
-        project_keys=frozenset({"t03o4q"}),
-        project_simple_names=frozenset({"t03o4q"}),
-        work_item_type_keys=frozenset({"issue"}),
-        snapshot_patterns=frozenset({"State"}),
-        snapshot_sub_stages=frozenset({"OPEN"}),
-    )
-    policies = {
-        **_contract_kwargs(),
-        "creation_policy": _policy(
-            "creation_policy",
-            {"rule": policy.policy_version},
-        ),
-    }
-    authority_body = {
-        "schema_version": W3_SNAPSHOT_AUTHORITY_SCHEMA_VERSION,
-        "policies": policies,
-    }
-    authority = {
-        **authority_body,
-        "authority_sha256": canonical_json_sha256(authority_body),
-    }
-
-    def profile_record(offset, option_id):
-        value = {
-            "created_at": 1783650001000,
-            "fields": [{"field_key": "field_052f23", "field_value": [option_id]}],
-            "id": 7041712812,
-            "name": "ACC braking issue",
-            "pattern": "State",
-            "project_key": "t03o4q",
-            "project_simple_name": "t03o4q",
-            "sub_stage": "OPEN",
-            "updated_at": 1783650000000 + offset,
-            "work_item_status": {"state_key": "open"},
-            "work_item_type_key": "issue",
-        }
-        return KafkaRecord(
-            topic="topic",
-            partition=0,
-            offset=offset,
-            value=json.dumps(value, sort_keys=True).encode(),
-        )
-
-    first = store.ingest_record(
-        profile_record(101, "6670325063"),
-        policy=policy,
-        submit_enabled=False,
-        snapshot_authority=authority,
-    )
-    monkeypatch.setattr(
-        RcaControlStore,
-        "_execution_terminal_tx",
-        classmethod(lambda _cls, _conn, _row: True),
-    )
-
-    observed = store.ingest_record(
-        profile_record(102, "7019637554"),
-        policy=policy,
-        submit_enabled=False,
-        snapshot_authority=authority,
-    )
-
-    assert observed.decision == "deduped"
-    assert observed.reason == W3_KAFKA_OBSERVATION_JOIN_REASON
-    assert observed.generation == first.generation == 1
-    assert observed.submission_key == first.submission_key
-    assert len(store.list_rows("business_triggers")) == 1
-    assert len(store.list_rows("rca_outbox")) == 1
-    assert len(store.list_rows("rca_admission_snapshots")) == 1
-    envelopes = store.list_rows("rca_snapshot_source_envelopes")
-    assert [row["binding_action"] for row in envelopes] == ["create", "join"]
-    assert store.get_inbox(observed.event_uid)["decision"] == "deduped"
-    assert store.pending_event_uids() == []
-
-
-def test_kafka_w3_input_wait_terminal_update_joins_without_generation_two(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
-    authority = _runtime_authority()
-    first = store.ingest_record(
-        _kafka_record(offset=1),
-        policy=_kafka_policy(),
-        submit_enabled=True,
-        snapshot_authority=authority,
-    )
-    _terminalize_input_wait(store, first.submission_key)
-
-    observed = store.ingest_record(
-        _kafka_update_record(offset=2),
-        policy=_kafka_policy(),
-        submit_enabled=True,
-        snapshot_authority=authority,
-    )
-
-    assert observed.decision == "deduped"
-    assert observed.reason == W3_KAFKA_OBSERVATION_JOIN_REASON
-    assert observed.generation == first.generation == 1
-    assert observed.submission_key == first.submission_key
-    assert [row["generation"] for row in store.list_rows("business_triggers")] == [1]
-    assert [row["generation"] for row in store.list_rows("rca_outbox")] == [1]
-    assert [
-        row["binding_action"]
-        for row in store.list_rows("rca_snapshot_source_envelopes")
-    ] == ["create", "join"]
-    assert {row["role"] for row in store.list_rows("rca_trigger_bindings")} == {
-        "observer",
-        "origin",
-    }
-    inbox = store.get_inbox(observed.event_uid)
-    assert inbox["decision"] == "deduped"
-    assert inbox["processing_attempts"] == 0
-    assert store.pending_event_uids() == []
-    assert store.partition_progress(topic="topic", partitions=[0]) == {0: 3}
-    assert store.list_rows("kafka_dead_letters") == []
-
-
-def test_kafka_w3_input_wait_terminal_title_drift_dead_letters_and_advances(
-    tmp_path,
-):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
-    authority = _runtime_authority()
-    first = store.ingest_record(
-        _kafka_record(offset=1),
-        policy=_kafka_policy(),
-        submit_enabled=True,
-        snapshot_authority=authority,
-    )
-    _terminalize_input_wait(store, first.submission_key)
-
-    observed = store.ingest_record(
-        _kafka_update_record(offset=2, title="ACC braking issue renamed"),
-        policy=_kafka_policy(),
-        submit_enabled=True,
-        snapshot_authority=authority,
-    )
-
-    assert observed.decision == "invalid"
-    assert observed.reason == W3_AUTOMATIC_OBSERVATION_SNAPSHOT_MISMATCH_REASON
-    assert observed.generation == 0
-    assert observed.submission_key == ""
-    assert [row["generation"] for row in store.list_rows("business_triggers")] == [1]
-    assert [row["generation"] for row in store.list_rows("rca_outbox")] == [1]
-    assert len(store.list_rows("rca_trigger_sources")) == 1
-    assert len(store.list_rows("rca_snapshot_source_envelopes")) == 1
-    [dead_letter] = store.list_rows("kafka_dead_letters")
-    assert dead_letter["source_event_id"] == observed.event_uid
-    assert (
-        dead_letter["error_code"]
-        == W3_AUTOMATIC_OBSERVATION_SNAPSHOT_MISMATCH_REASON
-    )
-    inbox = store.get_inbox(observed.event_uid)
-    assert inbox["decision"] == "invalid"
-    assert inbox["processing_attempts"] == 0
-    assert store.pending_event_uids() == []
-    assert store.partition_progress(topic="topic", partitions=[0]) == {0: 3}
-
-
-def test_kafka_w3_legacy_parent_without_snapshot_dead_letters_without_blocking(
-    tmp_path,
-):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
-    legacy = store.ingest_record(
-        _kafka_record(offset=1),
-        policy=_kafka_policy(),
-        submit_enabled=False,
-    )
-
-    observed = store.ingest_record(
-        _kafka_record(offset=2),
-        policy=_kafka_policy(),
-        submit_enabled=False,
-        snapshot_authority=_runtime_authority(),
-    )
-
-    assert legacy.generation == 1
-    assert observed.decision == "invalid"
-    assert observed.reason == W3_LEGACY_PARENT_SNAPSHOT_MISSING_REASON
-    assert observed.generation == 0
-    assert len(store.list_rows("business_triggers")) == 1
-    assert len(store.list_rows("rca_outbox")) == 1
-    assert store.list_rows("rca_admission_snapshots") == []
-    assert store.list_rows("rca_snapshot_source_envelopes") == []
-    [dead_letter] = store.list_rows("kafka_dead_letters")
-    assert dead_letter["source_event_id"] == observed.event_uid
-    assert dead_letter["error_code"] == W3_LEGACY_PARENT_SNAPSHOT_MISSING_REASON
-    [progress] = store.list_rows("kafka_partition_progress")
-    assert progress["last_event_uid"] == observed.event_uid
-    assert progress["durable_next_offset"] == 3
-    assert store.pending_event_uids() == []
-
-
-def test_w3_shadow_promotion_requires_immutable_promotion_lineage(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
-    admitted = store.ingest_record(
-        _kafka_record(),
-        policy=_kafka_policy(),
-        submit_enabled=False,
-        snapshot_authority=_runtime_authority(),
-    )
-
-    with pytest.raises(
-        ShadowPromotionError,
-        match="w3_snapshot_promotion_lineage_required",
-    ):
-        store.promote_shadow_event(
-            admitted.event_uid,
-            operator="w3-test",
-            reason="legacy promotion cannot authorize a W3 snapshot",
-        )
-
-    [outbox] = store.list_rows("rca_outbox")
-    [trigger] = store.list_rows("business_triggers")
-    inbox = store.get_inbox(admitted.event_uid)
-    assert outbox["status"] == trigger["state"] == inbox["submission_mode"] == "shadow"
-    [audit] = store.list_rows("rca_shadow_promotion_audit")
-    assert audit["outcome"] == "denied"
-    assert audit["detail"] == "w3_snapshot_promotion_lineage_required"
-
-
-def test_legacy_manual_caller_cannot_promote_existing_w3_shadow(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
-    admitted = store.ingest_record(
-        _kafka_record(),
-        policy=_kafka_policy(),
-        submit_enabled=False,
-        snapshot_authority=_runtime_authority(),
-    )
-
-    with pytest.raises(
-        ManualRcaAdmissionError,
-        match="w3_snapshot_promotion_lineage_required",
-    ):
-        store.admit_manual_trigger(
-            _manual_request(message_id="om_legacy_promotion_bypass"),
-            allowed_chat_ids={"oc_allowed"},
-            submit_enabled=True,
-            active_policy=_kafka_policy(),
-        )
-
-    [outbox] = store.list_rows("rca_outbox")
-    [trigger] = store.list_rows("business_triggers")
-    inbox = store.get_inbox(admitted.event_uid)
-    assert outbox["status"] == trigger["state"] == inbox["submission_mode"] == "shadow"
-    assert len(store.list_rows("rca_trigger_sources")) == 1
-    assert store.list_rows("rca_shadow_promotion_audit") == []
-
-
-def test_w3_shadow_snapshot_rejects_mutable_pending_state_without_lineage(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
-    admitted = store.ingest_record(
-        _kafka_record(),
-        policy=_kafka_policy(),
-        submit_enabled=False,
-        snapshot_authority=_runtime_authority(),
-    )
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute(
-            "UPDATE kafka_inbox SET submission_mode='pending' WHERE event_uid=?",
-            (admitted.event_uid,),
-        )
-        conn.execute(
-            "UPDATE rca_outbox SET status='pending' WHERE submission_key=?",
-            (admitted.submission_key,),
-        )
-        conn.execute(
-            "UPDATE business_triggers SET state='pending' WHERE submission_key=?",
-            (admitted.submission_key,),
-        )
-
-    with pytest.raises(
-        RecordConflictError,
-        match="w3_execution_snapshot_invalid",
-    ):
-        store.read_w3_execution_snapshot(
-            admitted.submission_key,
-            snapshot_authority=_runtime_authority(),
-            required=True,
-        )
 
 
 def test_manual_entrypoint_persists_w3_creator_in_admission_transaction(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
 
     result = _admit_manual_w3(store)
 
@@ -2812,47 +2588,9 @@ def test_manual_entrypoint_persists_w3_creator_in_admission_transaction(tmp_path
     assert envelope["source_id"] == result.source_id
 
 
-def test_kafka_and_manual_entrypoints_share_one_snapshot_core(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
-    request = _manual_request()
-    kafka = store.ingest_record(
-        _kafka_record(),
-        policy=_kafka_policy(),
-        submit_enabled=False,
-        snapshot_authority=_runtime_authority(),
-    )
-    [before_snapshot] = store.list_rows("rca_admission_snapshots")
-
-    manual = _admit_manual_w3(store, request=request)
-    replay = _admit_manual_w3(store, request=request)
-
-    assert manual.business_key == kafka.business_key
-    assert manual.submission_key == kafka.submission_key
-    assert manual.generation == kafka.generation == 1
-    assert manual.outcome == replay.outcome == "joined"
-    assert manual.state == replay.state == "shadow"
-    [after_snapshot] = store.list_rows("rca_admission_snapshots")
-    envelopes = store.list_rows("rca_snapshot_source_envelopes")
-    [outbox] = store.list_rows("rca_outbox")
-    [trigger] = store.list_rows("business_triggers")
-    inbox = store.get_inbox(kafka.event_uid)
-    assert after_snapshot == before_snapshot
-    assert len(envelopes) == 2
-    assert {row["binding_action"] for row in envelopes} == {"create", "join"}
-    assert {row["source_kind"] for row in envelopes} == {
-        "kafka_workflow_event",
-        "feishu_group_manual",
-    }
-    assert {row["snapshot_sha256"] for row in envelopes} == {
-        after_snapshot["snapshot_sha256"]
-    }
-    assert len({row["source_envelope_sha256"] for row in envelopes}) == 2
-    assert outbox["status"] == trigger["state"] == inbox["submission_mode"] == "shadow"
-    assert store.list_rows("rca_shadow_promotion_audit") == []
-
 
 def test_manual_entrypoint_exact_replay_does_not_rewrite_w3_authority(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     request = _manual_request()
     first = _admit_manual_w3(store, request=request)
     before = {
@@ -2875,7 +2613,7 @@ def test_manual_entrypoint_exact_replay_does_not_rewrite_w3_authority(tmp_path):
 def test_manual_entrypoint_w3_late_fault_rolls_back_legacy_and_snapshot(
     tmp_path, monkeypatch
 ):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     original = store.persist_admission_snapshot_source_tx
 
     def fail_after_write(conn, **kwargs):
@@ -2902,7 +2640,7 @@ def test_manual_entrypoint_w3_late_fault_rolls_back_legacy_and_snapshot(
 
 
 def test_control_store_persists_exact_creator_before_generation_two_join(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     _request, snapshot = _rerun_snapshot()
     creator_metadata = _manual_metadata(mode="rerun")
     creator = build_snapshot_source_envelope(
@@ -2976,7 +2714,7 @@ def test_control_store_persists_exact_creator_before_generation_two_join(tmp_pat
 
 
 def test_control_store_rejects_join_before_creator_without_partial_authority(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     _request, snapshot = _rerun_snapshot()
     metadata = _kafka_metadata(event_uid="topic:0:2", offset=2)
     joined = build_snapshot_source_envelope(
@@ -3016,7 +2754,7 @@ def test_control_store_rejects_join_before_creator_without_partial_authority(tmp
 
 @pytest.mark.parametrize("drift", ["binding", "transport"])
 def test_control_store_rejects_unbound_or_transport_drifted_source(tmp_path, drift):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     _request, snapshot = _snapshot()
     metadata = _kafka_metadata()
     envelope = build_snapshot_source_envelope(
@@ -3070,7 +2808,7 @@ def test_control_store_current_validation_detects_post_persist_transport_drift(
     tmp_path, drift
 ):
     path = tmp_path / "control.sqlite3"
-    store = RcaControlStore(path)
+    store = _steady_control_store(path)
     _request, snapshot = _snapshot()
     metadata = _kafka_metadata()
     envelope = build_snapshot_source_envelope(
@@ -3131,7 +2869,7 @@ def test_control_store_current_validation_detects_post_persist_transport_drift(
 def test_control_store_authority_pins_fail_closed_and_exact_retry_is_idempotent(
     tmp_path,
 ):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     _request, snapshot = _snapshot()
     metadata = _kafka_metadata()
     envelope = build_snapshot_source_envelope(
@@ -3185,70 +2923,24 @@ def _seed_steady_execution(
 ):
     if source_identity is None:
         source_identity = {"event_uid": "topic:0:1"}
-    source_identity_sha256, _normalized = store._normalize_activation_source_identity(
-        source_kind,
-        source_identity,
-    )
-    admission_key = store._activation_admission_key(
-        source_kind=source_kind,
-        source_identity_sha256=source_identity_sha256,
-        business_key=admission.business_key,
-        submission_key=admission.submission_key,
-        generation=admission.generation,
-    )
+    _activate_steady(store)
     conn = store._connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            """
-            INSERT INTO rca_activation_epochs(
-                epoch_id, state, is_current,
-                preauthorization_fingerprint,
-                preauthorization_gate_receipt_sha256,
-                preauthorization_capsule_sha256,
-                preproduction_fingerprint,
-                preproduction_gate_receipt_sha256,
-                preproduction_capsule_sha256,
-                config_sha256,
-                db_logical_identity_json, db_logical_identity_sha256,
-                partition_start_fence_json, partition_start_fence_sha256,
-                created_at, updated_at, steady_activated_at
-            ) VALUES(
-                'epoch-w3-test', 'steady_active', 1,
-                ?, ?, ?, ?, ?, ?, ?, '{}', ?, '{}', ?, ?, ?, ?
-            )
-            """,
-            tuple(f"{value:x}" * 64 for value in range(1, 10))
-            + (OBSERVED_AT, OBSERVED_AT, OBSERVED_AT),
+        decision = store.adjudicate_activation_tx(
+            conn,
+            entrypoint="manual_admit" if source_kind == "manual" else "kafka_ingest",
+            source_kind=source_kind,
+            source_identity=source_identity,
+            business_key=admission.business_key,
+            submission_key=admission.submission_key,
+            generation=admission.generation,
+            new_execution=True,
+            ingress_epoch_id=STEADY_EPOCH_ID,
         )
-        cursor = conn.execute(
-            """
-            INSERT INTO rca_activation_admission_ledger(
-                epoch_id, admission_key, entrypoint, source_kind,
-                source_identity_sha256, slot_kind, decision, reason,
-                business_key, submission_key, generation,
-                first_adjudicated_at, last_adjudicated_at, admitted_at
-            ) VALUES(
-                'epoch-w3-test', ?, ?, ?,
-                ?, NULL, 'admit', 'activation_steady_active', ?, ?, ?, ?, ?, ?
-            )
-            """,
-            (
-                admission_key,
-                "manual_admit" if source_kind == "manual" else "kafka_ingest",
-                source_kind,
-                source_identity_sha256,
-                admission.business_key,
-                admission.submission_key,
-                admission.generation,
-                OBSERVED_AT,
-                OBSERVED_AT,
-                OBSERVED_AT,
-            ),
-        )
-        ledger_id = int(cursor.lastrowid)
         conn.commit()
-        return ledger_id
+        assert decision.ledger_id is not None
+        return decision.ledger_id
     except Exception:
         conn.rollback()
         raise
@@ -3257,7 +2949,7 @@ def _seed_steady_execution(
 
 
 def test_control_store_roots_active_snapshot_in_exact_execution_ledger(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     admission, context = _admission_and_context()
     ledger_id = _seed_steady_execution(store, admission)
     request = build_canonical_rca_request(
@@ -3313,7 +3005,7 @@ def test_control_store_roots_active_snapshot_in_exact_execution_ledger(tmp_path)
         ingress_decision=_ingress(),
     )
     with pytest.raises(
-        RecordConflictError, match="w3_snapshot_execution_authority_mismatch"
+        RecordConflictError, match="w3_snapshot_steady_activation_required"
     ):
         _persist_snapshot_source(
             store,
@@ -3372,7 +3064,7 @@ def test_control_store_roots_active_snapshot_in_exact_execution_ledger(tmp_path)
 def test_control_store_persists_active_operator_identity_with_durable_placeholders(
     tmp_path,
 ):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     admission, context = _admission_and_context(trigger_kind="manual_issue_request")
     metadata = _manual_metadata(platform="operator", mode="debug")
     ledger_id = _seed_steady_execution(
@@ -3432,7 +3124,7 @@ def test_control_store_persists_active_operator_identity_with_durable_placeholde
 
 
 def test_control_store_reads_approved_w3_execution_bundle(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     authority = _runtime_authority()
     admitted = _admit_manual_w3(store)
 
@@ -3453,7 +3145,7 @@ def test_control_store_reads_approved_w3_execution_bundle(tmp_path):
 
 
 def test_w3_execution_bundle_ignores_mutable_legacy_outbox_payload(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     authority = _runtime_authority()
     admitted = _admit_manual_w3(store)
     before = store.read_w3_execution_snapshot(
@@ -3478,7 +3170,7 @@ def test_w3_execution_bundle_ignores_mutable_legacy_outbox_payload(tmp_path):
 
 
 def test_dispatcher_builds_execution_request_only_from_w3_bundle(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     authority = _runtime_authority()
     admitted = _admit_manual_w3(store)
     claim = store.claim_outbox(lease_owner="w3-dispatcher-test")
@@ -3551,7 +3243,7 @@ def test_execution_request_preserves_valid_w3_bundle_policy_semantics(tmp_path):
         },
     )
     authority = _runtime_authority(policies)
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     admitted = _admit_manual_w3(store, policies=policies)
     claim = store.claim_outbox(lease_owner="w3-policy-preservation-test")
     assert claim is not None
@@ -3624,7 +3316,7 @@ def test_dispatcher_rejects_vm_envelope_excess_before_capacity_reservation(
         {"target": "issue", "nested": oversized},
     )
     authority = _runtime_authority(policies)
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     admitted = _admit_manual_w3(store, policies=policies)
     claim = store.claim_outbox(lease_owner="w3-shape-limit-test")
     assert claim is not None
@@ -3671,7 +3363,7 @@ def test_dispatcher_rejects_vm_envelope_excess_before_capacity_reservation(
 
 
 def test_dispatcher_missing_w3_snapshot_stops_before_external_boundaries(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     admitted = store.admit_manual_trigger(
         _manual_request(),
         allowed_chat_ids={"oc_allowed"},
@@ -3713,7 +3405,7 @@ def test_dispatcher_missing_w3_snapshot_stops_before_external_boundaries(tmp_pat
 def test_collector_admission_ignores_legacy_payload_and_binds_snapshot_receipt(
     tmp_path,
 ):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     authority = _runtime_authority()
     admitted = _admit_manual_w3(store)
     bundle = store.read_w3_execution_snapshot(
@@ -3754,7 +3446,7 @@ def test_collector_admission_ignores_legacy_payload_and_binds_snapshot_receipt(
 
 
 def test_w3_execution_bundle_rejects_unapproved_policy_authority(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     admitted = _admit_manual_w3(store)
     other = copy.deepcopy(_runtime_authority())
     execution = other["policies"]["execution_policy"]
@@ -3780,7 +3472,7 @@ def test_w3_execution_bundle_rejects_unapproved_policy_authority(tmp_path):
 
 
 def test_w3_execution_bundle_missing_and_tampered_fail_closed(tmp_path):
-    store = RcaControlStore(tmp_path / "control.sqlite3")
+    store = _steady_control_store(tmp_path / "control.sqlite3")
     authority = _runtime_authority()
     assert (
         store.read_w3_execution_snapshot(

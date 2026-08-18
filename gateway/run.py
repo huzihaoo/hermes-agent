@@ -2519,6 +2519,7 @@ def _admit_g1q3_manual_trigger(
         store = RcaControlStore(
             _g1q3_rca_control_db_path(),
             require_current=True,
+            allow_successor_write=True,
         )
     except (OSError, RuntimeError, sqlite3.Error) as exc:
         raise ManualRcaAdmissionError("manual_control_store_unavailable") from exc
@@ -2532,10 +2533,6 @@ def _admit_g1q3_manual_trigger(
         active_policy=resolved_admission_config.active_policy,
         outbox_high_watermark=resolved_admission_config.outbox_high_watermark,
         activation_required=_g1q3_rca_activation_required(),
-        # Bounded activation resolves one exact preauthorized manual slot from
-        # the immutable message identity, so success/failure canaries do not
-        # require a Gateway restart or a mutable per-request mode switch.
-        activation_slot_kind="",
         **snapshot_kwargs,
     )
     return result.to_dict()
@@ -11631,10 +11628,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 return (
                                     "RCA 当前处于生产激活保护阶段，本次人工请求未创建任务；"
                                     "已预授权的发布 canary 或正式 steady 状态恢复后可受理。"
-                                )
-                            if _manual_code.startswith("activation_bounded_"):
-                                return (
-                                    "RCA 当前仅放行精确预授权的发布 canary，本次人工请求未创建任务。"
                                 )
                             return (
                                 "G1Q3 RCA 人工受理失败并已安全中止，本次没有进入通用 Agent、"

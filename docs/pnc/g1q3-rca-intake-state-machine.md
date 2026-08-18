@@ -112,10 +112,10 @@ Kafka 自动链不发送群聊“接单即创建”回复；人工群 @ 只发�
 
 ## 防漂移回归
 
-本机 runtime：
+Host 定向回归必须在绑定内部 GitLab commit 的 clean 开发 worktree 中运行；不要进入 production runtime 改代码或执行会生成文件的开发测试：
 
 ```bash
-cd /Users/songying/.hermes/runtime/hermes-live
+cd <clean-gitlab-worktree>
 pytest -q -o addopts='' \
   tests/tools/test_fpx_tool.py \
   tests/gateway/test_pnc_issue_context.py \

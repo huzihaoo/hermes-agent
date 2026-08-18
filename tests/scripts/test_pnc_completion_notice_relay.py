@@ -12,6 +12,10 @@ from gateway.record_only import runtime
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from scripts import pnc_completion_notice_relay
 from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path, foxglove_url
+from tests.gateway.test_pnc_rca_delivery_store import (
+    _physical_v15_delivery_fixture,
+    _sqlite_storage_identity,
+)
 
 
 def _write_sidecar(tmp_path, task_id="task-1", *, send_status="pending"):
@@ -143,8 +147,8 @@ def test_hot_sender_auth_retry_revalidates_epoch_before_second_provider_call(
                 "external_write_fence_epoch_not_current"
             )
         return {
-            "epoch_id": "epoch-gray-1",
-            "state": "bounded_active",
+            "epoch_id": "epoch-steady-1",
+            "state": "steady_active",
             "ledger_id": 1,
             "chat_id": pnc_completion_notice_relay.G1Q3_RCA_CHAT_ID,
             "thread_id": "topic:om_root",
@@ -276,8 +280,8 @@ def test_fenced_one_shot_relay_never_uses_send_message_tool(monkeypatch):
     chat_id = pnc_completion_notice_relay.G1Q3_RCA_CHAT_ID
     thread_id = "topic:om_root"
     live = {
-        "epoch_id": "epoch-gray-1",
-        "state": "bounded_active",
+        "epoch_id": "epoch-steady-1",
+        "state": "steady_active",
         "ledger_id": 1,
         "business_key": "business-1",
         "submission_key": task_id,
@@ -344,7 +348,7 @@ def test_fenced_one_shot_relay_never_uses_send_message_tool(monkeypatch):
             {
                 "action": "send",
                 "target": f"feishu:{chat_id}:om_root",
-                "message": "bounded notice",
+                "message": "steady notice",
             }
         )
     )
@@ -354,6 +358,241 @@ def test_fenced_one_shot_relay_never_uses_send_message_tool(monkeypatch):
     assert type(calls[0]["_pnc_rca_external_write_guard"]) is (
         pnc_completion_notice_relay.RcaProviderWriteClaim
     )
+
+
+def _relay_current_write_capability():
+    return {
+        "observed_control_schema_version": "pnc_rca_control_store_v15",
+        "binary_write_schema_version": "pnc_rca_control_store_v15",
+        "mode": "current_write",
+        "read_supported": True,
+        "write_enabled": True,
+        "work_admission_enabled": True,
+        "lease_acquisition_enabled": True,
+        "external_effect_enabled": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("state", "external_effect_enabled", "expected_code"),
+    [
+        ("bounded_active", True, "external_write_fence_epoch_not_current"),
+        ("steady_active", False, "external_write_fence_schema_read_only"),
+        ("steady_active", True, None),
+    ],
+)
+def test_relay_live_fence_binding_requires_direct_steady_epoch(
+    monkeypatch,
+    tmp_path,
+    state,
+    external_effect_enabled,
+    expected_code,
+):
+    live = {
+        "epoch_id": "epoch-steady-1",
+        "state": state,
+        "ledger_id": 7,
+        "admission_key": "admission-1",
+        "business_key": "business-1",
+        "submission_key": "submission-1",
+        "generation": 2,
+        "chat_id": pnc_completion_notice_relay.G1Q3_RCA_CHAT_ID,
+        "thread_id": "topic:om_root",
+    }
+
+    class FakeStore:
+        def __init__(self, path, **kwargs):
+            assert path == tmp_path / "control.sqlite3"
+            assert kwargs == {
+                "require_current": True,
+                "ensure_current_rows": False,
+                "allow_successor_read_only": True,
+            }
+
+        def schema_runtime_capability(self):
+            capability = _relay_current_write_capability()
+            capability["external_effect_enabled"] = external_effect_enabled
+            return capability
+
+        def validate_external_write_fence_binding(self, _fence):
+            if state != "steady_active":
+                raise RuntimeError("external_write_fence_epoch_not_current")
+            return live
+
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "_relay_control_db_path",
+        lambda: tmp_path / "control.sqlite3",
+    )
+    fence = {
+        "activation_epoch_id": "epoch-steady-1",
+        "activation_ledger_id": 7,
+        "admission_key": "admission-1",
+    }
+    if expected_code:
+        with pytest.raises(
+            pnc_completion_notice_relay.ExternalWriteFenceError,
+            match=expected_code,
+        ):
+            pnc_completion_notice_relay._relay_live_fence_binding(
+                fence, store_factory=FakeStore
+            )
+        return
+
+    assert pnc_completion_notice_relay._relay_live_fence_binding(
+        fence, store_factory=FakeStore
+    ) == live
+
+
+@pytest.mark.parametrize(
+    "capability",
+    [
+        {"external_effect_enabled": True},
+        {**_relay_current_write_capability(), "unknown": True},
+        {
+            **_relay_current_write_capability(),
+            "observed_control_schema_version": "pnc_rca_control_store_v14",
+        },
+        {
+            **_relay_current_write_capability(),
+            "binary_write_schema_version": "pnc_rca_control_store_v14",
+        },
+        {**_relay_current_write_capability(), "mode": "successor_read_only"},
+        {**_relay_current_write_capability(), "read_supported": 1},
+        {**_relay_current_write_capability(), "write_enabled": "true"},
+    ],
+)
+def test_relay_capability_rejects_partial_unknown_v15_and_type_pollution_before_calls(
+    monkeypatch,
+    tmp_path,
+    capability,
+):
+    task_id = "task-rca-capability-red"
+    provider_calls = []
+    fence_calls = []
+    binding_calls = []
+
+    class FakeStore:
+        def __init__(self, path, **kwargs):
+            assert path == tmp_path / "control.sqlite3"
+            assert kwargs == {
+                "require_current": True,
+                "ensure_current_rows": False,
+                "allow_successor_read_only": True,
+            }
+
+        def schema_runtime_capability(self):
+            return dict(capability)
+
+        def validate_external_write_fence_binding(self, _fence):
+            binding_calls.append("db_fence")
+            return {}
+
+    original_live_binding = pnc_completion_notice_relay._relay_live_fence_binding
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "_relay_control_db_path",
+        lambda: tmp_path / "control.sqlite3",
+    )
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "_relay_live_fence_binding",
+        lambda fence: original_live_binding(fence, store_factory=FakeStore),
+    )
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "_load_task_write_fence",
+        lambda _task_id: {
+            "snapshot": {
+                "resolved_admission": {
+                    "business_key": "business-1",
+                    "submission_key": task_id,
+                    "generation": 1,
+                }
+            },
+            "snapshot_core_sha256": "a" * 64,
+            "write_fence": {"state": "issued"},
+        },
+    )
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "validate_write_fence",
+        lambda *_args, **_kwargs: fence_calls.append("write_fence"),
+    )
+    send_text, _send_card = pnc_completion_notice_relay._fenced_task_senders(
+        task_id,
+        lambda _args: provider_calls.append("provider") or "{}",
+        None,
+    )
+
+    with pytest.raises(
+        pnc_completion_notice_relay.ExternalWriteFenceError,
+        match="external_write_fence_schema_read_only",
+    ):
+        send_text({
+            "action": "send",
+            "target": f"feishu:{pnc_completion_notice_relay.G1Q3_RCA_CHAT_ID}",
+            "message": "must remain blocked",
+        })
+
+    assert binding_calls == []
+    assert fence_calls == []
+    assert provider_calls == []
+
+
+def test_real_v15_completion_relay_main_is_structured_red_before_mutation_or_provider(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    db_path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    sidecar = _write_sidecar(tmp_path, "g1q3-rca-v15-relay-red")
+    before_db = _sqlite_storage_identity(db_path)
+    before_sidecar = sidecar.read_bytes()
+
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "_relay_control_db_path",
+        lambda: db_path,
+    )
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "relay_pending_notices",
+        lambda **_kwargs: pytest.fail("relay scan must remain blocked on v15"),
+    )
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "watch_pending_notices",
+        lambda **_kwargs: pytest.fail("relay watch must remain blocked on v15"),
+    )
+    monkeypatch.setattr(
+        pnc_completion_notice_relay,
+        "FeishuHotSender",
+        lambda *_args, **_kwargs: pytest.fail(
+            "provider construction must remain blocked on v15"
+        ),
+    )
+
+    assert pnc_completion_notice_relay.main([
+        "--send",
+        "--json",
+        "--no-lock",
+        "--task-id",
+        "g1q3-rca-v15-relay-red",
+    ]) == 2
+
+    result = json.loads(capsys.readouterr().out)
+    assert result == {
+        "candidate_count": 0,
+        "dry_run": False,
+        "error": "external_write_fence_schema_read_only",
+        "errors": ["external_write_fence_schema_read_only"],
+        "ok": False,
+        "rows": [],
+        "sent_count": 0,
+    }
+    assert _sqlite_storage_identity(db_path) == before_db
+    assert sidecar.read_bytes() == before_sidecar
 
 
 def test_l4_sealed_clock_and_business_timestamp_format_are_idempotent(monkeypatch):

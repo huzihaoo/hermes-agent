@@ -368,6 +368,7 @@ def _require_current_rca_manual_activation_epoch() -> dict[str, Any]:
     store = RcaControlStore(
         _g1q3_rca_control_db_path(),
         require_current=True,
+        allow_successor_write=True,
     )
     return require_resident_activation_epoch(store)
 
@@ -383,6 +384,7 @@ def _require_current_rca_manual_admission(
     store = RcaControlStore(
         _g1q3_rca_control_db_path(),
         require_current=True,
+        allow_successor_write=True,
     )
     return store.validate_manual_external_write_admission(
         admission,

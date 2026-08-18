@@ -22,12 +22,27 @@ from gateway.pnc_rca_data_access import (
     validate_remote_data_access,
 )
 from gateway.pnc_rca_prod_admission import (
+    HISTORICAL_PLAN_SCHEMA,
+    HISTORICAL_PREPARE,
+    HISTORICAL_REQUEST_SCHEMA,
+    HISTORICAL_RUNNER,
+    HISTORICAL_FROZEN_SOURCE_ROOT,
+    HistoricalFullRerunPlan,
     RcaProdAdmissionError,
+    build_historical_full_rerun_execute_argv,
+    build_historical_full_rerun_plan,
+    build_historical_full_rerun_verify_argv,
     build_rca_prod_command_argv,
     command_sha256 as rca_prod_command_sha256,
+    consume_historical_bootstrap_and_reserve_lanes,
+    derive_historical_result_binding,
     goal_sha256 as rca_prod_goal_sha256,
     issue_rca_prod_admission,
+    materialize_historical_full_rerun_plan,
+    release_historical_lane_reservation,
+    validate_historical_full_rerun_bootstrap,
     validate_existing_rca_prod_meta,
+    verify_historical_lane_reservation,
 )
 from gateway.pnc_rca_workspace_runtime import (
     WorkspaceRuntimeError,
@@ -185,6 +200,9 @@ _RCA_SHARED_STATE_GOAL_PREFIX = (
 _RCA_VM_REPO_ROOT = RCA_PROD_VM_RELEASE_ROOT
 _RCA_FIXED_CLI_RELATIVE_PATH = f"./{RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH}"
 _RCA_VM_TASK_ROOT = "/home/mini/.hermes/shared-state/tasks"
+_RCA_HISTORICAL_OPERATIONS = frozenset({"plan", "execute", "verify"})
+_RCA_HISTORICAL_GOAL_BEGIN = "<!-- G1Q3_RCA_HISTORICAL_FULL308:BEGIN -->"
+_RCA_HISTORICAL_GOAL_END = "<!-- G1Q3_RCA_HISTORICAL_FULL308:END -->"
 _RCA_STORAGE_ADMISSION_SCHEMA_VERSION = "pnc_rca_derived_capacity_admission_v2"
 _RCA_FORBIDDEN_LEGACY_DOWNLOAD_FIELDS = frozenset({
     "pdcl_download_cmd",
@@ -381,12 +399,19 @@ def _is_reserved_rca_service_submission(
         _RCA_EXECUTION_REQUEST_JSON_BEGIN.lower() in normalized_goal_lower,
         _RCA_EXECUTION_REQUEST_JSON_END.lower() in normalized_goal_lower,
         _RCA_FIXED_CLI_RELATIVE_PATH.lower() in normalized_goal_lower,
+        _RCA_HISTORICAL_GOAL_BEGIN.lower() in normalized_goal_lower,
+        _RCA_HISTORICAL_GOAL_END.lower() in normalized_goal_lower,
+        HISTORICAL_PREPARE.lower() in normalized_goal_lower,
+        HISTORICAL_RUNNER.lower() in normalized_goal_lower,
+        normalized_task_id.startswith("g1q3-rca-full308-"),
         "/api/g1q3_rca/scripts/run_rca_service_request.py" in normalized_goal_lower,
         "run_rca_auto_pipeline.py" in normalized_goal_lower,
         "/g1q3-rca-s1-" in normalized_artifact_root,
         "/g1q3_rca_issue_intake_" in normalized_artifact_root,
         "/g1q3-rca-s1-" in normalized_artifact_cifs_root,
         "/g1q3_rca_issue_intake_" in normalized_artifact_cifs_root,
+        "/g1q3-rca-full308-" in normalized_artifact_root,
+        "/g1q3-rca-full308-" in normalized_artifact_cifs_root,
     ))
 
 
@@ -1361,6 +1386,324 @@ def _vm_task_submit_trusted(
     }
 
 
+def _historical_title(plan: HistoricalFullRerunPlan) -> str:
+    return "G1Q3 RCA governed historical full308: " + plan.request["request_id"]
+
+
+def _historical_meta(plan: HistoricalFullRerunPlan) -> dict[str, Any]:
+    return {
+        "actor_kind": "service",
+        "business_line": "g1q3_rca",
+        "service_operation": "historical_full308",
+        "rca_historical_request_sha256": plan.request_sha256,
+        "rca_historical_plan_sha256": plan.plan_sha256,
+        "rca_historical_source_commit": plan.request["remote_commit"],
+        "rca_historical_source_tree": plan.request["remote_tree"],
+        "rca_historical_fixed_prepare": HISTORICAL_PREPARE,
+        "rca_historical_fixed_runner": build_historical_full_rerun_verify_argv(
+            plan, full_chain_output_seal_sha256="0" * 64
+        )[2],
+        "rca_historical_command_sha256": rca_prod_command_sha256(
+            build_historical_full_rerun_execute_argv(plan)
+        ),
+        "rca_historical_host_reservation_path": str(plan.host_reservation_path),
+        "rca_prod_capacity_mode": "bootstrap",
+        "queue_if_blocked": False,
+        "resource_gate_bypass": False,
+    }
+
+
+_HISTORICAL_OFFLINE_VERIFY_FIELDS = frozenset({
+    "ok", "terminal_complete", "all_pass", "item_count", "source_manifest_sha256",
+})
+_HISTORICAL_OFFLINE_VERIFY_TIMEOUT_SECONDS = 180
+_HISTORICAL_OFFLINE_VERIFY_MAX_OUTPUT_BYTES = 64 * 1024
+
+
+def _strict_historical_verify_json(raw: str) -> Any:
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    return json.loads(
+        raw,
+        object_pairs_hook=pairs,
+        parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+    )
+
+
+def _run_historical_offline_verify(
+    plan: HistoricalFullRerunPlan,
+    argv: list[str],
+    *,
+    run_func: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+) -> dict[str, Any]:
+    """Run the fixed VM verifier and require its complete terminal projection."""
+    expected_runner = HISTORICAL_FROZEN_SOURCE_ROOT / plan.task_id / "root" / HISTORICAL_RUNNER
+    if (
+        len(argv) != 8
+        or argv[0:2] != ["/usr/bin/python3.8", "-B"]
+        or argv[2] != str(expected_runner)
+        or argv[3:5] != ["verify", "--run-root"]
+        or argv[5] != str(plan.output_root)
+        or argv[6] != "--final-execution-seal-sha256"
+        or re.fullmatch(r"[0-9a-f]{64}", str(argv[7] or "")) is None
+    ):
+        raise RcaProdAdmissionError("rca_historical_verify_argv_invalid", retryable=False)
+    frozen_root = HISTORICAL_FROZEN_SOURCE_ROOT / plan.task_id / "root"
+    command = (
+        "exec env -i PATH=/usr/bin:/bin PYTHONDONTWRITEBYTECODE=1 "
+        "PYTHONPATH=%s %s"
+        % (shlex.quote(str(frozen_root)), shlex.join(argv))
+    )
+    wrapper = Path.home() / ".local/bin/ssh-mini-agent"
+    try:
+        result = run_func(
+            [str(wrapper), "run_bash_json"],
+            input=command,
+            text=True,
+            capture_output=True,
+            timeout=_HISTORICAL_OFFLINE_VERIFY_TIMEOUT_SECONDS,
+            env={**os.environ, "SSH_MINI_AGENT_TIMEOUT": "165", "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+        raise RcaProdAdmissionError("rca_historical_offline_verify_failed") from exc
+    if result.returncode != 0:
+        raise RcaProdAdmissionError("rca_historical_offline_verify_failed")
+    raw = str(result.stdout or "").strip()
+    if len(raw.encode("utf-8")) > _HISTORICAL_OFFLINE_VERIFY_MAX_OUTPUT_BYTES:
+        raise RcaProdAdmissionError("rca_historical_offline_verify_schema_invalid", retryable=False)
+    try:
+        value = _strict_historical_verify_json(raw)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RcaProdAdmissionError("rca_historical_offline_verify_schema_invalid", retryable=False) from exc
+    if (
+        not isinstance(value, dict)
+        or set(value) != _HISTORICAL_OFFLINE_VERIFY_FIELDS
+        or value.get("ok") is not True
+        or value.get("terminal_complete") is not True
+        or type(value.get("all_pass")) is not bool
+        or type(value.get("item_count")) is not int
+        or value.get("item_count") != 308
+        or re.fullmatch(r"[0-9a-f]{64}", str(value.get("source_manifest_sha256") or "")) is None
+    ):
+        raise RcaProdAdmissionError("rca_historical_offline_verify_schema_invalid", retryable=False)
+    return value
+
+
+def _historical_goal(
+    plan: HistoricalFullRerunPlan, receipt: Mapping[str, Any]
+) -> str:
+    contract = json.dumps(
+        {
+            "schema_version": "g1q3-rca-historical-full308-task/v1",
+            "plan": plan.plan,
+            "plan_sha256": plan.plan_sha256,
+            "bootstrap_receipt": dict(receipt),
+            "execute_argv": build_historical_full_rerun_execute_argv(plan),
+            "environment": {"PYTHONDONTWRITEBYTECODE": "1"},
+        },
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    )
+    return canonicalize_rca_goal_text("\n".join((
+        "Execute the fixed historical full308 comparison run.",
+        "resource_class=rca_prod capacity_mode=bootstrap queue_if_blocked=false",
+        "authority_mode=development_only production_effects=false",
+        _RCA_HISTORICAL_GOAL_BEGIN, contract, _RCA_HISTORICAL_GOAL_END,
+        "PYTHONDONTWRITEBYTECODE=1 "
+        + shlex.join(build_historical_full_rerun_execute_argv(plan)),
+    )))
+
+
+def vm_task_historical_full_rerun_service(
+    *, operation: str, request: Any, expected_request_sha256: str,
+    bootstrap_receipt: Any = None,
+) -> Dict[str, Any]:
+    operation = str(operation or "").strip()
+    if operation not in _RCA_HISTORICAL_OPERATIONS:
+        return _vm_task_service_denied_payload(
+            "rca_historical_operation_denied", "operation must be plan, execute, or verify"
+        )
+    if operation != "execute" and bootstrap_receipt is not None:
+        return _vm_task_service_denied_payload(
+            "rca_historical_bootstrap_not_allowed", "bootstrap receipt is execute-only"
+        )
+    try:
+        plan = build_historical_full_rerun_plan(
+            request, expected_request_sha256=expected_request_sha256
+        )
+    except RcaProdAdmissionError as exc:
+        return {
+            **_vm_task_service_denied_payload("rca_historical_request_invalid", exc.code),
+            "retryable": exc.retryable,
+        }
+    if operation == "plan":
+        return {
+            "success": True, "operation": "plan", "schema_version": HISTORICAL_PLAN_SCHEMA,
+            "request_sha256": plan.request_sha256, "plan_sha256": plan.plan_sha256,
+            "task_id": plan.task_id, "plan": plan.plan,
+            "execute_argv": build_historical_full_rerun_execute_argv(plan),
+        }
+    try:
+        status = vm_task_status(plan.task_id, include_markdown=False)
+    except Exception as exc:
+        return {
+            **_vm_task_service_denied_payload("rca_historical_status_unavailable", type(exc).__name__),
+            "retryable": True,
+        }
+    if operation == "verify":
+        if status.get("success") is not True or status.get("state") != "completed":
+            return {
+                **_vm_task_service_denied_payload("rca_historical_verify_not_completed", "task is not completed"),
+                "retryable": True, "status": status,
+            }
+        if _rca_existing_identity_error(
+            dict(status), task_id=plan.task_id, title=_historical_title(plan),
+            owner=plan.request["owner"], expected_meta=_historical_meta(plan),
+        ):
+            return _vm_task_service_denied_payload(
+                "rca_historical_existing_identity_conflict", "completed task identity drifted"
+            )
+        try:
+            meta = status.get("meta")
+            historical_receipt = (
+                meta.get("rca_prod_admission_receipt")
+                if isinstance(meta, Mapping) else None
+            )
+            validated_receipt = validate_historical_full_rerun_bootstrap(
+                historical_receipt, plan=plan,
+                expected_owner=plan.request["owner"], allow_historical=True,
+            )
+            binding = derive_historical_result_binding(plan)
+            reservation = verify_historical_lane_reservation(
+                plan, raw_sha256=binding["host_reservation_raw_sha256"],
+                semantic_sha256=binding["host_reservation_semantic_sha256"],
+            )
+            if (
+                reservation.get("receipt_id") != validated_receipt["receipt_id"]
+                or reservation.get("reservation_id")
+                != validated_receipt["reservation_id"]
+            ):
+                raise RcaProdAdmissionError(
+                    "rca_historical_sidecar_authority_mismatch", retryable=False
+                )
+            argv = build_historical_full_rerun_verify_argv(
+                plan, full_chain_output_seal_sha256=binding["full_chain_output_seal_sha256"]
+            )
+            offline_verify = _run_historical_offline_verify(plan, argv)
+            lane_release = release_historical_lane_reservation(
+                plan, receipt_id=validated_receipt["receipt_id"],
+                reservation_id=validated_receipt["reservation_id"],
+                raw_sha256=binding["host_reservation_raw_sha256"],
+                semantic_sha256=binding["host_reservation_semantic_sha256"],
+                reason="verify_succeeded",
+            )
+        except RcaProdAdmissionError as exc:
+            return _vm_task_service_denied_payload("rca_historical_verify_blocked", exc.code)
+        return {
+            "success": True, "operation": "verify", "task_id": plan.task_id,
+            "plan_sha256": plan.plan_sha256, "host_reservation": reservation,
+            "verify_argv": argv, "offline_verify": offline_verify,
+            "lane_release": lane_release,
+        }
+    try:
+        receipt = validate_historical_full_rerun_bootstrap(
+            bootstrap_receipt, plan=plan, expected_owner=plan.request["owner"]
+        )
+        workspace = validate_workspace_runtime()
+    except (RcaProdAdmissionError, WorkspaceRuntimeError) as exc:
+        code = exc.code if hasattr(exc, "code") else type(exc).__name__
+        return {
+            **_vm_task_service_denied_payload("rca_historical_execute_denied", code),
+            "create_suppressed": True,
+        }
+    if status.get("success") is True:
+        conflict = _rca_existing_identity_error(
+            dict(status), task_id=plan.task_id, title=_historical_title(plan),
+            owner=plan.request["owner"], expected_meta=_historical_meta(plan),
+        )
+        if conflict:
+            return _vm_task_service_denied_payload(
+                "rca_historical_existing_identity_conflict", conflict
+            )
+        return {
+            "success": True, "operation": "execute", "created": False,
+            "deduped": True, "task_id": plan.task_id, "existing_status": status,
+        }
+    if status.get("state") != "missing":
+        return _vm_task_service_denied_payload(
+            "rca_historical_status_unavailable", "task absence is not proven"
+        )
+    materialize_historical_full_rerun_plan(plan)
+    routing_meta = {
+        **_historical_meta(plan), **workspace.task_meta(),
+        "rca_prod_admission_receipt": receipt,
+    }
+    reservation: dict[str, Any] = {}
+
+    def reserve() -> Mapping[str, Any] | None:
+        try:
+            reservation.update(consume_historical_bootstrap_and_reserve_lanes(
+                receipt, plan=plan, expected_owner=plan.request["owner"]
+            ))
+        except RcaProdAdmissionError as exc:
+            return {
+                **_vm_task_service_denied_payload("rca_historical_lane_blocked", exc.code),
+                "create_suppressed": True,
+            }
+        return None
+
+    result = _vm_task_submit_trusted(
+        title=_historical_title(plan), goal=_historical_goal(plan, receipt),
+        task_id=plan.task_id, owner=plan.request["owner"], lane="heavy",
+        resource_class="rca_prod", repo_scope="unknown", workspace_scope="none",
+        risk_class="high", artifact_root=str(plan.task_root) + "/",
+        artifact_cifs_root=(
+            "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
+            + plan.task_id + "/"
+        ),
+        executor_type="direct_cli", agent_backend="none", codex_backend_enabled=False,
+        routing_meta_extra=routing_meta, create_once=True,
+        create_task_script=workspace.creator_path, rca_prod_service_receipt=receipt,
+        rca_prod_workspace_runtime=workspace, pre_create_guard=reserve,
+    )
+    lane_release: Mapping[str, Any] = {
+        "released": False, "retained": bool(reservation),
+    }
+    if result.get("success") is not True and reservation:
+        try:
+            after_failure = vm_task_status(plan.task_id, include_markdown=False)
+        except Exception:
+            after_failure = None
+        if (
+            isinstance(after_failure, Mapping)
+            and after_failure.get("success") is False
+            and after_failure.get("state") == "missing"
+        ):
+            try:
+                lane_release = release_historical_lane_reservation(
+                    plan, receipt_id=receipt["receipt_id"],
+                    reservation_id=receipt["reservation_id"],
+                    raw_sha256=str(reservation["raw_sha256"]),
+                    semantic_sha256=str(reservation["semantic_sha256"]),
+                    reason="create_failed_missing_reconfirmed",
+                )
+            except RcaProdAdmissionError as exc:
+                lane_release = {
+                    "released": False, "retained": True,
+                    "error_code": exc.code,
+                }
+    return {
+        **result, "operation": "execute", "task_id": plan.task_id,
+        "plan_sha256": plan.plan_sha256, "host_reservation": reservation,
+        "lane_release": lane_release,
+    }
+
+
 def vm_task_submit_service(
     *,
     service_id: str,
@@ -1369,13 +1712,6 @@ def vm_task_submit_service(
     admission: Any,
     execution_request: Any,
     reconcile_only: bool = False,
-    capacity_mode: str = "",
-    bootstrap_epoch_id: str = "",
-    release_bom_sha256: str = "",
-    bootstrap_started_at: str = "",
-    bootstrap_deadline: str = "",
-    bootstrap_authorization_fingerprint: str = "",
-    active_release_binding_sha256: str = "",
     snapshot_required: bool = False,
     live_write_fence_authority: Callable[
         [Mapping[str, Any]], Mapping[str, Any]
@@ -1392,46 +1728,6 @@ def vm_task_submit_service(
     normalized_service = str(service_id or "").strip()
     normalized_capability = str(capability or "").strip()
     normalized_operation = str(operation or "").strip()
-    normalized_capacity_mode = str(capacity_mode or "").strip()
-    normalized_bootstrap_epoch = str(bootstrap_epoch_id or "").strip()
-    normalized_release_bom = str(release_bom_sha256 or "").strip().lower()
-    normalized_bootstrap_started = str(bootstrap_started_at or "").strip()
-    normalized_bootstrap_deadline = str(bootstrap_deadline or "").strip()
-    normalized_bootstrap_fingerprint = str(
-        bootstrap_authorization_fingerprint or ""
-    ).strip().lower()
-    normalized_active_release_binding = str(
-        active_release_binding_sha256 or ""
-    ).strip().lower()
-    if normalized_capacity_mode not in {"steady", "bootstrap"}:
-        return _vm_task_service_denied_payload(
-            "vm_task_service_capacity_mode_invalid",
-            "capacity_mode must be explicitly steady or bootstrap",
-        )
-    if normalized_capacity_mode == "steady" and (
-        normalized_bootstrap_epoch
-        or normalized_release_bom
-        or normalized_bootstrap_started
-        or normalized_bootstrap_deadline
-        or normalized_bootstrap_fingerprint
-        or normalized_active_release_binding
-    ):
-        return _vm_task_service_denied_payload(
-            "vm_task_service_capacity_mode_invalid",
-            "steady capacity mode cannot carry bootstrap release bindings",
-        )
-    if normalized_capacity_mode == "bootstrap" and (
-        not normalized_bootstrap_epoch
-        or not re.fullmatch(r"[0-9a-f]{64}", normalized_release_bom)
-        or not normalized_bootstrap_started
-        or not normalized_bootstrap_deadline
-        or not re.fullmatch(r"[0-9a-f]{64}", normalized_bootstrap_fingerprint)
-        or not re.fullmatch(r"[0-9a-f]{64}", normalized_active_release_binding)
-    ):
-        return _vm_task_service_denied_payload(
-            "vm_task_service_bootstrap_binding_invalid",
-            "bootstrap capacity mode requires an epoch id and release BOM SHA",
-        )
     if not isinstance(reconcile_only, bool):
         return _vm_task_service_denied_payload(
             "vm_task_service_request_invalid",
@@ -1985,7 +2281,7 @@ def vm_task_submit_service(
             "lane": "heavy",
             "queue_if_blocked": False,
             "resource_gate_bypass": False,
-            "rca_prod_capacity_mode": normalized_capacity_mode,
+            "rca_prod_capacity_mode": "steady",
             "reservation_id": reservation_id,
             "reservation_fence": reservation_fence,
             "reservation_contract_sha256": reservation_contract_sha256,
@@ -1999,22 +2295,6 @@ def vm_task_submit_service(
         return _vm_task_service_denied_payload(
             "vm_task_service_rca_prod_command_invalid",
             f"fixed RCA VM command contract is invalid: {exc.code}",
-        )
-    if normalized_capacity_mode == "bootstrap":
-        stable_rca_prod_meta.update(
-            {
-                "rca_prod_capacity_mode": "bootstrap",
-                "rca_prod_bootstrap_epoch_id": normalized_bootstrap_epoch,
-                "rca_prod_bootstrap_started_at": normalized_bootstrap_started,
-                "rca_prod_bootstrap_deadline": normalized_bootstrap_deadline,
-                "rca_prod_bootstrap_authorization_fingerprint": (
-                    normalized_bootstrap_fingerprint
-                ),
-                "rca_prod_release_bom_sha256": normalized_release_bom,
-                "rca_prod_active_release_binding_sha256": (
-                    normalized_active_release_binding
-                ),
-            }
         )
     identity_meta = {**base_identity_meta, **stable_rca_prod_meta}
     try:
@@ -2056,15 +2336,6 @@ def vm_task_submit_service(
                 reservation_id=reservation_id,
                 reservation_fence=reservation_fence,
                 reservation_contract_sha256=reservation_contract_sha256,
-                capacity_mode=normalized_capacity_mode,
-                bootstrap_epoch_id=normalized_bootstrap_epoch,
-                release_bom_sha256=normalized_release_bom,
-                bootstrap_started_at=normalized_bootstrap_started,
-                bootstrap_deadline=normalized_bootstrap_deadline,
-                bootstrap_authorization_fingerprint=(
-                    normalized_bootstrap_fingerprint
-                ),
-                active_release_binding_sha256=(normalized_active_release_binding),
             )
         except RcaProdAdmissionError as exc:
             return {
@@ -2358,13 +2629,6 @@ def vm_task_submit_service(
             reservation_id=reservation_id,
             reservation_fence=reservation_fence,
             reservation_contract_sha256=reservation_contract_sha256,
-            capacity_mode=normalized_capacity_mode,
-            bootstrap_epoch_id=normalized_bootstrap_epoch,
-            release_bom_sha256=normalized_release_bom,
-            bootstrap_started_at=normalized_bootstrap_started,
-            bootstrap_deadline=normalized_bootstrap_deadline,
-            bootstrap_authorization_fingerprint=normalized_bootstrap_fingerprint,
-            active_release_binding_sha256=normalized_active_release_binding,
         )
     except RcaProdAdmissionError as exc:
         return {
@@ -2470,17 +2734,6 @@ def vm_task_submit_service(
                 reservation_id=reservation_id,
                 reservation_fence=reservation_fence,
                 reservation_contract_sha256=reservation_contract_sha256,
-                capacity_mode=normalized_capacity_mode,
-                bootstrap_epoch_id=normalized_bootstrap_epoch,
-                release_bom_sha256=normalized_release_bom,
-                bootstrap_started_at=normalized_bootstrap_started,
-                bootstrap_deadline=normalized_bootstrap_deadline,
-                bootstrap_authorization_fingerprint=(
-                    normalized_bootstrap_fingerprint
-                ),
-                active_release_binding_sha256=(
-                    normalized_active_release_binding
-                ),
             )
         except RcaProdAdmissionError as exc:
             return {

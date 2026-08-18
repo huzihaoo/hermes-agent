@@ -835,7 +835,7 @@ def _require_current_activation_epoch(conn: sqlite3.Connection) -> str:
         raise ConclusionAdjudicationError(
             "conclusion_adjudication_activation_ambiguous"
         )
-    if str(rows[0]["state"] or "") not in {"bounded_active", "steady_active"}:
+    if str(rows[0]["state"] or "") != "steady_active":
         raise ConclusionAdjudicationError(
             "conclusion_adjudication_activation_inactive"
         )
@@ -1476,7 +1476,7 @@ def validate_adjudication_effect_ledger_binding(
         )
     if require_current_activation and (
         row.get("activation_is_current") != 1
-        or row.get("activation_state") not in {"bounded_active", "steady_active"}
+        or row.get("activation_state") != "steady_active"
     ):
         raise ConclusionAdjudicationError(
             "conclusion_adjudication_effect_activation_stale"

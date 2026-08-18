@@ -8,6 +8,10 @@ import sqlite3
 import pytest
 
 from scripts import pnc_rca_w3_shadow_audit as audit
+from tests.gateway.test_pnc_rca_delivery_store import (
+    _physical_v15_delivery_fixture,
+    _sqlite_storage_identity,
+)
 
 
 NOW = "2026-07-26T10:00:00+00:00"
@@ -379,6 +383,23 @@ def test_current_v13_control_schema_is_accepted(tmp_path: Path) -> None:
     assert result["control_db"]["control_schema_version"] == (
         "pnc_rca_control_store_v13"
     )
+
+
+def test_physical_v15_control_schema_is_audited_without_mutation(
+    tmp_path: Path,
+) -> None:
+    path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    before = _sqlite_storage_identity(path)
+
+    result = audit.audit_w3_shadow(path)
+
+    assert result["ok"] is True
+    assert result["control_db"]["control_schema_version"] == (
+        "pnc_rca_control_store_v15"
+    )
+    assert result["external_writes"] is False
+    assert result["production_actions_performed"] is False
+    assert _sqlite_storage_identity(path) == before
 
 
 def test_forbidden_execution_core_mismatch_fails_closed(tmp_path: Path) -> None:

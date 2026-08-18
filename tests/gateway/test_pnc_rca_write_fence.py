@@ -8,12 +8,20 @@ import pytest
 
 from gateway.pnc_rca_write_fence import (
     ExternalWriteFenceError,
+    MINIMAL_RELEASE_CONTROL_SCHEMA_V14,
+    MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+    MINIMAL_RELEASE_HOST_REMOTE,
+    MINIMAL_RELEASE_NOTE_SCHEMA_VERSION,
+    MINIMAL_RELEASE_PRODUCTION_DEFINITION,
+    MinimalReleaseNoteIdentityError,
     RESIDENT_INGRESS_OPEN_STATES,
     build_issued_write_fence,
     canonical_write_fence_sha256,
+    minimal_release_epoch_contract_sha256,
     require_resident_activation_epoch,
     snapshot_core_sha256,
     validate_bound_resident_release,
+    validate_minimal_release_note_identity,
     validate_write_fence,
     validate_write_fence_source_binding,
     validate_resident_release_note,
@@ -21,6 +29,22 @@ from gateway.pnc_rca_write_fence import (
 
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
+
+
+def _schema_runtime_capability(
+    observed=MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+    binary_write=MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+):
+    return {
+        "observed_control_schema_version": observed,
+        "binary_write_schema_version": binary_write,
+        "mode": "current_write",
+        "read_supported": True,
+        "write_enabled": True,
+        "work_admission_enabled": True,
+        "lease_acquisition_enabled": True,
+        "external_effect_enabled": True,
+    }
 
 
 def _seal_release_note(path, note):
@@ -46,10 +70,15 @@ def _release_note(tmp_path):
     env_path.write_bytes(env_raw)
     os.chmod(env_path, 0o600)
     env_sha256 = hashlib.sha256(env_raw).hexdigest()
+    control_db_path = (
+        tmp_path / "runtime/pnc_agent/feishu_issue_kafka_rca/control.sqlite3"
+    )
     identity = {
         "host": {
             "commit": runtime_commit,
             "tree": runtime_tree,
+            "remote": MINIMAL_RELEASE_HOST_REMOTE,
+            "remote_branch": "refs/heads/production/rca",
             "runtime_root": str(runtime_root),
             "remote_tag": "rca-host-r15av-test",
             "remote_tag_object": "d" * 40,
@@ -57,6 +86,8 @@ def _release_note(tmp_path):
         "worker": {
             "commit": "a" * 40,
             "tree": "b" * 40,
+            "remote": "git@git.minieye.tech:planning_algo/vm-worker-state.git",
+            "remote_branch": "refs/heads/release/rca",
             "runtime_root": "/home/mini/.hermes/worker/releases/r15av-test",
             "remote_tag": "rca-worker-r15av-test",
             "remote_tag_object": "e" * 40,
@@ -64,21 +95,65 @@ def _release_note(tmp_path):
         "pipeline": {
             "commit": pipeline_commit,
             "tree": pipeline_tree,
+            "remote": "git@git.minieye.tech:pdcl/yj-evaluation-server.git",
+            "remote_branch": "refs/heads/rca",
             "runtime_root": "/home/mini/.hermes/rca-prod-runtime/releases/r15av-test",
+            "remote_tag": "rca-pipeline-r15av-test",
+            "remote_tag_object": "f" * 40,
         },
         "report_service": {
+            "manifest_path": "/home/mini/.config/g1q3-rca/report-runtime-manifest.json",
             "manifest_sha256": "c" * 64,
             "pipeline_commit": pipeline_commit,
             "pipeline_tree": pipeline_tree,
         },
     }
+    db_identity = {"schema_version": "test_db_v1"}
+    activation = {
+        "epoch_id": "rca-activation-r15av-test",
+        "control_db_path": str(control_db_path),
+        "operator": "owner:test",
+        "reason": "resident release binding test",
+        "expected_control_schema_version": MINIMAL_RELEASE_CONTROL_SCHEMA_V14,
+        "target_control_schema_version": MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+        "expected_predecessor_epoch_id": "",
+        "expected_predecessor_state": "",
+        "expected_predecessor_binding_fingerprint": "",
+        "db_logical_identity": db_identity,
+        "db_logical_identity_sha256": canonical_write_fence_sha256(db_identity),
+        "partition_start_fence": {},
+        "partition_start_fence_sha256": canonical_write_fence_sha256({}),
+    }
+    activation["epoch_contract_sha256"] = minimal_release_epoch_contract_sha256(
+        activation
+    )
     note = {
-        "schema_version": "pnc_rca_minimal_release_note_v1",
+        "schema_version": MINIMAL_RELEASE_NOTE_SCHEMA_VERSION,
+        "production_definition": MINIMAL_RELEASE_PRODUCTION_DEFINITION,
         "release_id": "rca-r15av-test",
         "release_identity": identity,
         "runtime_projection": {
             "env_sha256": env_sha256,
             "live_manifest_sha256": manifest_sha256,
+        },
+        "activation": activation,
+        "resident_profile": {
+            "name": "operator_issue_only_v1",
+            "required": [
+                "ai.hermes.gateway",
+                "local.pnc.rca-outbox-dispatcher",
+                "local.pnc.rca-delivery-collector",
+                "local.pnc.rca-delivery-dispatcher",
+            ],
+            "disabled": [
+                "local.pnc.rca-kafka-consumer",
+                "local.pnc.completion-notice-relay",
+            ],
+        },
+        "canary": {
+            "batch_id": "canary-r15av-test",
+            "issue_id": "7049076163",
+            "state_path": str(tmp_path / "canary.state.json"),
         },
     }
     path = tmp_path / "release-note.json"
@@ -87,12 +162,13 @@ def _release_note(tmp_path):
         "config_sha256": env_sha256,
         "epoch_id": "epoch-1",
         "state": "steady_active",
-        "production_fingerprint": fingerprint,
-        "production_gate_receipt_sha256": note_sha256,
+        "release_fingerprint_sha256": fingerprint,
+        "release_note_sha256": note_sha256,
     }
     return SimpleNamespace(
         env_path=env_path,
         env_sha256=env_sha256,
+        control_db_path=control_db_path,
         epoch=epoch,
         fingerprint=fingerprint,
         manifest_sha256=manifest_sha256,
@@ -115,18 +191,55 @@ def test_resident_release_note_binds_epoch_runtime_and_manifest(tmp_path):
         runtime_tree=fixture.runtime_tree,
         live_manifest_sha256=fixture.manifest_sha256,
         live_env_path=fixture.env_path,
+        control_db_path=fixture.control_db_path,
     ) == {
         "epoch_id": "epoch-1",
         "release_id": "rca-r15av-test",
         "release_fingerprint_sha256": fixture.fingerprint,
         "release_note_path": str(fixture.path),
-        "release_note_sha256": fixture.epoch["production_gate_receipt_sha256"],
+        "release_note_sha256": fixture.epoch["release_note_sha256"],
         "runtime_root": str(fixture.runtime_root),
         "runtime_commit": fixture.runtime_commit,
         "runtime_tree": fixture.runtime_tree,
         "live_manifest_sha256": fixture.manifest_sha256,
         "live_env_sha256": fixture.env_sha256,
     }
+
+
+@pytest.mark.parametrize("change", ["missing_field", "contract_hash", "invalid_pair"])
+def test_resident_release_note_rejects_invalid_v2_activation_contract(
+    tmp_path, change
+):
+    fixture = _release_note(tmp_path)
+    activation = fixture.note["activation"]
+    if change == "missing_field":
+        activation.pop("epoch_contract_sha256")
+    elif change == "contract_hash":
+        activation["epoch_contract_sha256"] = "d" * 64
+    else:
+        activation["target_control_schema_version"] = (
+            MINIMAL_RELEASE_CONTROL_SCHEMA_V14
+        )
+        activation["epoch_contract_sha256"] = minimal_release_epoch_contract_sha256(
+            activation
+        )
+    fingerprint, receipt = _seal_release_note(fixture.path, fixture.note)
+    fixture.epoch["release_fingerprint_sha256"] = fingerprint
+    fixture.epoch["release_note_sha256"] = receipt
+
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        validate_resident_release_note(
+            fixture.epoch,
+            release_note_path=fixture.path,
+            runtime_root=fixture.runtime_root,
+            runtime_commit=fixture.runtime_commit,
+            runtime_tree=fixture.runtime_tree,
+            live_manifest_sha256=fixture.manifest_sha256,
+            live_env_path=fixture.env_path,
+            control_db_path=fixture.control_db_path,
+        )
+
+    assert exc.value.code == "resident_release_note_schema_invalid"
 
 
 @pytest.mark.parametrize(
@@ -144,9 +257,9 @@ def test_resident_release_note_binds_epoch_runtime_and_manifest(tmp_path):
 def test_resident_release_note_rejects_identity_drift(tmp_path, mutation, code):
     fixture = _release_note(tmp_path)
     if mutation == "fingerprint":
-        fixture.epoch["production_fingerprint"] = "d" * 64
+        fixture.epoch["release_fingerprint_sha256"] = "d" * 64
     elif mutation == "receipt":
-        fixture.epoch["production_gate_receipt_sha256"] = "d" * 64
+        fixture.epoch["release_note_sha256"] = "d" * 64
     elif mutation == "root":
         fixture.runtime_root = tmp_path / "other-host-release"
     elif mutation == "commit":
@@ -167,25 +280,40 @@ def test_resident_release_note_rejects_identity_drift(tmp_path, mutation, code):
             runtime_tree=fixture.runtime_tree,
             live_manifest_sha256=fixture.manifest_sha256,
             live_env_path=fixture.env_path,
+            control_db_path=fixture.control_db_path,
         )
     assert exc.value.code == code
 
 
 @pytest.mark.parametrize(
-    ("role", "code"),
+    ("mutation", "code"),
     [
-        ("host", "resident_release_runtime_commit_mismatch"),
-        ("worker", "resident_release_identity_invalid"),
+        ("host_github", "resident_release_runtime_commit_mismatch"),
+        ("worker_github", "resident_release_identity_invalid"),
+        ("pipeline_github", "resident_release_identity_invalid"),
+        ("worker_branch", "resident_release_identity_invalid"),
+        ("definition", "resident_release_note_schema_invalid"),
+        ("release_id", "resident_release_note_schema_invalid"),
     ],
 )
-def test_resident_release_note_rejects_incomplete_release_identity(
-    tmp_path, role, code
+def test_resident_release_note_requires_gitlab_only_identity_and_definition(
+    tmp_path, mutation, code
 ):
     fixture = _release_note(tmp_path)
-    fixture.note["release_identity"][role].pop("remote_tag_object")
+    if mutation.endswith("_github"):
+        role = mutation.removesuffix("_github")
+        fixture.note["release_identity"][role]["remote"] = (
+            "git@github.com:example/repository.git"
+        )
+    elif mutation == "worker_branch":
+        fixture.note["release_identity"]["worker"]["remote_branch"] = "main"
+    elif mutation == "definition":
+        fixture.note["production_definition"] = "github_release"
+    else:
+        fixture.note["release_id"] = "INVALID RELEASE"
     fingerprint, receipt = _seal_release_note(fixture.path, fixture.note)
-    fixture.epoch["production_fingerprint"] = fingerprint
-    fixture.epoch["production_gate_receipt_sha256"] = receipt
+    fixture.epoch["release_fingerprint_sha256"] = fingerprint
+    fixture.epoch["release_note_sha256"] = receipt
 
     with pytest.raises(ExternalWriteFenceError) as exc:
         validate_resident_release_note(
@@ -196,6 +324,39 @@ def test_resident_release_note_rejects_incomplete_release_identity(
             runtime_tree=fixture.runtime_tree,
             live_manifest_sha256=fixture.manifest_sha256,
             live_env_path=fixture.env_path,
+            control_db_path=fixture.control_db_path,
+        )
+
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize(
+    ("role", "code"),
+    [
+        ("host", "resident_release_runtime_commit_mismatch"),
+        ("worker", "resident_release_identity_invalid"),
+        ("pipeline", "resident_release_identity_invalid"),
+    ],
+)
+def test_resident_release_note_rejects_incomplete_release_identity(
+    tmp_path, role, code
+):
+    fixture = _release_note(tmp_path)
+    fixture.note["release_identity"][role].pop("remote_tag_object")
+    fingerprint, receipt = _seal_release_note(fixture.path, fixture.note)
+    fixture.epoch["release_fingerprint_sha256"] = fingerprint
+    fixture.epoch["release_note_sha256"] = receipt
+
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        validate_resident_release_note(
+            fixture.epoch,
+            release_note_path=fixture.path,
+            runtime_root=fixture.runtime_root,
+            runtime_commit=fixture.runtime_commit,
+            runtime_tree=fixture.runtime_tree,
+            live_manifest_sha256=fixture.manifest_sha256,
+            live_env_path=fixture.env_path,
+            control_db_path=fixture.control_db_path,
         )
 
     assert exc.value.code == code
@@ -206,6 +367,11 @@ def test_bound_resident_release_rejects_startup_binding_drift(tmp_path, drift):
     fixture = _release_note(tmp_path)
 
     class Store:
+        db_path = fixture.control_db_path
+
+        def schema_runtime_capability(self):
+            return _schema_runtime_capability()
+
         def activation_epoch(self):
             return fixture.epoch
 
@@ -218,7 +384,7 @@ def test_bound_resident_release_rejects_startup_binding_drift(tmp_path, drift):
         "live_env_path": fixture.env_path,
         "expected_epoch_id": fixture.epoch["epoch_id"],
         "expected_fingerprint": fixture.fingerprint,
-        "expected_note_sha256": fixture.epoch["production_gate_receipt_sha256"],
+        "expected_note_sha256": fixture.epoch["release_note_sha256"],
     }
     assert validate_bound_resident_release(Store(), **kwargs)["epoch_id"] == "epoch-1"
     if drift == "epoch":
@@ -232,6 +398,211 @@ def test_bound_resident_release_rejects_startup_binding_drift(tmp_path, drift):
         validate_bound_resident_release(Store(), **kwargs)
 
     assert exc.value.code == "resident_release_binding_changed"
+
+
+def test_bound_resident_release_rejects_v14_store_before_epoch_read(tmp_path):
+    fixture = _release_note(tmp_path)
+
+    class Store:
+        db_path = fixture.control_db_path
+
+        def __init__(self):
+            self.activation_reads = 0
+
+        def schema_runtime_capability(self):
+            return _schema_runtime_capability(
+                observed=MINIMAL_RELEASE_CONTROL_SCHEMA_V14,
+                binary_write=MINIMAL_RELEASE_CONTROL_SCHEMA_VERSION,
+            )
+
+        def activation_epoch(self):
+            self.activation_reads += 1
+            return fixture.epoch
+
+    store = Store()
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        validate_bound_resident_release(
+            store,
+            release_note_path=fixture.path,
+            runtime_root=fixture.runtime_root,
+            runtime_commit=fixture.runtime_commit,
+            runtime_tree=fixture.runtime_tree,
+            live_manifest_sha256=fixture.manifest_sha256,
+            live_env_path=fixture.env_path,
+        )
+
+    assert exc.value.code == "resident_control_schema_not_v15"
+    assert store.activation_reads == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("mode", "successor_read_only"),
+        ("read_supported", False),
+        ("write_enabled", False),
+        ("external_effect_enabled", False),
+    ],
+)
+def test_bound_resident_release_rejects_forged_v14_capability_before_epoch_read(
+    tmp_path, field, value
+):
+    fixture = _release_note(tmp_path)
+    capability = _schema_runtime_capability()
+    capability[field] = value
+
+    class Store:
+        db_path = fixture.control_db_path
+
+        def __init__(self):
+            self.activation_reads = 0
+
+        def schema_runtime_capability(self):
+            return dict(capability)
+
+        def activation_epoch(self):
+            self.activation_reads += 1
+            return fixture.epoch
+
+    store = Store()
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        validate_bound_resident_release(
+            store,
+            release_note_path=fixture.path,
+            runtime_root=fixture.runtime_root,
+            runtime_commit=fixture.runtime_commit,
+            runtime_tree=fixture.runtime_tree,
+            live_manifest_sha256=fixture.manifest_sha256,
+            live_env_path=fixture.env_path,
+        )
+
+    assert exc.value.code == "resident_control_schema_capability_invalid"
+    assert store.activation_reads == 0
+
+
+@pytest.mark.parametrize(
+    ("scope", "code"),
+    [
+        ("top", "minimal_release_note_contract_invalid"),
+        ("identity", "minimal_release_note_identity_invalid"),
+        ("host", "minimal_release_note_host_invalid"),
+        ("worker", "minimal_release_note_identity_invalid"),
+        ("pipeline", "minimal_release_note_identity_invalid"),
+        ("report", "minimal_release_note_identity_invalid"),
+    ],
+)
+@pytest.mark.parametrize("extension_key", ["github_mirror", "unknown_extension"])
+def test_minimal_release_note_rejects_extension_keys(
+    tmp_path, scope, code, extension_key
+):
+    fixture = _release_note(tmp_path)
+    target = {
+        "top": fixture.note,
+        "identity": fixture.note["release_identity"],
+        "host": fixture.note["release_identity"]["host"],
+        "worker": fixture.note["release_identity"]["worker"],
+        "pipeline": fixture.note["release_identity"]["pipeline"],
+        "report": fixture.note["release_identity"]["report_service"],
+    }[scope]
+    target[extension_key] = "git@github.com:example/legacy.git"
+
+    with pytest.raises(MinimalReleaseNoteIdentityError) as exc:
+        validate_minimal_release_note_identity(fixture.note)
+
+    assert exc.value.code == code
+
+
+def test_minimal_release_note_rejects_github_key_in_other_formal_section(tmp_path):
+    fixture = _release_note(tmp_path)
+    fixture.note["activation"]["github_release"] = "legacy"
+
+    with pytest.raises(MinimalReleaseNoteIdentityError) as exc:
+        validate_minimal_release_note_identity(fixture.note)
+
+    assert exc.value.code == "minimal_release_note_contract_invalid"
+
+
+def test_resident_release_note_binds_exact_control_database(tmp_path):
+    fixture = _release_note(tmp_path)
+
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        validate_resident_release_note(
+            fixture.epoch,
+            release_note_path=fixture.path,
+            runtime_root=fixture.runtime_root,
+            runtime_commit=fixture.runtime_commit,
+            runtime_tree=fixture.runtime_tree,
+            live_manifest_sha256=fixture.manifest_sha256,
+            live_env_path=fixture.env_path,
+            control_db_path=tmp_path / "other-control.sqlite3",
+        )
+
+    assert exc.value.code == "resident_release_control_db_mismatch"
+
+
+def test_resident_release_note_rejects_note_and_store_bound_to_same_clone_db(tmp_path):
+    fixture = _release_note(tmp_path)
+    clone = tmp_path / "clone.sqlite3"
+    fixture.note["activation"]["control_db_path"] = str(clone)
+    fingerprint, receipt = _seal_release_note(fixture.path, fixture.note)
+    fixture.epoch["release_fingerprint_sha256"] = fingerprint
+    fixture.epoch["release_note_sha256"] = receipt
+
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        validate_resident_release_note(
+            fixture.epoch,
+            release_note_path=fixture.path,
+            runtime_root=fixture.runtime_root,
+            runtime_commit=fixture.runtime_commit,
+            runtime_tree=fixture.runtime_tree,
+            live_manifest_sha256=fixture.manifest_sha256,
+            live_env_path=fixture.env_path,
+            control_db_path=clone,
+        )
+
+    assert exc.value.code == "resident_release_control_db_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("store_db_path", "code"),
+    [
+        (None, "resident_release_control_db_path_unavailable"),
+        ("relative/control.sqlite3", "resident_release_control_db_path_invalid"),
+        ("other-control.sqlite3", "resident_release_control_db_mismatch"),
+    ],
+)
+def test_bound_resident_release_rejects_missing_or_noncanonical_store_path(
+    tmp_path, store_db_path, code
+):
+    fixture = _release_note(tmp_path)
+
+    class Store:
+        def schema_runtime_capability(self):
+            return _schema_runtime_capability()
+
+        def activation_epoch(self):
+            return fixture.epoch
+
+    store = Store()
+    if store_db_path is not None:
+        store.db_path = (
+            tmp_path / store_db_path
+            if store_db_path == "other-control.sqlite3"
+            else store_db_path
+        )
+
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        validate_bound_resident_release(
+            store,
+            release_note_path=fixture.path,
+            runtime_root=fixture.runtime_root,
+            runtime_commit=fixture.runtime_commit,
+            runtime_tree=fixture.runtime_tree,
+            live_manifest_sha256=fixture.manifest_sha256,
+            live_env_path=fixture.env_path,
+        )
+
+    assert exc.value.code == code
 
 
 def _snapshot():
@@ -354,8 +725,14 @@ def test_issued_fence_is_bound_to_core_and_operation():
     ("mutation", "code"),
     [
         (lambda f: f.pop("write_fence", None), "external_write_fence_missing"),
-        (lambda f: f.update({"activation_epoch_id": "stale"}), "external_write_fence_schema_invalid"),
-        (lambda f: f.update({"allowed_write_kinds": ["vm_submit"]}), "external_write_fence_schema_invalid"),
+        (
+            lambda f: f.update({"activation_epoch_id": "stale"}),
+            "external_write_fence_schema_invalid",
+        ),
+        (
+            lambda f: f.update({"allowed_write_kinds": ["vm_submit"]}),
+            "external_write_fence_schema_invalid",
+        ),
     ],
 )
 def test_fence_mutations_fail_closed(mutation, code):
@@ -376,7 +753,9 @@ def test_fence_mutations_fail_closed(mutation, code):
 
 def test_legacy_boolean_does_not_grant_without_fence():
     with pytest.raises(ExternalWriteFenceError) as exc:
-        validate_write_fence({}, operation="feishu_issue_comment", target="issue", now=NOW)
+        validate_write_fence(
+            {}, operation="feishu_issue_comment", target="issue", now=NOW
+        )
     assert exc.value.code == "external_write_fence_missing"
 
 
@@ -398,11 +777,18 @@ def test_resident_epoch_guard_ignores_environment_style_booleans():
         )
     assert exc.value.code == "resident_activation_epoch_state_invalid"
 
+    with pytest.raises(ExternalWriteFenceError) as exc:
+        require_resident_activation_epoch(
+            Store({"epoch_id": "epoch-confirmed", "state": "confirmed"}),
+            allowed_states=RESIDENT_INGRESS_OPEN_STATES,
+        )
+    assert exc.value.code == "resident_activation_epoch_state_invalid"
+
     ingress = require_resident_activation_epoch(
-        Store({"epoch_id": "epoch-confirmed", "state": "confirmed"}),
+        Store({"epoch_id": "epoch-steady", "state": "steady_active"}),
         allowed_states=RESIDENT_INGRESS_OPEN_STATES,
     )
-    assert ingress["state"] == "confirmed"
+    assert ingress["state"] == "steady_active"
 
 
 def test_source_binding_rejects_target_and_envelope_hash_mutations():
@@ -447,9 +833,7 @@ def test_source_binding_rejects_self_consistent_epoch_ledger_mismatch():
     forged_payload = {
         key: forged[key] for key in forged if key not in {"fence_id", "state"}
     }
-    forged["fence_id"] = (
-        "pnc-rca-wf1-" + canonical_write_fence_sha256(forged_payload)
-    )
+    forged["fence_id"] = "pnc-rca-wf1-" + canonical_write_fence_sha256(forged_payload)
     snapshot_identity = {
         key: value
         for key, value in snapshot.items()
@@ -534,9 +918,7 @@ def test_w13_shaped_claim_cannot_change_authoritative_issue_target():
         },
         effect_created_at=NOW.isoformat(),
         effect_kind="feishu_issue_comment",
-        payload={
-            "schema_version": "pnc_rca_conclusion_adjudication_effect_v2"
-        },
+        payload={"schema_version": "pnc_rca_conclusion_adjudication_effect_v2"},
         business_key="business-1",
         submission_key="submission-1",
         generation=1,
@@ -599,13 +981,10 @@ def test_relay_boundary_uses_live_bound_thread_and_rejects_forged_target(
     send, send_card = relay._fenced_task_senders(
         "g1q3-rca-s1-submission-1",
         lambda args: sent.append(args) or "ok",
-        lambda target, _payload, **_kwargs: cards.append(target)
-        or {"success": True},
+        lambda target, _payload, **_kwargs: cards.append(target) or {"success": True},
     )
     assert send({"target": "feishu:oc_1:abc", "message": "ok"}) == "ok"
-    assert send_card(
-        "feishu:oc_1:abc", {"title": "ok"}
-    )["success"] is True
+    assert send_card("feishu:oc_1:abc", {"title": "ok"})["success"] is True
     with pytest.raises(ExternalWriteFenceError) as exc:
         send({"target": "feishu:oc_1:attacker", "message": "bad"})
     assert exc.value.code == "external_write_fence_target_mismatch"

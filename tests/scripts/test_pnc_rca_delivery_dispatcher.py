@@ -65,11 +65,15 @@ from scripts.pnc_rca_delivery_dispatcher import (
 from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path, foxglove_url
 from tests.gateway.test_pnc_rca_delivery_store import (
     NOW,
+    _activate_direct_steady,
     _bind_activation_execution,
     _control,
+    _current_epoch_valid_w3_quarantined_control,
     _insert_subscription,
-    _legacy_pre_w3_pending_effects,
-    _switch_activation_epoch,
+    _physical_v15_delivery_fixture,
+    _policy,
+    _record,
+    _sqlite_storage_identity,
 )
 from tests.gateway.test_pnc_rca_delivery_contract import (
     _add_structural_candidate,
@@ -77,6 +81,7 @@ from tests.gateway.test_pnc_rca_delivery_contract import (
     _consumer_capability,
     _focus_payload,
 )
+from tests.gateway.test_pnc_rca_control_store import _migrate_v14_fixture_to_v15
 from tests.gateway.test_pnc_rca_write_fence import _release_note
 from gateway.pnc_rca_issue_focus import ANALYSIS_INSUFFICIENT_STATEMENT
 
@@ -87,19 +92,49 @@ _TEST_PROVIDER_WRITE_CLAIM = build_write_fence_provider_claim({"state": "issued"
 def _bind_minimal_release(control, fixture, *, epoch_id="delivery-epoch-1"):
     fixture.epoch["epoch_id"] = epoch_id
     with sqlite3.connect(control.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        release_note_sha256 = fixture.epoch["release_note_sha256"]
         updated = conn.execute(
             "UPDATE rca_activation_epochs "
-            "SET state = 'steady_active', config_sha256 = ?, "
+            "SET state = 'steady_active', preauthorization_fingerprint = ?, "
+            "preauthorization_gate_receipt_sha256 = ?, "
+            "preauthorization_capsule_sha256 = ?, "
+            "preproduction_fingerprint = ?, "
+            "preproduction_gate_receipt_sha256 = ?, "
+            "preproduction_capsule_sha256 = ?, config_sha256 = ?, "
             "production_fingerprint = ?, production_gate_receipt_sha256 = ? "
             "WHERE epoch_id = ? AND is_current = 1",
             (
+                fixture.fingerprint,
+                release_note_sha256,
+                release_note_sha256,
+                fixture.fingerprint,
+                release_note_sha256,
+                release_note_sha256,
                 fixture.env_sha256,
                 fixture.fingerprint,
-                fixture.epoch["production_gate_receipt_sha256"],
+                release_note_sha256,
                 epoch_id,
             ),
         )
-    assert updated.rowcount == 1
+        assert updated.rowcount == 1
+        epoch = conn.execute(
+            "SELECT * FROM rca_activation_epochs "
+            "WHERE epoch_id = ? AND is_current = 1",
+            (epoch_id,),
+        ).fetchone()
+        assert epoch is not None
+        RcaControlStore._insert_activation_transition_audit_tx(
+            conn,
+            epoch=epoch,
+            from_state="direct_release",
+            to_state="steady_active",
+            operator="test:fixture",
+            reason="bind test minimal release",
+            transitioned_at="2026-08-17T12:00:00+00:00",
+        )
+        conn.commit()
 
 
 def _set_live_release_environment(monkeypatch, fixture):
@@ -107,6 +142,167 @@ def _set_live_release_environment(monkeypatch, fixture):
     monkeypatch.setenv("PNC_LIVE_RUNTIME_COMMIT", fixture.runtime_commit)
     monkeypatch.setenv("PNC_LIVE_RUNTIME_TREE", fixture.runtime_tree)
     monkeypatch.setenv("PNC_LIVE_MANIFEST_SHA256", fixture.manifest_sha256)
+
+
+def _open_v15_delivery_store(db_path):
+    return RcaDeliveryStore(
+        db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+
+
+def _migrate_delivery_fixture_store(store):
+    _migrate_v14_fixture_to_v15(store.db_path)
+    return _open_v15_delivery_store(store.db_path)
+
+
+def _new_v15_delivery_store(db_path):
+    control = RcaControlStore(db_path)
+    _activate_direct_steady(control)
+    legacy_store = RcaDeliveryStore(db_path)
+    return _migrate_delivery_fixture_store(legacy_store)
+
+
+def _control_v15(
+    tmp_path,
+    *,
+    completed: bool = True,
+    offset: int = 10,
+    issue_id: int = 7041712812,
+):
+    path = tmp_path / "control.sqlite3"
+    legacy_control = RcaControlStore(path)
+    _activate_direct_steady(legacy_control)
+    RcaDeliveryStore(path)
+    _migrate_v14_fixture_to_v15(
+        path,
+        successor_epoch_id="delivery-epoch-v15",
+    )
+    control = RcaControlStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    result = control.ingest_record(
+        _record(offset=offset, issue_id=issue_id),
+        policy=_policy(),
+        submit_enabled=True,
+        activation_required=True,
+    )
+    if completed:
+        claim = control.claim_outbox(lease_owner="submission-worker", now=NOW)
+        assert claim is not None
+        control.complete_outbox(
+            outbox_id=claim.outbox_id,
+            lease_token=claim.lease_token,
+            result={
+                "success": True,
+                "submission_key": result.submission_key,
+                "task_id": result.submission_key,
+                "task_state": "submitted",
+                "deduped": False,
+            },
+            now=NOW,
+        )
+    return control, result
+
+
+def _switch_v15_activation_epoch(control, *, old_epoch, new_epoch):
+    switched_at = (NOW + timedelta(seconds=1)).isoformat()
+    with sqlite3.connect(control.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT * FROM rca_activation_epochs "
+            "WHERE epoch_id = ? AND is_current = 1",
+            (old_epoch,),
+        ).fetchone()
+        assert current is not None
+        retired = conn.execute(
+            "UPDATE rca_activation_epochs SET state = 'retired', is_current = 0, "
+            "updated_at = ?, retired_at = ? "
+            "WHERE epoch_id = ? AND state = 'steady_active' AND is_current = 1",
+            (switched_at, switched_at, old_epoch),
+        )
+        assert retired.rowcount == 1
+        retired_epoch = conn.execute(
+            "SELECT * FROM rca_activation_epochs WHERE epoch_id = ?",
+            (old_epoch,),
+        ).fetchone()
+        assert retired_epoch is not None
+        RcaControlStore._insert_activation_transition_audit_tx(
+            conn,
+            epoch=retired_epoch,
+            from_state="steady_active",
+            to_state="retired",
+            operator="dispatcher-test",
+            reason="simulate a v15 release epoch switch",
+            transitioned_at=switched_at,
+            schema_version="pnc_rca_control_store_v15",
+        )
+        conn.execute(
+            """
+            INSERT INTO rca_activation_epochs(
+                epoch_id, state, is_current,
+                release_fingerprint_sha256, release_note_sha256,
+                config_sha256, db_logical_identity_json,
+                db_logical_identity_sha256, partition_start_fence_json,
+                partition_start_fence_sha256, created_at, updated_at,
+                activated_at, retired_at
+            ) VALUES (?, 'steady_active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                new_epoch,
+                "d" * 64,
+                "e" * 64,
+                "f" * 64,
+                current["db_logical_identity_json"],
+                current["db_logical_identity_sha256"],
+                current["partition_start_fence_json"],
+                current["partition_start_fence_sha256"],
+                switched_at,
+                switched_at,
+                switched_at,
+            ),
+        )
+        successor = conn.execute(
+            "SELECT * FROM rca_activation_epochs "
+            "WHERE epoch_id = ? AND is_current = 1",
+            (new_epoch,),
+        ).fetchone()
+        assert successor is not None
+        RcaControlStore._insert_activation_transition_audit_tx(
+            conn,
+            epoch=successor,
+            from_state="direct_release",
+            to_state="steady_active",
+            operator="dispatcher-test",
+            reason="simulate a v15 release epoch switch",
+            transitioned_at=switched_at,
+            schema_version="pnc_rca_control_store_v15",
+        )
+        RcaControlStore._validate_current_activation_binding_tx(
+            conn,
+            schema_version="pnc_rca_control_store_v15",
+        )
+        conn.commit()
+
+
+def _dispatcher_fixture_store(db_path):
+    path = Path(db_path)
+    if path.is_file():
+        uri = f"{path.resolve().as_uri()}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as conn:
+            row = conn.execute(
+                "SELECT value FROM control_meta WHERE key = 'schema_version'"
+            ).fetchone()
+        if row is not None and row[0] == "pnc_rca_control_store_v15":
+            return _open_v15_delivery_store(path)
+    return RcaDeliveryStore(path)
+
+
 REAL_G1Q3_PROJECT_KEY = "68ef617fb371dc80a10641f7"
 REAL_G1Q3_PROJECT_SIMPLE_NAME = "t03o4q"
 
@@ -157,7 +353,7 @@ def _test_provider_revalidate(
 ):
     binding = {
         "epoch_id": "epoch-test-active",
-        "state": "bounded_active",
+        "state": "steady_active",
         "ledger_id": 1,
     }
     if operation == "feishu_thread_reply":
@@ -216,8 +412,14 @@ def test_enabled_resident_without_epoch_exits_before_provider_creation(
     capsys,
 ):
     config = _config(tmp_path, enabled=True)
-    control = RcaControlStore(config.control_db_path)
-    delivery = RcaDeliveryStore(config.control_db_path)
+    path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    delivery = _open_v15_delivery_store(path)
+    with sqlite3.connect(path) as conn:
+        retired = conn.execute(
+            "UPDATE rca_activation_epochs SET state = 'retired', is_current = 0, "
+            "retired_at = updated_at WHERE is_current = 1"
+        )
+    assert retired.rowcount == 1
     provider_created = False
 
     def unexpected_provider(*_args, **_kwargs):
@@ -243,17 +445,286 @@ def test_enabled_resident_without_epoch_exits_before_provider_creation(
     assert "resident_activation_epoch_missing" in capsys.readouterr().out
 
 
+def _successor_read_only_capability() -> dict[str, object]:
+    return {
+        "observed_control_schema_version": "pnc_rca_control_store_v15",
+        "binary_write_schema_version": "pnc_rca_control_store_v15",
+        "mode": "successor_read_only",
+        "read_supported": True,
+        "write_enabled": False,
+        "work_admission_enabled": False,
+        "lease_acquisition_enabled": False,
+        "external_effect_enabled": False,
+    }
+
+
+def test_successor_read_only_dispatcher_writes_health_without_provider_or_claim(
+    tmp_path,
+    monkeypatch,
+):
+    config = _config(tmp_path, enabled=True)
+    calls = []
+
+    class SuccessorStore:
+        def schema_runtime_capability(self):
+            return _successor_read_only_capability()
+
+        def health(self, **kwargs):
+            calls.append(("health", kwargs))
+            return {
+                "ok": False,
+                "process_healthy": True,
+                "schema_runtime_capability": _successor_read_only_capability(),
+            }
+
+        def delivery_dispatcher_circuits(self):
+            pytest.fail("circuit state must not be read in quiescent mode")
+
+        def claim_due_effect(self, **_kwargs):
+            pytest.fail("effect claim must not run")
+
+    def store_factory(*_args, **kwargs):
+        calls.append(("store", kwargs))
+        return SuccessorStore()
+
+    monkeypatch.setattr(
+        dispatcher_module, "load_delivery_dispatcher_environment", lambda: None
+    )
+    monkeypatch.setattr(
+        dispatcher_module.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(dispatcher_module, "RcaDeliveryStore", store_factory)
+    monkeypatch.setattr(
+        dispatcher_module,
+        "validate_bound_resident_release",
+        lambda *_args, **_kwargs: pytest.fail("release writer gate must not run"),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "MeegleIssueCommentAdapter",
+        lambda *_args, **_kwargs: pytest.fail("Meegle provider must not be created"),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "FeishuThreadReplyAdapter",
+        lambda *_args, **_kwargs: pytest.fail("Feishu provider must not be created"),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "DeliveryDispatcher",
+        lambda *_args, **_kwargs: pytest.fail("dispatcher must not be created"),
+    )
+
+    assert dispatcher_module.main(["--once"]) == 0
+
+    assert calls[0][0] == "store"
+    assert calls[0][1].get("read_only", False) is False
+    assert calls[0][1]["ensure_current_rows"] is False
+    assert calls[0][1].get("allow_successor_read_only", False) is False
+    assert calls[0][1]["allow_successor_write"] is True
+    assert calls[1] == (
+        "health",
+        {"activation_required": config.activation_required},
+    )
+    payload = json.loads(config.health_path.read_text(encoding="utf-8"))
+    assert payload["mode"] == "successor_read_only"
+    assert payload["ok"] is False
+    assert payload["healthy"] is True
+    assert payload["process_healthy"] is True
+    assert payload["business_ready"] is False
+    assert payload["ready"] is False
+    assert payload["processing"] is False
+    assert payload["schema_runtime_capability"] == (
+        _successor_read_only_capability()
+    )
+    healthy, observed = dispatcher_module.read_health(
+        config.health_path,
+        max_age_seconds=config.health_max_age_seconds,
+    )
+    assert healthy is False
+    assert observed["liveness_ok"] is True
+
+
+def test_real_v15_dispatcher_dry_run_preserves_db_wal_shm_without_provider_or_claim(
+    tmp_path,
+    monkeypatch,
+):
+    path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    wal_writer = sqlite3.connect(path)
+    assert wal_writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    wal_writer.execute("PRAGMA wal_autocheckpoint=0")
+    wal_writer.execute(
+        "INSERT INTO rca_delivery_meta(key, value) VALUES(?, ?)",
+        ("dispatcher_resident_live_wal_fixture", "present"),
+    )
+    wal_writer.commit()
+    assert Path(f"{path}-wal").is_file()
+    assert Path(f"{path}-shm").is_file()
+    before = _sqlite_storage_identity(path)
+    config = replace(_config(tmp_path, enabled=True), control_db_path=path)
+
+    monkeypatch.setattr(
+        dispatcher_module, "load_delivery_dispatcher_environment", lambda: None
+    )
+    monkeypatch.setattr(
+        dispatcher_module.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "validate_bound_resident_release",
+        lambda *_args, **_kwargs: pytest.fail("release writer gate must not run"),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "MeegleIssueCommentAdapter",
+        lambda *_args, **_kwargs: pytest.fail("Meegle provider must not be created"),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "FeishuThreadReplyAdapter",
+        lambda *_args, **_kwargs: pytest.fail("Feishu provider must not be created"),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "DeliveryDispatcher",
+        lambda *_args, **_kwargs: pytest.fail("dispatcher must not be created"),
+    )
+
+    try:
+        assert dispatcher_module.main(["--dry-run"]) == 2
+        after = _sqlite_storage_identity(path)
+        assert after["db"] == before["db"]
+        assert after["-wal"] == before["-wal"]
+        assert (after["-shm"] is None) is (before["-shm"] is None)
+    finally:
+        wal_writer.close()
+
+@pytest.mark.parametrize("mode", ["check_config", "dry_run"])
+def test_successor_read_only_dispatcher_diagnostics_do_not_create_provider(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    mode,
+):
+    config = _config(tmp_path, enabled=True)
+    config.control_db_path.write_bytes(b"fixture")
+    calls = []
+
+    class SuccessorStore:
+        def schema_runtime_capability(self):
+            return _successor_read_only_capability()
+
+        def preview_dispatchable_effects(self, **_kwargs):
+            calls.append("preview")
+            return []
+
+    def store_factory(*_args, **kwargs):
+        calls.append(("store", kwargs))
+        return SuccessorStore()
+
+    monkeypatch.setattr(
+        dispatcher_module, "load_delivery_dispatcher_environment", lambda: None
+    )
+    monkeypatch.setattr(
+        dispatcher_module.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(dispatcher_module, "RcaDeliveryStore", store_factory)
+    monkeypatch.setattr(
+        dispatcher_module,
+        "validate_bound_resident_release",
+        lambda *_args, **_kwargs: pytest.fail("release writer gate must not run"),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "MeegleIssueCommentAdapter",
+        lambda *_args, **_kwargs: pytest.fail("provider must not be created"),
+    )
+
+    flag = "--check-config" if mode == "check_config" else "--dry-run"
+    assert dispatcher_module.main([flag]) == 2
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["mode"] == "successor_read_only"
+    assert payload["ready"] is False
+    assert payload["processing"] is False
+    assert payload["operation"] == mode
+    assert "preview" not in calls
+    [store_call] = calls
+    assert store_call[0] == "store"
+    assert store_call[1]["ensure_current_rows"] is False
+    if mode == "check_config":
+        assert store_call[1].get("read_only", False) is False
+        assert store_call[1].get("allow_successor_read_only", False) is False
+        assert store_call[1]["allow_successor_write"] is True
+    else:
+        assert store_call[1]["read_only"] is True
+        assert store_call[1]["allow_successor_read_only"] is True
+        assert store_call[1]["allow_successor_write"] is False
+
+
+def test_disabled_dispatcher_check_config_does_not_probe_existing_control_db(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    config = _config(tmp_path, enabled=False)
+    config.control_db_path.write_bytes(b"not-a-database")
+    monkeypatch.setattr(
+        dispatcher_module, "load_delivery_dispatcher_environment", lambda: None
+    )
+    monkeypatch.setattr(
+        dispatcher_module.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(
+        dispatcher_module,
+        "RcaDeliveryStore",
+        lambda *_args, **_kwargs: pytest.fail("disabled check-config probed DB"),
+    )
+
+    assert dispatcher_module.main(["--check-config"]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
 def test_enabled_startup_locks_minimal_release_before_writable_store_and_provider(
     tmp_path,
     monkeypatch,
 ):
-    control, result = _control(tmp_path)
+    fixture = _release_note(tmp_path)
+    control, result = _control(tmp_path, db_path=fixture.control_db_path)
     _bind_activation_execution(control, result, state="steady_active")
     RcaDeliveryStore(control.db_path)
-    fixture = _release_note(tmp_path)
     _bind_minimal_release(control, fixture)
+    migration = _migrate_v14_fixture_to_v15(
+        control.db_path,
+        successor_epoch_id=fixture.note["activation"]["epoch_id"],
+        successor_release_fingerprint_sha256=fixture.fingerprint,
+        successor_release_note_sha256=fixture.epoch["release_note_sha256"],
+        successor_config_sha256=fixture.env_sha256,
+    )
+    fixture.epoch["epoch_id"] = migration["successor_epoch_id"]
     _set_live_release_environment(monkeypatch, fixture)
-    config = replace(_config(tmp_path), release_note_path=fixture.path)
+    wal_writer = sqlite3.connect(control.db_path)
+    assert wal_writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    wal_writer.execute("PRAGMA wal_autocheckpoint=0")
+    wal_writer.execute(
+        "INSERT INTO rca_delivery_meta(key, value) VALUES(?, ?)",
+        ("dispatcher_startup_active_wal", "present"),
+    )
+    wal_writer.commit()
+    config = replace(
+        _config(tmp_path),
+        control_db_path=control.db_path,
+        release_note_path=fixture.path,
+    )
     events = []
     captured = {}
     real_store = dispatcher_module.RcaDeliveryStore
@@ -296,8 +767,12 @@ def test_enabled_startup_locks_minimal_release_before_writable_store_and_provide
 
     monkeypatch.setattr(
         RcaControlStore,
-        "_create_read_only_snapshot",
-        lambda _self: pytest.fail("normal startup must not copy the control DB"),
+        "create_schema_probe_snapshot",
+        classmethod(
+            lambda _cls, *_args, **_kwargs: pytest.fail(
+                "normal startup must not copy the control DB"
+            )
+        ),
     )
     monkeypatch.setattr(dispatcher_module, "RcaDeliveryStore", tracked_store)
     monkeypatch.setattr(
@@ -326,9 +801,12 @@ def test_enabled_startup_locks_minimal_release_before_writable_store_and_provide
         dispatcher_module, "run_dispatch_loop", lambda *_args, **_kwargs: 0
     )
 
-    assert dispatcher_module.main(["--once"]) == 0
+    try:
+        assert dispatcher_module.main(["--once"]) == 0
+    finally:
+        wal_writer.close()
     assert events == [
-        ("store", True, False),
+        ("store", False, False),
         ("validate",),
         ("store", False, True),
         ("provider", "meegle"),
@@ -343,7 +821,7 @@ def test_enabled_startup_locks_minimal_release_before_writable_store_and_provide
     assert locked.release_fingerprint_sha256 == fixture.fingerprint
     assert (
         locked.release_note_sha256
-        == fixture.epoch["production_gate_receipt_sha256"]
+        == fixture.epoch["release_note_sha256"]
     )
 
 
@@ -353,11 +831,25 @@ def test_dispatcher_epoch_switch_rejects_claim_and_provider_boundaries(
     monkeypatch,
     boundary,
 ):
-    control, result = _control(tmp_path)
-    _bind_activation_execution(control, result, state="steady_active")
-    store = RcaDeliveryStore(control.db_path)
     fixture = _release_note(tmp_path)
+    control, result = _control(tmp_path, db_path=fixture.control_db_path)
+    _bind_activation_execution(control, result, state="steady_active")
+    RcaDeliveryStore(control.db_path)
     _bind_minimal_release(control, fixture)
+    migration = _migrate_v14_fixture_to_v15(
+        control.db_path,
+        successor_epoch_id=fixture.note["activation"]["epoch_id"],
+        successor_release_fingerprint_sha256=fixture.fingerprint,
+        successor_release_note_sha256=fixture.epoch["release_note_sha256"],
+        successor_config_sha256=fixture.env_sha256,
+    )
+    fixture.epoch["epoch_id"] = migration["successor_epoch_id"]
+    control = RcaControlStore(
+        control.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    store = _open_v15_delivery_store(control.db_path)
     _set_live_release_environment(monkeypatch, fixture)
     binding = dispatcher_module.validate_bound_resident_release(
         store,
@@ -370,6 +862,7 @@ def test_dispatcher_epoch_switch_rejects_claim_and_provider_boundaries(
     )
     config = replace(
         _config(tmp_path),
+        control_db_path=control.db_path,
         release_note_path=fixture.path,
         release_env_path=fixture.env_path,
         resident_release_enforced=True,
@@ -394,12 +887,14 @@ def test_dispatcher_epoch_switch_rejects_claim_and_provider_boundaries(
         report_verifier=provider,
         now=lambda: NOW,
     )
-    assert dispatcher._validate_runtime_release()["epoch_id"] == "delivery-epoch-1"
-    with sqlite3.connect(control.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_activation_epochs SET epoch_id = 'delivery-epoch-2' "
-            "WHERE is_current = 1"
-        )
+    assert dispatcher._validate_runtime_release()["epoch_id"] == fixture.epoch[
+        "epoch_id"
+    ]
+    _switch_v15_activation_epoch(
+        control,
+        old_epoch=fixture.epoch["epoch_id"],
+        new_epoch="delivery-epoch-2",
+    )
     if boundary == "claim":
         monkeypatch.setattr(
             store,
@@ -418,7 +913,61 @@ def test_dispatcher_epoch_switch_rejects_claim_and_provider_boundaries(
             )
             provider()
 
-    assert exc.value.code == "resident_release_binding_changed"
+    assert exc.value.code == "resident_release_fingerprint_mismatch"
+    assert provider_calls == []
+
+
+def test_w3_provider_rejects_hidden_v14_tamper_before_adapter_call(tmp_path):
+    control, current, snapshot = _current_epoch_valid_w3_quarantined_control(
+        tmp_path
+    )
+    store = RcaDeliveryStore(control.db_path)
+    assert store.backfill_completed_submissions(
+        now=current + timedelta(seconds=3),
+        activation_required=True,
+    ) == 1
+    effect = store.claim_due_effect(
+        lease_owner="w3-provider-audit-test",
+        now=current + timedelta(seconds=4),
+        activation_required=True,
+    )
+    assert effect is not None
+    fence = snapshot["write_fence"]
+    provider_claim = build_write_fence_provider_claim(fence)
+    provider_calls = []
+    adapter = MeegleIssueCommentAdapter(
+        lambda args: (
+            provider_calls.append(args)
+            or (0, json.dumps({"comment_id": "unexpected"}), "")
+        )
+    )
+    dispatcher = object.__new__(DeliveryDispatcher)
+    dispatcher.store = store
+    dispatcher._validate_runtime_release = lambda: {}
+    dispatcher.now = lambda: current + timedelta(seconds=4)
+    with sqlite3.connect(control.db_path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs "
+            "SET preauthorization_fingerprint = ? WHERE is_current = 1",
+            ("f" * 64,),
+        )
+
+    with pytest.raises(
+        dispatcher_module.ExternalWriteFenceError,
+        match="external_write_fence_epoch_not_current",
+    ):
+        dispatcher._validate_external_write(
+            effect,
+            operation="feishu_issue_comment",
+            target=effect.issue_url,
+        )
+        with dispatcher_module._bound_provider_write_guard(provider_claim):
+            adapter.add_comment(
+                effect.project_key,
+                effect.work_item_id,
+                "must not send",
+            )
+
     assert provider_calls == []
 
 
@@ -519,12 +1068,16 @@ def test_delivery_dispatcher_environment_loader_preserves_literal_expansion_synt
 
 def _patch_circuit_reset_cli(monkeypatch, config, tmp_path):
     binding = {
-        "path": str((tmp_path / "active-release-binding.json").absolute()),
-        "sha256": "1" * 64,
+        "epoch_id": "rca-steady-test",
         "release_id": "rca-test-release",
-        "authority_sha256": "2" * 64,
-        "authority_epoch_id": "rca-authority-test",
-        "bootstrap_epoch_id": "rca-bootstrap-test",
+        "release_fingerprint_sha256": "1" * 64,
+        "release_note_path": str((tmp_path / "release-note.json").absolute()),
+        "release_note_sha256": "2" * 64,
+        "runtime_root": str(tmp_path.absolute()),
+        "runtime_commit": "3" * 40,
+        "runtime_tree": "4" * 40,
+        "live_manifest_sha256": "5" * 64,
+        "live_env_sha256": "6" * 64,
     }
     provenance = {
         "entrypoint_path": str((tmp_path / "dispatcher.py").absolute()),
@@ -535,8 +1088,6 @@ def _patch_circuit_reset_cli(monkeypatch, config, tmp_path):
         "receipt_helper_sha256": "5" * 64,
         "control_store_path": str((tmp_path / "control-store.py").absolute()),
         "control_store_sha256": "6" * 64,
-        "bootstrap_path": str((tmp_path / "bootstrap.py").absolute()),
-        "bootstrap_sha256": "7" * 64,
     }
     monkeypatch.setattr(
         dispatcher_module, "load_delivery_dispatcher_environment", lambda: None
@@ -548,8 +1099,8 @@ def _patch_circuit_reset_cli(monkeypatch, config, tmp_path):
     )
     monkeypatch.setattr(
         dispatcher_module,
-        "_active_release_binding_snapshot",
-        lambda _config: dict(binding),
+        "_current_release_binding_snapshot",
+        lambda _config, _store: dict(binding),
     )
     monkeypatch.setattr(
         dispatcher_module,
@@ -557,349 +1108,6 @@ def _patch_circuit_reset_cli(monkeypatch, config, tmp_path):
         lambda: dict(provenance),
     )
     return binding
-
-
-def test_circuit_reset_binding_observes_live_env_drift(monkeypatch, tmp_path):
-    live_env = tmp_path / ".env"
-    live_env.write_text("CURRENT=true\n", encoding="utf-8")
-    active_binding = tmp_path / "active-release-binding.json"
-    active_binding.write_text("{}\n", encoding="utf-8")
-    config = replace(
-        _config(tmp_path, enabled=False),
-        quarantine_release_id="rca-test-release",
-        quarantine_bootstrap_epoch_id="rca-bootstrap-test",
-        quarantine_active_release_binding_path=active_binding,
-        quarantine_live_env_path=live_env,
-    )
-    calls = []
-
-    def load_binding(**kwargs):
-        calls.append(kwargs)
-        return {
-            "binding_receipt_sha256": "1" * 64,
-            "release_id": "rca-test-release",
-            "authority_sha256": "2" * 64,
-            "authority_epoch_id": "rca-authority-test",
-            "bootstrap_epoch_id": "rca-bootstrap-test",
-            "candidate_env_sha256": "3" * 64,
-        }
-
-    monkeypatch.setattr(dispatcher_module, "load_active_release_binding", load_binding)
-
-    observed = dispatcher_module._active_release_binding_snapshot(config)
-
-    assert calls[0]["verify_live_env"] is False
-    assert observed["live_env_matches_candidate"] is False
-    assert observed["live_env_sha256"] == hashlib.sha256(
-        live_env.read_bytes()
-    ).hexdigest()
-    assert observed["mismatch_policy"] == (
-        "observed_only_operator_authorized_reset"
-    )
-
-
-def _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path):
-    _patch_circuit_reset_cli(monkeypatch, config, tmp_path)
-    binding = {
-        "path": str((tmp_path / "active-release-binding.json").absolute()),
-        "sha256": "1" * 64,
-        "release_id": "rca-test-release",
-        "authority_sha256": "2" * 64,
-        "authority_epoch_id": "rca-authority-test",
-        "bootstrap_epoch_id": "rca-bootstrap-test",
-        "release_bom_sha256": "3" * 64,
-        "candidate_env_sha256": "4" * 64,
-        "live_env_path": str((tmp_path / ".env").absolute()),
-        "live_env_sha256": "5" * 64,
-        "live_env_matches_candidate": False,
-        "mismatch_policy": "observed_only_no_external_write",
-    }
-    monkeypatch.setattr(
-        dispatcher_module,
-        "_pre_w3_effect_disposition_active_release_binding",
-        lambda _config: dict(binding),
-    )
-    return binding
-
-
-def _sqlite_backup(source_path, backup_path):
-    source = sqlite3.connect(source_path)
-    destination = sqlite3.connect(backup_path)
-    try:
-        source.backup(destination)
-        destination.execute("PRAGMA journal_mode=DELETE")
-        destination.commit()
-    finally:
-        destination.close()
-        source.close()
-    backup_path.chmod(0o600)
-    return hashlib.sha256(backup_path.read_bytes()).hexdigest()
-
-
-def _pre_w3_cli_args(keys, *, receipt, backup, backup_sha256):
-    args = []
-    for key in keys:
-        args.extend(("--dispose-pre-w3-effect", key))
-    args.extend((
-        "--operator",
-        "test-operator",
-        "--reason",
-        "exact pre-W3 disposition without provider calls",
-        "--receipt",
-        str(receipt),
-        "--backup",
-        str(backup),
-        "--backup-sha256",
-        backup_sha256,
-    ))
-    return args
-
-
-def test_pre_w3_disposition_cli_plan_apply_and_recovery_never_builds_provider(
-    tmp_path, monkeypatch, capsys
-):
-    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path)
-    config = _config(tmp_path, enabled=False)
-    _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
-    provider_created = False
-
-    def unexpected_provider(*_args, **_kwargs):
-        nonlocal provider_created
-        provider_created = True
-        raise AssertionError("provider must not be built for disposition")
-
-    monkeypatch.setattr(
-        dispatcher_module,
-        "MeegleIssueCommentAdapter",
-        unexpected_provider,
-    )
-    backup = (tmp_path / "control.before.sqlite3").absolute()
-    backup_sha256 = _sqlite_backup(config.control_db_path, backup)
-    receipt = (tmp_path / "pre-w3-disposition.json").absolute()
-    base_args = _pre_w3_cli_args(
-        reversed(keys),
-        receipt=receipt,
-        backup=backup,
-        backup_sha256=backup_sha256,
-    )
-    before = store.list_rows("rca_delivery_effects")
-
-    assert dispatcher_module.main(base_args) == 0
-    plan_output = json.loads(capsys.readouterr().out)
-    assert plan_output["mode"] == "plan"
-    assert plan_output["external_effects_triggered"] is False
-    assert plan_output["provider_calls_performed"] == 0
-    assert store.list_rows("rca_delivery_effects") == before
-    assert not receipt.exists()
-
-    expected = plan_output["expected_apply"]
-    apply_args = [*base_args, "--apply"]
-    for name, value in expected.items():
-        apply_args.extend((f"--{name.replace('_', '-')}", value))
-    assert dispatcher_module.main(apply_args) == 0
-    applied = json.loads(capsys.readouterr().out)
-    assert applied["applied"] is True
-    assert applied["provider_calls_performed"] == 0
-    assert provider_created is False
-    assert receipt.stat().st_mode & 0o777 == 0o444
-    assert Path(f"{receipt}.sha256").is_file()
-    body = json.loads(receipt.read_text(encoding="utf-8"))
-    assert body["disposition_id"] == applied["disposition_id"]
-    assert body["active_release_binding"]["live_env_matches_candidate"] is False
-    effects = store.list_rows("rca_delivery_effects")
-    assert {row["status"] for row in effects} == {"quarantined"}
-    assert {row["attempt"] for row in effects} == {0}
-    assert all(row["remote_receipt_json"] is None for row in effects)
-
-    before_retry = {
-        table: store.list_rows(table)
-        for table in (
-            "rca_delivery_effects",
-            "rca_delivery_jobs",
-            "rca_delivery_attempts",
-        )
-    }
-    # A crash after the immutable main receipt but before its sidecar must be
-    # recoverable without another database mutation.
-    Path(f"{receipt}.sha256").unlink()
-    assert dispatcher_module.main(apply_args) == 0
-    repaired = json.loads(capsys.readouterr().out)
-    assert repaired["applied"] is False
-    assert repaired["idempotent"] is True
-    assert Path(f"{receipt}.sha256").read_text(encoding="ascii") == (
-        f"{repaired['receipt_sha256']}  {receipt.name}\n"
-    )
-    assert dispatcher_module.main(apply_args) == 0
-    retried = json.loads(capsys.readouterr().out)
-    assert retried["applied"] is False
-    assert retried["idempotent"] is True
-    assert retried["disposition_id"] == applied["disposition_id"]
-    assert before_retry == {
-        table: store.list_rows(table) for table in before_retry
-    }
-
-    recovered = (tmp_path / "pre-w3-disposition.recovered.json").absolute()
-    assert dispatcher_module.main([
-        "--materialize-pre-w3-disposition",
-        applied["disposition_id"],
-        "--receipt",
-        str(recovered),
-    ]) == 0
-    recovery = json.loads(capsys.readouterr().out)
-    assert recovery["recovered"] is True
-    assert recovery["provider_calls_performed"] == 0
-    envelope = json.loads(recovered.read_text(encoding="utf-8"))
-    assert envelope["source_disposition_id"] == applied["disposition_id"]
-    assert envelope["audit"] == body
-    assert provider_created is False
-
-
-def test_pre_w3_disposition_cli_rejects_active_binding_drift_before_mutation(
-    tmp_path, monkeypatch, capsys
-):
-    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
-    config = _config(tmp_path, enabled=False)
-    binding = _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
-    backup = (tmp_path / "control.before.sqlite3").absolute()
-    backup_sha256 = _sqlite_backup(config.control_db_path, backup)
-    receipt = (tmp_path / "pre-w3-drift.json").absolute()
-    base_args = _pre_w3_cli_args(
-        keys,
-        receipt=receipt,
-        backup=backup,
-        backup_sha256=backup_sha256,
-    )
-    assert dispatcher_module.main(base_args) == 0
-    planned = json.loads(capsys.readouterr().out)
-    binding["sha256"] = "9" * 64
-    apply_args = [*base_args, "--apply"]
-    for name, value in planned["expected_apply"].items():
-        apply_args.extend((f"--{name.replace('_', '-')}", value))
-
-    assert dispatcher_module.main(apply_args) == 2
-    error = json.loads(capsys.readouterr().out)
-    assert "plan_changed" in error["message"]
-    [effect] = store.list_rows("rca_delivery_effects")
-    assert effect["status"] == "pending"
-    assert store.list_rows("rca_delivery_attempts") == []
-    assert not receipt.exists()
-
-
-def test_pre_w3_disposition_cli_rejects_live_db_as_backup(
-    tmp_path, monkeypatch, capsys
-):
-    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
-    config = _config(tmp_path, enabled=False)
-    _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
-    live_sha256 = hashlib.sha256(config.control_db_path.read_bytes()).hexdigest()
-    receipt = (tmp_path / "pre-w3-live-db-backup.json").absolute()
-    args = _pre_w3_cli_args(
-        keys,
-        receipt=receipt,
-        backup=config.control_db_path.absolute(),
-        backup_sha256=live_sha256,
-    )
-
-    assert dispatcher_module.main(args) == 2
-    error = json.loads(capsys.readouterr().out)
-    assert "backup_invalid" in error["message"]
-    [effect] = store.list_rows("rca_delivery_effects")
-    assert effect["status"] == "pending"
-    assert store.list_rows("rca_delivery_attempts") == []
-    assert not receipt.exists()
-
-
-def test_pre_w3_disposition_cli_rejects_unrelated_sqlite_backup(
-    tmp_path, monkeypatch, capsys
-):
-    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
-    config = _config(tmp_path, enabled=False)
-    _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
-    unrelated_root = tmp_path / "unrelated"
-    _other_control, other_store, _other_keys = _legacy_pre_w3_pending_effects(
-        unrelated_root,
-        count=1,
-    )
-    with sqlite3.connect(other_store.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_activation_epochs SET production_fingerprint = ? "
-            "WHERE is_current = 1",
-            ("9" * 64,),
-        )
-    backup = (tmp_path / "unrelated.before.sqlite3").absolute()
-    backup_sha256 = _sqlite_backup(other_store.db_path, backup)
-    receipt = (tmp_path / "pre-w3-unrelated-backup.json").absolute()
-    args = _pre_w3_cli_args(
-        keys,
-        receipt=receipt,
-        backup=backup,
-        backup_sha256=backup_sha256,
-    )
-
-    assert dispatcher_module.main(args) == 2
-    error = json.loads(capsys.readouterr().out)
-    assert "backup" in error["message"]
-    [effect] = store.list_rows("rca_delivery_effects")
-    assert effect["status"] == "pending"
-    assert store.list_rows("rca_delivery_attempts") == []
-    assert not receipt.exists()
-
-
-@pytest.mark.parametrize("mutation_sql", [
-    "INSERT INTO control_meta(key, value) VALUES('unrelated-backup-row', 'x')",
-    "INSERT INTO rca_delivery_meta(key, value) VALUES('unrelated-backup-row', 'x')",
-])
-def test_pre_w3_disposition_cli_rejects_backup_with_unrelated_row(
-    tmp_path, monkeypatch, capsys, mutation_sql
-):
-    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
-    config = _config(tmp_path, enabled=False)
-    _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
-    backup = (tmp_path / "control.before.extra-row.sqlite3").absolute()
-    _sqlite_backup(config.control_db_path, backup)
-    with sqlite3.connect(backup) as conn:
-        conn.execute(mutation_sql)
-    backup_sha256 = hashlib.sha256(backup.read_bytes()).hexdigest()
-    receipt = (tmp_path / "pre-w3-extra-row.json").absolute()
-    args = _pre_w3_cli_args(
-        keys,
-        receipt=receipt,
-        backup=backup,
-        backup_sha256=backup_sha256,
-    )
-
-    assert dispatcher_module.main(args) == 2
-    error = json.loads(capsys.readouterr().out)
-    assert "backup" in error["message"]
-    assert store.list_rows("rca_delivery_attempts") == []
-    assert not receipt.exists()
-
-
-def test_pre_w3_disposition_cli_rejects_live_unrelated_row_drift(
-    tmp_path, monkeypatch, capsys
-):
-    _control_store, store, keys = _legacy_pre_w3_pending_effects(tmp_path, count=1)
-    config = _config(tmp_path, enabled=False)
-    _patch_pre_w3_disposition_cli(monkeypatch, config, tmp_path)
-    backup = (tmp_path / "control.before.sqlite3").absolute()
-    backup_sha256 = _sqlite_backup(config.control_db_path, backup)
-    with sqlite3.connect(config.control_db_path) as conn:
-        conn.execute(
-            "INSERT INTO control_meta(key, value) VALUES('live-unrelated-row', 'x')"
-        )
-    receipt = (tmp_path / "pre-w3-live-extra-row.json").absolute()
-    args = _pre_w3_cli_args(
-        keys,
-        receipt=receipt,
-        backup=backup,
-        backup_sha256=backup_sha256,
-    )
-
-    assert dispatcher_module.main(args) == 2
-    error = json.loads(capsys.readouterr().out)
-    assert "backup" in error["message"] or "snapshot" in error["message"]
-    assert store.list_rows("rca_delivery_attempts") == []
-    assert not receipt.exists()
 
 
 def test_bound_source_rejects_group_or_world_writable_file(tmp_path):
@@ -915,8 +1123,7 @@ def test_clear_circuit_cli_plans_then_applies_without_claiming_effects(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="operator_test_open",
@@ -943,7 +1150,7 @@ def test_clear_circuit_cli_plans_then_applies_without_claiming_effects(
     plan = json.loads(capsys.readouterr().out)
     assert plan["mode"] == "plan"
     assert plan["applied"] is False
-    assert plan["plan"]["active_release_binding"]["sha256"] == binding["sha256"]
+    assert plan["plan"]["release_binding"] == binding
     assert plan["plan"]["effect_delta"]["external_writes"] == 0
     config_sha = plan["plan"]["config_binding_sha256"]
     plan_id = plan["plan"]["plan_id"]
@@ -962,8 +1169,8 @@ def test_clear_circuit_cli_plans_then_applies_without_claiming_effects(
             "--reason",
             "validated provider recovery",
             "--apply",
-            "--expected-active-release-binding-sha256",
-            binding["sha256"],
+            "--expected-release-note-sha256",
+            binding["release_note_sha256"],
             "--expected-config-binding-sha256",
             config_sha,
             "--expected-plan-id",
@@ -980,7 +1187,7 @@ def test_clear_circuit_cli_plans_then_applies_without_claiming_effects(
     assert payload["ok"] is True
     assert payload["applied"] is True
     assert payload["effect_delta"]["external_effects_triggered"] is False
-    assert body["active_release_binding"] == binding
+    assert body["release_binding"] == binding
     assert body["effect_delta"]["delivery_effect_rows"] == 0
     assert body["effect_delta"]["database_rows"]["total"] == 3
     assert receipt.stat().st_mode & 0o777 == 0o444
@@ -996,8 +1203,7 @@ def test_clear_circuit_rejects_binding_drift_before_mutation(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="operator_test_open",
@@ -1018,11 +1224,11 @@ def test_clear_circuit_rejects_binding_drift_before_mutation(
     ]) == 0
     plan = json.loads(capsys.readouterr().out)
     changed = dict(binding)
-    changed["sha256"] = "6" * 64
+    changed["release_note_sha256"] = "7" * 64
     monkeypatch.setattr(
         dispatcher_module,
-        "_active_release_binding_snapshot",
-        lambda _config: changed,
+        "_current_release_binding_snapshot",
+        lambda _config, _store: changed,
     )
     assert dispatcher_module.main([
         "--clear-circuit",
@@ -1033,8 +1239,8 @@ def test_clear_circuit_rejects_binding_drift_before_mutation(
         "--reason",
         "plan binding",
         "--apply",
-        "--expected-active-release-binding-sha256",
-        binding["sha256"],
+        "--expected-release-note-sha256",
+        binding["release_note_sha256"],
         "--expected-config-binding-sha256",
         plan["plan"]["config_binding_sha256"],
         "--expected-plan-id",
@@ -1044,7 +1250,7 @@ def test_clear_circuit_rejects_binding_drift_before_mutation(
         "--receipt",
         str(receipt),
     ]) == 2
-    assert "active_binding_changed" in capsys.readouterr().out
+    assert "release_binding_changed" in capsys.readouterr().out
     assert store.delivery_dispatcher_circuit(DELIVERY_EFFECT_KIND).state == "open"
     assert not receipt.exists()
 
@@ -1053,8 +1259,7 @@ def test_clear_circuit_rejects_config_drift_before_mutation(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="operator_test_open",
@@ -1089,8 +1294,8 @@ def test_clear_circuit_rejects_config_drift_before_mutation(
         "--reason",
         "plan config",
         "--apply",
-        "--expected-active-release-binding-sha256",
-        binding["sha256"],
+        "--expected-release-note-sha256",
+        binding["release_note_sha256"],
         "--expected-config-binding-sha256",
         plan["config_binding_sha256"],
         "--expected-plan-id",
@@ -1109,8 +1314,7 @@ def test_clear_circuit_rejects_exact_before_state_drift(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="first-open",
@@ -1144,8 +1348,8 @@ def test_clear_circuit_rejects_exact_before_state_drift(
         "--reason",
         "exact before",
         "--apply",
-        "--expected-active-release-binding-sha256",
-        binding["sha256"],
+        "--expected-release-note-sha256",
+        binding["release_note_sha256"],
         "--expected-config-binding-sha256",
         plan["config_binding_sha256"],
         "--expected-plan-id",
@@ -1166,8 +1370,7 @@ def test_clear_circuit_rejects_destination_drift_from_reviewed_plan(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="operator_test_open",
@@ -1197,8 +1400,8 @@ def test_clear_circuit_rejects_destination_drift_from_reviewed_plan(
         "--reason",
         "destination binding",
         "--apply",
-        "--expected-active-release-binding-sha256",
-        binding["sha256"],
+        "--expected-release-note-sha256",
+        binding["release_note_sha256"],
         "--expected-config-binding-sha256",
         plan["config_binding_sha256"],
         "--expected-plan-id",
@@ -1218,8 +1421,7 @@ def test_clear_circuit_parent_swap_is_rejected_before_receipt_write(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="operator_test_open",
@@ -1263,8 +1465,8 @@ def test_clear_circuit_parent_swap_is_rejected_before_receipt_write(
         "--reason",
         "parent swap",
         "--apply",
-        "--expected-active-release-binding-sha256",
-        binding["sha256"],
+        "--expected-release-note-sha256",
+        binding["release_note_sha256"],
         "--expected-config-binding-sha256",
         plan["config_binding_sha256"],
         "--expected-plan-id",
@@ -1303,8 +1505,7 @@ def test_clear_circuit_receipt_materialization_failure_is_recoverable(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="operator_test_open",
@@ -1341,8 +1542,8 @@ def test_clear_circuit_receipt_materialization_failure_is_recoverable(
         "--reason",
         "recover durable audit",
         "--apply",
-        "--expected-active-release-binding-sha256",
-        binding["sha256"],
+        "--expected-release-note-sha256",
+        binding["release_note_sha256"],
         "--expected-config-binding-sha256",
         plan["config_binding_sha256"],
         "--expected-plan-id",
@@ -1387,8 +1588,7 @@ def test_clear_circuit_requires_governed_inputs_and_leaves_open_state(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="operator_test_open",
@@ -1408,8 +1608,7 @@ def test_reset_plan_and_missing_recovery_are_read_only_without_card_row(
     tmp_path, monkeypatch, capsys
 ):
     config = _config(tmp_path, enabled=False)
-    RcaControlStore(config.control_db_path)
-    store = RcaDeliveryStore(config.control_db_path)
+    store = _new_v15_delivery_store(config.control_db_path)
     store.open_delivery_dispatcher_circuit(
         effect_kind=DELIVERY_EFFECT_KIND,
         reason_code="operator_test_open",
@@ -1532,7 +1731,7 @@ def _collector(
         hermes_home=tmp_path,
     )
     return DeliveryCollector(
-        store=RcaDeliveryStore(tmp_path / "control.sqlite3"),
+        store=_dispatcher_fixture_store(tmp_path / "control.sqlite3"),
         config=config,
         status_reader=status_reader
         or (
@@ -1563,13 +1762,18 @@ def _collector(
 
 
 def _seed(tmp_path, *, bundle_payload=None):
-    control, result = _control(tmp_path)
+    control, result = _control_v15(tmp_path)
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
             "UPDATE business_triggers SET created_at = ? WHERE submission_key = ?",
             (NOW.isoformat(), result.submission_key),
         )
-    _bind_activation_execution(control, result, state="steady_active")
+    _bind_activation_execution(
+        control,
+        result,
+        epoch_id="delivery-epoch-v15",
+        state="steady_active",
+    )
     collector = _collector(
         tmp_path,
         bundle_reader=(
@@ -1581,15 +1785,20 @@ def _seed(tmp_path, *, bundle_payload=None):
 
 
 def _seed_with_thread_subscription(tmp_path, *, bundle_payload=None):
-    control, result = _control(tmp_path)
+    control, result = _control_v15(tmp_path)
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
             "UPDATE business_triggers SET created_at = ? WHERE submission_key = ?",
             (NOW.isoformat(), result.submission_key),
         )
-    _bind_activation_execution(control, result, state="steady_active")
+    _bind_activation_execution(
+        control,
+        result,
+        epoch_id="delivery-epoch-v15",
+        state="steady_active",
+    )
     trigger = control.list_rows("business_triggers")[0]
-    store = RcaDeliveryStore(tmp_path / "control.sqlite3")
+    store = _dispatcher_fixture_store(tmp_path / "control.sqlite3")
     _insert_subscription(
         store,
         SimpleNamespace(
@@ -1619,14 +1828,19 @@ def _seed_terminal(tmp_path, *, with_thread: bool = False):
     rows that were already materialized before that policy existed, without
     asserting that the current collector may create them.
     """
-    control, result = _control(tmp_path)
+    control, result = _control_v15(tmp_path)
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
             "UPDATE business_triggers SET created_at = ? WHERE submission_key = ?",
             (NOW.isoformat(), result.submission_key),
         )
-    _bind_activation_execution(control, result, state="steady_active")
-    store = RcaDeliveryStore(tmp_path / "control.sqlite3")
+    _bind_activation_execution(
+        control,
+        result,
+        epoch_id="delivery-epoch-v15",
+        state="steady_active",
+    )
+    store = _dispatcher_fixture_store(tmp_path / "control.sqlite3")
     if with_thread:
         trigger = control.list_rows("business_triggers")[0]
         _insert_subscription(
@@ -1663,19 +1877,23 @@ def _seed_terminal(tmp_path, *, with_thread: bool = False):
 def _seed_profile_terminal(tmp_path, *, split_project_identity: bool = False):
     """Materialize one current Kafka profile terminal without a W3 snapshot."""
     from tests.gateway.test_pnc_rca_control_store import (
-        _create_activation_epoch,
         _profile_snapshot_policy,
         _profile_snapshot_record,
     )
 
-    control = RcaControlStore(tmp_path / "control.sqlite3")
-    epoch = _create_activation_epoch(control, start_offset=20)
-    with sqlite3.connect(control.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_activation_epochs SET state='steady_active' "
-            "WHERE epoch_id=? AND is_current=1",
-            (epoch["epoch_id"],),
-        )
+    path = tmp_path / "control.sqlite3"
+    legacy_control = RcaControlStore(path)
+    _activate_direct_steady(legacy_control, start_offset=20)
+    RcaDeliveryStore(path)
+    _migrate_v14_fixture_to_v15(
+        path,
+        successor_epoch_id="profile-delivery-epoch-v15",
+    )
+    control = RcaControlStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
     policy = _profile_snapshot_policy()
     record = _profile_snapshot_record(20, "7019637554")
     if split_project_identity:
@@ -1696,7 +1914,6 @@ def _seed_profile_terminal(tmp_path, *, split_project_identity: bool = False):
         policy=policy,
         submit_enabled=True,
         activation_required=True,
-        activation_slot_kind="kafka_success",
     )
     assert result.decision == "accepted"
     with sqlite3.connect(control.db_path) as conn:
@@ -1716,7 +1933,7 @@ def _seed_profile_terminal(tmp_path, *, split_project_identity: bool = False):
         error_detail="matched profile input adapter is not ready",
         now=NOW + timedelta(seconds=1),
     )
-    store = RcaDeliveryStore(control.db_path)
+    store = _open_v15_delivery_store(control.db_path)
     assert store.backfill_completed_submissions(
         now=NOW + timedelta(seconds=2),
         activation_required=True,
@@ -1928,7 +2145,7 @@ def _dispatcher(
     lease_owner="delivery-dispatcher-test",
     lease_renew_interval_seconds=None,
 ):
-    store = RcaDeliveryStore(tmp_path / "control.sqlite3")
+    store = _dispatcher_fixture_store(tmp_path / "control.sqlite3")
     remote = remote or Remote()
     clock = clock or Clock()
     return (
@@ -3266,10 +3483,12 @@ def test_terminal_manual_delivery_skips_report_http_and_sends_both_effects(tmp_p
     assert before["business_ready"] is True
     assert before["business_blockers"]["unresolved_required_effects"] == 2
     assert before["production_blockers"] == {
+        "schema_successor_read_only": 0,
         "activation_schema_unavailable": 0,
         "activation_epoch_not_steady": 0,
-        "activation_fingerprint_invalid": 0,
-        "activation_gate_receipt_invalid": 0,
+        "activation_binding_invalid": 0,
+        "release_fingerprint_invalid": 0,
+        "release_note_invalid": 0,
         "uncertain_effects": 0,
         "pending_delivery_observations": 0,
     }
@@ -3504,7 +3723,7 @@ def test_current_profile_terminal_without_w3_dispatches_comment_only_with_scoped
     )
 
 
-def test_pre_submit_quarantine_keeps_specific_safe_diagnostic_only(tmp_path):
+def test_pre_submit_quarantine_without_w3_remains_internal_and_redacted(tmp_path):
     control, _result = _control(tmp_path, completed=False)
     outbox = control.claim_outbox(lease_owner="submission-worker", now=NOW)
     assert outbox is not None
@@ -3519,15 +3738,17 @@ def test_pre_submit_quarantine_keeps_specific_safe_diagnostic_only(tmp_path):
 
     assert store.backfill_completed_submissions(now=NOW + timedelta(seconds=2)) == 1
 
-    [job] = store.list_rows("rca_delivery_jobs")
-    [effect] = store.list_rows("rca_delivery_effects")
-    contract = json.loads(job["contract_json"])
-    payload = json.loads(effect["payload_json"])
-    assert contract["diagnostic_code"] == "input_frame_required"
-    assert payload["diagnostic_code"] == "input_frame_required"
-    assert payload["error_code"] == "outbox_submission_quarantined"
-    assert "issue_field_invalid_frame_reference" not in effect["payload_json"]
-    assert "SECRET-MUST-NOT-LEAK" not in effect["payload_json"]
+    [watch] = store.list_rows("rca_execution_watch")
+    assert watch["state"] == "quarantined"
+    assert watch["delivery_id"] is None
+    status = json.loads(watch["last_status_json"])
+    assert status["external_writes"] is False
+    assert status["terminal_delivery_policy"] == "silent_internal_alert_only"
+    assert status["error_code"] == "w3_execution_snapshot_missing"
+    assert "issue_field_invalid_frame_reference" not in watch["last_status_json"]
+    assert "SECRET-MUST-NOT-LEAK" not in watch["last_status_json"]
+    assert store.list_rows("rca_delivery_jobs") == []
+    assert store.list_rows("rca_delivery_effects") == []
 
 
 def test_older_terminal_generation_is_suppressed_before_any_remote_call(tmp_path):
@@ -3699,14 +3920,19 @@ def test_write_boundary_rechecks_newer_settled_terminal_field_effect(tmp_path):
 
 
 def test_terminal_v2_epoch_switch_blocks_field_write_and_comment(tmp_path):
-    control, result = _control(tmp_path)
-    _bind_activation_execution(control, result, state="steady_active")
+    control, result = _control_v15(tmp_path)
+    _bind_activation_execution(
+        control,
+        result,
+        epoch_id="delivery-epoch-v15",
+        state="steady_active",
+    )
     with sqlite3.connect(control.db_path) as conn:
         conn.execute(
             "UPDATE business_triggers SET created_at = ? WHERE submission_key = ?",
             (NOW.isoformat(), result.submission_key),
         )
-    store = RcaDeliveryStore(control.db_path)
+    store = _open_v15_delivery_store(control.db_path)
     assert store.backfill_completed_submissions(now=NOW) == 1
     watch = store.claim_due_watch(lease_owner="activation-collector", now=NOW)
     assert watch is not None
@@ -3727,9 +3953,9 @@ def test_terminal_v2_epoch_switch_blocks_field_write_and_comment(tmp_path):
             result = super().list_comments(project_key, work_item_id)
             if not self.switched:
                 self.switched = True
-                _switch_activation_epoch(
+                _switch_v15_activation_epoch(
                     control,
-                    old_epoch="delivery-epoch-1",
+                    old_epoch="delivery-epoch-v15",
                     new_epoch="delivery-epoch-2",
                 )
             return result
@@ -4451,7 +4677,7 @@ def test_foxglove_delivery_verifies_only_primary_html_artifact(
     def verifier(url, size, sha256):
         clock.current += timedelta(seconds=80)
         contender_claims.append(
-            RcaDeliveryStore(store.db_path).claim_due_effect(
+            _open_v15_delivery_store(store.db_path).claim_due_effect(
                 lease_owner="worker-2",
                 lease_seconds=90,
                 now=clock.current,
@@ -4524,7 +4750,7 @@ def test_effect_lease_keeper_fences_contender_past_original_lease(
             assert lease_expires_at >= NOW + timedelta(seconds=170)
 
             clock.current = NOW + timedelta(seconds=91)
-            contender = RcaDeliveryStore(store.db_path).claim_due_effect(
+            contender = _open_v15_delivery_store(store.db_path).claim_due_effect(
                 lease_owner="worker-2",
                 lease_seconds=90,
                 now=clock.current,
@@ -4700,7 +4926,7 @@ def test_concurrent_effect_claim_has_exactly_one_winner(tmp_path):
     store = _seed(tmp_path)
 
     def claim(index):
-        return RcaDeliveryStore(store.db_path).claim_due_effect(
+        return _open_v15_delivery_store(store.db_path).claim_due_effect(
             lease_owner=f"worker-{index}", now=NOW
         )
 

@@ -1,260 +1,257 @@
-# G1Q3-RCA 生产功能 Runbook
+# G1Q3-RCA 生产 Runbook
 
-> 适用范围：Hermes v0.18.2 已上线后的 RCA 业务开发、故障处理和端到端验收。
-> 当前状态以 live runtime、控制库、服务 health、Kafka broker 和飞书问题单读回为准。
-> 不再使用 14.6 -> 18.2 迁移 worktree、candidate runtime、release gate、容量评测、24 小时 soak 或 7 天样本门禁。
+> 适用范围：Host `operator_issue_only_v1` 发布、读回、单 canary 和回滚。
+> 当前事实以 live manifest、ControlStore、resident 进程/health、VM task receipt 和飞书字段读回为准。
 
-## 1. 唯一代码与运行路径
+## 1. 不可混淆的职责
 
-| 用途 | 路径 |
+| 对象 | 职责 |
 |---|---|
-| 开发主仓 | `/Users/songying/.hermes/hermes-agent` |
-| 生产运行代码 | `/Users/songying/.hermes/runtime/hermes-live` |
-| RCA workspace manifest | `/Users/songying/.hermes/runtime/rca-workspace-runtime` |
-| 控制与投递库 | `~/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca/control.sqlite3` |
-| VM 业务仓 | `/home/mini/data3/yj-evaluation-server` |
-| VM 任务产物 | `/mnt/tmp/<submission_key>/` |
+| Host | Issue 读取、准入、outbox、VM 投递、结果收敛和飞书字段交付 |
+| VM | RCA scheduler、实时资源 gate、fixed direct CLI 和结果回传 |
+| VM 业务仓 | 归因领域实现与报告生成 |
+| Codex/Claude | 开发、审查和发布运维；不执行生产 RCA 分析 |
 
-代码只在开发主仓修改并提交。生产生效时只同步本次业务变更涉及的文件，校验 SHA 后重启受影响的 resident；不重建 Hermes runtime，不创建发布沙箱或候选 worktree。
+Host release 不复制 VM 调度、资源控制或归因能力。VM 业务改动由业务仓自己的 GitLab release identity 管理，Host note 只绑定并读回该 identity。
 
-## 2. 业务链路
+## 2. 唯一生产定义
+
+生产远端固定为：
 
 ```text
-Kafka feishu-project-workflow-event
-  -> 固定 group rca_root_cause_analysis_agent
-  -> 读取真实飞书问题单
-  -> 识别功能域和 DNP 关键字
-  -> 解析问题发生时间并定位前视 frame_id
-  -> durable outbox
-  -> VM S2/S3a/S3b/S5/S6
-  -> delivery collector
-  -> 写入「归因结果」「归因报告」
-  -> 逐字段读回确认
-  -> 输出已处理问题单清单供人工 review
+git@git.minieye.tech:planning_algo/hermes.git
 ```
 
-生产必须满足以下约束：
-
-- Kafka 使用真实 topic、固定 group 和已授权的 `rca` principal；不得用影子 group 的成功替代生产消费。
-- 最近 7 天 Kafka 消息只用于定位真实问题单和功能验收；探针必须禁用 auto commit，不改生产 group offset。
-- 问题数据只走 PDCL remote read，不恢复 MDI 下载或本机输入物化。
-- VM 使用 fixed direct CLI，`agent_backend=none`，不允许 Agent fallback。
-- 归因输出保持 `need_review`，由业务人员在问题单上确认。
-- 成功交付必须写指定字段并读回；评论或话题回复不能替代字段写入。
-
-## 3. 业务字段规则
-
-### 3.1 功能域与 DNP
-
-DNP 从问题名称、问题所属部门和简洁部门字段中识别。至少支持：
-
-- `规划`
-- `SPP`
-- `OOI`
-
-中文使用规范化后的子串匹配；ASCII 关键字使用字母数字 token 边界匹配。ACC、LCC、AEB、FCW 等继续使用已确认的功能域映射。
-
-### 3.2 问题时间与 frame_id
-
-「问题发生 frame_id」允许直接填写正整数，也允许填写测试人员打点时间，例如：
+每次发布只保留以下合同：
 
 ```text
-2026-07-12 15:31:16
-20260708, 20:05:00
+exact GitLab branch/tag/commit/tree
++ owner-only minimal release note
++ immutable runtime
++ atomic ControlStore v14-to-v15 cutover and steady successor
++ four-face restart/readback
++ one transport canary
 ```
 
-时间处理顺序：
+GitHub 仅作 Hermes 官方 upstream/reference，不参与 RCA production release，也不要求同步。
 
-1. 按 `Asia/Shanghai` 解析问题单时间。
-2. 转为管理面 Unix 微秒时间戳。
-3. 在固定前视相机 topic 中查找对应帧。
-4. 秒级打点允许 1 秒内最近帧；同差值选择更早帧。
-5. 超出容差、无前视数据或结果不唯一时 fail closed，不猜 frame_id。
+发布工具：
 
-### 3.3 飞书结果字段
+```text
+scripts/pnc_rca_minimal_release.py
+```
 
-S6 成功后必须完成：
-
-1. 将非空归因摘要写入「归因结果」`field_9193cb`。
-2. 将可访问的正式 HTML 报告链接写入「归因报告」`field_8c912e`。
-3. 对两个字段分别执行 read-before、write、read-after。
-4. 读回值与预期完全一致后，才把 delivery effect 标记为成功。
-5. 写入结果不确定时只对当前 effect 做字段读回裁决，不盲目重发，也不启动历史全表 reconciliation。
-
-字段 ID 必须从当前飞书字段元数据解析并与字段名称核对，禁止依赖历史手工常量。
-
-## 4. 端到端验收
-
-一次有效的功能验收必须绑定同一个真实 `work_item_id`，并留下以下证据：
-
-| 阶段 | 必须证明 |
-|---|---|
-| Kafka | topic、partition、offset、work item identity；生产 group 消费可见 |
-| 飞书读取 | 问题名称、功能域来源、远程数据引用、问题时间可解析 |
-| DNP | 命中的关键字和最终映射，原始敏感字段不进入通用 receipt |
-| frame | 管理面时间戳、相机 topic、匹配时间戳、frame_id、delta |
-| S2 | 完整远程读取、扫描范围、派生 MCAP seal |
-| S3b | 转换返回码为 0、输出 size/SHA/MCAP seal |
-| S5/S6 | 对齐完成、`report_data.json`、`index.html` |
-| 飞书交付 | 两个字段写入与 read-after-write 一致 |
-| Review 清单 | work item ID、归因摘要、报告链接、交付状态 |
-
-验收只针对需求链路跑定向测试和一个真实问题单。不得为了“发布完整性”重新运行已退役的全量回归、release gate、容量、soak 或历史 replay。
-
-## 5. 日常健康检查
+从当前 live manifest 解析受管 runtime Python；不要使用缺少生产依赖的系统 Python：
 
 ```bash
-# Host
-curl -fsS http://127.0.0.1:18789/health/detailed | python3 -m json.tool
-meegle auth status --format json
-for name in health outbox_dispatcher_health delivery_collector_health delivery_dispatcher_health; do
-  test ! -e "$HOME/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca/$name.json" || \
-    python3 -m json.tool "$HOME/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca/$name.json"
-done
-
-# VM，只读检查
-~/.local/bin/ssh-mini-status
-~/.local/bin/ssh-mini-resource --summary
-~/.local/bin/ssh-mini-mcap-status --summary
+REPO_ROOT='/path/to/reviewed/hermes-release-worktree'
+PY="$(jq -er '.runtime_python' "$HOME/.hermes/runtime/LIVE_MANIFEST.json")"
+test -x "$PY"
+cd "$REPO_ROOT"
 ```
 
-生产常驻服务：
+禁止直接修改 `~/.hermes/runtime/releases/<release>/`，禁止从 mutable source 目录启动 resident，禁止手工写 live manifest、epoch 或 release binding。
 
-- `local.pnc.rca-kafka-consumer`
+## 3. 发布输入
+
+不得手工拼 release note、candidate env 或 candidate manifest。使用同一个 driver 从语义输入生成三份 owner-only 候选文件：
+
+```bash
+"$PY" scripts/pnc_rca_minimal_release.py prepare \
+  --release-id "$RELEASE_ID" \
+  --epoch-id "$EPOCH_ID" \
+  --operator "$OPERATOR" \
+  --reason "$REASON" \
+  --canary-batch-id "$CANARY_BATCH_ID" \
+  --canary-issue-id "$CANARY_ISSUE_ID" \
+  --canary-state-path "$CANARY_STATE" \
+  --host-branch "$HOST_BRANCH" \
+  --host-tag "$HOST_TAG" \
+  --host-runtime-root "$HOST_RUNTIME_ROOT" \
+  --worker-remote "$WORKER_GITLAB_REMOTE" \
+  --worker-branch "$WORKER_BRANCH" \
+  --worker-tag "$WORKER_TAG" \
+  --worker-runtime-root "$WORKER_RUNTIME_ROOT" \
+  --pipeline-remote "$PIPELINE_GITLAB_REMOTE" \
+  --pipeline-branch "$PIPELINE_BRANCH" \
+  --pipeline-tag "$PIPELINE_TAG" \
+  --pipeline-runtime-root "$PIPELINE_RUNTIME_ROOT" \
+  --report-manifest-path /home/mini/.config/g1q3-rca/report-runtime-manifest.json \
+  --control-db "$CONTROL_DB" \
+  --release-note "$RELEASE_NOTE" \
+  --manifest-output "$MANIFEST_SOURCE" \
+  --env-output "$ENV_SOURCE"
+```
+
+`prepare` 不接收 commit/tree/tag object、report SHA、partition offset 或 candidate hash。它从 GitLab exact branch/tag 派生三面 commit/tree/tag object，通过固定的 `~/.local/bin/ssh-mini-agent` 只读稳定 VM report manifest 并绑定原始 SHA，从只读 ControlStore snapshot 派生数据库 identity、v14 predecessor、partition fence 和 v14-to-v15 epoch contract，再从当前 live env/manifest 模板生成候选投影。`operator_issue_only_v1` 默认不启用 Kafka，因此 fence 可以为空；只有明确启用 Kafka 的后续 profile 才传 `--partition-topic TOPIC=PARTITION`。发布前会再次读回 GitLab、Host runtime 和 report manifest；任一漂移时不创建输出。当前 driver 只生成 exact v14-to-v15 cutover note；已有 v15 只允许同一 successor 的幂等读回，不能用它创建另一个 v15 epoch。
+
+三个输出使用 `0600`、`O_EXCL` 和 fsync；任一输出已存在时拒绝覆盖。`prepare` 的 `templates` 给出 plan 所需的 live expected SHA，`outputs` 给出 candidate SHA：
+
+```bash
+CANDIDATE_MANIFEST_SHA='<prepare.outputs.manifest.sha256>'
+CANDIDATE_ENV_SHA='<prepare.outputs.env.sha256>'
+LIVE_MANIFEST_SHA='<prepare.templates.manifest.sha256>'
+LIVE_ENV_SHA='<prepare.templates.env.sha256>'
+```
+
+## 4. Plan
+
+先执行只读 plan：
+
+```bash
+"$PY" scripts/pnc_rca_minimal_release.py plan \
+  --release-note "$RELEASE_NOTE" \
+  --manifest-source "$MANIFEST_SOURCE" \
+  --env-source "$ENV_SOURCE" \
+  --expected-manifest-sha256 "$LIVE_MANIFEST_SHA" \
+  --expected-env-sha256 "$LIVE_ENV_SHA"
+```
+
+Plan 必须同时证明：
+
+- GitLab branch 与 tag 解析到 note 固定的 commit/tag object；
+- commit/tree 与 immutable Host runtime 完全一致且 tree clean；
+- worker、pipeline、report service identity 完整；
+- manifest/env 字节与 note projection 一致；
+- current v14 predecessor、transition audit、零 inflight 和 partition fence 精确匹配 note 中的 v14-to-v15 epoch contract；
+- resident 当前状态可读。
+
+任一项不一致时修正源输入或 release note 后重新 plan，不修改 production runtime 来迎合 note。
+
+## 5. Apply 与 Resident 读回
+
+Apply 是生产变更，只能由明确操作者在 plan 输入未变化后执行：
+
+```bash
+"$PY" scripts/pnc_rca_minimal_release.py apply \
+  --release-note "$RELEASE_NOTE" \
+  --manifest-source "$MANIFEST_SOURCE" \
+  --env-source "$ENV_SOURCE" \
+  --expected-manifest-sha256 "$LIVE_MANIFEST_SHA" \
+  --expected-env-sha256 "$LIVE_ENV_SHA" \
+  --confirm-release-id "$RELEASE_ID" \
+  --receipt "$APPLY_RECEIPT"
+```
+
+Apply 在同一个 release lock 下执行完整切换：先以 `activation_outcome=unknown` 写并 fsync `started` receipt，再停止六个 resident；持久 enable 四个 required resident、disable Kafka consumer 与 completion relay并读回；随后以 exact expected hash 安装 live manifest/env，并在一个 SQLite `BEGIN IMMEDIATE` 事务内校验 v14 predecessor/audit/inflight/fence、重建 v15 activation schema、激活唯一 steady successor，最后才 CAS schema marker。迁移 outcome 会立即 checkpoint 到同一个 receipt inode；只有独立探针证明 `committed` 后才启动四个 required resident。最后再次读回 GitLab/runtime/live projection/v15 epoch/PID/cwd/entrypoint/health/release binding，原 inode 收敛为 completed receipt。
+
+失败语义按迁移 outcome 分层：`not_committed` 才允许恢复 manifest/env；`committed` 必须保留 v15 artifact、保持六面全停并走 successor-read-only 或 forward fix；`unknown` 同样保持 artifact 和六面全停，必须人工裁决，禁止猜测并回滚 SQLite。任何路径都不伪造 epoch 回滚。迁移提交后，旧 v14 writer binary 不再是自动回滚目标。
+
+`operator_issue_only_v1` 要求运行：
+
+- `ai.hermes.gateway`
 - `local.pnc.rca-outbox-dispatcher`
 - `local.pnc.rca-delivery-collector`
 - `local.pnc.rca-delivery-dispatcher`
-- `local.pnc.vm-task-sync`
 
-dispatcher 可以在字段协议修复期间保持停止或 circuit open；这不是 Kafka 鉴权失败。恢复写入前必须先用一个真实问题单完成字段写入与读回。
+要求未加载：
 
-## 6. 定向测试
+- `local.pnc.rca-kafka-consumer`
+- `local.pnc.completion-notice-relay`
 
-根据实际改动选择最小测试集：
+不允许用已有 PID、陈旧 health JSON 或文件指纹代替 restart/readback。
+
+## 6. 唯一 Transport Canary
+
+Apply 不自动创建业务任务。每个 release 单独提交一个真实 issue canary，batch state 必须只包含该 issue，并显式选择 transport 轴：
 
 ```bash
-cd /Users/songying/.hermes/hermes-agent
-RCA_PYTHON=/Users/songying/.hermes/runtime/hermes-live/.venv/bin/python
-PYTHONDONTWRITEBYTECODE=1 "$RCA_PYTHON" -m pytest -q -o addopts='' \
-  tests/gateway/test_pnc_rca_frame_reference.py \
-  tests/scripts/test_pnc_rca_kafka_consumer.py \
-  tests/scripts/test_pnc_rca_outbox_dispatcher.py \
-  tests/scripts/test_pnc_rca_delivery_collector.py \
-  tests/scripts/test_pnc_rca_delivery_dispatcher.py
+"$PY" scripts/pnc_rca_batch_rerun.py \
+  --control-db "$CONTROL_DB" \
+  --queue "$CANARY_QUEUE" \
+  --state "$CANARY_STATE" \
+  --batch-id "$CANARY_BATCH_ID" \
+  --expected-runtime-commit "$HOST_COMMIT" \
+  --expected-runtime-tree "$HOST_TREE" \
+  --owner-receipt "$CANARY_OWNER_RECEIPT" \
+  --acceptance-axis transport
 ```
 
-不要默认运行整个 Hermes 测试集。VM 改动只运行对应 pipeline/service 测试和同一真实任务产物的阶段级验证，不新建无业务价值的 generation。
+Canary 只有在以下条件全部满足时通过：
 
-## 7. 紧急止血（生产操作）
+- state 为 `completed`，唯一 item 为 `accepted` 或 `completed`；
+- approval 与 state 都记录 `acceptance_axis=transport`；
+- `acceptance.transport.status=pass`；
+- transport 记录非空 `official_comment_id`；
+- `official_field_keys` 精确为 `field_8c912e` 和 `field_9193cb`；
+- official readback source 为 `read_after_write` 或 `read_after_recovery_write`；
+- state runtime commit/tree 与本 release Host identity 一致。
 
-唯一对外写者是 delivery dispatcher。需要止血时必须按顺序卸载三个 launchd 服务：
+`causal_attribution` 同时保留并展示，但不是 Host transport release 的阻断项。不得为了发布验收改写或放宽归因判定。
+
+## 7. Verify 与 GA 判定
+
+Canary 完成后执行：
 
 ```bash
-launchctl bootout gui/$(id -u)/local.pnc.rca-delivery-dispatcher
-launchctl bootout gui/$(id -u)/local.pnc.completion-notice-relay
-launchctl bootout gui/$(id -u)/local.pnc.feishu-delivery-repair
+"$PY" scripts/pnc_rca_minimal_release.py verify \
+  --release-note "$RELEASE_NOTE" \
+  --apply-receipt "$APPLY_RECEIPT"
 ```
 
-使用 `bootout`，不要只 `kill`：这些 plist 具有 `KeepAlive`/`RunAtLoad`，单纯杀进程可能在 `ThrottleInterval` 后被重新拉起。`ExitTimeOut=30` 意味着已 claim 且仍在 lease 内的 effect 最多还可能完成；止血不是瞬时零风险。
+只有 `verify` 返回 `ok=true`，且 apply receipt、canary state 与 live readback 都绑定同一 release identity，才可标记 GA。以下证据不能单独证明 GA：
 
-止血后的只读确认：
+- 单测通过；
+- report 文件存在；
+- shared-state task completed；
+- collector `healthy=true`；
+- 本地 delivery receipt 但没有官方字段读回；
+- 因果归因 PASS 但 transport 未完成。
+
+## 8. 日常只读检查
 
 ```bash
-for label in \
-  local.pnc.rca-delivery-dispatcher \
-  local.pnc.completion-notice-relay \
-  local.pnc.feishu-delivery-repair; do
-  launchctl print gui/$(id -u)/"$label" >/dev/null 2>&1 && echo "still-loaded:$label" || echo "unloaded:$label"
+curl -fsS http://127.0.0.1:18789/health/detailed | python3 -m json.tool
+
+for name in \
+  outbox_dispatcher_health \
+  delivery_collector_health \
+  delivery_dispatcher_health; do
+  python3 -m json.tool \
+    "$HOME/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca/$name.json"
 done
+
+~/.local/bin/ssh-mini-status
+~/.local/bin/ssh-mini-resource --summary
 ```
 
-submission 熔断只阻止新任务进入，不能撤回已经存在的外发 effect；外发闸是 `HERMES_RCA_DELIVERY_DISPATCHER_ENABLED=false`，修改后需要重启/重新加载对应服务才生效。`HERMES_RCA_OUTBOX_ALLOW_FEISHU_WRITEBACK=false` 不是评论闸门，outbox 对 `true` 会 fail closed。
+检查时必须把进程存在、PID/cwd、heartbeat 新鲜度、release block 和业务 readiness 分开看。任何一个绿色字段都不能覆盖其他轴的失败。
 
-submission 熔断复位必须先做 plan，再由明确操作者以新 receipt 路径 apply；不能直接调用 store 方法或复用旧 receipt：
+## 9. Resident Liveness 与旧 Watchdog 退役
+
+RCA resident 的生存和版本证据只由 `pnc_rca_minimal_release.py` 的 readback 判定：
+
+- `launchctl` 必须返回唯一正 PID；
+- 实际进程的 cwd、entrypoint、create time 必须匹配 immutable Host runtime；
+- health 中的 PID、runtime identity、release block 必须与进程及 release note 一致；
+- 三个带 schema 的 RCA health 必须在 120 秒 freshness 窗口内，状态不得为 starting、stopped、disabled、error 或 circuit open；Gateway 没有连续 heartbeat，常规 `verify` 以 live PID/cwd/entrypoint 和 `gateway_state=running` 为准，apply 的 restart transition 仍受 120 秒窗口约束；
+- Kafka consumer 与 completion relay 必须保持未加载；
+- `verify` 在同一 release lock 内做两次 resident identity 读回，期间 PID 或 identity 变化即失败。
+
+旧 `local.pnc.watcher-staleness-watchdog` 通过 launchd plist 文本和进程命令行猜测加载关系，既不能可靠识别 `pnc_live_exec.py` exec 后的进程，也没有把 `actual=down` 纳入告警，因此不再作为 RCA liveness 或发布门禁。仓库不再分发它的 plist 和 shell 脚本。
+
+`hermes-release-fingerprint-check` 暂时保留为通用、手工调用的非 RCA binding 审计工具；它的 `--watchers-fresh` 结果不得用于 RCA 验收。删除该通用 CLI 前必须先迁移 `context_local_source_retirement.py` 和 `context_local_rebuildable_retirement.py` 的 strict binding 消费链。
+
+生产机上的历史 label、plist 和 `runtime/governance-tools/watcher-staleness-watchdog.sh` 不随候选代码删除。只有在新 release 的 completed apply receipt、resident readback 和 transport canary 全部通过后，才能在单独的生产审批中执行 `launchctl bootout` 和 live 文件退役；随后至少跨过两个旧 `StartInterval` 窗口，确认旧日志不再增长，并再次运行 minimal `verify`。候选代码审查、测试或 GitLab push 均不得执行这些 live 动作。
+
+## 10. 失败恢复与回滚上限
+
+先读取 apply receipt 的 `activation_outcome` 和 `rollback_ceiling`，不得只根据 CLI 退出码判断：
+
+1. `not_committed / artifact_restore_permitted`：确认独立 outcome probe 仍证明完整 v14 preimage 后，才允许恢复本次 manifest/env preimage。
+2. `committed / successor_read_only_or_forward_fix`：保留 v15 DB 和 candidate artifact，保持六个 resident 全停；修复 v15 binary 后执行 forward apply 和完整 readback，禁止启动 v14 writer。
+3. `unknown / operator_adjudication_required`：保持六个 resident 全停且不替换 artifact，由操作者使用同一 note 的只读 outcome probe 裁决；不得把 unknown 当作 not committed。
+
+当前 driver 不提供 v15-to-v14 schema 回滚，也不允许用同一 note 创建另一个 v15 epoch。未来 v15 release 或回滚必须使用另行审定的 v15-aware 合同。禁止原地修改 runtime、手工拼 binding、复活旧 epoch、直接改 SQLite 或绕过 canary。历史任务和 delivery effect 保持不可变；确需业务重试时创建新 generation。
+
+## 11. 定向验证
+
+代码变更在 clean GitLab worktree 中运行最小相关测试；不要进入 production runtime 改代码或跑会生成文件的开发测试。Host 发布工具至少覆盖：
 
 ```bash
-python3 scripts/pnc_rca_outbox_dispatcher.py \
-  --clear-circuit \
-  --operator '<operator-id>' \
-  --reason '<bounded reason>' \
-  --receipt '/absolute/path/rca-circuit-reset.json'
-
-python3 scripts/pnc_rca_outbox_dispatcher.py \
-  --clear-circuit \
-  --operator '<operator-id>' \
-  --reason '<bounded reason>' \
-  --apply \
-  --receipt '/absolute/path/rca-circuit-reset.json'
+PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -o addopts='' \
+  tests/scripts/test_pnc_rca_minimal_release.py \
+  tests/scripts/test_pnc_rca_batch_rerun.py
 ```
 
-第一条只读并输出前态/计划后态；第二条在 SQLite 同一事务中写入 `control_meta` 审计记录并关闭 circuit，随后以 0444 receipt 和 `.sha256` sidecar 物化。receipt 或 sidecar 物化失败时，数据库状态可能已经关闭，命令会返回 `recovery_required`、`reset_id` 和 `meta_key`；先从该审计记录恢复 receipt，不得再次盲目 reset。
-
-reset receipt 必须同时记录 active release identity、candidate env SHA 和当前 live env SHA；live env 漂移本身只作观察，不阻塞这个 operator-authorized、零 provider write 的 reset 命令。apply 仍必须匹配紧邻 plan 的 release binding、config、tool provenance、circuit 前态和 receipt 目标，真正字段写入继续由 dispatcher 的目标校验、幂等 marker 与 read-after-write 约束。
-
-```bash
-python3 scripts/pnc_rca_outbox_dispatcher.py \
-  --materialize-reset '<reset-id>' \
-  --receipt '/absolute/path/recovered-rca-circuit-reset.json'
-```
-
-`control_meta` 是事务内 create-once 的应用层审计记录，并非 SQL trigger 强制不可变；恢复命令会重新校验 schema、DB identity、canonical JSON 和 fingerprint。`effect_delta.external_writes=0` 仅声明这个 reset 命令本身没有外部写路径，不能替代 B15 的 delivery DB 前后计数证据。
-
-B15 最终只读 preflight 必须把 resident/config、历史 outbox hold、Kafka freeze、120 秒 resource snapshot、record-only 完整配置、delivery disabled 和 effect baseline 收敛到一张 receipt；任何一项缺失都返回 `RED`，不启动或重载服务：
-
-```bash
-python3 scripts/pnc_rca_b15_preflight.py \
-  --env-file "$HOME/.hermes/.env" \
-  --runtime-dir "$HOME/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca" \
-  --launch-agents-dir "$HOME/Library/LaunchAgents" \
-  --control-db "$HOME/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca/control.sqlite3" \
-  --resource-snapshot '/absolute/path/resource-snapshot.json' \
-  --receipt '/absolute/path/b15-preflight.json'
-```
-
-该脚本只读打开 SQLite（`query_only`），receipt 另写入 0444 文件和 hash sidecar；`RED` receipt 也必须保留，不能把空输入、非法嵌套 snapshot 或缺失 snapshot 当成绿灯。CLI 只使用执行时的 live UTC clock，不提供 `--now` 或其他 freshness 覆盖参数。resident gate 会校验四类 health 的 exact schema、关键布尔/config、各自权威 freshness 字段、完整 runtime identity 及 plist/release 绑定；历史 outbox gate 会用 v13 canonical table/trigger validator 重算 sealed/current 非空 cohort，并要求 Kafka freeze epoch 与当前 activation epoch 一致。`HERMES_RCA_OUTBOX_ALLOW_FEISHU_WRITEBACK=false` 也必须显式存在，缺失不能继承默认值。`external_effect_baseline` 是后续零增量比较的起点，不等同于已经完成零增量验收。
-
-恢复前先取 service PID、配置指纹、数据库 effect 增量和 receipt；不得用 `kill -9`、跳过 `bootout`，或在未记录 receipt 时直接重新加载 plist。上线前演练应在隔离/无写环境完成，并记录最多 30 秒的残余 lease 窗口。
-
-## 8. 故障定位
-
-| 信号 | 处理 |
-|---|---|
-| Kafka consumer 未运行或无新 offset | 查 resident health、broker 连接、固定 group 和 topic；认证通过后不要改 group 名绕过问题 |
-| `host_issue_preread_failed` | 查 Meegle/Feishu 读取链路和网络；飞书权限已验证时不要误报为长期权限 blocker。批量排队时间不计入首次真实 preread 失败后的 900 秒重试窗口；已静默封存且无 task/job/effect/provider attempt 的 pre-W3 终态仅可由 owner 批次追加新代次，旧代次保持不可变 |
-| `missing_frame_id` | 核对时间格式、时区、前视 topic 和 1 秒容差；不扩大到无业务依据的宽窗口 |
-| `remote_scope_incomplete` | 完整读取请求范围；不得静默截断消息数 |
-| `translate_failed` | 查任务专属 Docker 输出、设备和镜像；不要求不存在的 NVIDIA runtime |
-| `alignment_failed` | 查 S5 参数、case root 和 task root；优先复用同一任务已完成的 S2-S45 产物 |
-| 报告存在但字段为空 | 修 delivery adapter 和字段元数据映射；不要用评论冒充交付 |
-| 远端写入结果不确定 | 保持 circuit open，按 marker/UUID/字段读回裁决，不直接重试 |
-
-## 9. 清理与保留
-
-迁移 worktree、candidate runtime、precutover 快照、stage plan/lock、发布评测器和退役 gate 应删除。只保留：
-
-- 当前主仓与 `hermes-live`
-- 当前生产 identity/binding 的一份 canonical receipt
-- 当前 RCA workspace manifest
-- 控制库和历史不确定投递审计
-- 真实业务任务的必要报告与阶段 receipt
-
-历史不确定投递记录不能作为普通缓存删除；必须在字段 reconciliation 完成后按审计规则处置。
-
-## 10. v19 最小稳定生产路径
-
-本节定义 v19 能力上线后处理真实问题单的最短路径；只核验本次变更面和当前批次，不恢复旧 release gate、历史对账或合成入口验收。
-
-1. **绑定 v19 runtime。** Host 的 VM release binding、RCA workspace 的 fixed CLI、VM worker 的 `RCA_SERVICE_REPO_ROOT` 与任务状态中的 `route/cwd/fixed_cli_entrypoint` 必须共同指向当前 installed runtime。本轮基准路径是 `/home/mini/.hermes/rca-prod-runtime/releases/rca-platform-20260809.installed-eeb1bb9`；后续切换时用新的完整 installed 路径整体替换，不混用两个 runtime。
-2. **补齐 remote-reader 生效面。** installed runtime 的 Git commit/tree clean 不代表 remote reader 已就绪；`.rca-runtime` 是 Git ignored 的本地生效面。先在目标 runtime 执行 `api/g1q3_rca/scripts/bootstrap_remote_reader_runtime.py --check`；若返回 `remote_reader_runtime_not_bootstrapped`，执行同一脚本的 `--install-offline`，再独立 `--check` 到 `status=ready`。不得联网补包，也不得用 Host 预扫描替代 VM 检查。
-3. **核对三面 identity。** Host 核对 source commit/tree、clean 状态和 VM binding；Workspace 核对 manifest SHA、closure SHA 与 fixed CLI；VM 核对 pipeline commit/tree、正式 origin、必需 submodule、installed path，以及 worker 实际 route/cwd/fixed CLI。任一面不一致只修该面，未变化的面不重复发布。
-4. **直接交付并读回。** 对真实 issue 只写 `field_9193cb` 和 `field_8c912e`，每个字段执行 read-before、write、read-after；两项官方回读与本代 payload 完全一致后才记成功。评论、报告文件存在或本地 receipt 都不能替代字段读回。
-5. **历史 delivery 不阻塞新批。** 批量处理只以当前 generation 的可调度工作和实时资源为背压依据；旧 generation 的 pending/stalled/uncertain/terminal 行保持审计态，不得倒灌成新批 admission blocker。当前 delivery 水位配置为 `HERMES_RCA_OUTBOX_DELIVERY_HIGH_WATERMARK=10000`、`HERMES_RCA_OUTBOX_DELIVERY_RESUME_WATERMARK=9999`，它不同于 Kafka outbox 水位，用于避免历史 delivery backlog 把新问题单入口压停；不得为清旧账而降低水位或暂停当前批次。
-6. **失败代次只前进，不复活。** 已失败或终止的 task、submission key 和 delivery effect 保持不可变。需要重试时必须显式创建 `generation + 1`，生成新的 submission key/task ID，并绑定当前 runtime identity；禁止把旧 task 改回 pending、复用旧任务目录或重新 claim 旧 effect。
-7. **不模拟机器人入口。** operator issue-only 批次不创建 `@机器人`、话题回复或卡片更新，也不把这些动作作为字段写入验收门。真实 `@` 入口仍沿用原 `chat_id/thread_id/message_id` 和既有 topic/card 链路，由真实事件触发并按原功能回归；发布与批处理不得合成事件替代它。
-8. **VM 排队时间不计入执行超时。** Host collector 对 `pending/submitted/queued/claimed/running/in_progress` 只轮询，不得从 outbox 完成时间或入队时间生成执行 deadline；真实执行超时由 VM worker 从进程启动时起算并产出终态。Host 的 30 分钟失败回退只从 `terminal_first_seen_at` 的首次真实失败观测起算，后续健康状态必须清空该窗口。有效 completed 产物无论排队多久都进入同一套产物校验和字段交付。
-9. **大批恢复使用 bulk refresh。** `pnc_rca_batch_rerun.py --submit-all --retry-failed` 必须先按 live DB 刷新 state 中已有的 `submitted/running` 条目：已完成读回的直接 accepted，错误终态创建 `generation + 1`，仍活跃的保持原 submission；刷新后一次性提交所有可重试项，不得在第一条任务上串行等待。暂时没有精确 rerun authority 的单标为 `waiting_for_prior_terminal` 并单独处理，不能阻塞其余条目。常规逐单诊断才省略 `--submit-all`。
-10. **steady 并发为 4，bootstrap 保持 1。** 新任务使用 `capacity_mode=steady` 时 Host 和 VM 都按最多 4 个在途执行；历史 bootstrap receipt 仍按 1 个执行，不篡改签名 receipt。队列等待不使静态 admission receipt 失效，真正开始执行时仍须重新通过实时资源 preflight；并发竞争失败回到 pending，不伪造成业务终态。
-11. **技术终态不污染飞书写入 circuit。** VM execution watch 的失败、超时或缺 receipt 只终结对应执行链，不计入飞书字段投递的 permanent-failure circuit。只有真实 required field effect 的 provider 写入失败才影响该 circuit；恢复后按第 7 节执行一次有 receipt 的 reset，由 dispatcher 继续消费 pending effects。
-12. **Meegle 健康态不发续期噪声。** launchd watchdog 固定使用 `--no-assist`，`authenticated=true` 时依赖 token 正常自动滚动，不创建 proactive device-code，也不发送扫码提醒；只有真实 `expired/unknown` 才告警，并在告警中给出人工续期命令。
-
-最小验收结果是一张当前批次清单：`work_item_id`、generation、Host/Workspace/VM identity、两个字段的 read-after 值和最终状态。旧 baseline 重放、全历史差异矩阵、历史 delivery 清算及额外 canary 均不属于该路径。
+VM 业务仓、归因 evaluator 和报告语义由各自负责人测试与发布；Host release 验收只读取它们的 immutable identity，不建立平行实现。

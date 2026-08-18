@@ -65,7 +65,7 @@ def _plan(case: dict[str, Any], transaction_id: str) -> tuple[dict, Path]:
     )
 
 
-def test_retired_inventory_matches_release_freshness_contract() -> None:
+def test_retired_inventory_is_explicit() -> None:
     assert wrappers.RETIRED_NAMES == (
         "hermes-g1q3-e2e-smoke",
         "hermes-live",

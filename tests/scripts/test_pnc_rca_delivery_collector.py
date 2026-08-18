@@ -4,7 +4,7 @@ from dataclasses import replace
 import hashlib
 import json
 from datetime import timedelta
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import sqlite3
 import subprocess
 import sys
@@ -29,9 +29,17 @@ from tests.gateway.test_pnc_rca_delivery_store import (
     _control,
     _delivery,
     _insert_subscription,
+    _physical_v15_delivery_fixture,
+    _policy,
+    _record,
+    _sqlite_storage_identity,
 )
 from tests.gateway.test_pnc_rca_w3_snapshot import _runtime_authority
 from tests.gateway.test_pnc_rca_write_fence import _release_note
+from tests.gateway.test_pnc_rca_control_store import (
+    _direct_steady_contract,
+    _migrate_v14_fixture_to_v15,
+)
 
 
 def _config_env(tmp_path) -> dict[str, str]:
@@ -44,26 +52,55 @@ def _config_env(tmp_path) -> dict[str, str]:
         "HERMES_RCA_DELIVERY_COLLECTOR_SSH_MINI_AGENT": "/safe/ssh-mini-agent",
         "HERMES_RCA_DELIVERY_COLLECTOR_ARTIFACT_READ_TIMEOUT_SECONDS": "30",
         "HERMES_RCA_DELIVERY_COLLECTOR_LEASE_SECONDS": "60",
-        "HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED": "true",
     }
 
 
 def _bind_minimal_release(control, fixture, *, epoch_id="delivery-epoch-1"):
     fixture.epoch["epoch_id"] = epoch_id
     with sqlite3.connect(control.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        release_note_sha256 = fixture.epoch["release_note_sha256"]
         updated = conn.execute(
             "UPDATE rca_activation_epochs "
-            "SET state = 'steady_active', config_sha256 = ?, "
+            "SET state = 'steady_active', preauthorization_fingerprint = ?, "
+            "preauthorization_gate_receipt_sha256 = ?, "
+            "preauthorization_capsule_sha256 = ?, "
+            "preproduction_fingerprint = ?, "
+            "preproduction_gate_receipt_sha256 = ?, "
+            "preproduction_capsule_sha256 = ?, config_sha256 = ?, "
             "production_fingerprint = ?, production_gate_receipt_sha256 = ? "
             "WHERE epoch_id = ? AND is_current = 1",
             (
+                fixture.fingerprint,
+                release_note_sha256,
+                release_note_sha256,
+                fixture.fingerprint,
+                release_note_sha256,
+                release_note_sha256,
                 fixture.env_sha256,
                 fixture.fingerprint,
-                fixture.epoch["production_gate_receipt_sha256"],
+                release_note_sha256,
                 epoch_id,
             ),
         )
-    assert updated.rowcount == 1
+        assert updated.rowcount == 1
+        epoch = conn.execute(
+            "SELECT * FROM rca_activation_epochs "
+            "WHERE epoch_id = ? AND is_current = 1",
+            (epoch_id,),
+        ).fetchone()
+        assert epoch is not None
+        RcaControlStore._insert_activation_transition_audit_tx(
+            conn,
+            epoch=epoch,
+            from_state="direct_release",
+            to_state="steady_active",
+            operator="test:fixture",
+            reason="bind test minimal release",
+            transitioned_at="2026-08-17T12:00:00+00:00",
+        )
+        conn.commit()
 
 
 def _set_live_release_environment(monkeypatch, fixture):
@@ -312,6 +349,161 @@ def _run_remote_bundle_reader(
     return json.loads(process.stdout)
 
 
+def _init_identity_repo(root, files):
+    root.mkdir(parents=True)
+    for relative, raw in files.items():
+        path = root.joinpath(*PurePosixPath(relative).parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+    subprocess.run(["/usr/bin/git", "init", "-q", str(root)], check=True)
+    subprocess.run(["/usr/bin/git", "-C", str(root), "add", "."], check=True)
+    subprocess.run(
+        [
+            "/usr/bin/git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=collector-test",
+            "-c",
+            "user.email=collector-test@example.invalid",
+            "commit",
+            "-qm",
+            "identity fixture",
+        ],
+        check=True,
+    )
+
+    def rev_parse(revision):
+        return subprocess.run(
+            [
+                "/usr/bin/git",
+                "-C",
+                str(root),
+                "rev-parse",
+                "--verify",
+                revision,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    return {"commit": rev_parse("HEAD"), "tree": rev_parse("HEAD^{tree}")}
+
+
+def _execution_identity_reader_fixture(tmp_path, monkeypatch):
+    submission_key = "g1q3-rca-s1-" + "e" * 64
+    worker_root = tmp_path / "worker-state"
+    pipeline_root = tmp_path / "pipeline-runtime"
+    worker_entrypoint = worker_root / collector.REMOTE_WORKER_ENTRYPOINT_RELATIVE
+    service_entrypoint = pipeline_root.joinpath(
+        *PurePosixPath(collector.REMOTE_PIPELINE_ENTRYPOINT_RELATIVE).parts
+    )
+    report_entrypoint = pipeline_root.joinpath(
+        *PurePosixPath(collector.REMOTE_REPORT_ENTRYPOINT_RELATIVE).parts
+    )
+    worker_raw = b"#!/usr/bin/env python3\nprint('worker')\n"
+    service_raw = b"#!/usr/bin/env python3\nprint('service')\n"
+    report_raw = b"#!/usr/bin/env python3\nprint('report')\n"
+    worker_identity = _init_identity_repo(
+        worker_root,
+        {collector.REMOTE_WORKER_ENTRYPOINT_RELATIVE: worker_raw},
+    )
+    pipeline_identity = _init_identity_repo(
+        pipeline_root,
+        {
+            collector.REMOTE_PIPELINE_ENTRYPOINT_RELATIVE: service_raw,
+            collector.REMOTE_REPORT_ENTRYPOINT_RELATIVE: report_raw,
+        },
+    )
+    shared_root = tmp_path / "shared-state"
+    report_manifest_path = tmp_path / "config" / "report-runtime-manifest.json"
+    monkeypatch.setattr(collector, "REMOTE_SHARED_STATE_ROOT", str(shared_root))
+    monkeypatch.setattr(collector, "REMOTE_WORKER_REPO_ROOT", str(worker_root))
+    monkeypatch.setattr(
+        collector,
+        "REMOTE_REPORT_RUNTIME_MANIFEST_PATH",
+        str(report_manifest_path),
+    )
+    output_root = tmp_path / "bundle"
+    worker_result = {
+        "schema_version": "g1q3_rca_worker_result_v1",
+        "task_id": submission_key,
+        "rca_submission_key": submission_key,
+        "execution_route": "rca_direct_cli",
+        "repo_root": str(pipeline_root),
+        "execution_attestation": {
+            "schema_version": "g1q3_rca_worker_execution_attestation_v2",
+            "task_id": submission_key,
+            "available": True,
+            "agent_backend": "none",
+            "cwd": str(pipeline_root),
+            "worker_source_commit": worker_identity["commit"],
+            "worker_tree_clean": True,
+            "worker_entrypoint_path": str(worker_entrypoint),
+            "worker_entrypoint_sha256": hashlib.sha256(worker_raw).hexdigest(),
+        },
+    }
+    service_result = {
+        "schema_version": "g1q3_rca_service_result_v2",
+        "task_id": submission_key,
+        "output_dir": str(output_root),
+        "success": True,
+        "status": "completed",
+        "service_provenance": {
+            "schema_version": "g1q3_rca_service_provenance_v1",
+            "available": True,
+            "vm_source_commit": pipeline_identity["commit"],
+            "vm_tree_clean": True,
+            "service_entrypoint_path": str(service_entrypoint),
+            "service_entrypoint_sha256": hashlib.sha256(service_raw).hexdigest(),
+        },
+    }
+    report_manifest = {
+        "schema_version": "pnc_rca_report_manifest_v1",
+        "runtime_root": str(pipeline_root),
+        "pipeline_commit": pipeline_identity["commit"],
+        "pipeline_tree": pipeline_identity["tree"],
+        "report_script_sha256": hashlib.sha256(report_raw).hexdigest(),
+    }
+    fixture = {
+        "submission_key": submission_key,
+        "worker_root": worker_root,
+        "pipeline_root": pipeline_root,
+        "worker_entrypoint": worker_entrypoint,
+        "service_entrypoint": service_entrypoint,
+        "report_entrypoint": report_entrypoint,
+        "worker_identity": worker_identity,
+        "pipeline_identity": pipeline_identity,
+        "worker_result": worker_result,
+        "service_result": service_result,
+        "report_manifest": report_manifest,
+        "report_manifest_path": report_manifest_path,
+        "script_mutator": lambda script: script,
+    }
+
+    def write_identity_inputs(script):
+        result_path = shared_root / "tasks" / submission_key / "result.md"
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(
+            f"# Result: {submission_key}\n\n"
+            "## Result JSON\n\n"
+            "```json\n"
+            + json.dumps(fixture["worker_result"], sort_keys=True)
+            + "\n```\n",
+            encoding="utf-8",
+        )
+        (output_root / "rca_service_result.json").write_bytes(
+            _json_bytes(fixture["service_result"])
+        )
+        report_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        report_manifest_path.write_bytes(_json_bytes(fixture["report_manifest"]))
+        return fixture["script_mutator"](script)
+
+    fixture["script_transform"] = write_identity_inputs
+    return fixture
+
+
 def test_remote_bundle_reader_uses_formal_viz_publication_root():
     submission_key = "g1q3-rca-s1-" + "a" * 64
     formal_root = str(PurePosixPath(canonical_viz_mcap_path(submission_key)).parent)
@@ -371,6 +563,374 @@ def test_remote_bundle_reader_returns_manifest_bound_issue_focus(tmp_path, monke
 
     assert payload["ok"] is True
     assert payload["report_issue_focus"] == focus
+
+
+def test_remote_bundle_reader_parses_canonical_worker_result_markdown(
+    tmp_path, monkeypatch
+):
+    submission_key = "g1q3-rca-s1-" + "e" * 64
+    shared_root = tmp_path / "shared-state"
+    result_path = shared_root / "tasks" / submission_key / "result.md"
+    result_path.parent.mkdir(parents=True)
+    result_path.write_bytes(
+        (
+            f"# Result: {submission_key}\n\n"
+            "## Result JSON\n\n"
+            "```json\n{}\n```\n"
+        ).encode()
+    )
+    monkeypatch.setattr(collector, "REMOTE_SHARED_STATE_ROOT", str(shared_root))
+
+    payload = _run_remote_bundle_reader(tmp_path, monkeypatch)
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == "service_terminal_receipt_missing"
+
+
+def test_remote_bundle_reader_reads_actual_git_and_entrypoint_identity(
+    tmp_path, monkeypatch
+):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    evidence = payload["execution_identity_evidence"]
+    assert payload["execution_identity_error"] == ""
+    assert evidence["worker"]["commit"] == fixture["worker_identity"]["commit"]
+    assert evidence["worker"]["tree"] == fixture["worker_identity"]["tree"]
+    assert evidence["worker"]["clean"] is True
+    assert evidence["worker"]["entrypoint_sha256"] == hashlib.sha256(
+        fixture["worker_entrypoint"].read_bytes()
+    ).hexdigest()
+    assert evidence["pipeline"]["commit"] == fixture["pipeline_identity"]["commit"]
+    assert evidence["pipeline"]["tree"] == fixture["pipeline_identity"]["tree"]
+    assert evidence["pipeline"]["clean"] is True
+    assert evidence["pipeline"]["entrypoint_path"] == str(
+        fixture["service_entrypoint"]
+    )
+    assert evidence["report_service"]["report_script_sha256"] == hashlib.sha256(
+        fixture["report_entrypoint"].read_bytes()
+    ).hexdigest()
+    assert evidence["report_service"]["manifest_sha256"] == hashlib.sha256(
+        fixture["report_manifest_path"].read_bytes()
+    ).hexdigest()
+
+
+def test_remote_bundle_reader_ignores_inherited_git_environment(
+    tmp_path, monkeypatch
+):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    hostile = tmp_path / "hostile-git-override"
+    for key, value in {
+        "GIT_DIR": str(hostile / "git-dir"),
+        "GIT_WORK_TREE": str(hostile / "work-tree"),
+        "GIT_OBJECT_DIRECTORY": str(hostile / "objects"),
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(hostile / "alternates"),
+        "GIT_INDEX_FILE": str(hostile / "index"),
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.repositoryformatversion",
+        "GIT_CONFIG_VALUE_0": "999",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_error"] == ""
+    assert payload["execution_identity_evidence"]["worker"]["commit"] == (
+        fixture["worker_identity"]["commit"]
+    )
+    assert payload["execution_identity_evidence"]["pipeline"]["commit"] == (
+        fixture["pipeline_identity"]["commit"]
+    )
+
+
+def test_remote_bundle_reader_detects_untracked_files_despite_local_git_config(
+    tmp_path, monkeypatch
+):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    subprocess.run(
+        [
+            "/usr/bin/git",
+            "-C",
+            str(fixture["worker_root"]),
+            "config",
+            "status.showUntrackedFiles",
+            "no",
+        ],
+        check=True,
+    )
+    (fixture["worker_root"] / "untracked-runtime-hook.py").write_text(
+        "raise SystemExit('must be detected')\n",
+        encoding="utf-8",
+    )
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == "worker_git_dirty"
+
+
+@pytest.mark.parametrize("face", ["worker", "pipeline"])
+def test_remote_bundle_reader_rejects_receipt_head_drift(tmp_path, monkeypatch, face):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    if face == "worker":
+        fixture["worker_result"]["execution_attestation"][
+            "worker_source_commit"
+        ] = "f" * 40
+    else:
+        fixture["service_result"]["service_provenance"]["vm_source_commit"] = (
+            "f" * 40
+        )
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == f"{face}_git_head_receipt_mismatch"
+
+
+@pytest.mark.parametrize("face", ["worker", "pipeline"])
+def test_remote_bundle_reader_rejects_dirty_runtime(tmp_path, monkeypatch, face):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    (fixture[f"{face}_root"] / "untracked.txt").write_text(
+        "dirty", encoding="utf-8"
+    )
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == f"{face}_git_dirty"
+
+
+@pytest.mark.parametrize("face", ["worker", "pipeline"])
+def test_remote_bundle_reader_rejects_entrypoint_hash_mismatch(
+    tmp_path, monkeypatch, face
+):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    if face == "worker":
+        fixture["worker_result"]["execution_attestation"][
+            "worker_entrypoint_sha256"
+        ] = "f" * 64
+    else:
+        fixture["service_result"]["service_provenance"][
+            "service_entrypoint_sha256"
+        ] = "f" * 64
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    expected_prefix = "worker" if face == "worker" else "service"
+    assert payload["execution_identity_error"] == (
+        f"{expected_prefix}_entrypoint_sha256_mismatch"
+    )
+
+
+def test_remote_bundle_reader_rejects_report_script_hash_mismatch(
+    tmp_path, monkeypatch
+):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    fixture["report_manifest"]["report_script_sha256"] = "f" * 64
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == "report_script_sha256_mismatch"
+
+
+def test_remote_bundle_reader_rejects_service_entrypoint_path_traversal(
+    tmp_path, monkeypatch
+):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    fixture["service_result"]["service_provenance"]["service_entrypoint_path"] = (
+        str(fixture["pipeline_root"] / "api" / ".." / "escape.py")
+    )
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == (
+        "service_terminal_receipt_identity_invalid"
+    )
+
+
+def test_remote_bundle_reader_rejects_git_identity_toctou(tmp_path, monkeypatch):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    needle = (
+        "    worker_identity_after = git_identity(\n"
+        "        WORKER_REPO_ROOT, 'worker_git'\n"
+        "    )"
+    )
+
+    def commit_during_read(script):
+        assert needle in script
+        mutation = (
+            "    with open(WORKER_ENTRYPOINT_PATH, 'ab') as handle:\n"
+            "        handle.write(b'\\n# identity drift\\n')\n"
+            "    subprocess.run(\n"
+            "        ['/usr/bin/git', '-C', WORKER_REPO_ROOT, 'add', "
+            "WORKER_ENTRYPOINT_PATH], check=True\n"
+            "    )\n"
+            "    subprocess.run(\n"
+            "        ['/usr/bin/git', '-C', WORKER_REPO_ROOT, "
+            "'-c', 'user.name=collector-test', "
+            "'-c', 'user.email=collector-test@example.invalid', "
+            "'commit', '-qm', 'identity drift'], check=True\n"
+            "    )\n"
+        )
+        return script.replace(needle, mutation + needle, 1)
+
+    fixture["script_mutator"] = commit_during_read
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == (
+        "worker_git_identity_changed_during_read"
+    )
+
+
+def _vm_execution_identity_evidence(submission_key):
+    artifact_root = f"/mnt/tmp/{submission_key}/"
+    worker_root = "/home/mini/.hermes/worker-state"
+    pipeline_root = "/home/mini/.hermes/rca-prod-runtime/releases/r15aw"
+    return {
+        "schema_version": collector.VM_EXECUTION_IDENTITY_EVIDENCE_SCHEMA_VERSION,
+        "source": "canonical_vm_terminal_service_report_receipts",
+        "task_id": submission_key,
+        "submission_key": submission_key,
+        "worker": {
+            "commit": "1" * 40,
+            "tree": "2" * 40,
+            "runtime_root": worker_root,
+            "clean": True,
+            "entrypoint_path": worker_root + "/vm_coding_worker_v2.py",
+            "entrypoint_sha256": "3" * 64,
+            "receipt_path": (
+                f"/home/mini/.hermes/shared-state/tasks/{submission_key}/result.md"
+            ),
+            "receipt_sha256": "4" * 64,
+        },
+        "pipeline": {
+            "commit": "5" * 40,
+            "tree": "6" * 40,
+            "runtime_root": pipeline_root,
+            "clean": True,
+            "entrypoint_path": (
+                pipeline_root + "/" + collector.REMOTE_PIPELINE_ENTRYPOINT_RELATIVE
+            ),
+            "entrypoint_sha256": "7" * 64,
+            "receipt_path": artifact_root + "rca_service_result.json",
+            "receipt_sha256": "8" * 64,
+        },
+        "report_service": {
+            "manifest_path": collector.REMOTE_REPORT_RUNTIME_MANIFEST_PATH,
+            "manifest_sha256": "9" * 64,
+            "pipeline_commit": "5" * 40,
+            "pipeline_tree": "6" * 40,
+            "runtime_root": pipeline_root,
+            "report_script_sha256": "a" * 64,
+        },
+        "delivery_manifest": {
+            "path": artifact_root + "delivery_manifest.json",
+            "sha256": "b" * 64,
+        },
+    }
+
+
+def test_execution_identity_readback_binds_canonical_vm_receipt_paths_and_hashes():
+    submission_key = "g1q3-rca-s1-" + "f" * 64
+    evidence = _vm_execution_identity_evidence(submission_key)
+    result = collector._execution_identity_readback(
+        claim=SimpleNamespace(task_id=submission_key, submission_key=submission_key),
+        bundle={
+            "execution_identity_evidence": evidence,
+            "execution_identity_error": "",
+        },
+        release_binding={
+            "release_id": "rca-r15aw-20260817",
+            "epoch_id": "rca-activation-r15aw-20260817",
+            "release_fingerprint_sha256": "c" * 64,
+            "release_note_sha256": "d" * 64,
+        },
+    )
+
+    assert result["source"] == "host_collector_canonical_vm_receipts_v1"
+    assert result["worker"]["receipt_path"].endswith("/result.md")
+    assert result["worker"]["receipt_sha256"] == "4" * 64
+    assert result["pipeline"]["receipt_sha256"] == "8" * 64
+    assert result["report_service"]["manifest_sha256"] == "9" * 64
+    assert result["delivery_manifest"]["sha256"] == "b" * 64
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("worker", "clean", False),
+        ("worker", "receipt_path", "/tmp/operator-filled.json"),
+        (
+            "pipeline",
+            "entrypoint_path",
+            "/home/mini/.hermes/rca-prod-runtime/releases/r15aw/../../escape.py",
+        ),
+        ("report_service", "manifest_sha256", "0" * 64),
+        ("delivery_manifest", "path", "/tmp/delivery_manifest.json"),
+    ],
+)
+def test_execution_identity_readback_rejects_noncanonical_evidence(
+    section, field, value
+):
+    submission_key = "g1q3-rca-s1-" + "f" * 64
+    evidence = _vm_execution_identity_evidence(submission_key)
+    evidence[section][field] = value
+
+    with pytest.raises(DeliveryContractError, match="execution_identity_readback_invalid"):
+        collector._execution_identity_readback(
+            claim=SimpleNamespace(task_id=submission_key, submission_key=submission_key),
+            bundle={
+                "execution_identity_evidence": evidence,
+                "execution_identity_error": "",
+            },
+            release_binding={
+                "release_id": "rca-r15aw-20260817",
+                "epoch_id": "rca-activation-r15aw-20260817",
+                "release_fingerprint_sha256": "c" * 64,
+                "release_note_sha256": "d" * 64,
+            },
+        )
 
 
 def test_remote_bundle_reader_rejects_missing_report_role(tmp_path, monkeypatch):
@@ -730,16 +1290,23 @@ def test_viz_surface_errors_retry_internally_instead_of_becoming_user_results():
     assert "if viz_publication:" in script
 
 
-def test_config_exposes_capacity_sampling_and_activation_required(tmp_path):
+def test_config_ignores_retired_capacity_sampling_env(tmp_path):
     env = _config_env(tmp_path)
     env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = "true"
+    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "not-a-bool"
+    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_BATCH_SIZE"] = "invalid"
+    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_LOCK_TIMEOUT_SECONDS"] = (
+        "invalid"
+    )
+    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_TERMINAL_RECEIPT_TIMEOUT_SECONDS"] = (
+        "invalid"
+    )
     config = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
 
     public = config.public_dict()
     assert config.activation_required is True
     assert public["activation_required"] is True
-    assert public["capacity_sample_enabled"] is True
-    assert public["capacity_sample_batch_size"] == 20
+    assert not any(key.startswith("capacity_") for key in public)
 
 
 def test_activation_required_defaults_false(tmp_path):
@@ -761,8 +1328,20 @@ def test_enabled_resident_without_epoch_exits_before_collector_creation(
         _config_env(tmp_path),
         hermes_home=tmp_path,
     )
-    control = RcaControlStore(config.control_db_path)
-    delivery = RcaDeliveryStore(config.control_db_path)
+    path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    assert path == config.control_db_path
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_epochs "
+            "SET state = 'retired', is_current = 0, "
+            "retired_at = COALESCE(retired_at, updated_at) "
+            "WHERE is_current = 1"
+        )
+    delivery = RcaDeliveryStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
     constructed = False
 
     def unexpected_collector(*_args, **_kwargs):
@@ -784,21 +1363,294 @@ def test_enabled_resident_without_epoch_exits_before_collector_creation(
     assert "resident_activation_epoch_missing" in capsys.readouterr().out
 
 
+def _successor_read_only_capability() -> dict[str, object]:
+    return {
+        "observed_control_schema_version": "pnc_rca_control_store_v15",
+        "binary_write_schema_version": "pnc_rca_control_store_v15",
+        "mode": "successor_read_only",
+        "read_supported": True,
+        "write_enabled": False,
+        "work_admission_enabled": False,
+        "lease_acquisition_enabled": False,
+        "external_effect_enabled": False,
+    }
+
+
+def test_successor_read_only_collector_writes_health_without_work_or_probes(
+    tmp_path,
+    monkeypatch,
+):
+    config = collector.CollectorConfig.from_env(
+        _config_env(tmp_path),
+        hermes_home=tmp_path,
+    )
+    calls = []
+
+    class SuccessorStore:
+        def schema_runtime_capability(self):
+            return _successor_read_only_capability()
+
+        def health(self, **kwargs):
+            calls.append(("health", kwargs))
+            return {
+                "ok": False,
+                "process_healthy": True,
+                "schema_runtime_capability": _successor_read_only_capability(),
+            }
+
+        def backfill_completed_submissions(self, **_kwargs):
+            pytest.fail("backfill must not run")
+
+        def claim_due_watch(self, **_kwargs):
+            pytest.fail("watch claim must not run")
+
+    def store_factory(*_args, **kwargs):
+        calls.append(("store", kwargs))
+        return SuccessorStore()
+
+    monkeypatch.setattr(collector, "load_collector_environment", lambda: None)
+    monkeypatch.setattr(
+        collector.CollectorConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(collector, "RcaDeliveryStore", store_factory)
+    monkeypatch.setattr(
+        collector,
+        "validate_bound_resident_release",
+        lambda *_args, **_kwargs: pytest.fail("release writer gate must not run"),
+    )
+    monkeypatch.setattr(
+        collector,
+        "probe_remote_css_parser",
+        lambda *_args, **_kwargs: pytest.fail("VM dependency probe must not run"),
+    )
+    monkeypatch.setattr(
+        collector,
+        "DeliveryCollector",
+        lambda *_args, **_kwargs: pytest.fail("collector must not be created"),
+    )
+
+    assert collector.main(["--once"]) == 0
+
+    assert calls[0][0] == "store"
+    assert calls[0][1].get("read_only", False) is False
+    assert calls[0][1]["ensure_current_rows"] is False
+    assert calls[0][1].get("allow_successor_read_only", False) is False
+    assert calls[0][1]["allow_successor_write"] is True
+    assert calls[1] == (
+        "health",
+        {"activation_required": config.activation_required},
+    )
+    payload = json.loads(config.health_path.read_text(encoding="utf-8"))
+    assert payload["mode"] == "successor_read_only"
+    assert payload["ready"] is False
+    assert payload["processing"] is False
+    assert payload["healthy"] is True
+    assert payload["process_healthy"] is True
+    assert payload["business_ready"] is False
+    assert payload["ok"] is False
+    assert payload["schema_runtime_capability"] == (
+        _successor_read_only_capability()
+    )
+    assert payload["dependencies"]["remote_css_parser"]["status"] == (
+        "not_evaluated_successor_read_only"
+    )
+    healthy, observed = collector.read_health(
+        config.health_path,
+        max_age_seconds=config.health_max_age_seconds,
+    )
+    assert healthy is False
+    assert observed["mode"] == "successor_read_only"
+    assert observed["liveness_ok"] is True
+
+
+def test_real_v15_collector_dry_run_preserves_db_wal_shm_without_work_or_vm_probe(
+    tmp_path,
+    monkeypatch,
+):
+    path, _migration = _physical_v15_delivery_fixture(tmp_path)
+    wal_writer = sqlite3.connect(path)
+    assert wal_writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    wal_writer.execute("PRAGMA wal_autocheckpoint=0")
+    wal_writer.execute(
+        "INSERT INTO rca_delivery_meta(key, value) VALUES(?, ?)",
+        ("collector_resident_live_wal_fixture", "present"),
+    )
+    wal_writer.commit()
+    assert Path(f"{path}-wal").is_file()
+    assert Path(f"{path}-shm").is_file()
+    before = _sqlite_storage_identity(path)
+    config = collector.CollectorConfig.from_env(
+        _config_env(tmp_path),
+        hermes_home=tmp_path,
+    )
+
+    monkeypatch.setattr(collector, "load_collector_environment", lambda: None)
+    monkeypatch.setattr(
+        collector.CollectorConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(
+        collector,
+        "validate_bound_resident_release",
+        lambda *_args, **_kwargs: pytest.fail("release writer gate must not run"),
+    )
+    monkeypatch.setattr(
+        collector,
+        "probe_remote_css_parser",
+        lambda *_args, **_kwargs: pytest.fail("VM dependency probe must not run"),
+    )
+    monkeypatch.setattr(
+        collector,
+        "DeliveryCollector",
+        lambda *_args, **_kwargs: pytest.fail("collector must not be created"),
+    )
+
+    try:
+        assert collector.main(["--dry-run"]) == 2
+        after = _sqlite_storage_identity(path)
+        assert after["db"] == before["db"]
+        assert after["-wal"] == before["-wal"]
+        assert (after["-shm"] is None) is (before["-shm"] is None)
+    finally:
+        wal_writer.close()
+
+@pytest.mark.parametrize("mode", ["check_config", "dry_run"])
+def test_successor_read_only_collector_diagnostics_do_not_probe_or_preview(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    mode,
+):
+    config = collector.CollectorConfig.from_env(
+        _config_env(tmp_path),
+        hermes_home=tmp_path,
+    )
+    config.control_db_path.write_bytes(b"fixture")
+    calls = []
+
+    class SuccessorStore:
+        def schema_runtime_capability(self):
+            return _successor_read_only_capability()
+
+        def preview_unwatched_completed(self, **_kwargs):
+            calls.append("preview")
+            return []
+
+    def store_factory(*_args, **kwargs):
+        calls.append(("store", kwargs))
+        return SuccessorStore()
+
+    monkeypatch.setattr(collector, "load_collector_environment", lambda: None)
+    monkeypatch.setattr(
+        collector.CollectorConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(collector, "RcaDeliveryStore", store_factory)
+    monkeypatch.setattr(
+        collector,
+        "validate_bound_resident_release",
+        lambda *_args, **_kwargs: pytest.fail("release writer gate must not run"),
+    )
+    monkeypatch.setattr(
+        collector,
+        "probe_remote_css_parser",
+        lambda *_args, **_kwargs: pytest.fail("VM dependency probe must not run"),
+    )
+
+    flag = "--check-config" if mode == "check_config" else "--dry-run"
+    assert collector.main([flag]) == 2
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["mode"] == "successor_read_only"
+    assert payload["ready"] is False
+    assert payload["processing"] is False
+    assert payload["operation"] == mode
+    assert "preview" not in calls
+    [store_call] = calls
+    assert store_call[0] == "store"
+    assert store_call[1]["ensure_current_rows"] is False
+    if mode == "check_config":
+        assert store_call[1].get("read_only", False) is False
+        assert store_call[1].get("allow_successor_read_only", False) is False
+        assert store_call[1]["allow_successor_write"] is True
+    else:
+        assert store_call[1]["read_only"] is True
+        assert store_call[1]["allow_successor_read_only"] is True
+        assert store_call[1]["allow_successor_write"] is False
+
+
+def test_disabled_collector_check_config_does_not_probe_existing_control_db(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    env = _config_env(tmp_path)
+    env["HERMES_RCA_DELIVERY_COLLECTOR_ENABLED"] = "false"
+    config = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
+    config.control_db_path.write_bytes(b"not-a-database")
+    monkeypatch.setattr(collector, "load_collector_environment", lambda: None)
+    monkeypatch.setattr(
+        collector.CollectorConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(
+        collector,
+        "RcaDeliveryStore",
+        lambda *_args, **_kwargs: pytest.fail("disabled check-config probed DB"),
+    )
+    monkeypatch.setattr(
+        collector,
+        "probe_remote_css_parser",
+        lambda *_args, **_kwargs: collector.expected_remote_css_runtime_dependency(),
+    )
+    monkeypatch.setattr(
+        collector.FailureRouteOutlet,
+        "inspect",
+        lambda *_args, **_kwargs: {"ready": True, "status": "uninitialized"},
+    )
+
+    assert collector.main(["--check-config"]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+
+
 def test_enabled_startup_locks_minimal_release_before_writable_collector(
     tmp_path,
     monkeypatch,
 ):
-    control, result = _control(tmp_path)
+    fixture = _release_note(tmp_path)
+    control, result = _control(tmp_path, db_path=fixture.control_db_path)
     _bind_activation_execution(control, result, state="steady_active")
     RcaDeliveryStore(control.db_path)
-    fixture = _release_note(tmp_path)
     _bind_minimal_release(control, fixture)
+    migration = _migrate_v14_fixture_to_v15(
+        control.db_path,
+        successor_epoch_id=fixture.note["activation"]["epoch_id"],
+        successor_release_fingerprint_sha256=fixture.fingerprint,
+        successor_release_note_sha256=fixture.epoch["release_note_sha256"],
+        successor_config_sha256=fixture.env_sha256,
+    )
+    fixture.epoch["epoch_id"] = migration["successor_epoch_id"]
     _set_live_release_environment(monkeypatch, fixture)
+    wal_writer = sqlite3.connect(control.db_path)
+    assert wal_writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    wal_writer.execute("PRAGMA wal_autocheckpoint=0")
+    wal_writer.execute(
+        "INSERT INTO rca_delivery_meta(key, value) VALUES(?, ?)",
+        ("collector_startup_active_wal", "present"),
+    )
+    wal_writer.commit()
     config = replace(
         collector.CollectorConfig.from_env(
             _config_env(tmp_path),
             hermes_home=tmp_path,
         ),
+        control_db_path=control.db_path,
         release_note_path=fixture.path,
     )
     events = []
@@ -827,8 +1679,12 @@ def test_enabled_startup_locks_minimal_release_before_writable_collector(
 
     monkeypatch.setattr(
         RcaControlStore,
-        "_create_read_only_snapshot",
-        lambda _self: pytest.fail("normal startup must not copy the control DB"),
+        "create_schema_probe_snapshot",
+        classmethod(
+            lambda _cls, *_args, **_kwargs: pytest.fail(
+                "normal startup must not copy the control DB"
+            )
+        ),
     )
     monkeypatch.setattr(collector, "RcaDeliveryStore", tracked_store)
     monkeypatch.setattr(
@@ -845,9 +1701,12 @@ def test_enabled_startup_locks_minimal_release_before_writable_collector(
     monkeypatch.setattr(collector, "DeliveryCollector", constructed_collector)
     monkeypatch.setattr(collector, "run_collector_loop", lambda *_args, **_kwargs: 0)
 
-    assert collector.main(["--once"]) == 0
+    try:
+        assert collector.main(["--once"]) == 0
+    finally:
+        wal_writer.close()
     assert events == [
-        ("store", True, False),
+        ("store", False, False),
         ("validate",),
         ("store", False, True),
         ("collector",),
@@ -859,7 +1718,7 @@ def test_enabled_startup_locks_minimal_release_before_writable_collector(
     assert locked.release_fingerprint_sha256 == fixture.fingerprint
     assert (
         locked.release_note_sha256
-        == fixture.epoch["production_gate_receipt_sha256"]
+        == fixture.epoch["release_note_sha256"]
     )
 
 
@@ -867,14 +1726,31 @@ def test_collector_epoch_switch_rejects_batch_before_backfill_or_claim(
     tmp_path,
     monkeypatch,
 ):
-    control, result = _control(tmp_path)
-    _bind_activation_execution(control, result, state="steady_active")
-    store = RcaDeliveryStore(control.db_path)
     fixture = _release_note(tmp_path)
+    control, result = _control(tmp_path, db_path=fixture.control_db_path)
+    _bind_activation_execution(control, result, state="steady_active")
+    RcaDeliveryStore(control.db_path)
     _bind_minimal_release(control, fixture)
+    migration = _migrate_v14_fixture_to_v15(
+        control.db_path,
+        successor_epoch_id=fixture.note["activation"]["epoch_id"],
+        successor_release_fingerprint_sha256=fixture.fingerprint,
+        successor_release_note_sha256=fixture.epoch["release_note_sha256"],
+        successor_config_sha256=fixture.env_sha256,
+    )
+    fixture.epoch["epoch_id"] = migration["successor_epoch_id"]
+    control = RcaControlStore(
+        control.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    store = RcaDeliveryStore(
+        control.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
     _set_live_release_environment(monkeypatch, fixture)
     env = _config_env(tmp_path)
-    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "false"
     base = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
     binding = collector.validate_bound_resident_release(
         store,
@@ -887,6 +1763,7 @@ def test_collector_epoch_switch_rejects_batch_before_backfill_or_claim(
     )
     config = replace(
         base,
+        control_db_path=control.db_path,
         release_note_path=fixture.path,
         release_env_path=fixture.env_path,
         resident_release_enforced=True,
@@ -901,12 +1778,34 @@ def test_collector_epoch_switch_rejects_batch_before_backfill_or_claim(
         config=config,
         status_reader=lambda *_args: provider_calls.append("status"),
     )
-    assert instance._validate_runtime_release()["epoch_id"] == "delivery-epoch-1"
-    with sqlite3.connect(control.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_activation_epochs SET epoch_id = 'delivery-epoch-2' "
-            "WHERE is_current = 1"
-        )
+    assert instance._validate_runtime_release()["epoch_id"] == (
+        migration["successor_epoch_id"]
+    )
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    record = _record()
+    progress = control.partition_progress(
+        topic=record.topic,
+        partitions=(record.partition,),
+    )
+    successor = _direct_steady_contract(
+        predecessor=predecessor,
+        epoch_id="delivery-epoch-2",
+        expected_schema="pnc_rca_control_store_v15",
+        target_schema="pnc_rca_control_store_v15",
+        release_fingerprint_sha256="d" * 64,
+        release_note_sha256="e" * 64,
+        config_sha256="f" * 64,
+        partition_start_fence={
+            record.topic: {str(record.partition): progress[record.partition]}
+        },
+    )
+    control.activate_direct_steady_epoch(
+        **successor,
+        operator="collector-test",
+        reason="simulate an exact v15 release epoch switch",
+        now=NOW + timedelta(seconds=1),
+    )
     monkeypatch.setattr(
         store,
         "backfill_completed_submissions",
@@ -921,7 +1820,7 @@ def test_collector_epoch_switch_rejects_batch_before_backfill_or_claim(
     with pytest.raises(collector.ExternalWriteFenceError) as exc:
         instance.collect_batch()
 
-    assert exc.value.code == "resident_release_binding_changed"
+    assert exc.value.code == "resident_release_fingerprint_mismatch"
     assert provider_calls == []
 
 
@@ -938,8 +1837,23 @@ def test_activation_gate_does_not_backfill_claim_or_preview_legacy_null_row(
     tmp_path,
 ):
     control, legacy = _control(tmp_path)
+    with sqlite3.connect(control.db_path) as conn:
+        trigger_update = conn.execute(
+            "UPDATE business_triggers "
+            "SET activation_epoch_id = NULL, activation_ledger_id = NULL "
+            "WHERE submission_key = ?",
+            (legacy.submission_key,),
+        )
+        outbox_update = conn.execute(
+            "UPDATE rca_outbox "
+            "SET activation_epoch_id = NULL, activation_ledger_id = NULL "
+            "WHERE submission_key = ?",
+            (legacy.submission_key,),
+        )
+    assert trigger_update.rowcount == 1
+    assert outbox_update.rowcount == 1
+    ledger_before = control.list_rows("rca_activation_admission_ledger")
     env = _config_env(tmp_path)
-    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "false"
     env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = "true"
     instance = collector.DeliveryCollector(
         store=RcaDeliveryStore(control.db_path),
@@ -960,6 +1874,11 @@ def test_activation_gate_does_not_backfill_claim_or_preview_legacy_null_row(
     assert row["activation_epoch_id"] is None
     assert row["activation_ledger_id"] is None
     assert row["status"] == "completed"
+    [trigger] = control.list_rows("business_triggers")
+    assert trigger["submission_key"] == legacy.submission_key
+    assert trigger["activation_epoch_id"] is None
+    assert trigger["activation_ledger_id"] is None
+    assert control.list_rows("rca_activation_admission_ledger") == ledger_before
 
 
 def test_activation_required_reaches_watch_claim_and_successful_create(
@@ -994,7 +1913,6 @@ def test_activation_required_reaches_watch_claim_and_successful_create(
         ),
     )
     env = _config_env(tmp_path)
-    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "false"
     env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = "true"
     instance = collector.DeliveryCollector(
         store=store,
@@ -1025,7 +1943,6 @@ def test_activation_required_reaches_watch_claim_and_successful_create(
 
 def test_terminal_failure_is_silent_and_does_not_create_delivery(tmp_path):
     env = _config_env(tmp_path)
-    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "false"
     env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = "true"
     calls = []
     instance = object.__new__(collector.DeliveryCollector)
@@ -1063,38 +1980,31 @@ def test_terminal_failure_is_silent_and_does_not_create_delivery(tmp_path):
     assert "activation_required" not in calls[0]
 
 
-def test_collect_batch_collects_delivery_then_capacity_samples():
+def test_collect_batch_collects_delivery_until_idle():
     instance = collector.DeliveryCollector.__new__(collector.DeliveryCollector)
     instance.config = SimpleNamespace(batch_size=3)
     instance.stats = collector.CollectorStats()
+    instance._validate_runtime_release = lambda: {}
     instance.backfill = lambda: 0
     outcomes = iter([
         collector.CollectOutcome(status="running"),
         collector.CollectOutcome(status="idle"),
     ])
     instance.collect_one = lambda: next(outcomes)
-    capacity_calls = []
-    instance.collect_capacity_samples = lambda: capacity_calls.append(True)
 
     result = instance.collect_batch()
 
     assert [item.status for item in result] == ["running", "idle"]
-    assert capacity_calls == [True]
 
 
-def test_collector_stats_expose_capacity_counters_without_activation_counter():
+def test_collector_stats_omit_retired_capacity_counters():
     public = collector.asdict(collector.CollectorStats())
     assert "activation_blocked" not in public
-    assert public["capacity_scanned"] == 0
-    assert public["capacity_eligible"] == 0
-    assert public["capacity_appended"] == 0
-    assert public["capacity_rejected"] == 0
-    assert public["capacity_frozen"] == 0
-    assert public["capacity_last_error"] == ""
+    assert not any(key.startswith("capacity_") for key in public)
     assert public["stale_lease"] == 0
 
 
-def test_capacity_observation_error_does_not_mark_delivery_unhealthy(tmp_path):
+def test_health_omits_retired_capacity_sample_projection(tmp_path):
     env = _config_env(tmp_path)
     env["HERMES_RCA_DELIVERY_COLLECTOR_ACTIVATION_REQUIRED"] = "true"
     config = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
@@ -1112,16 +2022,13 @@ def test_capacity_observation_error_does_not_mark_delivery_unhealthy(tmp_path):
     reporter._failure_route_outlet_receipt = {"ready": True, "status": "ready"}
     reporter._failure_route_outlet_error = ""
 
-    stats = collector.CollectorStats(
-        capacity_last_error="rca_capacity_vm_measurement_time_invalid"
-    )
+    stats = collector.CollectorStats()
     reporter.write(state="idle", stats=stats, refresh_dependencies=False)
 
     payload = json.loads(config.health_path.read_text(encoding="utf-8"))
     assert health_calls[0]["activation_required"] is True
     assert payload["healthy"] is True
-    assert payload["capacity_samples"]["observation_healthy"] is False
-    assert payload["capacity_samples"]["blocks_delivery_health"] is False
+    assert "capacity_samples" not in payload
 
 
 def _remote_event_blocker():
@@ -1159,6 +2066,54 @@ def _remote_event_blocker():
     }
 
 
+def _v15_completed_control(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    record = _record()
+    seed = RcaControlStore(path)
+    seed.activate_direct_steady_epoch(
+        epoch_id="delivery-epoch-1",
+        release_fingerprint_sha256="a" * 64,
+        release_note_sha256="b" * 64,
+        config_sha256="c" * 64,
+        db_logical_identity={"database": "delivery-test"},
+        partition_start_fence={record.topic: {str(record.partition): 0}},
+        operator="delivery-test",
+        reason="activate v14 predecessor before collector cutover fixture",
+        now=NOW,
+    )
+    RcaDeliveryStore(path)
+    _migrate_v14_fixture_to_v15(
+        path,
+        successor_epoch_id="delivery-epoch-v15",
+    )
+    control = RcaControlStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    result = control.ingest_record(
+        record,
+        policy=_policy(),
+        submit_enabled=True,
+        activation_required=True,
+    )
+    claim = control.claim_outbox(lease_owner="submission-worker", now=NOW)
+    assert claim is not None
+    control.complete_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        result={
+            "success": True,
+            "submission_key": result.submission_key,
+            "task_id": result.submission_key,
+            "task_state": "submitted",
+            "deduped": False,
+        },
+        now=NOW,
+    )
+    return control, result
+
+
 def _real_terminal_collector(
     tmp_path,
     *,
@@ -1168,12 +2123,15 @@ def _real_terminal_collector(
     failure_receipt_reader=None,
     infra_remediation_runner=None,
 ):
-    _control(tmp_path)
+    control, _result = _v15_completed_control(tmp_path)
     env = _config_env(tmp_path)
-    env["HERMES_RCA_DELIVERY_COLLECTOR_CAPACITY_SAMPLE_ENABLED"] = "false"
     config = collector.CollectorConfig.from_env(env, hermes_home=tmp_path)
     instance = collector.DeliveryCollector(
-        store=RcaDeliveryStore(tmp_path / "control.sqlite3"),
+        store=RcaDeliveryStore(
+            tmp_path / "control.sqlite3",
+            require_current=True,
+            allow_successor_write=True,
+        ),
         config=config,
         status_reader=status_reader
         or (
@@ -1196,6 +2154,7 @@ def _real_terminal_collector(
             }
         ),
         infra_remediation_runner=infra_remediation_runner,
+        control_store=control,
         now=lambda: clock[0],
         lease_owner="taxonomy-real-path",
     )

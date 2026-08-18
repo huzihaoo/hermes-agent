@@ -33,9 +33,44 @@ from gateway.pnc_group_binding import (
 )
 from gateway.session import SessionSource
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from tests.gateway.test_pnc_rca_control_store import (
+    _direct_steady_contract,
+    _migration_apply_kwargs,
+)
 
 
 G1Q3_GROUP_ID = "oc_6cfc782212009ff4cd815349909dd423"
+
+
+def _steady_control_store(path):
+    from gateway.pnc_rca_control_store import RcaControlStore
+
+    predecessor_store = RcaControlStore(path)
+    predecessor_store.activate_direct_steady_epoch(
+        epoch_id="rca-gateway-test-steady",
+        release_fingerprint_sha256="1" * 64,
+        release_note_sha256="a" * 64,
+        config_sha256="2" * 64,
+        db_logical_identity={"database": "gateway-test"},
+        partition_start_fence={},
+        operator="gateway-test",
+        reason="activate steady gateway test runtime",
+    )
+    predecessor = predecessor_store.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(
+        predecessor=predecessor,
+        epoch_id="rca-gateway-test-v15",
+    )
+    RcaControlStore.migrate_v14_to_v15_and_activate(
+        path,
+        **_migration_apply_kwargs(contract),
+    )
+    return RcaControlStore(
+        path,
+        require_current=True,
+        allow_successor_write=True,
+    )
 
 
 def test_rca_manual_chat_allowlist_accepts_canonical_three_group_subset(monkeypatch):
@@ -1076,7 +1111,7 @@ def test_manual_gateway_passes_exact_kafka_policy_and_high_watermark(
 
     from gateway.pnc_rca_control_store import RcaControlStore
 
-    RcaControlStore(control_path)
+    _steady_control_store(control_path)
 
     result = gateway_run._admit_g1q3_manual_trigger(
         issue_url="https://project.feishu.cn/g1q3/issue/detail/7013527412",
@@ -1093,12 +1128,49 @@ def test_manual_gateway_passes_exact_kafka_policy_and_high_watermark(
         admission_runtime_config=admission_runtime_config,
     )
 
-    store = RcaControlStore(control_path)
+    store = RcaControlStore(
+        control_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
     [outbox] = store.list_rows("rca_outbox")
     [policy] = store.list_rows("rca_policy_snapshots")
     assert result["outcome"] == "created"
     assert outbox["creation_rule_version"] == "issue-created-v2"
     assert policy["policy_version"] == "issue-created-v2"
+
+
+def test_manual_gateway_rejects_exact_v14_control_store(monkeypatch, tmp_path):
+    from gateway.pnc_rca_control_store import ManualRcaAdmissionError, RcaControlStore
+
+    control_path = tmp_path / "control.sqlite3"
+    monkeypatch.setenv("HERMES_RCA_KAFKA_CONTROL_DB_PATH", str(control_path))
+    monkeypatch.setenv("HERMES_RCA_ACTIVATION_REQUIRED", "false")
+    store = RcaControlStore(control_path)
+
+    with pytest.raises(
+        ManualRcaAdmissionError,
+        match="manual_control_store_unavailable",
+    ):
+        gateway_run._admit_g1q3_manual_trigger(
+            issue_url=(
+                "https://project.feishu.cn/g1q3/issue/detail/7013527412"
+            ),
+            mode="run_or_join",
+            chat_id=G1Q3_GROUP_ID,
+            thread_id="topic:om_v14_root",
+            message_id="om_v14_source",
+            requester_id="ou_test_user",
+            submit_enabled=True,
+            operator_authorized=True,
+            operator_rate_limit=3,
+            operator_rate_window_seconds=600,
+            allowed_chat_ids=(G1Q3_GROUP_ID,),
+            admission_runtime_config=_manual_admission_runtime_config(),
+        )
+
+    assert store.list_rows("business_triggers") == []
+    assert store.list_rows("rca_outbox") == []
 
 
 def test_manual_gateway_w3_uses_official_preread_before_admission(
@@ -1109,7 +1181,7 @@ def test_manual_gateway_w3_uses_official_preread_before_admission(
     control_path = tmp_path / "control.sqlite3"
     monkeypatch.setenv("HERMES_RCA_KAFKA_CONTROL_DB_PATH", str(control_path))
     monkeypatch.setenv("HERMES_RCA_ACTIVATION_REQUIRED", "false")
-    RcaControlStore(control_path)
+    _steady_control_store(control_path)
     config = _w3_manual_admission_runtime_config()
     preread_calls = []
 
@@ -1151,7 +1223,11 @@ def test_manual_gateway_w3_uses_official_preread_before_admission(
         {"project_key": "project-key", "work_item_id": "7013527412"}
     ]
     assert result["outcome"] == "created"
-    store = RcaControlStore(control_path)
+    store = RcaControlStore(
+        control_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
     [snapshot] = store.list_rows("rca_admission_snapshots")
     snapshot_json = json.loads(snapshot["admission_snapshot_json"])
     assert snapshot_json["canonical_request"]["ticket"]["title"] == (

@@ -26,7 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from dotenv import dotenv_values, load_dotenv
+from dotenv import load_dotenv
 
 from gateway.pnc_rca_admission import (
     RCA_KAFKA_TRIGGER_KINDS,
@@ -36,14 +36,7 @@ from gateway.pnc_rca_admission import (
     validate_rca_trigger_context,
 )
 from gateway.pnc_rca_control_store import (
-    ACTIVATION_HISTORICAL_OUTBOX_ROW_FIELDS,
-    EXACT_OUTBOX_HOLD_META_PREFIX,
-    EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS,
-    EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS,
-    EXACT_OUTBOX_RUNTIME_PLIST_LABELS,
-    EXACT_OUTBOX_RUNTIME_PROVENANCE_SCHEMA_VERSION,
-    EXACT_OUTBOX_HOLD_SCHEMA_VERSION,
-    EXACT_OUTBOX_HOLD_UNTIL,
+    CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
     OutboxClaim,
     OUTBOX_CIRCUIT_RESET_SCHEMA_VERSION,
     RcaControlStore,
@@ -71,15 +64,8 @@ from gateway.pnc_rca_derived_capacity_reservation import (
     validate_derived_capacity_precreate_abort_receipt,
     validate_derived_capacity_reservation_receipt,
 )
-from gateway.pnc_rca_kafka_contract import NORMALIZED_EVENT_SCHEMA_VERSION
 from gateway.pnc_rca_issue_focus import issue_title_sha256, normalized_issue_title
-from gateway.pnc_rca_prod_bootstrap import (
-    ACTIVE_RELEASE_BINDING_NAME,
-    EPOCH_ID_RE as BOOTSTRAP_EPOCH_ID_RE,
-    RcaBootstrapAuthorizationError,
-    load_active_release_binding,
-    load_bootstrap_authorization,
-)
+from gateway.pnc_rca_kafka_contract import NORMALIZED_EVENT_SCHEMA_VERSION
 from gateway.pnc_rca_prod_admission import (
     RcaProdAdmissionError,
     hmac_key_fingerprint,
@@ -130,15 +116,13 @@ from hermes_constants import get_hermes_home
 
 
 ENV_PREFIX = "HERMES_RCA_OUTBOX_"
-PROD_CAPACITY_MODE_ENV = "HERMES_RCA_PROD_CAPACITY_MODE"
-PROD_RELEASE_ID_ENV = "HERMES_RCA_PROD_RELEASE_ID"
-PROD_BOOTSTRAP_EPOCH_ID_ENV = "HERMES_RCA_PROD_BOOTSTRAP_EPOCH_ID"
 DISPATCHER_HEALTH_SCHEMA_VERSION = "pnc_rca_outbox_dispatcher_health_v2"
 SERVICE_LABEL = "local.pnc.rca-outbox-dispatcher"
 OUTBOX_PAYLOAD_SCHEMA_VERSION = "pnc_rca_submission_outbox_v2"
-SUPPORTED_OUTBOX_PAYLOAD_SCHEMA_VERSIONS = frozenset(
-    {"pnc_rca_submission_outbox_v1", OUTBOX_PAYLOAD_SCHEMA_VERSION}
-)
+SUPPORTED_OUTBOX_PAYLOAD_SCHEMA_VERSIONS = frozenset({
+    "pnc_rca_submission_outbox_v1",
+    OUTBOX_PAYLOAD_SCHEMA_VERSION,
+})
 SERVICE_CAPABILITY = "submit_rca_issue_intake"
 SERVICE_OPERATION = "rca_issue_intake"
 DEFAULT_SERVICE_ID = "root_cause_analysis_agent"
@@ -165,7 +149,17 @@ DEFAULT_INPUT_WAIT_MAX_AGE_SECONDS = 900
 MIN_INPUT_WAIT_MAX_AGE_SECONDS = 60
 MAX_INPUT_WAIT_MAX_AGE_SECONDS = 3_600
 HEALTH_HEARTBEAT_INTERVAL_SECONDS = 10.0
-PROD_RELEASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{7,127}$")
+SUCCESSOR_READ_ONLY_MODE = "successor_read_only"
+SCHEMA_RUNTIME_CAPABILITY_KEYS = frozenset({
+    "observed_control_schema_version",
+    "binary_write_schema_version",
+    "mode",
+    "read_supported",
+    "write_enabled",
+    "work_admission_enabled",
+    "lease_acquisition_enabled",
+    "external_effect_enabled",
+})
 _FORBIDDEN_MDI_COMMAND_PATTERN = re.compile(
     r"\bmdi\s+(?:download|refresh2?|clip|event)\b", re.IGNORECASE
 )
@@ -179,8 +173,6 @@ _SERVICE_ERROR_CODES = frozenset({
     "vm_task_service_rca_prod_admission_blocked",
     "vm_task_permission_policy_unavailable",
     "vm_task_service_admission_invalid",
-    "vm_task_service_bootstrap_binding_invalid",
-    "vm_task_service_capacity_mode_invalid",
     "vm_task_service_rca_prod_command_invalid",
     "vm_task_service_request_invalid",
     "vm_task_service_request_identity_mismatch",
@@ -194,7 +186,6 @@ _SERVICE_ERROR_CODES = frozenset({
 })
 
 _GLOBAL_CIRCUIT_ERROR_CODES = frozenset({
-    "dispatcher_bootstrap_authorization_invalid",
     "dispatcher_dependency_unavailable",
     "dispatcher_snapshot_authority_mismatch",
     "dispatcher_submit_contract_invalid",
@@ -208,9 +199,7 @@ _GLOBAL_CIRCUIT_ERROR_CODES = frozenset({
     "storage_admission_response_invalid",
     "storage_admission_wrapper_invalid",
     "vm_task_service_admission_invalid",
-    "vm_task_service_bootstrap_binding_invalid",
     "vm_task_service_capability_denied",
-    "vm_task_service_capacity_mode_invalid",
     "vm_task_service_operation_denied",
     "vm_task_service_permission_denied",
     "vm_task_service_rca_prod_admission_blocked",
@@ -329,9 +318,7 @@ def _validate_vm_submit_fence(
             "target_set_sha256",
         )
     ):
-        raise ExternalWriteFenceError(
-            "external_write_fence_target_mismatch"
-        )
+        raise ExternalWriteFenceError("external_write_fence_target_mismatch")
     validate_write_fence(
         fence,
         snapshot=bundle.snapshot,
@@ -386,9 +373,7 @@ def _boolean(env: Mapping[str, str], name: str, default: bool = False) -> bool:
     raise ValueError(f"{name} must be true or false")
 
 
-def _strict_boolean(
-    env: Mapping[str, str], name: str, default: bool = False
-) -> bool:
+def _strict_boolean(env: Mapping[str, str], name: str, default: bool = False) -> bool:
     value = str(env.get(name, "true" if default else "false")).strip().lower()
     if value == "true":
         return True
@@ -456,18 +441,6 @@ class CircuitResetReceiptMaterializationError(RuntimeError):
         )
 
 
-class ExactOutboxHoldReceiptMaterializationError(RuntimeError):
-    def __init__(self, *, hold_id: str, receipt_path: Path, cause: Exception):
-        self.hold_id = str(hold_id)
-        self.receipt_path = receipt_path
-        self.meta_key = f"{EXACT_OUTBOX_HOLD_META_PREFIX}{self.hold_id}"
-        self.cause = cause
-        super().__init__(
-            "exact_outbox_hold_recovery_required:"
-            f"hold_id={self.hold_id}:receipt={receipt_path}:cause={cause}"
-        )
-
-
 class PermanentDispatchError(RuntimeError):
     def __init__(self, code: str, detail: str = ""):
         super().__init__(detail or code)
@@ -475,25 +448,9 @@ class PermanentDispatchError(RuntimeError):
         self.detail = str(detail or code)
 
 
-OUTBOX_CIRCUIT_RESET_RECEIPT_SCHEMA_VERSION = (
-    OUTBOX_CIRCUIT_RESET_SCHEMA_VERSION
-)
+OUTBOX_CIRCUIT_RESET_RECEIPT_SCHEMA_VERSION = OUTBOX_CIRCUIT_RESET_SCHEMA_VERSION
 _CIRCUIT_RESET_MAX_OPERATOR_BYTES = 200
 _CIRCUIT_RESET_MAX_REASON_BYTES = 1000
-EXACT_OUTBOX_HOLD_RECOVERY_SCHEMA_VERSION = (
-    "pnc_rca_exact_outbox_hold_recovery_v1"
-)
-EXACT_OUTBOX_RESIDENT_CENSUS_SCHEMA_VERSION = (
-    "pnc_rca_exact_outbox_resident_census_v1"
-)
-EXACT_OUTBOX_FORBIDDEN_RESIDENT_LABELS = (
-    "local.pnc.rca-kafka-consumer",
-    "local.pnc.rca-outbox-dispatcher",
-    "local.pnc.rca-delivery-collector",
-    "local.pnc.rca-delivery-dispatcher",
-    "local.pnc.completion-notice-relay",
-    "local.pnc.feishu-delivery-repair",
-)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -612,7 +569,9 @@ def _open_receipt_parent(path: Path) -> tuple[int, dict[str, int]]:
         raise
 
 
-def _receipt_parent_stable(parent_path: Path, parent_fd: int, identity: Mapping[str, int]) -> None:
+def _receipt_parent_stable(
+    parent_path: Path, parent_fd: int, identity: Mapping[str, int]
+) -> None:
     observed = os.fstat(parent_fd)
     lexical = parent_path.lstat()
     if (
@@ -802,736 +761,6 @@ def _build_circuit_reset_receipt(
     return receipt
 
 
-def _exact_hold_destination_binding(path: Path) -> dict[str, Any]:
-    absolute = str(path.expanduser().absolute())
-    parent = _receipt_parent_identity(path)
-    return {
-        "path_sha256": hashlib.sha256(absolute.encode("utf-8")).hexdigest(),
-        "parent_device": int(parent["device"]),
-        "parent_inode": int(parent["inode"]),
-    }
-
-
-def _exact_hold_json_sha256(value: Any) -> str:
-    raw = json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
-
-
-def _bound_exact_hold_source_sha256(path: Path) -> str:
-    lexical = path.expanduser().absolute()
-    lexical_stat = lexical.lstat()
-    if stat.S_ISLNK(lexical_stat.st_mode):
-        raise ValueError("exact_outbox_hold_tool_provenance_invalid")
-    resolved = lexical.resolve(strict=True)
-    if resolved != lexical:
-        raise ValueError("exact_outbox_hold_tool_provenance_invalid")
-    descriptor = os.open(
-        resolved,
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
-    )
-    try:
-        before = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
-            or before.st_uid != os.getuid()
-            or stat.S_IMODE(before.st_mode) & 0o022
-            or before.st_dev != lexical_stat.st_dev
-            or before.st_ino != lexical_stat.st_ino
-        ):
-            raise ValueError("exact_outbox_hold_tool_provenance_invalid")
-        digest = hashlib.sha256()
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-        after = os.fstat(descriptor)
-        if (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-        ) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-        ):
-            raise ValueError("exact_outbox_hold_tool_provenance_changed")
-        return digest.hexdigest()
-    finally:
-        os.close(descriptor)
-
-
-def _bound_exact_hold_source_bytes(path: Path) -> tuple[str, bytes, os.stat_result]:
-    """Read and hash one stable, non-symlink file through the same fd."""
-    lexical = path.expanduser().absolute()
-    lexical_stat = lexical.lstat()
-    if stat.S_ISLNK(lexical_stat.st_mode):
-        raise ValueError("exact_outbox_hold_tool_provenance_invalid")
-    descriptor = os.open(
-        lexical,
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0),
-    )
-    try:
-        before = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
-            or before.st_uid != os.getuid()
-            or stat.S_IMODE(before.st_mode) & 0o022
-            or before.st_dev != lexical_stat.st_dev
-            or before.st_ino != lexical_stat.st_ino
-        ):
-            raise ValueError("exact_outbox_hold_tool_provenance_invalid")
-        chunks: list[bytes] = []
-        digest = hashlib.sha256()
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            digest.update(chunk)
-        after = os.fstat(descriptor)
-        if (
-            before.st_dev,
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-        ) != (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-        ):
-            raise ValueError("exact_outbox_hold_tool_provenance_changed")
-        return digest.hexdigest(), b"".join(chunks), before
-    finally:
-        os.close(descriptor)
-
-
-def _exact_runtime_file_binding(path: Path, *, label: str | None = None) -> dict[str, Any]:
-    lexical = path.expanduser().absolute()
-    digest, _raw, observed = _bound_exact_hold_source_bytes(lexical)
-    return {
-        "present": True,
-        **({"label": label} if label is not None else {}),
-        "path": str(lexical),
-        "sha256": digest,
-        "size": int(observed.st_size),
-        "mode": int(stat.S_IMODE(observed.st_mode)),
-        "uid": int(observed.st_uid),
-        "nlink": int(observed.st_nlink),
-    }
-
-
-def _exact_outbox_runtime_provenance(
-    hermes_home: str | Path | None = None,
-) -> dict[str, Any]:
-    """Bind the active runtime manifest and canonical resident source files."""
-    runtime_home = Path(hermes_home or get_hermes_home()).expanduser().absolute()
-    manifest_path = Path(
-        str(runtime_home / "runtime" / "LIVE_MANIFEST.json")
-        if hermes_home is not None
-        else os.environ.get(
-            "HERMES_RCA_OUTBOX_RUNTIME_MANIFEST_PATH",
-            str(runtime_home / "runtime" / "LIVE_MANIFEST.json"),
-        )
-    )
-    manifest_digest, manifest_raw, manifest_stat = _bound_exact_hold_source_bytes(
-        manifest_path
-    )
-    manifest_binding = {
-        "present": True,
-        "path": str(manifest_path.expanduser().absolute()),
-        "sha256": manifest_digest,
-        "size": int(manifest_stat.st_size),
-        "mode": int(stat.S_IMODE(manifest_stat.st_mode)),
-        "uid": int(manifest_stat.st_uid),
-        "nlink": int(manifest_stat.st_nlink),
-    }
-    try:
-        manifest = json.loads(
-            manifest_raw.decode("utf-8"),
-            parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()),
-        )
-    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError("exact_outbox_hold_runtime_manifest_invalid") from exc
-    if not isinstance(manifest, Mapping):
-        raise ValueError("exact_outbox_hold_runtime_manifest_invalid")
-    runtime_root = Path(str(manifest.get("runtime_root") or "")).expanduser()
-    if (
-        not runtime_root.is_absolute()
-        or runtime_root != runtime_root.absolute()
-        or runtime_root != runtime_root.resolve(strict=True)
-    ):
-        raise ValueError("exact_outbox_hold_runtime_manifest_invalid")
-    try:
-        runtime_root_stat = runtime_root.lstat()
-    except OSError as exc:
-        raise ValueError("exact_outbox_hold_runtime_manifest_invalid") from exc
-    if (
-        stat.S_ISLNK(runtime_root_stat.st_mode)
-        or not stat.S_ISDIR(runtime_root_stat.st_mode)
-        or runtime_root_stat.st_uid != os.getuid()
-        or stat.S_IMODE(runtime_root_stat.st_mode) & 0o022
-        or Path(os.path.realpath(runtime_root)) != runtime_root
-        or runtime_root.parent != runtime_home / "runtime" / "releases"
-    ):
-        raise ValueError("exact_outbox_hold_runtime_manifest_invalid")
-    try:
-        from scripts.pnc_live_exec import (
-            SERVICE_TARGETS,
-            _stable_target_registry,
-            resolve_active_runtime,
-        )
-
-        resolved = resolve_active_runtime(
-            manifest_path=manifest_path,
-            hermes_home=runtime_home,
-            service_label="local.pnc.rca-outbox-dispatcher",
-        )
-        if (
-            resolved["manifest_sha256"] != manifest_digest
-            or Path(resolved["runtime_root"]) != runtime_root
-        ):
-            raise ValueError("exact_outbox_hold_runtime_manifest_changed")
-        runtime_git_head = str(resolved["runtime_commit"])
-        runtime_git_tree = str(resolved["runtime_tree"])
-        runtime_venv = Path(resolved["runtime_venv"])
-        runtime_python = Path(resolved["runtime_python"])
-
-        runtime_scripts: list[dict[str, Any]] = []
-        for label in EXACT_OUTBOX_RUNTIME_PLIST_LABELS:
-            target_kind, relative_target = SERVICE_TARGETS[label]
-            if target_kind != "runtime_script":
-                raise ValueError("exact_outbox_hold_runtime_target_changed")
-            target_path = (runtime_root / relative_target).absolute()
-            if Path(os.path.realpath(target_path)) != target_path:
-                raise ValueError("exact_outbox_hold_runtime_target_changed")
-            runtime_scripts.append(
-                _exact_runtime_file_binding(target_path, label=label)
-            )
-
-        launcher_source_path = runtime_root / "scripts" / "pnc_live_exec.py"
-        installed_launcher_path = (
-            runtime_home / "runtime" / "governance-tools" / "pnc_live_exec.py"
-        )
-        launcher_source_digest, launcher_source_raw, launcher_source_stat = (
-            _bound_exact_hold_source_bytes(launcher_source_path)
-        )
-        launcher_installed_digest, launcher_installed_raw, launcher_installed_stat = (
-            _bound_exact_hold_source_bytes(installed_launcher_path)
-        )
-        if (
-            Path(os.path.realpath(launcher_source_path)) != launcher_source_path
-            or Path(os.path.realpath(installed_launcher_path))
-            != installed_launcher_path
-            or launcher_source_raw != launcher_installed_raw
-            or launcher_source_digest != launcher_installed_digest
-            or launcher_source_stat.st_size != launcher_installed_stat.st_size
-        ):
-            raise ValueError("exact_outbox_hold_runtime_launcher_changed")
-
-        registry = (
-            runtime_root
-            / "gateway"
-            / "assets"
-            / "pnc_stable_target_registry_v1.json"
-        )
-
-        registered_targets = _stable_target_registry(runtime_root)
-        for label, (target_kind, relative_target) in SERVICE_TARGETS.items():
-            if target_kind not in {"governance_tool", "runtime_file"}:
-                continue
-            target_base = (
-                runtime_home / "runtime" / "governance-tools"
-                if target_kind == "governance_tool"
-                else runtime_home / "runtime"
-            )
-            target_path = (target_base / relative_target).absolute()
-            expected = registered_targets[label]
-            digest, raw, _identity = _bound_exact_hold_source_bytes(target_path)
-            if (
-                Path(os.path.realpath(target_path)) != target_path
-                or len(raw) != expected["size"]
-                or digest != expected["sha256"]
-            ):
-                raise ValueError("exact_outbox_hold_runtime_target_changed")
-    except Exception as exc:
-        if isinstance(exc, ValueError) and str(exc).startswith(
-            "exact_outbox_hold_runtime_"
-        ):
-            raise
-        raise ValueError("exact_outbox_hold_runtime_target_changed") from exc
-    plist_dir = Path.home() / "Library" / "LaunchAgents"
-    plists: list[dict[str, Any]] = []
-    from scripts.pnc_rca_release_transaction import _validate_plist
-
-    for label in EXACT_OUTBOX_RUNTIME_PLIST_LABELS:
-        installed_path = plist_dir / f"{label}.plist"
-        source_path = runtime_root / f"{label}.plist"
-        installed_digest, installed_raw, installed_stat = (
-            _bound_exact_hold_source_bytes(installed_path)
-        )
-        source_digest, source_raw, _source_stat = _bound_exact_hold_source_bytes(
-            source_path
-        )
-        if (
-            Path(os.path.realpath(installed_path)) != installed_path
-            or Path(os.path.realpath(source_path)) != source_path
-            or installed_raw != source_raw
-            or installed_digest != source_digest
-        ):
-            raise ValueError("exact_outbox_hold_runtime_plist_changed")
-        try:
-            _validate_plist(installed_raw, label=label, hermes_home=runtime_home)
-        except Exception as exc:
-            raise ValueError("exact_outbox_hold_runtime_plist_changed") from exc
-        plists.append(
-            {
-                "present": True,
-                "label": label,
-                "path": str(installed_path),
-                "sha256": installed_digest,
-                "size": int(installed_stat.st_size),
-                "mode": int(stat.S_IMODE(installed_stat.st_mode)),
-                "uid": int(installed_stat.st_uid),
-                "nlink": int(installed_stat.st_nlink),
-            }
-        )
-    return {
-        "schema_version": EXACT_OUTBOX_RUNTIME_PROVENANCE_SCHEMA_VERSION,
-        "manifest": manifest_binding,
-        "manifest_runtime_root": str(runtime_root.absolute()),
-        "runtime_venv": str(runtime_venv),
-        "runtime_python": str(runtime_python),
-        "manifest_runtime_release_target": str(
-            manifest.get("runtime_release_target") or ""
-        ),
-        "manifest_gateway_release_target": str(
-            manifest.get("gateway_release_target") or ""
-        ),
-        "manifest_commit": str(
-            (manifest.get("gateway_release_binding") or {}).get("commit") or ""
-        ),
-        "manifest_tree": str(
-            (manifest.get("gateway_release_binding") or {}).get("tree") or ""
-        ),
-        "runtime_git_head": runtime_git_head,
-        "runtime_git_tree": runtime_git_tree,
-        "release_bom_sha256": str(
-            (manifest.get("gateway_release_binding") or {}).get(
-                "capacity_admission", {}
-            ).get("release_bom_sha256")
-            or ""
-        ),
-        "plists": plists,
-        "stable_target_registry": _exact_runtime_file_binding(registry),
-        "launcher_source": {
-            "present": True,
-            "path": str(launcher_source_path),
-            "sha256": launcher_source_digest,
-            "size": int(launcher_source_stat.st_size),
-            "mode": int(stat.S_IMODE(launcher_source_stat.st_mode)),
-            "uid": int(launcher_source_stat.st_uid),
-            "nlink": int(launcher_source_stat.st_nlink),
-        },
-        "installed_launcher": {
-            "present": True,
-            "path": str(installed_launcher_path),
-            "sha256": launcher_installed_digest,
-            "size": int(launcher_installed_stat.st_size),
-            "mode": int(stat.S_IMODE(launcher_installed_stat.st_mode)),
-            "uid": int(launcher_installed_stat.st_uid),
-            "nlink": int(launcher_installed_stat.st_nlink),
-        },
-        "runtime_scripts": runtime_scripts,
-    }
-
-
-def _exact_outbox_hold_tool_provenance(
-    hermes_home: str | Path | None = None,
-) -> dict[str, Any]:
-    entrypoint = Path(__file__).resolve(strict=True)
-    control_path = (REPO_ROOT / "gateway" / "pnc_rca_control_store.py").resolve(
-        strict=True
-    )
-    bootstrap_path = (REPO_ROOT / "gateway" / "pnc_rca_prod_bootstrap.py").resolve(
-        strict=True
-    )
-    git_head_result = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=5,
-    )
-    git_tree_result = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD^{tree}"],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=5,
-    )
-    git_status = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "status", "--porcelain", "--untracked-files=all"],
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=5,
-    )
-    git_head = git_head_result.stdout.strip()
-    git_tree = git_tree_result.stdout.strip()
-    if (
-        git_head_result.returncode != 0
-        or git_tree_result.returncode != 0
-        or re.fullmatch(r"[0-9a-f]{40}", git_head) is None
-        or re.fullmatch(r"[0-9a-f]{40}", git_tree) is None
-        or git_status.returncode != 0
-        or bool(git_status.stdout.strip())
-    ):
-        raise ValueError("exact_outbox_hold_git_provenance_invalid")
-    return {
-        "entrypoint_path": str(entrypoint),
-        "entrypoint_sha256": _bound_exact_hold_source_sha256(entrypoint),
-        "control_store_path": str(control_path),
-        "control_store_sha256": _bound_exact_hold_source_sha256(control_path),
-        "bootstrap_path": str(bootstrap_path),
-        "bootstrap_sha256": _bound_exact_hold_source_sha256(bootstrap_path),
-        "git_head": git_head,
-        "git_tree": git_tree,
-        "git_status_returncode": int(git_status.returncode),
-        "git_clean": git_status.returncode == 0 and not git_status.stdout.strip(),
-        "runtime_provenance": _exact_outbox_runtime_provenance(hermes_home),
-    }
-
-
-def _exact_outbox_resident_census(config: "DispatcherConfig") -> dict[str, Any]:
-    """Read-only launchd census; never unloads or signals a resident."""
-    observations: list[dict[str, Any]] = []
-    uid = str(os.getuid())
-    for label in EXACT_OUTBOX_FORBIDDEN_RESIDENT_LABELS:
-        try:
-            result = subprocess.run(
-                ["launchctl", "print", f"gui/{uid}/{label}"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=3,
-            )
-            combined = (result.stdout or "") + (result.stderr or "")
-            raw = combined.encode("utf-8")
-            loaded = result.returncode == 0
-            unloaded_proven = bool(
-                result.returncode == 113
-                and re.fullmatch(
-                    rf"Bad request\.\nCould not find service \"{re.escape(label)}\" in domain for user gui: {re.escape(uid)}\n?",
-                    combined,
-                )
-            )
-            if not loaded and not unloaded_proven:
-                raise RuntimeError("exact_outbox_hold_resident_census_unavailable")
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError("exact_outbox_hold_resident_census_unavailable") from exc
-        observations.append(
-            {
-                "label": label,
-                "loaded": loaded,
-                "returncode": int(result.returncode),
-                "unloaded_proven": unloaded_proven,
-                "output_sha256": hashlib.sha256(raw).hexdigest(),
-            }
-        )
-    loaded = [item["label"] for item in observations if item["loaded"]]
-    census: dict[str, Any] = {
-        "schema_version": EXACT_OUTBOX_RESIDENT_CENSUS_SCHEMA_VERSION,
-        "observed_at": _utc_now().isoformat(),
-        "forbidden_labels": list(EXACT_OUTBOX_FORBIDDEN_RESIDENT_LABELS),
-        "observations": observations,
-        "loaded_labels": loaded,
-        "loaded_count": len(loaded),
-        "all_unloaded": not loaded,
-        "source_kind": "launchctl_read_only_print",
-        "domain": f"gui/{uid}",
-        "active_release_binding_path": str(config.active_release_binding_path),
-    }
-    census["source_sha256"] = _exact_hold_json_sha256(
-        {key: value for key, value in census.items() if key != "source_sha256"}
-    )
-    if not census["all_unloaded"]:
-        raise RuntimeError(
-            "exact_outbox_hold_forbidden_resident_loaded:" + ",".join(loaded)
-        )
-    return census
-
-
-def _exact_outbox_hold_active_release_binding(
-    config: "DispatcherConfig",
-) -> dict[str, Any]:
-    binding = load_active_release_binding(
-        path=config.active_release_binding_path,
-        live_env_path=config.live_env_path,
-        expected_release_id=config.release_id,
-        expected_epoch_id=config.bootstrap_epoch_id,
-    )
-    runtime = _exact_outbox_runtime_provenance(config.live_env_path.parent)
-    release_bom_sha256 = str(binding.get("release_bom_sha256") or "")
-    if release_bom_sha256 != runtime.get("release_bom_sha256"):
-        raise RuntimeError("exact_outbox_hold_runtime_release_bom_changed")
-    if (
-        runtime.get("runtime_git_head") != runtime.get("manifest_commit")
-        or runtime.get("runtime_git_tree") != runtime.get("manifest_tree")
-    ):
-        raise RuntimeError("exact_outbox_hold_runtime_git_changed")
-    return {
-        "path": str(config.active_release_binding_path.expanduser().absolute()),
-        "sha256": str(binding["binding_receipt_sha256"]),
-        "release_id": str(binding["release_id"]),
-        "authority_sha256": str(binding["authority_sha256"]),
-        "authority_epoch_id": str(binding["authority_epoch_id"]),
-        "bootstrap_epoch_id": str(binding["bootstrap_epoch_id"]),
-        "release_bom_sha256": release_bom_sha256,
-        "candidate_env_sha256": str(binding["candidate_env_sha256"]),
-        "authorization_fingerprint": str(binding["authorization_fingerprint"]),
-        "authorization_receipt_sha256": str(
-            binding["authorization_receipt_sha256"]
-        ),
-        "approval_evidence_sha256": str(binding["approval_evidence_sha256"]),
-        "runtime_manifest_sha256": runtime["manifest"]["sha256"],
-        "runtime_release_target": runtime["manifest_runtime_release_target"],
-        "runtime_git_head": runtime["runtime_git_head"],
-        "runtime_git_tree": runtime["runtime_git_tree"],
-        "raw_sha256": _bound_exact_hold_source_sha256(
-            config.active_release_binding_path
-        ),
-        "live_env_path": str(config.live_env_path.expanduser().absolute()),
-        "live_env_sha256": _bound_exact_hold_source_sha256(config.live_env_path),
-    }
-
-
-def _exact_outbox_hold_config_binding(config: "DispatcherConfig") -> str:
-    return _exact_hold_json_sha256(config.public_dict())
-
-
-def _public_exact_hold_row(value: Mapping[str, Any]) -> dict[str, Any]:
-    return {key: item for key, item in value.items() if not key.startswith("_")}
-
-
-def _exact_hold_row_sha256(projection: Mapping[str, Any]) -> str:
-    return _exact_hold_json_sha256(
-        {field: projection[field] for field in ACTIVATION_HISTORICAL_OUTBOX_ROW_FIELDS}
-    )
-
-
-def _build_exact_outbox_hold_receipt(
-    *,
-    config: "DispatcherConfig",
-    snapshot: Mapping[str, Any],
-    operator: str,
-    reason: str,
-    recorded_at: str,
-    receipt_path: Path,
-    control_db_identity: Mapping[str, Any],
-    active_release_binding: Mapping[str, Any],
-    tool_provenance: Mapping[str, Any],
-    resident_census: Mapping[str, Any],
-) -> dict[str, Any]:
-    target_raw = snapshot["target"]
-    predecessor_raw = snapshot["predecessor"]
-    if not isinstance(target_raw, Mapping) or not isinstance(
-        predecessor_raw, Mapping
-    ):
-        raise ValueError("exact_outbox_hold_snapshot_invalid")
-    target_before = _public_exact_hold_row(target_raw)
-    predecessor = _public_exact_hold_row(predecessor_raw)
-    projection = dict(target_raw["_row_projection"])
-    projection["next_attempt_at"] = EXACT_OUTBOX_HOLD_UNTIL
-    projection["updated_at"] = recorded_at
-    target_after = {
-        **target_before,
-        "next_attempt_at": EXACT_OUTBOX_HOLD_UNTIL,
-        "updated_at": recorded_at,
-        "row_sha256": _exact_hold_row_sha256(projection),
-    }
-    queue_before = dict(snapshot["eligible_queue"])
-    queue_after_entries = [
-        {
-            "outbox_id": predecessor["outbox_id"],
-            "row_sha256": predecessor["row_sha256"],
-        }
-    ]
-    queue_after = {
-        "outbox_ids": [predecessor["outbox_id"]],
-        "entries": queue_after_entries,
-        "sha256": RcaControlStore._exact_outbox_queue_sha256(queue_after_entries),
-    }
-    destination_binding = _exact_hold_destination_binding(receipt_path)
-    config_binding_sha256 = _exact_outbox_hold_config_binding(config)
-    tool_provenance_sha256 = _exact_hold_json_sha256(dict(tool_provenance))
-    raw_retry_horizon = dict(snapshot["retry_horizon"])
-    try:
-        expires_at = datetime.fromisoformat(
-            str(raw_retry_horizon["expires_at"]).replace("Z", "+00:00")
-        )
-        recorded_datetime = datetime.fromisoformat(
-            str(recorded_at).replace("Z", "+00:00")
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("exact_outbox_hold_retry_horizon_invalid") from exc
-    plan_remaining_seconds = int(
-        (expires_at.astimezone(timezone.utc) - recorded_datetime.astimezone(timezone.utc)).total_seconds()
-    )
-    if plan_remaining_seconds < EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS:
-        raise ValueError("exact_outbox_hold_retry_horizon_headroom_insufficient")
-    retry_horizon = {
-        "target_outbox_id": int(raw_retry_horizon["target_outbox_id"]),
-        "anchor": str(raw_retry_horizon["anchor"]),
-        "expires_at": str(raw_retry_horizon["expires_at"]),
-        "min_remaining_seconds": EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS,
-        "safety_headroom_seconds": EXACT_OUTBOX_HOLD_MIN_REMAINING_SECONDS,
-        "record_max_age_seconds": EXACT_OUTBOX_HOLD_RECORD_MAX_AGE_SECONDS,
-        "plan_remaining_seconds": plan_remaining_seconds,
-        "apply_observed_at": None,
-        "apply_remaining_seconds": None,
-    }
-    plan_logical_db_identity = dict(control_db_identity["logical_db_identity"])
-    plan_wal = dict(plan_logical_db_identity.get("wal") or {})
-    if plan_wal.get("present") is True and int(plan_wal.get("size", 0)) == 0:
-        plan_wal = {"present": False}
-    plan_logical_db_identity["wal"] = plan_wal
-    plan_control_db_identity = {
-        "path": control_db_identity["path"],
-        "logical_db_identity": plan_logical_db_identity,
-    }
-    config_binding = config.public_dict()
-    plan_id = _exact_hold_json_sha256(
-        {
-            "command": "hold-exact-outbox",
-            "operator": operator,
-            "reason": reason,
-            "target_outbox_id": int(snapshot["target_outbox_id"]),
-            "predecessor_outbox_id": int(snapshot["predecessor_outbox_id"]),
-            "activation_required": bool(snapshot["activation_required"]),
-            "max_age_seconds": int(snapshot["max_age_seconds"]),
-            "active_activation": dict(snapshot["active_activation"]),
-            "active_release_binding": dict(active_release_binding),
-            "control_db_identity": plan_control_db_identity,
-            "config_binding_sha256": config_binding_sha256,
-            "tool_provenance_sha256": tool_provenance_sha256,
-            "target_row_sha256": target_before["row_sha256"],
-            "predecessor_row_sha256": predecessor["row_sha256"],
-            "eligible_queue_sha256": queue_before["sha256"],
-            "retry_horizon": {
-                key: retry_horizon[key]
-                for key in (
-                    "target_outbox_id",
-                    "anchor",
-                    "expires_at",
-                    "min_remaining_seconds",
-                    "safety_headroom_seconds",
-                    "record_max_age_seconds",
-                )
-            },
-            "destination_path": str(receipt_path.expanduser().absolute()),
-            "destination_binding": destination_binding,
-            "resident_census_policy": {
-                "schema_version": resident_census["schema_version"],
-                "source_kind": resident_census["source_kind"],
-                "domain": resident_census["domain"],
-                "forbidden_labels": resident_census["forbidden_labels"],
-                "all_unloaded": resident_census["all_unloaded"],
-            },
-        }
-    )
-    hold_id = _exact_hold_json_sha256(
-        {
-            "plan_id": plan_id,
-            "recorded_at": recorded_at,
-            "target_after_sha256": target_after["row_sha256"],
-        }
-    )
-    receipt: dict[str, Any] = {
-        "schema_version": EXACT_OUTBOX_HOLD_SCHEMA_VERSION,
-        "command": "hold-exact-outbox",
-        "phase": "hold",
-        "hold_id": hold_id,
-        "plan_id": plan_id,
-        "recorded_at": recorded_at,
-        "operator": operator,
-        "reason": reason,
-        "target_outbox_id": int(snapshot["target_outbox_id"]),
-        "predecessor_outbox_id": int(snapshot["predecessor_outbox_id"]),
-        "control_db_identity": dict(control_db_identity),
-        "activation_required": bool(snapshot["activation_required"]),
-        "max_age_seconds": int(snapshot["max_age_seconds"]),
-        "active_activation": dict(snapshot["active_activation"]),
-        "active_release_binding": dict(active_release_binding),
-        "config_binding": config_binding,
-        "config_binding_sha256": config_binding_sha256,
-        "tool_provenance": dict(tool_provenance),
-        "tool_provenance_sha256": tool_provenance_sha256,
-        "resident_census": dict(resident_census),
-        "destination_path": str(receipt_path.expanduser().absolute()),
-        "destination_binding": destination_binding,
-        "target_before": target_before,
-        "target_after": target_after,
-        "predecessor": predecessor,
-        "eligible_queue_before": queue_before,
-        "eligible_queue_after": queue_after,
-        "retry_horizon": retry_horizon,
-        "effect_delta": {
-            "external_writes": 0,
-            "external_effects_triggered": False,
-            "target_rows_updated": 1,
-            "control_meta_inserted": 1,
-            "business_trigger_rows_updated": 0,
-            "mutation": {
-                "next_attempt_at": EXACT_OUTBOX_HOLD_UNTIL,
-                "updated_at": recorded_at,
-            },
-        },
-    }
-    receipt["receipt_fingerprint"] = _exact_hold_json_sha256(receipt)
-    return receipt
-
-
-def _build_exact_outbox_hold_recovery_envelope(
-    audit: Mapping[str, Any], receipt_path: Path
-) -> dict[str, Any]:
-    destination = _exact_hold_destination_binding(receipt_path)
-    envelope: dict[str, Any] = {
-        "schema_version": EXACT_OUTBOX_HOLD_RECOVERY_SCHEMA_VERSION,
-        "command": "materialize-exact-outbox-hold",
-        "phase": "hold",
-        "recovered": True,
-        "source_hold_id": audit["hold_id"],
-        "source_plan_id": audit["plan_id"],
-        "source_receipt_fingerprint": audit["receipt_fingerprint"],
-        "planned_destination_binding": audit["destination_binding"],
-        "materialized_destination": {
-            "path": str(receipt_path),
-            "binding": destination,
-        },
-        "materialized_at": _utc_iso(),
-        "external_effects_triggered": False,
-        "audit": dict(audit),
-    }
-    envelope["receipt_fingerprint"] = canonical_json_sha256(envelope)
-    return envelope
-
-
 @dataclass(frozen=True)
 class DispatcherConfig:
     dispatch_enabled: bool
@@ -1552,7 +781,6 @@ class DispatcherConfig:
     translate_baseline: str
     translate_contract_path: str
     storage_admission_enabled: bool
-    storage_reservation_enabled: bool
     derived_capacity_reservation_enabled: bool
     delivery_backpressure_enabled: bool
     delivery_high_watermark: int
@@ -1563,11 +791,6 @@ class DispatcherConfig:
     storage_reserve_percent: int
     storage_timeout_seconds: int
     derived_capacity_reservation_timeout_seconds: int
-    capacity_mode: str
-    release_id: str
-    bootstrap_epoch_id: str
-    active_release_binding_path: Path
-    live_env_path: Path
     w3_snapshot_read_mode: str
     w3_snapshot_authority: W3SnapshotAuthority | None
 
@@ -1606,14 +829,6 @@ class DispatcherConfig:
         storage_admission_enabled = _boolean(
             source, f"{ENV_PREFIX}STORAGE_ADMISSION_ENABLED", False
         )
-        storage_reservation_enabled = _boolean(
-            source, f"{ENV_PREFIX}STORAGE_RESERVATION_ENABLED", False
-        )
-        if storage_reservation_enabled:
-            raise ValueError(
-                f"{ENV_PREFIX}STORAGE_RESERVATION_ENABLED must be false; the "
-                "legacy atomic reservation is bound to an MDI download command"
-            )
         derived_capacity_reservation_enabled = _boolean(
             source,
             f"{ENV_PREFIX}DERIVED_CAPACITY_RESERVATION_ENABLED",
@@ -1703,26 +918,8 @@ class DispatcherConfig:
                 f"{ENV_PREFIX}INPUT_WAIT_MAX_AGE_SECONDS must be at most "
                 f"{MAX_INPUT_WAIT_MAX_AGE_SECONDS}"
             )
-        capacity_mode = str(source.get(PROD_CAPACITY_MODE_ENV, "")).strip()
-        if capacity_mode not in {"steady", "bootstrap"}:
-            raise ValueError(
-                f"{PROD_CAPACITY_MODE_ENV} must be exactly steady or bootstrap"
-            )
-        release_id = str(source.get(PROD_RELEASE_ID_ENV, "")).strip()
-        bootstrap_epoch_id = str(
-            source.get(PROD_BOOTSTRAP_EPOCH_ID_ENV, "")
-        ).strip()
-        if PROD_RELEASE_ID_RE.fullmatch(release_id) is None:
-            raise ValueError("RCA production capacity requires a valid release id")
-        if capacity_mode == "bootstrap" and (
-            BOOTSTRAP_EPOCH_ID_RE.fullmatch(bootstrap_epoch_id) is None
-        ):
-            raise ValueError(
-                "bootstrap RCA production capacity requires valid release and "
-                "epoch ids"
-            )
-        w3_snapshot_read_mode, w3_snapshot_authority = (
-            w3_snapshot_read_config_from_env(source)
+        w3_snapshot_read_mode, w3_snapshot_authority = w3_snapshot_read_config_from_env(
+            source
         )
         requested_feishu_writeback = _boolean(
             source, f"{ENV_PREFIX}ALLOW_FEISHU_WRITEBACK", False
@@ -1783,7 +980,6 @@ class DispatcherConfig:
                 source.get(f"{ENV_PREFIX}TRANSLATE_CONTRACT_PATH", "")
             ).strip(),
             storage_admission_enabled=storage_admission_enabled,
-            storage_reservation_enabled=storage_reservation_enabled,
             derived_capacity_reservation_enabled=(derived_capacity_reservation_enabled),
             delivery_backpressure_enabled=delivery_backpressure_enabled,
             delivery_high_watermark=delivery_high_watermark,
@@ -1806,13 +1002,6 @@ class DispatcherConfig:
                 source, f"{ENV_PREFIX}STORAGE_TIMEOUT_SECONDS", 45
             ),
             derived_capacity_reservation_timeout_seconds=(derived_reservation_timeout),
-            capacity_mode=capacity_mode,
-            release_id=release_id,
-            bootstrap_epoch_id=bootstrap_epoch_id,
-            active_release_binding_path=(
-                control_db_path.parent / ACTIVE_RELEASE_BINDING_NAME
-            ),
-            live_env_path=home / ".env",
             w3_snapshot_read_mode=w3_snapshot_read_mode,
             w3_snapshot_authority=w3_snapshot_authority,
         )
@@ -1856,7 +1045,6 @@ class DispatcherConfig:
             "translate_baseline": self.translate_baseline,
             "translate_contract_path": self.translate_contract_path,
             "storage_admission_enabled": self.storage_admission_enabled,
-            "storage_reservation_enabled": self.storage_reservation_enabled,
             "derived_capacity_reservation_enabled": (
                 self.derived_capacity_reservation_enabled
             ),
@@ -1879,11 +1067,6 @@ class DispatcherConfig:
             "derived_capacity_reservation_timeout_seconds": (
                 self.derived_capacity_reservation_timeout_seconds
             ),
-            "capacity_mode": self.capacity_mode,
-            "release_id": self.release_id,
-            "bootstrap_epoch_id": self.bootstrap_epoch_id,
-            "active_release_binding_path": str(self.active_release_binding_path),
-            "live_env_path": str(self.live_env_path),
             "w3_snapshot_read": (
                 {
                     "mode": self.w3_snapshot_read_mode,
@@ -2028,26 +1211,6 @@ def default_submit(
     reconcile_only = (
         isinstance(reservation, Mapping) and reservation.get("status") == "released"
     )
-    capacity_bindings: dict[str, str] = {}
-    if config.capacity_mode == "bootstrap":
-        try:
-            authorization = _load_bound_bootstrap_authorization(config)
-        except RcaBootstrapAuthorizationError as exc:
-            raise DispatchCircuitError(
-                "dispatcher_bootstrap_authorization_invalid", exc.code
-            ) from exc
-        capacity_bindings = {
-            "bootstrap_epoch_id": authorization["bootstrap_epoch_id"],
-            "release_bom_sha256": authorization["release_bom_sha256"],
-            "bootstrap_started_at": authorization["started_at"],
-            "bootstrap_deadline": authorization["deadline"],
-            "bootstrap_authorization_fingerprint": authorization[
-                "receipt_fingerprint"
-            ],
-            "active_release_binding_sha256": authorization[
-                "active_release_binding_sha256"
-            ],
-        }
     snapshot_requirement = (
         {"snapshot_required": True}
         if config.w3_snapshot_read_mode == "snapshot_required"
@@ -2079,47 +1242,13 @@ def default_submit(
         "admission": admission,
         "execution_request": execution_request,
         "reconcile_only": reconcile_only,
-        "capacity_mode": config.capacity_mode,
         **snapshot_requirement,
-        **capacity_bindings,
     }
     if control_store is not None:
         submit_kwargs["live_write_fence_authority"] = lambda fence: (
             _live_write_fence_binding(control_store, fence)
         )
     return vm_task_submit_service(**submit_kwargs)
-
-
-def _load_bound_bootstrap_authorization(
-    config: DispatcherConfig,
-) -> dict[str, Any]:
-    binding = load_active_release_binding(
-        path=config.active_release_binding_path,
-        live_env_path=config.live_env_path,
-        expected_release_id=config.release_id,
-        expected_epoch_id=config.bootstrap_epoch_id,
-        verify_live_env=False,
-    )
-    authorization = load_bootstrap_authorization(
-        expected_epoch_id=binding["bootstrap_epoch_id"],
-        expected_release_bom_sha256=binding["release_bom_sha256"],
-        expected_release_approval_id=binding["release_id"],
-        expected_approval_evidence_sha256=binding["approval_evidence_sha256"],
-    )
-    if (
-        authorization["authorization_receipt_sha256"]
-        != binding["authorization_receipt_sha256"]
-        or authorization["receipt_fingerprint"]
-        != binding["authorization_fingerprint"]
-    ):
-        raise RcaBootstrapAuthorizationError(
-            "rca_active_release_authorization_identity_mismatch"
-        )
-    return {
-        **authorization,
-        "active_release_binding_sha256": binding["binding_receipt_sha256"],
-        "candidate_env_sha256": binding["candidate_env_sha256"],
-    }
 
 
 def _remote_storage_admission_script(request: StorageAdmissionRequest) -> str:
@@ -2263,7 +1392,12 @@ def _storage_target_summary(
             raise ValueError("target observation_error must contain text")
         if any(
             value.get(field) is not None
-            for field in ("total_bytes", "free_bytes", "available_bytes", "reserve_bytes")
+            for field in (
+                "total_bytes",
+                "free_bytes",
+                "available_bytes",
+                "reserve_bytes",
+            )
         ):
             raise ValueError("target failed observation must not claim capacity")
         if (
@@ -2480,10 +1614,15 @@ def validate_storage_admission(
     reserve_percent = _exact_float(
         policy.get("reserve_percent"), "policy.reserve_percent"
     )
-    if abs(
-        _exact_float(policy.get("task_output_multiplier"), "policy.task_output_multiplier")
-        - 3.25
-    ) > 1e-9:
+    if (
+        abs(
+            _exact_float(
+                policy.get("task_output_multiplier"), "policy.task_output_multiplier"
+            )
+            - 3.25
+        )
+        > 1e-9
+    ):
         raise ValueError("storage admission task_output_multiplier mismatch")
     logical_multipliers = policy.get("logical_budget_multipliers")
     if not isinstance(logical_multipliers, Mapping) or set(logical_multipliers) != {
@@ -2497,10 +1636,16 @@ def validate_storage_admission(
         "derived_artifacts_and_publisher": 2.25,
         "total": 3.25,
     }.items():
-        if abs(
-            _exact_float(logical_multipliers.get(key), f"policy.logical_budget_multipliers.{key}")
-            - expected
-        ) > 1e-9:
+        if (
+            abs(
+                _exact_float(
+                    logical_multipliers.get(key),
+                    f"policy.logical_budget_multipliers.{key}",
+                )
+                - expected
+            )
+            > 1e-9
+        ):
             raise ValueError("storage admission logical multiplier mismatch")
     logical_bytes = policy.get("logical_budget_bytes_per_case")
     if not isinstance(logical_bytes, Mapping) or set(logical_bytes) != {
@@ -2510,12 +1655,14 @@ def validate_storage_admission(
     }:
         raise ValueError("storage admission logical byte budget shape mismatch")
     expected_cache = expected_artifact_cache_bytes
-    expected_artifacts_and_publisher = (
-        expected_artifact_cache_bytes * 9 + 3
-    ) // 4
+    expected_artifacts_and_publisher = (expected_artifact_cache_bytes * 9 + 3) // 4
     expected_bytes_per_case = expected_cache + expected_artifacts_and_publisher
     if {
-        key: _exact_int(logical_bytes.get(key), f"policy.logical_budget_bytes_per_case.{key}", minimum=1)
+        key: _exact_int(
+            logical_bytes.get(key),
+            f"policy.logical_budget_bytes_per_case.{key}",
+            minimum=1,
+        )
         for key in logical_bytes
     } != {
         "derived_cache": expected_cache,
@@ -2582,9 +1729,7 @@ def validate_storage_admission(
             "requested_cases_scope": DERIVED_CAPACITY_REQUEST_SCOPE,
             "assumed_cases_per_day": assumed_cases_per_day,
             "assumed_cases_per_day_scope": ("days_horizon_calculation_only"),
-            "expected_derived_artifact_bytes_per_case": (
-                expected_artifact_cache_bytes
-            ),
+            "expected_derived_artifact_bytes_per_case": (expected_artifact_cache_bytes),
             "reserve_percent": reserve_percent,
             "task_output_multiplier": 3.25,
         },
@@ -2773,14 +1918,12 @@ def _validated_claim_contract(
             )
         outer_identity["origin_source_id"] = claim.origin_source_id
     if payload_schema == "pnc_rca_submission_outbox_v1":
-        outer_identity.update(
-            {
-                "source_event_id": claim.source_event_id,
-                "topic": claim.source_topic,
-                "partition": claim.source_partition,
-                "offset": claim.source_offset,
-            }
-        )
+        outer_identity.update({
+            "source_event_id": claim.source_event_id,
+            "topic": claim.source_topic,
+            "partition": claim.source_partition,
+            "offset": claim.source_offset,
+        })
     for key, expected in outer_identity.items():
         if payload.get(key) != expected:
             raise DispatchCircuitError(
@@ -2828,9 +1971,7 @@ def _validated_claim_contract(
                 )
         elif source_kind == "feishu_group_manual":
             expected_trigger_kind = (
-                "manual_issue_request"
-                if claim.generation == 1
-                else "manual_retrigger"
+                "manual_issue_request" if claim.generation == 1 else "manual_retrigger"
             )
             if (
                 admission.trigger_kind not in RCA_MANUAL_TRIGGER_KINDS
@@ -3003,6 +2144,9 @@ def _validate_remote_read_execution_request(
             "dispatcher_remote_data_access_invalid",
             "remote-read execution request must not carry an MDI command",
         )
+    # Historical requests carrying this field are unsafe in remote-read mode.
+    # Reject the payload at the business boundary without restoring the retired
+    # resident configuration or public health surface.
     if _contains_mapping_key(request_body, "storage_reservation"):
         raise DispatchCircuitError(
             "dispatcher_remote_data_access_invalid",
@@ -3083,8 +2227,8 @@ def build_dispatch_execution_request(
         try:
             bundle = validate_snapshot_execution_bundle(snapshot_bundle)
             snapshot_admission, snapshot_context = snapshot_execution_inputs(bundle)
-            frozen_profile, frozen_execution_policy = (
-                snapshot_execution_request_inputs(bundle)
+            frozen_profile, frozen_execution_policy = snapshot_execution_request_inputs(
+                bundle
             )
         except Exception as exc:
             raise DispatchCircuitError(
@@ -3097,8 +2241,7 @@ def build_dispatch_execution_request(
             or snapshot_context.project_key != issue_context.project_key
             or snapshot_context.work_item_type_key != issue_context.work_item_type
             or snapshot_context.work_item_id != issue_context.work_item_id
-            or snapshot_context.issue_url.rstrip("/")
-            != issue_context.url.rstrip("/")
+            or snapshot_context.issue_url.rstrip("/") != issue_context.url.rstrip("/")
             or (
                 issue_context.title
                 and snapshot_context.title != issue_context.title.strip()
@@ -3179,7 +2322,9 @@ def build_dispatch_execution_request(
         origin_source_id = envelope.source_id
     else:
         trigger_context = claim.payload.get("trigger_context")
-        trigger_context = trigger_context if isinstance(trigger_context, Mapping) else {}
+        trigger_context = (
+            trigger_context if isinstance(trigger_context, Mapping) else {}
+        )
         source_kind = str(
             trigger_context.get("source_kind") or "kafka_workflow_event"
         ).strip()
@@ -3194,27 +2339,23 @@ def build_dispatch_execution_request(
         "origin_source_id": origin_source_id,
     }
     if bundle is not None:
-        durable_source_refs.update(
-            {
-                "snapshot_id": bundle.snapshot.snapshot_id,
-                "snapshot_sha256": bundle.snapshot.snapshot_sha256,
-                "request_sha256": bundle.snapshot.request_sha256,
-                "snapshot_bundle_sha256": bundle.bundle_sha256,
-                "creator_source_envelope_sha256": (
-                    bundle.creator_source_envelope.source_envelope_sha256
-                ),
-            }
-        )
+        durable_source_refs.update({
+            "snapshot_id": bundle.snapshot.snapshot_id,
+            "snapshot_sha256": bundle.snapshot.snapshot_sha256,
+            "request_sha256": bundle.snapshot.request_sha256,
+            "snapshot_bundle_sha256": bundle.bundle_sha256,
+            "creator_source_envelope_sha256": (
+                bundle.creator_source_envelope.source_envelope_sha256
+            ),
+        })
         if source_kind == "kafka_workflow_event":
             metadata = bundle.creator_source_envelope.source_metadata
-            durable_source_refs.update(
-                {
-                    "source_event_id": metadata["event_uid"],
-                    "topic": metadata["topic"],
-                    "partition": metadata["partition"],
-                    "offset": metadata["offset"],
-                }
-            )
+            durable_source_refs.update({
+                "source_event_id": metadata["event_uid"],
+                "topic": metadata["topic"],
+                "partition": metadata["partition"],
+                "offset": metadata["offset"],
+            })
     else:
         if claim.source_event_id is not None:
             durable_source_refs["source_event_id"] = claim.source_event_id
@@ -3450,10 +2591,6 @@ class OutboxDispatcher:
             raise ValueError(
                 "dispatcher input-wait retry horizon exceeds the general horizon"
             )
-        if config.storage_reservation_enabled:
-            raise ValueError(
-                "dispatcher legacy MDI-bound storage reservation must remain disabled"
-            )
         if config.dispatch_enabled and (
             not config.storage_admission_enabled
             or not config.derived_capacity_reservation_enabled
@@ -3509,7 +2646,6 @@ class OutboxDispatcher:
             lease_owner=self.lease_owner,
             lease_seconds=self.config.lease_seconds,
             max_age_seconds=self.config.max_age_seconds,
-            activation_required=self.config.activation_required,
             now=current,
         )
         if claim is None:
@@ -3691,7 +2827,10 @@ class OutboxDispatcher:
                 request, validated_reservation
             )
             self._renew(claim)
-            if snapshot_bundle is not None or self.config.w3_snapshot_read_mode == "snapshot_required":
+            if (
+                snapshot_bundle is not None
+                or self.config.w3_snapshot_read_mode == "snapshot_required"
+            ):
                 try:
                     _validate_vm_submit_fence(
                         bundle=snapshot_bundle,
@@ -3727,12 +2866,10 @@ class OutboxDispatcher:
                             "derived_capacity_reservation_abort_precreate_invalid",
                             "pre-create abort boundary returned an invalid receipt",
                         )
-                    validated_abort = (
-                        validate_derived_capacity_precreate_abort_receipt(
-                            abort_receipt,
-                            reservation_request,
-                            validated_reservation.receipt,
-                        )
+                    validated_abort = validate_derived_capacity_precreate_abort_receipt(
+                        abort_receipt,
+                        reservation_request,
+                        validated_reservation.receipt,
                     )
                     if dict(abort_receipt) != validated_abort:
                         raise DerivedCapacityReservationError(
@@ -3827,6 +2964,9 @@ class OutboxDispatcher:
                     self.config.delivery_db_path,
                     now=self.now(),
                     activation_required=self.config.activation_required,
+                    expected_control_schema_version=(
+                        CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+                    ),
                 )
             else:
                 snapshot = self.delivery_store.backpressure_snapshot(
@@ -3924,7 +3064,6 @@ class OutboxDispatcher:
             lease_token=claim.lease_token,
             lease_owner=claim.lease_owner,
             lease_seconds=self.config.lease_seconds,
-            activation_required=self.config.activation_required,
             now=self.now(),
         )
 
@@ -4078,12 +3217,8 @@ class HealthReporter:
         store: RcaControlStore,
         *,
         delivery_backpressure_status: Callable[[], Mapping[str, Any]] | None = None,
-        workspace_runtime_observer: Callable[
-            [], WorkspaceRuntimeIdentity
-        ] | None = None,
-        bootstrap_authorization_observer: Callable[
-            [], Mapping[str, Any]
-        ] | None = None,
+        workspace_runtime_observer: Callable[[], WorkspaceRuntimeIdentity]
+        | None = None,
         admission_key_fingerprint_observer: Callable[[], str] | None = None,
     ):
         self.config = config
@@ -4095,10 +3230,6 @@ class HealthReporter:
         self._last_body: dict[str, Any] | None = None
         self._workspace_runtime_observer = (
             workspace_runtime_observer or validate_workspace_runtime
-        )
-        self._bootstrap_authorization_observer = (
-            bootstrap_authorization_observer
-            or (lambda: _load_bound_bootstrap_authorization(self.config))
         )
         self._admission_key_fingerprint_observer = (
             admission_key_fingerprint_observer or hmac_key_fingerprint
@@ -4213,7 +3344,7 @@ class HealthReporter:
                 "ready": False,
                 "state": "unavailable",
                 "error_code": exc.code,
-                "capacity_mode": self.config.capacity_mode,
+                "capacity_mode": "steady",
                 "admission_key_fingerprint": None,
                 "authorization": None,
             }
@@ -4223,65 +3354,8 @@ class HealthReporter:
                 "ready": False,
                 "state": "unavailable",
                 "error_code": "rca_prod_hmac_key_observation_failed",
-                "capacity_mode": self.config.capacity_mode,
-                "admission_key_fingerprint": None,
-                "authorization": None,
-            }
-        if self.config.capacity_mode == "steady":
-            return {
-                "required": required,
-                "ready": True,
-                "state": "ready",
-                "error_code": "",
                 "capacity_mode": "steady",
-                "admission_key_fingerprint": admission_key_fingerprint,
-                "authorization": live_resource_policy(),
-            }
-        try:
-            authorization = dict(self._bootstrap_authorization_observer())
-            sha_fields = (
-                "receipt_fingerprint",
-                "authorization_receipt_sha256",
-                "active_release_binding_sha256",
-                "candidate_env_sha256",
-                "release_bom_sha256",
-                "approval_evidence_sha256",
-            )
-            if (
-                authorization.get("authorization_ready") is not True
-                or authorization.get("capacity_mode") != "bootstrap"
-                or authorization.get("bootstrap_epoch_id")
-                != self.config.bootstrap_epoch_id
-                or authorization.get("release_approval_id")
-                != self.config.release_id
-                or authorization.get("daily_started_attempt_quota") is not None
-                or any(
-                    re.fullmatch(r"[0-9a-f]{64}", str(authorization.get(field) or ""))
-                    is None
-                    for field in sha_fields
-                )
-            ):
-                raise RcaBootstrapAuthorizationError(
-                    "rca_bootstrap_authorization_projection_invalid"
-                )
-        except RcaBootstrapAuthorizationError as exc:
-            return {
-                "required": required,
-                "ready": False,
-                "state": "unavailable",
-                "error_code": exc.code,
-                "capacity_mode": "bootstrap",
-                "admission_key_fingerprint": admission_key_fingerprint,
-                "authorization": None,
-            }
-        except Exception:
-            return {
-                "required": required,
-                "ready": False,
-                "state": "unavailable",
-                "error_code": "rca_bootstrap_authorization_observation_failed",
-                "capacity_mode": "bootstrap",
-                "admission_key_fingerprint": admission_key_fingerprint,
+                "admission_key_fingerprint": None,
                 "authorization": None,
             }
         return {
@@ -4289,29 +3363,9 @@ class HealthReporter:
             "ready": True,
             "state": "ready",
             "error_code": "",
-            "capacity_mode": "bootstrap",
+            "capacity_mode": "steady",
             "admission_key_fingerprint": admission_key_fingerprint,
-            "authorization": {
-                "bootstrap_epoch_id": authorization["bootstrap_epoch_id"],
-                "daily_started_attempt_quota": authorization[
-                    "daily_started_attempt_quota"
-                ],
-                "started_at": authorization["started_at"],
-                "deadline": authorization["deadline"],
-                "receipt_fingerprint": authorization["receipt_fingerprint"],
-                "authorization_receipt_sha256": authorization[
-                    "authorization_receipt_sha256"
-                ],
-                "active_release_binding_sha256": authorization[
-                    "active_release_binding_sha256"
-                ],
-                "candidate_env_sha256": authorization["candidate_env_sha256"],
-                "release_bom_sha256": authorization["release_bom_sha256"],
-                "release_approval_id": authorization["release_approval_id"],
-                "approval_evidence_sha256": authorization[
-                    "approval_evidence_sha256"
-                ],
-            },
+            "authorization": live_resource_policy(),
         }
 
     def write(
@@ -4335,6 +3389,12 @@ class HealthReporter:
             }
         )
         store_health = self.store.health()
+        activation_health = store_health.get("activation")
+        activation_ready = (
+            isinstance(activation_health, Mapping)
+            and activation_health.get("configured") is True
+            and activation_health.get("production_active") is True
+        )
         workspace_runtime = self.workspace_runtime_status()
         capacity_admission = self.capacity_admission_status()
         healthy = (
@@ -4348,6 +3408,7 @@ class HealthReporter:
             }
             and not circuit.is_open
             and store_health.get("ok") is True
+            and (not self.config.activation_required or activation_ready)
             and (
                 workspace_runtime["required"] is not True
                 or workspace_runtime["ready"] is True
@@ -4460,13 +3521,164 @@ class HealthReporter:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         temporary.write_text(
-            json.dumps(serialized, ensure_ascii=False, indent=2, sort_keys=True)
-            + "\n",
+            json.dumps(serialized, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         os.chmod(temporary, 0o600)
         os.replace(temporary, path)
         self._last_body = serialized
+
+
+def _schema_runtime_capability(store: RcaControlStore) -> dict[str, Any]:
+    capability = dict(store.schema_runtime_capability())
+    if set(capability) != SCHEMA_RUNTIME_CAPABILITY_KEYS:
+        raise RuntimeError("rca_schema_runtime_capability_invalid")
+    if capability.get("mode") == SUCCESSOR_READ_ONLY_MODE and (
+        capability.get("read_supported") is not True
+        or any(
+            capability.get(name) is not False
+            for name in (
+                "write_enabled",
+                "work_admission_enabled",
+                "lease_acquisition_enabled",
+                "external_effect_enabled",
+            )
+        )
+    ):
+        raise RuntimeError("rca_successor_read_only_capability_invalid")
+    return capability
+
+
+def _successor_read_only_diagnostic(
+    config: DispatcherConfig,
+    capability: Mapping[str, Any],
+    *,
+    operation: str,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": "rca_resident_successor_read_only",
+        "operation": operation,
+        "mode": SUCCESSOR_READ_ONLY_MODE,
+        "ready": False,
+        "processing": False,
+        "config": config.public_dict(),
+        "schema_runtime_capability": dict(capability),
+    }
+
+
+class SuccessorReadOnlyHealthReporter:
+    """Publish process liveness without entering any work-producing boundary."""
+
+    def __init__(
+        self,
+        config: DispatcherConfig,
+        store: RcaControlStore,
+        capability: Mapping[str, Any],
+    ) -> None:
+        self.config = config
+        self.store = store
+        self.capability = dict(capability)
+        self.started_at = _utc_iso()
+        self.runtime_identity = build_runtime_identity(
+            service_label=SERVICE_LABEL,
+            script_path=Path(__file__),
+            public_config=config.runtime_public_dict(),
+            loaded_dependencies=RCA_OUTBOX_DISPATCHER_LOADED_DEPENDENCIES,
+        )
+
+    def write(self, *, state: str = SUCCESSOR_READ_ONLY_MODE) -> None:
+        observed_at = _utc_iso()
+        body = {
+            "schema_version": DISPATCHER_HEALTH_SCHEMA_VERSION,
+            "ok": False,
+            "healthy": True,
+            "process_healthy": True,
+            "business_ready": False,
+            "enabled": self.config.dispatch_enabled,
+            "state": state,
+            "mode": SUCCESSOR_READ_ONLY_MODE,
+            "ready": False,
+            "processing": False,
+            "started_at": self.started_at,
+            "heartbeat_at": observed_at,
+            "readiness_observed_at": observed_at,
+            "readiness": {
+                "state": SUCCESSOR_READ_ONLY_MODE,
+                "healthy": False,
+                "ready_for_dispatch": False,
+                "observed_at": observed_at,
+            },
+            "liveness": {
+                "state": "reporting",
+                "heartbeat_at": observed_at,
+                "readiness_observed_at": observed_at,
+            },
+            "runtime_identity": self.runtime_identity.to_dict(),
+            "config": self.config.runtime_public_dict(),
+            "schema_runtime_capability": dict(self.capability),
+            "workspace_runtime": {
+                "required": False,
+                "bound": False,
+                "ready": False,
+                "state": "not_evaluated_successor_read_only",
+                "error_code": "",
+                "identity": None,
+            },
+            "capacity_admission": {
+                "required": False,
+                "ready": False,
+                "state": "not_evaluated_successor_read_only",
+                "error_code": "",
+                "capacity_mode": "steady",
+                "admission_key_fingerprint": None,
+                "authorization": None,
+            },
+            "stats": asdict(DispatchStats()),
+            "last_outcome": None,
+            "delivery_backpressure": {
+                "enabled": False,
+                "active": False,
+                "high_watermark": self.config.delivery_high_watermark,
+                "resume_watermark": self.config.delivery_resume_watermark,
+                "last_snapshot": None,
+                "last_error": None,
+            },
+            "store": self.store.health(),
+        }
+        path = self.config.health_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+
+
+def run_successor_read_only_loop(
+    config: DispatcherConfig,
+    store: RcaControlStore,
+    capability: Mapping[str, Any],
+    *,
+    once: bool = False,
+    stop_requested: Callable[[], bool] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    stop = stop_requested or (lambda: False)
+    reporter = SuccessorReadOnlyHealthReporter(config, store, capability)
+    interval = min(
+        float(config.poll_interval_seconds),
+        HEALTH_HEARTBEAT_INTERVAL_SECONDS,
+    )
+    while not stop():
+        reporter.write()
+        if once:
+            return 0
+        sleep(interval)
+    reporter.write(state="stopped")
+    return 0
 
 
 def _health_runtime_identity_ok(payload: Mapping[str, Any]) -> bool:
@@ -4493,8 +3705,7 @@ def _health_workspace_runtime_ok(payload: Mapping[str, Any]) -> bool:
         or status.get("ready") is not True
         or status.get("state") != "ready"
         or not isinstance(identity, Mapping)
-        or identity.get("schema_version")
-        != WORKSPACE_RUNTIME_IDENTITY_SCHEMA_VERSION
+        or identity.get("schema_version") != WORKSPACE_RUNTIME_IDENTITY_SCHEMA_VERSION
         or re.fullmatch(r"[0-9a-f]{64}", str(identity.get("manifest_sha256") or ""))
         is None
         or re.fullmatch(r"[0-9a-f]{64}", str(identity.get("closure_sha256") or ""))
@@ -4504,11 +3715,13 @@ def _health_workspace_runtime_ok(payload: Mapping[str, Any]) -> bool:
     ):
         return False
     file_sha256 = identity.get("file_sha256")
-    return isinstance(file_sha256, Mapping) and set(file_sha256) == set(
-        WORKSPACE_RUNTIME_FILES
-    ) and all(
-        re.fullmatch(r"[0-9a-f]{64}", str(file_sha256[path] or "")) is not None
-        for path in WORKSPACE_RUNTIME_FILES
+    return (
+        isinstance(file_sha256, Mapping)
+        and set(file_sha256) == set(WORKSPACE_RUNTIME_FILES)
+        and all(
+            re.fullmatch(r"[0-9a-f]{64}", str(file_sha256[path] or "")) is not None
+            for path in WORKSPACE_RUNTIME_FILES
+        )
     )
 
 
@@ -4518,8 +3731,10 @@ def _health_capacity_admission_ok(payload: Mapping[str, Any]) -> bool:
     if not isinstance(status, Mapping) or not isinstance(config, Mapping):
         return False
     required = payload.get("enabled") is True
-    mode = str(config.get("capacity_mode") or "")
-    if status.get("required") is not required or status.get("capacity_mode") != mode:
+    if (
+        status.get("required") is not required
+        or status.get("capacity_mode") != "steady"
+    ):
         return False
     if not required:
         return status.get("ready") in {True, False}
@@ -4532,34 +3747,10 @@ def _health_capacity_admission_ok(payload: Mapping[str, Any]) -> bool:
     ):
         return False
     authorization = status.get("authorization")
-    if mode == "steady":
-        return (
-            status.get("ready") is True
-            and status.get("state") == "ready"
-            and authorization == live_resource_policy()
-        )
-    if (
-        mode != "bootstrap"
-        or status.get("ready") is not True
-        or status.get("state") != "ready"
-        or not isinstance(authorization, Mapping)
-        or authorization.get("bootstrap_epoch_id")
-        != config.get("bootstrap_epoch_id")
-        or authorization.get("release_approval_id") != config.get("release_id")
-        or authorization.get("daily_started_attempt_quota") is not None
-    ):
-        return False
-    return all(
-        re.fullmatch(r"[0-9a-f]{64}", str(authorization.get(field) or ""))
-        is not None
-        for field in (
-            "receipt_fingerprint",
-            "authorization_receipt_sha256",
-            "active_release_binding_sha256",
-            "candidate_env_sha256",
-            "release_bom_sha256",
-            "approval_evidence_sha256",
-        )
+    return (
+        status.get("ready") is True
+        and status.get("state") == "ready"
+        and authorization == live_resource_policy()
     )
 
 
@@ -4611,27 +3802,58 @@ def read_health_status(
     )
     store = payload.get("store")
     downstream = payload.get("delivery_backpressure")
+    successor_read_only = (
+        payload.get("mode") == SUCCESSOR_READ_ONLY_MODE
+        and payload.get("state") == SUCCESSOR_READ_ONLY_MODE
+        and payload.get("ready") is False
+        and payload.get("processing") is False
+        and isinstance(payload.get("schema_runtime_capability"), Mapping)
+        and set(payload["schema_runtime_capability"])
+        == SCHEMA_RUNTIME_CAPABILITY_KEYS
+        and payload["schema_runtime_capability"].get("mode")
+        == SUCCESSOR_READ_ONLY_MODE
+        and payload["schema_runtime_capability"].get("read_supported") is True
+        and all(
+            payload["schema_runtime_capability"].get(name) is False
+            for name in (
+                "write_enabled",
+                "work_admission_enabled",
+                "lease_acquisition_enabled",
+                "external_effect_enabled",
+            )
+        )
+    )
     producer_ok = (
         payload.get("schema_version") == DISPATCHER_HEALTH_SCHEMA_VERSION
         and payload.get("ok") is True
         and payload.get("healthy") is True
-        and mode_ok
         and isinstance(store, Mapping)
-        and store.get("ok") is True
         and isinstance(downstream, Mapping)
         and _health_runtime_identity_ok(payload)
+        and mode_ok
+        and store.get("ok") is True
         and _health_workspace_runtime_ok(payload)
         and _health_capacity_admission_ok(payload)
     )
     result = dict(payload)
     result["ok"] = bool(fresh and producer_ok)
+    result["liveness_ok"] = bool(
+        fresh
+        and successor_read_only
+        and payload.get("process_healthy") is True
+        and payload.get("business_ready") is False
+        and payload.get("healthy") is True
+        and _health_runtime_identity_ok(payload)
+    )
     result["health_check"] = {
         "fresh": fresh,
         "heartbeat_age_seconds": age,
         "max_age_seconds": max_age_seconds,
         "checked_at": _utc_iso(now),
     }
-    if not producer_ok:
+    if successor_read_only:
+        result["health_check"]["reason"] = "successor_read_only_not_ready"
+    elif not producer_ok:
         result["health_check"]["reason"] = "dispatcher_reported_unhealthy"
     elif age < -MAX_HEALTH_FUTURE_SKEW_SECONDS:
         result["health_check"]["reason"] = "heartbeat_from_future"
@@ -4647,18 +3869,6 @@ def load_dispatcher_environment(env_file: str | Path | None = None) -> Path:
     return path
 
 
-def _exact_outbox_canonical_env_config(env_file: str | Path) -> DispatcherConfig:
-    """Build config solely from the canonical dotenv source, without interpolation."""
-    path = Path(env_file).expanduser().absolute()
-    parsed = dotenv_values(path, interpolate=False)
-    if not isinstance(parsed, Mapping) or any(
-        not isinstance(key, str) or value is None or not isinstance(value, str)
-        for key, value in parsed.items()
-    ):
-        raise ValueError("exact_outbox_hold_canonical_env_invalid")
-    return DispatcherConfig.from_env(dict(parsed), hermes_home=path.parent)
-
-
 def run_dispatch_loop(
     dispatcher: OutboxDispatcher,
     health: HealthReporter,
@@ -4667,10 +3877,9 @@ def run_dispatch_loop(
     sleep: Callable[[float], None] = time.sleep,
     heartbeat_interval_seconds: float = HEALTH_HEARTBEAT_INTERVAL_SECONDS,
 ) -> None:
-    if (
-        isinstance(heartbeat_interval_seconds, bool)
-        or not 0 < float(heartbeat_interval_seconds) < float("inf")
-    ):
+    if isinstance(heartbeat_interval_seconds, bool) or not 0 < float(
+        heartbeat_interval_seconds
+    ) < float("inf"):
         raise ValueError("heartbeat_interval_seconds must be a positive number")
 
     heartbeat_stop = threading.Event()
@@ -4682,9 +3891,7 @@ def run_dispatch_loop(
         while not heartbeat_stop.wait(float(heartbeat_interval_seconds)):
             try:
                 health.heartbeat(
-                    liveness_state=(
-                        "processing" if processing.is_set() else "waiting"
-                    ),
+                    liveness_state=("processing" if processing.is_set() else "waiting"),
                     stats=dispatcher.stats,
                     last_outcome=latest_outcome[0],
                 )
@@ -4734,233 +3941,6 @@ def run_dispatch_loop(
         heartbeat_thread.join(timeout=float(heartbeat_interval_seconds) + 1.0)
 
 
-def _validate_expected_sha256(value: Any, error: str) -> str:
-    normalized = str(value or "").strip()
-    if _SHA256_RE.fullmatch(normalized) is None or normalized == "0" * 64:
-        raise ValueError(error)
-    return normalized
-
-
-def _run_exact_outbox_hold_command(
-    *, args: argparse.Namespace, config: DispatcherConfig, store: RcaControlStore
-) -> int:
-    if args.materialize_exact_outbox_hold:
-        receipt_path = _absolute_new_receipt_path(args.receipt)
-        audit = store.exact_outbox_hold_audit(args.materialize_exact_outbox_hold)
-        if audit is None:
-            raise RuntimeError("exact_outbox_hold_audit_missing")
-        envelope = _build_exact_outbox_hold_recovery_envelope(audit, receipt_path)
-        try:
-            receipt_sha256 = _write_immutable_receipt(
-                receipt_path,
-                envelope,
-                expected_parent_identity={
-                    "device": envelope["materialized_destination"]["binding"][
-                        "parent_device"
-                    ],
-                    "inode": envelope["materialized_destination"]["binding"][
-                        "parent_inode"
-                    ],
-                },
-            )
-        except Exception as exc:
-            raise ValueError("exact_outbox_hold_recovery_materialization_failed") from exc
-        print(
-            json.dumps(
-                {
-                    "ok": True,
-                    "recovered": True,
-                    "phase": "hold",
-                    "hold_id": audit["hold_id"],
-                    "plan_id": audit["plan_id"],
-                    "receipt": str(receipt_path),
-                    "receipt_sha256": receipt_sha256,
-                    "receipt_fingerprint": envelope["receipt_fingerprint"],
-                    "source_receipt_fingerprint": audit["receipt_fingerprint"],
-                    "external_effects_triggered": False,
-                },
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            )
-        )
-        return 0
-
-    operator, reason = _validate_reset_audit_text(args.operator, args.reason)
-    receipt_path = _absolute_new_receipt_path(args.receipt)
-    observed_at = _utc_now()
-    active_binding = _exact_outbox_hold_active_release_binding(config)
-    config_binding_sha256 = _exact_outbox_hold_config_binding(config)
-    tool_provenance = _exact_outbox_hold_tool_provenance(
-        config.live_env_path.parent
-    )
-    tool_provenance_sha256 = _exact_hold_json_sha256(tool_provenance)
-    resident_census = _exact_outbox_resident_census(config)
-    if not store.read_only:
-        raise RuntimeError("exact_outbox_hold_planning_store_not_read_only")
-    planning_store = store
-    control_db_identity = planning_store.control_db_source_snapshot_identity()
-    snapshot = planning_store._exact_outbox_hold_private_snapshot(
-        target_outbox_id=int(args.hold_exact_outbox_id),
-        predecessor_outbox_id=int(args.predecessor_outbox_id),
-        activation_required=config.activation_required,
-        max_age_seconds=config.max_age_seconds,
-        now=observed_at,
-    )
-    planned = _build_exact_outbox_hold_receipt(
-        config=config,
-        snapshot=snapshot,
-        operator=operator,
-        reason=reason,
-        recorded_at=observed_at.isoformat(),
-        receipt_path=receipt_path,
-        control_db_identity=control_db_identity,
-        active_release_binding=active_binding,
-        tool_provenance=tool_provenance,
-        resident_census=resident_census,
-    )
-    if args.apply:
-        expected = {
-            "plan_id": _validate_expected_sha256(
-                args.expected_plan_id, "exact_outbox_hold_expected_plan_invalid"
-            ),
-            "target_row_sha256": _validate_expected_sha256(
-                args.expected_target_row_sha256,
-                "exact_outbox_hold_expected_target_row_invalid",
-            ),
-            "eligible_queue_sha256": _validate_expected_sha256(
-                args.expected_eligible_queue_sha256,
-                "exact_outbox_hold_expected_queue_invalid",
-            ),
-            "active_release_binding_sha256": _validate_expected_sha256(
-                args.expected_active_release_binding_sha256,
-                "exact_outbox_hold_expected_active_binding_invalid",
-            ),
-            "config_binding_sha256": _validate_expected_sha256(
-                args.expected_config_binding_sha256,
-                "exact_outbox_hold_expected_config_invalid",
-            ),
-            "tool_provenance_sha256": _validate_expected_sha256(
-                args.expected_tool_provenance_sha256,
-                "exact_outbox_hold_expected_tool_provenance_invalid",
-            ),
-        }
-        observed = {
-            "plan_id": planned["plan_id"],
-            "target_row_sha256": planned["target_before"]["row_sha256"],
-            "eligible_queue_sha256": planned["eligible_queue_before"]["sha256"],
-            "active_release_binding_sha256": planned["active_release_binding"][
-                "sha256"
-            ],
-            "config_binding_sha256": planned["config_binding_sha256"],
-            "tool_provenance_sha256": planned["tool_provenance_sha256"],
-        }
-        changed = [key for key, value in expected.items() if observed[key] != value]
-        if changed:
-            raise RuntimeError(f"exact_outbox_hold_plan_changed:{','.join(changed)}")
-    else:
-        print(
-            json.dumps(
-                {
-                    "ok": True,
-                    "mode": "plan",
-                    "applied": False,
-                    "external_effects_triggered": False,
-                    "receipt_path": str(receipt_path),
-                    "expected_apply": {
-                        "expected_plan_id": planned["plan_id"],
-                        "expected_target_row_sha256": planned["target_before"][
-                            "row_sha256"
-                        ],
-                        "expected_eligible_queue_sha256": planned[
-                            "eligible_queue_before"
-                        ]["sha256"],
-                        "expected_active_release_binding_sha256": planned[
-                            "active_release_binding"
-                        ]["sha256"],
-                        "expected_config_binding_sha256": planned[
-                            "config_binding_sha256"
-                        ],
-                        "expected_tool_provenance_sha256": planned[
-                            "tool_provenance_sha256"
-                        ],
-                    },
-                    "plan": planned,
-                },
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            )
-        )
-        return 0
-
-    if _exact_outbox_hold_active_release_binding(config) != active_binding:
-        raise RuntimeError("exact_outbox_hold_active_binding_changed")
-    if (
-        _exact_outbox_hold_config_binding(DispatcherConfig.from_env())
-        != config_binding_sha256
-    ):
-        raise RuntimeError("exact_outbox_hold_config_changed")
-    if (
-        _exact_outbox_hold_tool_provenance(config.live_env_path.parent)
-        != tool_provenance
-    ):
-        raise RuntimeError("exact_outbox_hold_tool_provenance_changed")
-    apply_resident_census = _exact_outbox_resident_census(config)
-    resident_policy_keys = (
-        "schema_version",
-        "source_kind",
-        "domain",
-        "forbidden_labels",
-        "all_unloaded",
-    )
-    if any(
-        apply_resident_census.get(key) != planned["resident_census"].get(key)
-        for key in resident_policy_keys
-    ):
-        raise RuntimeError("exact_outbox_hold_resident_census_changed")
-    mutation_store = RcaControlStore(
-        config.control_db_path,
-        require_current=True,
-    )
-    applied = mutation_store.hold_exact_outbox_with_audit(audit=planned, now=observed_at)
-    try:
-        receipt_sha256 = _write_immutable_receipt(
-            receipt_path,
-            applied,
-            expected_parent_identity={
-                "device": planned["destination_binding"]["parent_device"],
-                "inode": planned["destination_binding"]["parent_inode"],
-            },
-        )
-    except Exception as exc:
-        raise ExactOutboxHoldReceiptMaterializationError(
-            hold_id=planned["hold_id"], receipt_path=receipt_path, cause=exc
-        ) from exc
-    print(
-        json.dumps(
-            {
-                "ok": True,
-                "applied": True,
-                "command": "hold-exact-outbox",
-                "phase": "hold",
-                "hold_id": planned["hold_id"],
-                "plan_id": planned["plan_id"],
-                "target_outbox_id": planned["target_outbox_id"],
-                "predecessor_outbox_id": planned["predecessor_outbox_id"],
-                "receipt": str(receipt_path),
-                "receipt_sha256": receipt_sha256,
-                "receipt_fingerprint": applied["receipt_fingerprint"],
-                "effect_delta": applied["effect_delta"],
-            },
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        )
-    )
-    return 0
-
-
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", help="dotenv path; defaults to HERMES_HOME/.env")
@@ -4978,7 +3958,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="plan or apply an audited reset of the persisted submission circuit",
     )
-    parser.add_argument("--operator", help="bounded operator identity for circuit reset")
+    parser.add_argument(
+        "--operator", help="bounded operator identity for circuit reset"
+    )
     parser.add_argument("--reason", help="bounded reason for circuit reset")
     parser.add_argument(
         "--apply",
@@ -4995,63 +3977,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="RESET_ID",
         help="materialize an existing durable reset audit without changing the DB",
     )
-    parser.add_argument(
-        "--hold-exact-outbox-id",
-        type=int,
-        help="plan or apply a one-row outbox hold under the current bounded epoch",
-    )
-    parser.add_argument(
-        "--predecessor-outbox-id",
-        type=int,
-        help="exact predecessor that must remain dispatchable while the target is held",
-    )
-    parser.add_argument(
-        "--materialize-exact-outbox-hold",
-        metavar="HOLD_ID",
-        help="materialize a durable exact-outbox hold audit without changing the DB",
-    )
-    parser.add_argument(
-        "--phase",
-        choices=("hold", "release"),
-        help="audit phase for exact-outbox receipt recovery",
-    )
-    parser.add_argument("--expected-plan-id")
-    parser.add_argument("--expected-target-row-sha256")
-    parser.add_argument("--expected-eligible-queue-sha256")
-    parser.add_argument("--expected-active-release-binding-sha256")
-    parser.add_argument("--expected-config-binding-sha256")
-    parser.add_argument("--expected-tool-provenance-sha256")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_arg_parser().parse_args(argv)
     try:
-        exact_expected = (
-            args.expected_plan_id,
-            args.expected_target_row_sha256,
-            args.expected_eligible_queue_sha256,
-            args.expected_active_release_binding_sha256,
-            args.expected_config_binding_sha256,
-            args.expected_tool_provenance_sha256,
-        )
         modes = (
             bool(args.clear_circuit),
             bool(args.materialize_reset),
-            args.hold_exact_outbox_id is not None,
-            bool(args.materialize_exact_outbox_hold),
         )
         if sum(modes) > 1:
             raise ValueError("outbox_operator_modes_conflict")
         if args.materialize_reset:
-            if (
-                args.operator is not None
-                or args.reason is not None
-                or args.apply
-                or any(value is not None for value in exact_expected)
-                or args.predecessor_outbox_id is not None
-                or args.phase is not None
-            ):
+            if args.operator is not None or args.reason is not None or args.apply:
                 raise ValueError("dispatcher_circuit_reset_recovery_flags_conflict")
             if any((args.check_config, args.dry_run, args.health, args.once)):
                 raise ValueError("dispatcher_circuit_reset_flags_conflict")
@@ -5059,105 +3998,45 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("dispatcher_circuit_reset_receipt_required")
         if args.clear_circuit:
             if args.operator is None or args.reason is None:
-                raise ValueError("dispatcher_circuit_reset_operator_and_reason_required")
+                raise ValueError(
+                    "dispatcher_circuit_reset_operator_and_reason_required"
+                )
             if any((args.check_config, args.dry_run, args.health, args.once)):
                 raise ValueError("dispatcher_circuit_reset_flags_conflict")
-            if any(value is not None for value in exact_expected):
-                raise ValueError("exact_outbox_hold_arguments_require_hold_mode")
-            if args.predecessor_outbox_id is not None or args.phase is not None:
-                raise ValueError("exact_outbox_hold_arguments_require_hold_mode")
-        elif args.hold_exact_outbox_id is not None:
-            if (
-                args.hold_exact_outbox_id < 1
-                or args.predecessor_outbox_id is None
-                or args.predecessor_outbox_id < 1
-                or args.hold_exact_outbox_id == args.predecessor_outbox_id
-            ):
-                raise ValueError("exact_outbox_hold_identity_invalid")
-            if args.operator is None or args.reason is None:
-                raise ValueError("exact_outbox_hold_operator_and_reason_required")
-            if args.receipt is None:
-                raise ValueError("exact_outbox_hold_receipt_required")
-            if args.phase is not None:
-                raise ValueError("exact_outbox_hold_phase_recovery_only")
-            if any((args.check_config, args.dry_run, args.health, args.once)):
-                raise ValueError("exact_outbox_hold_flags_conflict")
-            if args.apply and any(value is None for value in exact_expected):
-                raise ValueError("exact_outbox_hold_expected_bindings_required")
-            if not args.apply and any(value is not None for value in exact_expected):
-                raise ValueError("exact_outbox_hold_expected_bindings_apply_only")
-        elif args.materialize_exact_outbox_hold:
-            if (
-                args.operator is not None
-                or args.reason is not None
-                or args.apply
-                or any(value is not None for value in exact_expected)
-                or args.predecessor_outbox_id is not None
-                or args.hold_exact_outbox_id is not None
-            ):
-                raise ValueError("exact_outbox_hold_recovery_flags_conflict")
-            if args.phase not in {None, "hold"}:
-                raise ValueError("exact_outbox_hold_recovery_phase_invalid")
-            if args.receipt is None:
-                raise ValueError("exact_outbox_hold_receipt_required")
-            if any((args.check_config, args.dry_run, args.health, args.once)):
-                raise ValueError("exact_outbox_hold_flags_conflict")
         elif not args.materialize_reset and (
             any(
                 value is not None
                 for value in (args.operator, args.reason, args.receipt)
             )
             or args.apply
-            or args.predecessor_outbox_id is not None
-            or args.phase is not None
-            or any(value is not None for value in exact_expected)
         ):
             raise ValueError("dispatcher_circuit_reset_arguments_require_clear_circuit")
         if args.clear_circuit and args.apply and args.receipt is None:
             raise ValueError("dispatcher_circuit_reset_receipt_required")
-        canonical_env_path = (
-            Path(get_hermes_home()).expanduser() / ".env"
-        ).absolute()
-        operator_mode_requested = bool(
-            args.clear_circuit
-            or args.materialize_reset
-            or args.hold_exact_outbox_id is not None
-            or args.materialize_exact_outbox_hold
-        )
-        requested_env_path = args.env_file or os.environ.get(f"{ENV_PREFIX}ENV_FILE")
-        if operator_mode_requested and requested_env_path:
-            try:
-                requested_resolved = Path(requested_env_path).expanduser().resolve(
-                    strict=True
-                )
-                canonical_resolved = canonical_env_path.resolve(strict=True)
-            except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                raise ValueError("exact_outbox_hold_canonical_env_path_required") from exc
-            if requested_resolved != canonical_resolved:
-                raise ValueError("exact_outbox_hold_canonical_env_path_required")
-        loaded_env_path = load_dispatcher_environment(args.env_file)
+        load_dispatcher_environment(args.env_file)
         config = DispatcherConfig.from_env()
-        if operator_mode_requested:
-            try:
-                loaded_resolved = Path(loaded_env_path).expanduser().resolve(strict=True)
-                canonical_resolved = canonical_env_path.resolve(strict=True)
-                config_resolved = (
-                    Path(config.live_env_path).expanduser().resolve(strict=True)
-                )
-            except (OSError, RuntimeError, TypeError, ValueError) as exc:
-                raise ValueError("exact_outbox_hold_canonical_env_path_required") from exc
-            if not (
-                loaded_resolved == canonical_resolved == config_resolved
-            ):
-                raise ValueError("exact_outbox_hold_canonical_env_path_required")
-        if args.hold_exact_outbox_id is not None or args.materialize_exact_outbox_hold:
-            canonical_config = _exact_outbox_canonical_env_config(canonical_env_path)
-            if (
-                canonical_config.public_dict() != config.public_dict()
-                or config.delivery_db_path != config.control_db_path
-            ):
-                raise ValueError("exact_outbox_hold_config_changed")
         if args.check_config:
+            if config.dispatch_enabled and config.control_db_path.is_file():
+                check_store = RcaControlStore(
+                    config.control_db_path,
+                    require_current=True,
+                    allow_successor_write=True,
+                )
+                capability = _schema_runtime_capability(check_store)
+                if capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
+                    print(
+                        json.dumps(
+                            _successor_read_only_diagnostic(
+                                config,
+                                capability,
+                                operation="check_config",
+                            ),
+                            ensure_ascii=False,
+                            indent=2,
+                            sort_keys=True,
+                        )
+                    )
+                    return 2
             print(json.dumps({"ok": True, "config": config.public_dict()}, indent=2))
             return 0
         if args.health:
@@ -5167,26 +4046,50 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
             return 0 if result.get("ok") is True else 2
 
-        exact_hold_mode = bool(
-            args.hold_exact_outbox_id is not None
-            or args.materialize_exact_outbox_hold
-        )
         read_only_operator = bool(
             args.materialize_reset
-            or args.materialize_exact_outbox_hold
-            or args.hold_exact_outbox_id is not None
+            or args.dry_run
+            or (args.clear_circuit and not args.apply)
         )
         store = RcaControlStore(
             config.control_db_path,
             require_current=True,
             read_only=read_only_operator,
+            allow_successor_read_only=read_only_operator,
+            allow_successor_write=not read_only_operator,
         )
-        if exact_hold_mode:
-            return _run_exact_outbox_hold_command(
-                args=args,
-                config=config,
-                store=store,
-            )
+        capability = _schema_runtime_capability(store)
+        if capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
+            if args.dry_run:
+                print(
+                    json.dumps(
+                        _successor_read_only_diagnostic(
+                            config,
+                            capability,
+                            operation="dry_run",
+                        ),
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                return 2
+            if not (args.clear_circuit or args.materialize_reset):
+                stopping = False
+
+                def request_successor_stop(_signum: int, _frame: Any) -> None:
+                    nonlocal stopping
+                    stopping = True
+
+                signal.signal(signal.SIGTERM, request_successor_stop)
+                signal.signal(signal.SIGINT, request_successor_stop)
+                return run_successor_read_only_loop(
+                    config,
+                    store,
+                    capability,
+                    once=args.once,
+                    stop_requested=lambda: stopping,
+                )
         if args.materialize_reset:
             receipt_path = _absolute_new_receipt_path(args.receipt)
             audit = store.dispatcher_circuit_reset_audit(args.materialize_reset)
@@ -5281,7 +4184,6 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             rows = store.preview_dispatchable(
                 limit=config.batch_size,
-                activation_required=config.activation_required,
             )
             print(
                 json.dumps(
@@ -5368,25 +4270,6 @@ def main(argv: list[str] | None = None) -> int:
             stop_requested=lambda: stopping,
         )
         return 0
-    except ExactOutboxHoldReceiptMaterializationError as exc:
-        print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "error": type(exc).__name__,
-                    "message": str(exc),
-                    "recovery_required": True,
-                    "phase": "hold",
-                    "hold_id": exc.hold_id,
-                    "meta_key": exc.meta_key,
-                    "receipt": str(exc.receipt_path),
-                    "external_effects_triggered": False,
-                },
-                ensure_ascii=False,
-            ),
-            file=sys.stderr,
-        )
-        return 2
     except CircuitResetReceiptMaterializationError as exc:
         print(
             json.dumps(

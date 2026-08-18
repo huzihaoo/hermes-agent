@@ -292,8 +292,17 @@ def test_check_config_outlet_preflight_is_read_only(
     )
     monkeypatch.setattr(
         collector,
-        "read_quarantine_baseline_status",
-        lambda *_args, **_kwargs: {"ready": True, "state": "ready"},
+        "RcaDeliveryStore",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            health=lambda **_kwargs: {
+                "activation": {"production_ready": True},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        collector,
+        "validate_bound_resident_release",
+        lambda *_args, **_kwargs: {},
     )
     monkeypatch.setattr(
         collector,

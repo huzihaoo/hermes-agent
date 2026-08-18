@@ -49,7 +49,6 @@ def test_status_report_summarizes_groups_notices_and_launchd(tmp_path, monkeypat
     assert g1q3["counts"]["running"] == 1
     assert report["completion_notices"]["counts"]["pending"] == 1
     assert report["completion_notices"]["pending_or_retryable_count"] == 1
-    assert report["g1q3_gray_route_audit"]["total_decisions"] == 0
 
 
 def test_status_report_surfaces_public_probe_failure(tmp_path, monkeypatch):
@@ -159,7 +158,6 @@ def test_format_markdown_report_is_feishu_friendly():
             {"label": "G1Q3 RCA", "counts": {"running": 0, "completed": 1, "failed": 1}, "taskstore_effective_status_mismatch_count": 0},
         ],
         "completion_notices": {"counts": {"pending": 0, "failed": 0, "sent": 1}},
-        "g1q3_gray_route_audit": {"counts": {"by_decision": {"accepted": 3, "dry_run": 1, "reject": 0}}, "false_rejection_candidate_count": 0},
         "warnings": [],
         "errors": [],
     }
@@ -169,8 +167,6 @@ def test_format_markdown_report_is_feishu_friendly():
     assert text.startswith("✅ PNC 任务可观测状态：OK")
     assert "用户侧入口：http://192.168.14.32:9125/tasks" in text
     assert "- G1Q3 RCA：running=0，completed=1，failed=1" in text
-    assert "G1Q3 灰度路由：" in text
-    assert "accepted=3，dry_run=1，reject=0，疑似误拒绝=0" in text
     assert "当前无治理告警。" in text
 
 
@@ -184,7 +180,6 @@ def test_format_markdown_report_includes_warnings_and_reconcile_command():
             {"label": "G1Q3 RCA", "counts": {"running": 1, "completed": 1, "failed": 0}, "taskstore_effective_status_mismatch_count": 1},
         ],
         "completion_notices": {"counts": {"pending": 1, "failed": 0, "sent": 1}},
-        "g1q3_gray_route_audit": {"counts": {"by_decision": {"accepted": 1, "dry_run": 0, "reject": 1}}, "false_rejection_candidate_count": 1},
         "reconcile_command": "python3 scripts/pnc_taskstore_status_reconcile.py --apply",
         "warnings": ["G1Q3 RCA TaskStore/effective status mismatch count=1"],
         "errors": [],

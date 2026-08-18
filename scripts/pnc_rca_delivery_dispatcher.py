@@ -102,18 +102,11 @@ from gateway.pnc_rca_delivery_store import (
     DELIVERY_CIRCUIT_RESET_META_PREFIX,
     DELIVERY_CIRCUIT_RESET_SCHEMA_VERSION,
     OUTBOX_PROFILE_TERMINAL_WRITE_ERROR_CODES,
-    PRE_W3_EFFECT_DISPOSITION_COMMAND,
-    PRE_W3_EFFECT_DISPOSITION_META_PREFIX,
-    PRE_W3_EFFECT_DISPOSITION_SCHEMA_VERSION,
     DeliveryEffectClaim,
     DeliveryRecordConflictError,
     RcaDeliveryStore,
     StaleDeliveryEffectLeaseError,
-    _pre_w3_disposition_sha256,
-    _pre_w3_effect_disposition_after,
-    _pre_w3_effect_disposition_fingerprint,
 )
-from gateway.pnc_rca_prod_bootstrap import load_active_release_binding
 from gateway.pnc_rca_delivery_observability import (
     DeliveryObservationError,
     append_delivery_observation_verified,
@@ -187,6 +180,17 @@ LEASE_BOUNDARY_MARGIN_SECONDS = 15
 EFFECT_LEASE_RENEW_INTERVAL_SECONDS = 10
 MAX_EFFECT_LEASE_RENEW_INTERVAL_SECONDS = 15
 MAX_HEALTH_HEARTBEAT_INTERVAL_SECONDS = 15.0
+SUCCESSOR_READ_ONLY_MODE = "successor_read_only"
+SCHEMA_RUNTIME_CAPABILITY_KEYS = frozenset({
+    "observed_control_schema_version",
+    "binary_write_schema_version",
+    "mode",
+    "read_supported",
+    "write_enabled",
+    "work_admission_enabled",
+    "lease_acquisition_enabled",
+    "external_effect_enabled",
+})
 HTTP_VERIFY_READ_CHUNK_BYTES = 64 * 1024
 RETRY_DELAYS_SECONDS = (2, 5, 10, 20, 40, 120, 300, 900, 3600)
 UNCERTAIN_RECONCILIATION_POLL_SECONDS = 30
@@ -213,9 +217,6 @@ _CIRCUIT_CODES = frozenset({
 DELIVERY_CIRCUIT_RESET_RECOVERY_SCHEMA_VERSION = (
     "pnc_rca_delivery_circuit_reset_recovery_v1"
 )
-PRE_W3_EFFECT_DISPOSITION_RECOVERY_SCHEMA_VERSION = (
-    "pnc_rca_pre_w3_effect_disposition_recovery_v1"
-)
 class DeliveryCircuitResetReceiptMaterializationError(RuntimeError):
     def __init__(self, *, reset_id: str, receipt_path: Path, cause: Exception):
         self.reset_id = str(reset_id)
@@ -225,20 +226,6 @@ class DeliveryCircuitResetReceiptMaterializationError(RuntimeError):
         super().__init__(
             "delivery_circuit_reset_recovery_required:"
             f"reset_id={self.reset_id}:receipt={receipt_path}:cause={cause}"
-        )
-
-
-class PreW3EffectDispositionReceiptMaterializationError(RuntimeError):
-    def __init__(self, *, disposition_id: str, receipt_path: Path, cause: Exception):
-        self.disposition_id = str(disposition_id)
-        self.receipt_path = receipt_path
-        self.meta_key = (
-            f"{PRE_W3_EFFECT_DISPOSITION_META_PREFIX}{self.disposition_id}"
-        )
-        self.cause = cause
-        super().__init__(
-            "pre_w3_effect_disposition_recovery_required:"
-            f"disposition_id={self.disposition_id}:receipt={receipt_path}:cause={cause}"
         )
 
 
@@ -590,9 +577,6 @@ def _circuit_reset_tool_provenance() -> dict[str, Any]:
     control_path = (REPO_ROOT / "gateway" / "pnc_rca_control_store.py").resolve(
         strict=True
     )
-    bootstrap_path = (REPO_ROOT / "gateway" / "pnc_rca_prod_bootstrap.py").resolve(
-        strict=True
-    )
     return {
         "entrypoint_path": str(entrypoint),
         "entrypoint_sha256": _bound_source_sha256(entrypoint),
@@ -602,43 +586,22 @@ def _circuit_reset_tool_provenance() -> dict[str, Any]:
         "receipt_helper_sha256": _bound_source_sha256(helper_path),
         "control_store_path": str(control_path),
         "control_store_sha256": _bound_source_sha256(control_path),
-        "bootstrap_path": str(bootstrap_path),
-        "bootstrap_sha256": _bound_source_sha256(bootstrap_path),
     }
 
 
-def _active_release_binding_snapshot(config: "DispatcherConfig") -> dict[str, Any]:
-    """Pin the release identity while observing, not blocking on, env drift.
-
-    Circuit reset is an operator-authorized database control-plane mutation. It
-    does not itself cross the provider boundary, so an unrelated live env
-    change must remain visible in the receipt without preventing the reset.
-    """
-    if not config.quarantine_release_id or not config.quarantine_bootstrap_epoch_id:
-        raise ValueError("delivery_circuit_reset_active_binding_config_missing")
-    binding = load_active_release_binding(
-        path=config.quarantine_active_release_binding_path,
-        live_env_path=config.quarantine_live_env_path,
-        expected_release_id=config.quarantine_release_id,
-        expected_epoch_id=config.quarantine_bootstrap_epoch_id,
-        verify_live_env=False,
+def _current_release_binding_snapshot(
+    config: "DispatcherConfig", store: RcaDeliveryStore
+) -> dict[str, Any]:
+    """Bind circuit reset to the current steady epoch and minimal release note."""
+    return validate_bound_resident_release(
+        store,
+        release_note_path=config.release_note_path,
+        runtime_root=os.environ.get("PNC_LIVE_RUNTIME_ROOT", ""),
+        runtime_commit=os.environ.get("PNC_LIVE_RUNTIME_COMMIT", ""),
+        runtime_tree=os.environ.get("PNC_LIVE_RUNTIME_TREE", ""),
+        live_manifest_sha256=os.environ.get("PNC_LIVE_MANIFEST_SHA256", ""),
+        live_env_path=config.release_env_path,
     )
-    live_env_path = config.quarantine_live_env_path.expanduser().absolute()
-    live_env_sha256 = _bound_source_sha256(live_env_path)
-    candidate_env_sha256 = str(binding["candidate_env_sha256"])
-    return {
-        "path": str(config.quarantine_active_release_binding_path.absolute()),
-        "sha256": binding["binding_receipt_sha256"],
-        "release_id": binding["release_id"],
-        "authority_sha256": binding["authority_sha256"],
-        "authority_epoch_id": binding["authority_epoch_id"],
-        "bootstrap_epoch_id": binding["bootstrap_epoch_id"],
-        "candidate_env_sha256": candidate_env_sha256,
-        "live_env_path": str(live_env_path),
-        "live_env_sha256": live_env_sha256,
-        "live_env_matches_candidate": live_env_sha256 == candidate_env_sha256,
-        "mismatch_policy": "observed_only_operator_authorized_reset",
-    }
 
 
 def _build_delivery_circuit_reset_receipt(
@@ -650,7 +613,7 @@ def _build_delivery_circuit_reset_receipt(
     before: Mapping[str, Any],
     recorded_at: str,
     receipt_path: Path | None,
-    active_release_binding: Mapping[str, Any],
+    release_binding: Mapping[str, Any],
     tool_provenance: Mapping[str, Any],
 ) -> dict[str, Any]:
     before_state = json.loads(_circuit_reset_canonical_json(before))
@@ -682,7 +645,7 @@ def _build_delivery_circuit_reset_receipt(
             "before": before_state,
             "control_db_identity": db_identity,
             "config_binding_sha256": config_binding_sha256,
-            "active_release_binding_sha256": active_release_binding["sha256"],
+            "release_note_sha256": release_binding["release_note_sha256"],
             "tool_provenance": dict(tool_provenance),
             "destination_binding": destination_binding,
         }
@@ -694,7 +657,7 @@ def _build_delivery_circuit_reset_receipt(
         "effect_kind": effect_kind,
         "before": before_state,
         "control_db_identity": db_identity,
-        "active_release_binding_sha256": active_release_binding["sha256"],
+        "release_note_sha256": release_binding["release_note_sha256"],
         "tool_provenance": dict(tool_provenance),
         "plan_id": plan_id,
     }
@@ -713,7 +676,7 @@ def _build_delivery_circuit_reset_receipt(
         "control_db_identity": db_identity,
         "config_binding_sha256": config_binding_sha256,
         "destination_binding": destination_binding,
-        "active_release_binding": dict(active_release_binding),
+        "release_binding": dict(release_binding),
         "tool_provenance": dict(tool_provenance),
         "before": before_state["circuit"],
         "after": after_circuit,
@@ -761,370 +724,6 @@ def _build_delivery_circuit_reset_recovery_envelope(
     }
     envelope["receipt_fingerprint"] = _circuit_reset_sha256(envelope)
     return envelope
-
-
-def _pre_w3_effect_disposition_active_release_binding(
-    config: "DispatcherConfig",
-) -> dict[str, Any]:
-    """Bind the active release while tolerating only an observed env mismatch.
-
-    This weaker live-env assertion is confined to a no-provider, risk-reducing
-    quarantine command.  Circuit reset continues to require exact env equality.
-    """
-    if not config.quarantine_release_id or not config.quarantine_bootstrap_epoch_id:
-        raise ValueError("pre_w3_effect_disposition_active_binding_config_missing")
-    binding = load_active_release_binding(
-        path=config.quarantine_active_release_binding_path,
-        live_env_path=config.quarantine_live_env_path,
-        expected_release_id=config.quarantine_release_id,
-        expected_epoch_id=config.quarantine_bootstrap_epoch_id,
-        verify_live_env=False,
-    )
-    live_env_path = config.quarantine_live_env_path.expanduser().absolute()
-    live_env_sha256 = _bound_source_sha256(live_env_path)
-    candidate_env_sha256 = str(binding["candidate_env_sha256"])
-    return {
-        "path": str(config.quarantine_active_release_binding_path.absolute()),
-        "sha256": str(binding["binding_receipt_sha256"]),
-        "release_id": str(binding["release_id"]),
-        "authority_sha256": str(binding["authority_sha256"]),
-        "authority_epoch_id": str(binding["authority_epoch_id"]),
-        "bootstrap_epoch_id": str(binding["bootstrap_epoch_id"]),
-        "release_bom_sha256": str(binding["release_bom_sha256"]),
-        "candidate_env_sha256": candidate_env_sha256,
-        "live_env_path": str(live_env_path),
-        "live_env_sha256": live_env_sha256,
-        "live_env_matches_candidate": live_env_sha256 == candidate_env_sha256,
-        "mismatch_policy": "observed_only_no_external_write",
-    }
-
-
-def _pre_w3_effect_disposition_backup_binding(
-    path: Path,
-    expected_sha256: str,
-    *,
-    source_path: Path,
-    expected_snapshot: Mapping[str, Any],
-    verify_source_logical_digest: bool = True,
-) -> dict[str, Any]:
-    selected = path.expanduser().absolute()
-    source = source_path.expanduser().absolute()
-    expected = str(expected_sha256 or "").strip().lower()
-    if (
-        not path.is_absolute()
-        or not source_path.is_absolute()
-        or _SHA256_RE.fullmatch(expected) is None
-    ):
-        raise ValueError("pre_w3_effect_disposition_backup_invalid")
-    try:
-        source_stat = source.lstat()
-    except OSError as exc:
-        raise ValueError("pre_w3_effect_disposition_backup_invalid") from exc
-    if (
-        stat.S_ISLNK(source_stat.st_mode)
-        or not stat.S_ISREG(source_stat.st_mode)
-        or source == selected
-    ):
-        raise ValueError("pre_w3_effect_disposition_backup_invalid")
-    source_sha256 = _bound_source_sha256(source)
-    observed_sha256 = _bound_source_sha256(selected)
-    backup_db: sqlite3.Connection | None = None
-    try:
-        backup_db = sqlite3.connect(
-            f"file:{selected}?mode=ro&immutable=1",
-            uri=True,
-            timeout=5,
-        )
-        backup_db.execute("PRAGMA query_only=ON")
-        journal_mode = str(backup_db.execute("PRAGMA journal_mode").fetchone()[0])
-        quick_check = str(backup_db.execute("PRAGMA quick_check").fetchone()[0])
-        foreign_key_violations = backup_db.execute(
-            "PRAGMA foreign_key_check"
-        ).fetchall()
-    except sqlite3.Error as exc:
-        raise ValueError("pre_w3_effect_disposition_backup_invalid") from exc
-    finally:
-        if backup_db is not None:
-            backup_db.close()
-    descriptor = -1
-    try:
-        before = selected.lstat()
-        descriptor = os.open(
-            selected,
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
-        opened = os.fstat(descriptor)
-        magic = os.read(descriptor, 16)
-        after = os.fstat(descriptor)
-        if (
-            observed_sha256 != expected
-            or magic != b"SQLite format 3\x00"
-            or journal_mode != "delete"
-            or quick_check != "ok"
-            or foreign_key_violations
-            or opened.st_size < 512
-            or opened.st_size % 512 != 0
-            or (opened.st_dev, opened.st_ino)
-            == (source_stat.st_dev, source_stat.st_ino)
-            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-            != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
-            or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
-            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-        ):
-            raise ValueError("pre_w3_effect_disposition_backup_invalid")
-        backup_store = RcaDeliveryStore(
-            selected,
-            require_current=True,
-            read_only=True,
-            ensure_current_rows=False,
-        )
-        backup_snapshot = backup_store.pre_w3_effect_disposition_snapshot(
-            effect_keys=expected_snapshot["effect_keys"],
-        )
-        expected_logical_digest = expected_snapshot["control_db_logical_digest"]
-        backup_logical_digest = backup_store.control_db_logical_digest()
-        source_logical_digest = expected_logical_digest
-        if verify_source_logical_digest:
-            source_store = RcaDeliveryStore(
-                source,
-                require_current=True,
-                read_only=True,
-                ensure_current_rows=False,
-            )
-            source_logical_digest = source_store.control_db_logical_digest()
-        if (
-            backup_snapshot != expected_snapshot
-            or backup_logical_digest != expected_logical_digest
-            or source_logical_digest != expected_logical_digest
-        ):
-            raise ValueError("pre_w3_effect_disposition_backup_snapshot_mismatch")
-        return {
-            "path": str(selected),
-            "sha256": observed_sha256,
-            "size_bytes": int(opened.st_size),
-            "device": int(opened.st_dev),
-            "inode": int(opened.st_ino),
-            "mtime_ns": int(opened.st_mtime_ns),
-            "source_path": str(source),
-            "source_sha256": source_sha256,
-            "source_device": int(source_stat.st_dev),
-            "source_inode": int(source_stat.st_ino),
-            "source_size_bytes": int(source_stat.st_size),
-            "source_mtime_ns": int(source_stat.st_mtime_ns),
-            "journal_mode": journal_mode,
-            "quick_check": quick_check,
-            "foreign_key_check": "ok",
-            "snapshot_sha256": str(backup_snapshot["snapshot_sha256"]),
-            "effect_set_sha256": str(backup_snapshot["effect_set_sha256"]),
-            "logical_digest_sha256": str(backup_logical_digest["sha256"]),
-        }
-    except (OSError, RuntimeError, sqlite3.Error) as exc:
-        raise ValueError("pre_w3_effect_disposition_backup_invalid") from exc
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-
-def _build_pre_w3_effect_disposition_receipt(
-    *,
-    config: "DispatcherConfig",
-    snapshot: Mapping[str, Any],
-    operator: str,
-    reason: str,
-    recorded_at: str,
-    receipt_path: Path,
-    backup_binding: Mapping[str, Any],
-    active_release_binding: Mapping[str, Any],
-    tool_provenance: Mapping[str, Any],
-) -> dict[str, Any]:
-    destination_binding = _circuit_reset_destination_binding(receipt_path)
-    control_db_identity = _control_db_identity(config.control_db_path)
-    config_binding_sha256 = _circuit_reset_config_binding(config)
-    tool_provenance_sha256 = _pre_w3_disposition_sha256(tool_provenance)
-    stable_db_identity = {
-        key: control_db_identity[key]
-        for key in ("path", "device", "inode")
-    }
-    stable_backup_binding = {
-        key: backup_binding[key]
-        for key in (
-            "path",
-            "sha256",
-            "size_bytes",
-            "device",
-            "inode",
-            "journal_mode",
-            "quick_check",
-            "foreign_key_check",
-            "snapshot_sha256",
-            "effect_set_sha256",
-            "logical_digest_sha256",
-            "source_path",
-            "source_device",
-            "source_inode",
-        )
-    }
-    plan_id = _pre_w3_disposition_sha256({
-        "command": PRE_W3_EFFECT_DISPOSITION_COMMAND,
-        "operator": operator,
-        "reason": reason,
-        "effect_keys": snapshot["effect_keys"],
-        "effect_set_sha256": snapshot["effect_set_sha256"],
-        "before_snapshot_sha256": snapshot["snapshot_sha256"],
-        "current_activation_sha256": snapshot["current_activation"]["sha256"],
-        "circuit": snapshot["circuit"],
-        "control_db_identity": stable_db_identity,
-        "destination_binding": destination_binding,
-        "backup_binding": stable_backup_binding,
-        "active_release_binding": dict(active_release_binding),
-        "config_binding_sha256": config_binding_sha256,
-        "tool_provenance_sha256": tool_provenance_sha256,
-    })
-    disposition_id = _pre_w3_disposition_sha256({"plan_id": plan_id})
-    after = _pre_w3_effect_disposition_after(
-        snapshot,
-        disposition_id=disposition_id,
-        recorded_at=recorded_at,
-    )
-    count = len(snapshot["effect_keys"])
-    receipt: dict[str, Any] = {
-        "schema_version": PRE_W3_EFFECT_DISPOSITION_SCHEMA_VERSION,
-        "command": PRE_W3_EFFECT_DISPOSITION_COMMAND,
-        "disposition_id": disposition_id,
-        "plan_id": plan_id,
-        "recorded_at": recorded_at,
-        "operator": operator,
-        "reason": reason,
-        "effect_kind": DELIVERY_EFFECT_KIND,
-        "effect_keys": list(snapshot["effect_keys"]),
-        "effect_set_sha256": snapshot["effect_set_sha256"],
-        "before_snapshot_sha256": snapshot["snapshot_sha256"],
-        "control_db_identity": control_db_identity,
-        "destination_binding": destination_binding,
-        "backup_binding": dict(backup_binding),
-        "active_release_binding": dict(active_release_binding),
-        "config_binding_sha256": config_binding_sha256,
-        "tool_provenance": dict(tool_provenance),
-        "tool_provenance_sha256": tool_provenance_sha256,
-        "before": dict(snapshot),
-        "after": after,
-        "effect_delta": {
-            "external_effects_triggered": False,
-            "provider_calls": 0,
-            "control_meta_inserted": 1,
-            "attempt_audits_inserted": count,
-            "effects_updated": count,
-            "jobs_updated": count,
-            "quarantine_audits_inserted": 2 * count,
-            "total_database_rows": 1 + (5 * count),
-        },
-        "external_writes_performed": False,
-        "provider_calls_performed": 0,
-    }
-    receipt["receipt_fingerprint"] = _pre_w3_effect_disposition_fingerprint(
-        receipt
-    )
-    return receipt
-
-
-def _build_pre_w3_effect_disposition_recovery_envelope(
-    audit: Mapping[str, Any],
-    receipt_path: Path,
-) -> dict[str, Any]:
-    destination = _circuit_reset_destination_binding(receipt_path)
-    envelope: dict[str, Any] = {
-        "schema_version": PRE_W3_EFFECT_DISPOSITION_RECOVERY_SCHEMA_VERSION,
-        "command": "materialize-pre-w3-effect-disposition",
-        "recovered": True,
-        "source_disposition_id": audit["disposition_id"],
-        "source_receipt_fingerprint": audit["receipt_fingerprint"],
-        "planned_destination_binding": audit["destination_binding"],
-        "materialized_destination": {
-            "path": str(receipt_path),
-            "binding": destination,
-        },
-        "materialized_at": _utc_now().isoformat(),
-        "external_effects_triggered": False,
-        "provider_calls_performed": 0,
-        "audit": dict(audit),
-    }
-    envelope["receipt_fingerprint"] = _pre_w3_disposition_sha256(envelope)
-    return envelope
-
-
-def _existing_pre_w3_disposition_receipt_sha256(
-    path: Path,
-    audit: Mapping[str, Any],
-) -> str | None:
-    selected = path.expanduser()
-    if not selected.is_absolute() or str(selected) != str(selected.absolute()):
-        raise ValueError("pre_w3_effect_disposition_receipt_path_invalid")
-    selected = selected.absolute()
-    if _circuit_reset_destination_binding(selected) != audit["destination_binding"]:
-        raise ValueError("pre_w3_effect_disposition_receipt_destination_changed")
-    sidecar = Path(f"{selected}.sha256")
-    try:
-        observed = selected.lstat()
-    except FileNotFoundError:
-        if sidecar.exists():
-            raise ValueError("pre_w3_effect_disposition_receipt_incomplete")
-        return None
-    if (
-        stat.S_ISLNK(observed.st_mode)
-        or not stat.S_ISREG(observed.st_mode)
-        or observed.st_nlink != 1
-        or observed.st_uid != os.getuid()
-        or stat.S_IMODE(observed.st_mode) != 0o444
-    ):
-        raise ValueError("pre_w3_effect_disposition_receipt_invalid")
-    expected_raw = _circuit_reset_canonical_json(audit).encode("utf-8")
-    raw = selected.read_bytes()
-    digest = hashlib.sha256(raw).hexdigest()
-    if raw != expected_raw or _bound_source_sha256(selected) != digest:
-        raise ValueError("pre_w3_effect_disposition_receipt_invalid")
-    try:
-        sidecar_stat = sidecar.lstat()
-    except FileNotFoundError:
-        # A DB commit can succeed immediately before the sidecar write.  The
-        # audit and immutable main receipt are already exact at this point, so
-        # repair only the missing sidecar and never rewrite either artifact.
-        parent_path = selected.parent
-        parent_fd, parent_identity = _open_receipt_parent(parent_path)
-        try:
-            expected_parent = {
-                "device": int(audit["destination_binding"]["parent_device"]),
-                "inode": int(audit["destination_binding"]["parent_inode"]),
-            }
-            if parent_identity != expected_parent:
-                raise ValueError("pre_w3_effect_disposition_receipt_parent_changed")
-            try:
-                _create_immutable_file(
-                    parent_path,
-                    parent_fd,
-                    sidecar.name,
-                    f"{digest}  {selected.name}\n".encode("ascii"),
-                    parent_identity,
-                )
-            except ValueError as exc:
-                # Another retry may have won the no-clobber race.  The final
-                # exact sidecar validation below remains authoritative.
-                if "already_exists" not in str(exc):
-                    raise
-        finally:
-            os.close(parent_fd)
-        sidecar_stat = sidecar.lstat()
-    if (
-        stat.S_ISLNK(sidecar_stat.st_mode)
-        or not stat.S_ISREG(sidecar_stat.st_mode)
-        or sidecar_stat.st_nlink != 1
-        or sidecar_stat.st_uid != os.getuid()
-        or stat.S_IMODE(sidecar_stat.st_mode) != 0o444
-        or sidecar.read_text(encoding="ascii") != f"{digest}  {selected.name}\n"
-    ):
-        raise ValueError("pre_w3_effect_disposition_receipt_invalid")
-    return digest
 
 
 def _stable_key(prefix: str, material: Mapping[str, Any]) -> str:
@@ -1187,10 +786,6 @@ class DispatcherConfig:
     reconciliation_visibility_grace_seconds: int
     reconciliation_min_missing_reads: int
     recovery_write_interval_seconds: int
-    quarantine_release_id: str
-    quarantine_bootstrap_epoch_id: str
-    quarantine_active_release_binding_path: Path
-    quarantine_live_env_path: Path
     observability_enabled: bool = True
     observability_path: Path = field(default_factory=default_observation_path)
     inventory_pin: str = ""
@@ -1302,23 +897,6 @@ class DispatcherConfig:
                 300,
                 minimum=60,
             ),
-            quarantine_release_id=str(
-                source.get("HERMES_RCA_PROD_RELEASE_ID", "") or ""
-            ).strip(),
-            quarantine_bootstrap_epoch_id=str(
-                source.get("HERMES_RCA_PROD_BOOTSTRAP_EPOCH_ID", "") or ""
-            ).strip(),
-            quarantine_active_release_binding_path=Path(
-                source.get(
-                    "HERMES_RCA_ACTIVE_RELEASE_BINDING_PATH",
-                    home
-                    / "runtime"
-                    / "pnc_agent"
-                    / "feishu_issue_kafka_rca"
-                    / "active-release-binding.json",
-                )
-            ).expanduser(),
-            quarantine_live_env_path=home / ".env",
             observability_enabled=_boolean(
                 source, f"{ENV_PREFIX}OBSERVABILITY_ENABLED", True
             ),
@@ -4776,6 +4354,7 @@ class DeliveryDispatcher:
         control_store = RcaControlStore(
             self.config.control_db_path,
             require_current=True,
+            allow_successor_write=True,
         )
         binding = control_store.manual_external_write_admission_for_effect(
             business_key=claim.business_key,
@@ -6476,6 +6055,152 @@ class HealthReporter:
         os.replace(temporary, path)
 
 
+def _schema_runtime_capability(store: RcaDeliveryStore) -> dict[str, Any]:
+    capability = dict(store.schema_runtime_capability())
+    if set(capability) != SCHEMA_RUNTIME_CAPABILITY_KEYS:
+        raise RuntimeError("rca_schema_runtime_capability_invalid")
+    if capability.get("mode") == SUCCESSOR_READ_ONLY_MODE and (
+        capability.get("read_supported") is not True
+        or any(
+            capability.get(name) is not False
+            for name in (
+                "write_enabled",
+                "work_admission_enabled",
+                "lease_acquisition_enabled",
+                "external_effect_enabled",
+            )
+        )
+    ):
+        raise RuntimeError("rca_successor_read_only_capability_invalid")
+    return capability
+
+
+def _successor_read_only_diagnostic(
+    config: DispatcherConfig,
+    capability: Mapping[str, Any],
+    *,
+    operation: str,
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": "rca_resident_successor_read_only",
+        "operation": operation,
+        "mode": SUCCESSOR_READ_ONLY_MODE,
+        "ready": False,
+        "processing": False,
+        "config": config.public_dict(),
+        "schema_runtime_capability": dict(capability),
+    }
+
+
+class SuccessorReadOnlyHealthReporter:
+    """Publish dispatcher liveness without opening provider or claim boundaries."""
+
+    def __init__(
+        self,
+        config: DispatcherConfig,
+        store: RcaDeliveryStore,
+        capability: Mapping[str, Any],
+    ) -> None:
+        self.config = config
+        self.store = store
+        self.capability = dict(capability)
+        self.started_at = _utc_iso()
+        self.runtime_identity = build_runtime_identity(
+            service_label=SERVICE_LABEL,
+            script_path=Path(__file__),
+            public_config=config.public_dict(),
+            loaded_dependencies={
+                distribution: module
+                for distribution, module in (
+                    RCA_DELIVERY_DISPATCHER_LOADED_DEPENDENCIES.items()
+                )
+                if distribution != "lark-oapi"
+            },
+        )
+
+    def write(self, *, state: str = SUCCESSOR_READ_ONLY_MODE) -> None:
+        body = {
+            "schema_version": HEALTH_SCHEMA_VERSION,
+            "ok": False,
+            "healthy": True,
+            "process_healthy": True,
+            "business_ready": False,
+            "ready": False,
+            "processing": False,
+            "state": state,
+            "mode": SUCCESSOR_READ_ONLY_MODE,
+            "started_at": self.started_at,
+            "updated_at": _utc_iso(),
+            "runtime_identity": self.runtime_identity.to_dict(),
+            "config": self.config.public_dict(),
+            "schema_runtime_capability": dict(self.capability),
+            "stats": asdict(DispatchStats()),
+            "effect_lease_keeper": {
+                "enabled": False,
+                "active": False,
+                "renew_interval_seconds": EFFECT_LEASE_RENEW_INTERVAL_SECONDS,
+                "started": 0,
+                "stopped": 0,
+                "renewals": 0,
+                "failures": 0,
+            },
+            "last_outcome": None,
+            "circuit": {"state": "not_observed_successor_read_only"},
+            "circuits": {},
+            "store": self.store.health(
+                activation_required=self.config.activation_required,
+            ),
+            "release": {},
+            "release_error": "",
+        }
+        path = self.config.health_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(
+            json.dumps(body, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+
+
+def run_successor_read_only_loop(
+    config: DispatcherConfig,
+    store: RcaDeliveryStore,
+    capability: Mapping[str, Any],
+    *,
+    once: bool = False,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    reporter = SuccessorReadOnlyHealthReporter(config, store, capability)
+    stop = False
+
+    def request_stop(_signum, _frame):
+        nonlocal stop
+        stop = True
+
+    previous: dict[int, Any] = {}
+    if not once:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous[signum] = signal.signal(signum, request_stop)
+    interval = min(
+        float(config.poll_interval_seconds),
+        _heartbeat_interval_seconds(config.health_max_age_seconds),
+    )
+    try:
+        while not stop:
+            reporter.write()
+            if once:
+                return 0
+            sleep(interval)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+    reporter.write(state="stopped")
+    return 0
+
+
 def read_health(
     path: Path,
     *,
@@ -6518,6 +6243,17 @@ def read_health(
         result["error"] = "heartbeat_from_future"
     elif age > max_age_seconds:
         result["error"] = "heartbeat_stale"
+    if payload.get("mode") == SUCCESSOR_READ_ONLY_MODE:
+        result["liveness_ok"] = bool(
+            fresh
+            and payload.get("healthy") is True
+            and payload.get("process_healthy") is True
+            and payload.get("business_ready") is False
+            and payload.get("ready") is False
+            and payload.get("processing") is False
+        )
+        result.setdefault("error", "successor_read_only_not_ready")
+        return False, result
     return payload.get("healthy") is True and fresh, result
 
 
@@ -6602,22 +6338,8 @@ def _parser() -> argparse.ArgumentParser:
         help="recover a receipt from the durable audit without changing the DB",
     )
     parser.add_argument(
-        "--dispose-pre-w3-effect",
-        dest="pre_w3_effect_keys",
-        action="append",
-        metavar="EFFECT_KEY",
-        help="plan or quarantine one exact pre-W3 pending issue effect",
-    )
-    parser.add_argument(
-        "--materialize-pre-w3-disposition",
-        metavar="DISPOSITION_ID",
-        help="recover an immutable receipt from a durable disposition audit",
-    )
-    parser.add_argument("--backup", type=Path, help="pre-mutation SQLite backup")
-    parser.add_argument("--backup-sha256")
-    parser.add_argument(
-        "--expected-active-release-binding-sha256",
-        help="binding SHA from the immediately preceding reset plan",
+        "--expected-release-note-sha256",
+        help="minimal release-note SHA from the immediately preceding reset plan",
     )
     parser.add_argument(
         "--expected-config-binding-sha256",
@@ -6631,12 +6353,6 @@ def _parser() -> argparse.ArgumentParser:
         "--expected-before-state-sha256",
         help="exact before-state SHA from the immediately preceding reset plan",
     )
-    parser.add_argument("--expected-effect-set-sha256")
-    parser.add_argument("--expected-database-logical-sha256")
-    parser.add_argument("--expected-disposition-id")
-    parser.add_argument("--expected-activation-sha256")
-    parser.add_argument("--expected-live-env-sha256")
-    parser.add_argument("--expected-tool-provenance-sha256")
     parser.add_argument(
         "--effect-kind",
         choices=sorted(DELIVERY_EFFECT_KINDS),
@@ -6646,39 +6362,18 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _validate_circuit_reset_arguments(args: argparse.Namespace) -> None:
-    reset_only_flags = (args.operator, args.reason, args.receipt)
-    expected_binding = args.expected_active_release_binding_sha256
-    expected_config = args.expected_config_binding_sha256
-    expected_plan = args.expected_plan_id
-    expected_before = args.expected_before_state_sha256
-    disposition_expected = (
-        args.expected_effect_set_sha256,
-        args.expected_database_logical_sha256,
-        args.expected_disposition_id,
-        args.expected_activation_sha256,
-        args.expected_live_env_sha256,
-        args.expected_tool_provenance_sha256,
+    expected = (
+        args.expected_release_note_sha256,
+        args.expected_config_binding_sha256,
+        args.expected_plan_id,
+        args.expected_before_state_sha256,
     )
-    modes = (
-        bool(args.clear_circuit),
-        bool(args.materialize_reset),
-        bool(args.pre_w3_effect_keys),
-        bool(args.materialize_pre_w3_disposition),
-    )
+    modes = (bool(args.clear_circuit), bool(args.materialize_reset))
     if sum(modes) > 1:
         raise ValueError("delivery_circuit_reset_modes_conflict")
     if args.materialize_reset:
-        if (
-            args.operator is not None
-            or args.reason is not None
-            or args.apply
-            or expected_binding is not None
-            or expected_config is not None
-            or expected_plan is not None
-            or expected_before is not None
-            or any(value is not None for value in disposition_expected)
-            or args.backup is not None
-            or args.backup_sha256 is not None
+        if args.operator is not None or args.reason is not None or args.apply or any(
+            value is not None for value in expected
         ):
             raise ValueError("delivery_circuit_reset_recovery_flags_conflict")
         if any((args.check_config, args.dry_run, args.health, args.once)):
@@ -6693,102 +6388,17 @@ def _validate_circuit_reset_arguments(args: argparse.Namespace) -> None:
             raise ValueError("delivery_circuit_reset_flags_conflict")
         if args.receipt is None:
             raise ValueError("delivery_circuit_reset_receipt_required")
-        if (
-            any(value is not None for value in disposition_expected)
-            or args.backup is not None
-            or args.backup_sha256 is not None
-        ):
-            raise ValueError("pre_w3_effect_disposition_flags_conflict")
-        if args.apply and expected_binding is None:
-            raise ValueError(
-                "delivery_circuit_reset_expected_active_binding_required"
-            )
-        if args.apply and expected_config is None:
-            raise ValueError("delivery_circuit_reset_expected_config_required")
-        if args.apply and expected_plan is None:
-            raise ValueError("delivery_circuit_reset_expected_plan_required")
-        if args.apply and expected_before is None:
-            raise ValueError("delivery_circuit_reset_expected_before_required")
-        if expected_binding is not None and (
-            _SHA256_RE.fullmatch(str(expected_binding)) is None
-            or str(expected_binding) == "0" * 64
-        ):
-            raise ValueError("delivery_circuit_reset_expected_active_binding_invalid")
-        if expected_config is not None and (
-            _SHA256_RE.fullmatch(str(expected_config)) is None
-            or str(expected_config) == "0" * 64
-        ):
-            raise ValueError("delivery_circuit_reset_expected_config_invalid")
-        if expected_plan is not None and (
-            _SHA256_RE.fullmatch(str(expected_plan)) is None
-            or str(expected_plan) == "0" * 64
-        ):
-            raise ValueError("delivery_circuit_reset_expected_plan_invalid")
-        if expected_before is not None and (
-            _SHA256_RE.fullmatch(str(expected_before)) is None
-            or str(expected_before) == "0" * 64
-        ):
-            raise ValueError("delivery_circuit_reset_expected_before_invalid")
-        return
-    if args.materialize_pre_w3_disposition:
-        if (
-            args.operator is not None
-            or args.reason is not None
-            or args.apply
-            or expected_binding is not None
-            or expected_config is not None
-            or expected_plan is not None
-            or expected_before is not None
-            or any(value is not None for value in disposition_expected)
-            or args.backup is not None
-            or args.backup_sha256 is not None
-            or any((args.check_config, args.dry_run, args.health, args.once))
-        ):
-            raise ValueError("pre_w3_effect_disposition_recovery_flags_conflict")
-        if args.receipt is None:
-            raise ValueError("pre_w3_effect_disposition_receipt_required")
-        return
-    if args.pre_w3_effect_keys:
-        if args.operator is None or args.reason is None:
-            raise ValueError(
-                "pre_w3_effect_disposition_operator_and_reason_required"
-            )
-        if args.receipt is None:
-            raise ValueError("pre_w3_effect_disposition_receipt_required")
-        if args.backup is None or args.backup_sha256 is None:
-            raise ValueError("pre_w3_effect_disposition_backup_required")
-        if args.effect_kind != DELIVERY_EFFECT_KIND:
-            raise ValueError("pre_w3_effect_disposition_effect_kind_invalid")
-        if any((args.check_config, args.dry_run, args.health, args.once)):
-            raise ValueError("pre_w3_effect_disposition_flags_conflict")
-        expected_values = (
-            expected_binding,
-            expected_config,
-            expected_plan,
-            expected_before,
-            *disposition_expected,
-        )
-        if args.apply and any(value is None for value in expected_values):
-            raise ValueError("pre_w3_effect_disposition_expected_bindings_required")
-        if not args.apply and any(value is not None for value in expected_values):
-            raise ValueError("pre_w3_effect_disposition_expected_bindings_apply_only")
+        if args.apply and any(value is None for value in expected):
+            raise ValueError("delivery_circuit_reset_expected_bindings_required")
+        if not args.apply and any(value is not None for value in expected):
+            raise ValueError("delivery_circuit_reset_expected_bindings_apply_only")
         if args.apply and any(
             _SHA256_RE.fullmatch(str(value)) is None or str(value) == "0" * 64
-            for value in expected_values
+            for value in expected
         ):
-            raise ValueError("pre_w3_effect_disposition_expected_binding_invalid")
+            raise ValueError("delivery_circuit_reset_expected_binding_invalid")
         return
-    if (
-        any(reset_only_flags)
-        or args.apply
-        or expected_binding is not None
-        or expected_config is not None
-        or expected_plan is not None
-        or expected_before is not None
-        or any(value is not None for value in disposition_expected)
-        or args.backup is not None
-        or args.backup_sha256 is not None
-    ):
+    if any(value is not None for value in (args.operator, args.reason, args.receipt, *expected)) or args.apply:
         raise ValueError("delivery_circuit_reset_arguments_require_clear_circuit")
 
 
@@ -6854,13 +6464,16 @@ def _run_circuit_reset_command(
         if args.receipt is not None
         else None
     )
-    active_binding = _active_release_binding_snapshot(config)
-    expected_binding = args.expected_active_release_binding_sha256
+    release_binding = _current_release_binding_snapshot(config, store)
+    expected_binding = args.expected_release_note_sha256
     expected_config = args.expected_config_binding_sha256
     expected_plan = args.expected_plan_id
     expected_before = args.expected_before_state_sha256
-    if expected_binding is not None and active_binding["sha256"] != expected_binding:
-        raise RuntimeError("delivery_circuit_reset_active_binding_changed")
+    if (
+        expected_binding is not None
+        and release_binding["release_note_sha256"] != expected_binding
+    ):
+        raise RuntimeError("delivery_circuit_reset_release_binding_changed")
     config_binding_sha256 = _circuit_reset_config_binding(config)
     if expected_config is not None and config_binding_sha256 != expected_config:
         raise RuntimeError("delivery_circuit_reset_config_changed")
@@ -6882,7 +6495,7 @@ def _run_circuit_reset_command(
         before=before,
         recorded_at=recorded_at,
         receipt_path=receipt_path,
-        active_release_binding=active_binding,
+        release_binding=release_binding,
         tool_provenance=tool_provenance,
     )
     if expected_plan is not None and planned["plan_id"] != expected_plan:
@@ -6905,8 +6518,8 @@ def _run_circuit_reset_command(
         )
         return 0
 
-    if _active_release_binding_snapshot(config) != active_binding:
-        raise RuntimeError("delivery_circuit_reset_active_binding_changed")
+    if _current_release_binding_snapshot(config, store) != release_binding:
+        raise RuntimeError("delivery_circuit_reset_release_binding_changed")
     if _circuit_reset_config_binding(DispatcherConfig.from_env()) != config_binding_sha256:
         raise RuntimeError("delivery_circuit_reset_config_changed")
     if _circuit_reset_tool_provenance() != tool_provenance:
@@ -6960,325 +6573,6 @@ def _run_circuit_reset_command(
     return 0
 
 
-def _run_pre_w3_effect_disposition_command(
-    *,
-    args: argparse.Namespace,
-    config: DispatcherConfig,
-    store: RcaDeliveryStore,
-) -> int:
-    if args.materialize_pre_w3_disposition:
-        receipt_path = _absolute_new_circuit_reset_receipt_path(args.receipt)
-        audit = store.pre_w3_effect_disposition_audit(
-            args.materialize_pre_w3_disposition
-        )
-        if audit is None:
-            raise RuntimeError("pre_w3_effect_disposition_audit_missing")
-        envelope = _build_pre_w3_effect_disposition_recovery_envelope(
-            audit,
-            receipt_path,
-        )
-        try:
-            receipt_sha256 = _write_immutable_circuit_reset_receipt(
-                receipt_path,
-                envelope,
-                expected_parent_identity={
-                    "device": envelope["materialized_destination"]["binding"][
-                        "parent_device"
-                    ],
-                    "inode": envelope["materialized_destination"]["binding"][
-                        "parent_inode"
-                    ],
-                },
-            )
-        except Exception as exc:
-            raise ValueError(
-                "pre_w3_effect_disposition_recovery_materialization_failed"
-            ) from exc
-        print(json.dumps({
-            "ok": True,
-            "recovered": True,
-            "disposition_id": audit["disposition_id"],
-            "receipt": str(receipt_path),
-            "receipt_sha256": receipt_sha256,
-            "receipt_fingerprint": envelope["receipt_fingerprint"],
-            "source_receipt_fingerprint": audit["receipt_fingerprint"],
-            "external_effects_triggered": False,
-            "provider_calls_performed": 0,
-        }, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-
-    operator, reason = _validate_circuit_reset_text(args.operator, args.reason)
-    if args.apply:
-        existing = store.pre_w3_effect_disposition_audit(
-            args.expected_disposition_id
-        )
-        if existing is not None:
-            expected_existing = {
-                "disposition_id": args.expected_disposition_id,
-                "plan_id": args.expected_plan_id,
-                "before_snapshot_sha256": args.expected_before_state_sha256,
-                "effect_set_sha256": args.expected_effect_set_sha256,
-                "database_logical_sha256": (
-                    args.expected_database_logical_sha256
-                ),
-                "activation_sha256": args.expected_activation_sha256,
-                "active_release_binding_sha256": (
-                    args.expected_active_release_binding_sha256
-                ),
-                "config_binding_sha256": args.expected_config_binding_sha256,
-                "live_env_sha256": args.expected_live_env_sha256,
-                "tool_provenance_sha256": args.expected_tool_provenance_sha256,
-            }
-            observed_existing = {
-                "disposition_id": existing["disposition_id"],
-                "plan_id": existing["plan_id"],
-                "before_snapshot_sha256": existing["before_snapshot_sha256"],
-                "effect_set_sha256": existing["effect_set_sha256"],
-                "database_logical_sha256": existing["before"][
-                    "control_db_logical_digest"
-                ]["sha256"],
-                "activation_sha256": existing["before"]["current_activation"][
-                    "sha256"
-                ],
-                "active_release_binding_sha256": existing[
-                    "active_release_binding"
-                ]["sha256"],
-                "config_binding_sha256": existing["config_binding_sha256"],
-                "live_env_sha256": existing["active_release_binding"][
-                    "live_env_sha256"
-                ],
-                "tool_provenance_sha256": existing["tool_provenance_sha256"],
-            }
-            changed = [
-                key
-                for key, value in expected_existing.items()
-                if observed_existing[key] != value
-            ]
-            requested_keys = sorted(
-                str(value or "").strip() for value in args.pre_w3_effect_keys
-            )
-            if (
-                changed
-                or requested_keys != existing["effect_keys"]
-                or operator != existing["operator"]
-                or reason != existing["reason"]
-                or not store.pre_w3_effect_disposition_is_applied(existing)
-            ):
-                raise RuntimeError(
-                    "pre_w3_effect_disposition_idempotent_retry_mismatch"
-                )
-            current_backup = _pre_w3_effect_disposition_backup_binding(
-                args.backup,
-                args.backup_sha256,
-                source_path=config.control_db_path,
-                expected_snapshot=existing["before"],
-                verify_source_logical_digest=False,
-            )
-            stable_backup_fields = {
-                "path",
-                "sha256",
-                "size_bytes",
-                "device",
-                "inode",
-                "mtime_ns",
-                "journal_mode",
-                "quick_check",
-                "foreign_key_check",
-                "snapshot_sha256",
-                "effect_set_sha256",
-                "logical_digest_sha256",
-            }
-            if any(
-                current_backup[field] != existing["backup_binding"][field]
-                for field in stable_backup_fields
-            ):
-                raise RuntimeError(
-                    "pre_w3_effect_disposition_backup_changed"
-                )
-            requested_receipt = Path(args.receipt).expanduser()
-            if (
-                not requested_receipt.is_absolute()
-                or str(requested_receipt) != str(requested_receipt.absolute())
-            ):
-                raise ValueError(
-                    "pre_w3_effect_disposition_receipt_path_invalid"
-                )
-            receipt_path = requested_receipt.absolute()
-            receipt_sha256 = _existing_pre_w3_disposition_receipt_sha256(
-                receipt_path,
-                existing,
-            )
-            if receipt_sha256 is None:
-                receipt_path = _absolute_new_circuit_reset_receipt_path(args.receipt)
-                receipt_sha256 = _write_immutable_circuit_reset_receipt(
-                    receipt_path,
-                    existing,
-                    expected_parent_identity={
-                        "device": existing["destination_binding"]["parent_device"],
-                        "inode": existing["destination_binding"]["parent_inode"],
-                    },
-                )
-            print(json.dumps({
-                "ok": True,
-                "applied": False,
-                "idempotent": True,
-                "command": PRE_W3_EFFECT_DISPOSITION_COMMAND,
-                "disposition_id": existing["disposition_id"],
-                "effect_keys": existing["effect_keys"],
-                "receipt": str(receipt_path),
-                "receipt_sha256": receipt_sha256,
-                "receipt_fingerprint": existing["receipt_fingerprint"],
-                "effect_delta": {
-                    **existing["effect_delta"],
-                    "database_rows_repeated": 0,
-                },
-                "external_effects_triggered": False,
-                "provider_calls_performed": 0,
-            }, ensure_ascii=False, indent=2, sort_keys=True))
-            return 0
-    receipt_path = _absolute_new_circuit_reset_receipt_path(args.receipt)
-    active_binding = _pre_w3_effect_disposition_active_release_binding(config)
-    config_binding_sha256 = _circuit_reset_config_binding(config)
-    tool_provenance = _circuit_reset_tool_provenance()
-    tool_provenance_sha256 = _pre_w3_disposition_sha256(tool_provenance)
-    recorded_at = _utc_now()
-    snapshot = store.pre_w3_effect_disposition_snapshot(
-        effect_keys=args.pre_w3_effect_keys,
-    )
-    backup_binding = _pre_w3_effect_disposition_backup_binding(
-        args.backup,
-        args.backup_sha256,
-        source_path=config.control_db_path,
-        expected_snapshot=snapshot,
-    )
-    planned = _build_pre_w3_effect_disposition_receipt(
-        config=config,
-        snapshot=snapshot,
-        operator=operator,
-        reason=reason,
-        recorded_at=recorded_at.isoformat(),
-        receipt_path=receipt_path,
-        backup_binding=backup_binding,
-        active_release_binding=active_binding,
-        tool_provenance=tool_provenance,
-    )
-    observed = {
-        "disposition_id": planned["disposition_id"],
-        "plan_id": planned["plan_id"],
-        "before_snapshot_sha256": planned["before_snapshot_sha256"],
-        "effect_set_sha256": planned["effect_set_sha256"],
-        "database_logical_sha256": planned["before"][
-            "control_db_logical_digest"
-        ]["sha256"],
-        "activation_sha256": planned["before"]["current_activation"]["sha256"],
-        "active_release_binding_sha256": planned["active_release_binding"]["sha256"],
-        "config_binding_sha256": planned["config_binding_sha256"],
-        "live_env_sha256": planned["active_release_binding"]["live_env_sha256"],
-        "tool_provenance_sha256": planned["tool_provenance_sha256"],
-    }
-    if not args.apply:
-        print(json.dumps({
-            "ok": True,
-            "mode": "plan",
-            "applied": False,
-            "external_effects_triggered": False,
-            "provider_calls_performed": 0,
-            "receipt_path": str(receipt_path),
-            "expected_apply": {
-                "expected_disposition_id": observed["disposition_id"],
-                "expected_plan_id": observed["plan_id"],
-                "expected_before_state_sha256": observed[
-                    "before_snapshot_sha256"
-                ],
-                "expected_effect_set_sha256": observed["effect_set_sha256"],
-                "expected_database_logical_sha256": observed[
-                    "database_logical_sha256"
-                ],
-                "expected_activation_sha256": observed["activation_sha256"],
-                "expected_active_release_binding_sha256": observed[
-                    "active_release_binding_sha256"
-                ],
-                "expected_config_binding_sha256": observed[
-                    "config_binding_sha256"
-                ],
-                "expected_live_env_sha256": observed["live_env_sha256"],
-                "expected_tool_provenance_sha256": observed[
-                    "tool_provenance_sha256"
-                ],
-            },
-            "plan": planned,
-        }, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
-
-    expected = {
-        "disposition_id": args.expected_disposition_id,
-        "plan_id": args.expected_plan_id,
-        "before_snapshot_sha256": args.expected_before_state_sha256,
-        "effect_set_sha256": args.expected_effect_set_sha256,
-        "database_logical_sha256": args.expected_database_logical_sha256,
-        "activation_sha256": args.expected_activation_sha256,
-        "active_release_binding_sha256": (
-            args.expected_active_release_binding_sha256
-        ),
-        "config_binding_sha256": args.expected_config_binding_sha256,
-        "live_env_sha256": args.expected_live_env_sha256,
-        "tool_provenance_sha256": args.expected_tool_provenance_sha256,
-    }
-    changed = [key for key, value in expected.items() if observed[key] != value]
-    if changed:
-        raise RuntimeError(
-            "pre_w3_effect_disposition_plan_changed:" + ",".join(changed)
-        )
-    if (
-        _pre_w3_effect_disposition_active_release_binding(config) != active_binding
-        or _circuit_reset_config_binding(DispatcherConfig.from_env())
-        != config_binding_sha256
-        or _circuit_reset_tool_provenance() != tool_provenance
-        or _pre_w3_effect_disposition_backup_binding(
-            args.backup,
-            args.backup_sha256,
-            source_path=config.control_db_path,
-            expected_snapshot=planned["before"],
-        )
-        != backup_binding
-    ):
-        raise RuntimeError("pre_w3_effect_disposition_external_binding_changed")
-    applied_audit, applied = store.quarantine_pre_w3_effects_with_audit(
-        audit=planned,
-        now=recorded_at,
-    )
-    try:
-        receipt_sha256 = _write_immutable_circuit_reset_receipt(
-            receipt_path,
-            applied_audit,
-            expected_parent_identity={
-                "device": planned["destination_binding"]["parent_device"],
-                "inode": planned["destination_binding"]["parent_inode"],
-            },
-        )
-    except Exception as exc:
-        raise PreW3EffectDispositionReceiptMaterializationError(
-            disposition_id=planned["disposition_id"],
-            receipt_path=receipt_path,
-            cause=exc,
-        ) from exc
-    print(json.dumps({
-        "ok": True,
-        "applied": applied,
-        "idempotent": not applied,
-        "command": PRE_W3_EFFECT_DISPOSITION_COMMAND,
-        "disposition_id": planned["disposition_id"],
-        "effect_keys": planned["effect_keys"],
-        "receipt": str(receipt_path),
-        "receipt_sha256": receipt_sha256,
-        "receipt_fingerprint": planned["receipt_fingerprint"],
-        "effect_delta": planned["effect_delta"],
-        "external_effects_triggered": False,
-        "provider_calls_performed": 0,
-    }, ensure_ascii=False, indent=2, sort_keys=True))
-    return 0
-
-
 def load_delivery_dispatcher_environment(
     env_file: str | Path | None = None,
 ) -> Path:
@@ -7308,9 +6602,22 @@ def main(argv: list[str] | None = None) -> int:
                 check_store = RcaDeliveryStore(
                     config.control_db_path,
                     require_current=True,
-                    read_only=True,
                     ensure_current_rows=False,
+                    allow_successor_write=True,
                 )
+                capability = _schema_runtime_capability(check_store)
+                if capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
+                    print(
+                        json.dumps(
+                            _successor_read_only_diagnostic(
+                                config,
+                                capability,
+                                operation="check_config",
+                            ),
+                            ensure_ascii=False,
+                        )
+                    )
+                    return 2
                 release_binding = validate_bound_resident_release(
                     check_store,
                     release_note_path=config.release_note_path,
@@ -7372,38 +6679,45 @@ def main(argv: list[str] | None = None) -> int:
     reset_mode = bool(
         args.clear_circuit
         or args.materialize_reset
-        or args.pre_w3_effect_keys
-        or args.materialize_pre_w3_disposition
     )
+    successor_store: RcaDeliveryStore | None = None
+    successor_capability: dict[str, Any] | None = None
     if config.enabled and not args.dry_run and not reset_mode:
         try:
             gate_store = RcaDeliveryStore(
                 config.control_db_path,
                 require_current=True,
-                read_only=True,
                 ensure_current_rows=False,
+                allow_successor_write=True,
             )
-            release_binding = validate_bound_resident_release(
-                gate_store,
-                release_note_path=config.release_note_path,
-                runtime_root=os.environ.get("PNC_LIVE_RUNTIME_ROOT", ""),
-                runtime_commit=os.environ.get("PNC_LIVE_RUNTIME_COMMIT", ""),
-                runtime_tree=os.environ.get("PNC_LIVE_RUNTIME_TREE", ""),
-                live_manifest_sha256=os.environ.get("PNC_LIVE_MANIFEST_SHA256", ""),
-                live_env_path=loaded_env_path,
-            )
-            config = replace(
-                config,
-                observation_release_id=release_binding["release_id"],
-                release_env_path=loaded_env_path,
-                resident_release_enforced=True,
-                release_id=release_binding["release_id"],
-                release_epoch_id=release_binding["epoch_id"],
-                release_fingerprint_sha256=release_binding[
-                    "release_fingerprint_sha256"
-                ],
-                release_note_sha256=release_binding["release_note_sha256"],
-            )
+            gate_capability = _schema_runtime_capability(gate_store)
+            if gate_capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
+                successor_store = gate_store
+                successor_capability = gate_capability
+            else:
+                release_binding = validate_bound_resident_release(
+                    gate_store,
+                    release_note_path=config.release_note_path,
+                    runtime_root=os.environ.get("PNC_LIVE_RUNTIME_ROOT", ""),
+                    runtime_commit=os.environ.get("PNC_LIVE_RUNTIME_COMMIT", ""),
+                    runtime_tree=os.environ.get("PNC_LIVE_RUNTIME_TREE", ""),
+                    live_manifest_sha256=os.environ.get(
+                        "PNC_LIVE_MANIFEST_SHA256", ""
+                    ),
+                    live_env_path=loaded_env_path,
+                )
+                config = replace(
+                    config,
+                    observation_release_id=release_binding["release_id"],
+                    release_env_path=loaded_env_path,
+                    resident_release_enforced=True,
+                    release_id=release_binding["release_id"],
+                    release_epoch_id=release_binding["epoch_id"],
+                    release_fingerprint_sha256=release_binding[
+                        "release_fingerprint_sha256"
+                    ],
+                    release_note_sha256=release_binding["release_note_sha256"],
+                )
         except (ExternalWriteFenceError, OSError, RuntimeError, sqlite3.Error) as exc:
             print(
                 json.dumps(
@@ -7416,50 +6730,53 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 2
-    try:
-        store = RcaDeliveryStore(
-            config.control_db_path,
-            require_current=True,
-            read_only=(reset_mode and not args.apply) or args.dry_run,
-            ensure_current_rows=not reset_mode and not args.dry_run,
-        )
-    except (OSError, RuntimeError, sqlite3.Error) as exc:
-        print(
-            json.dumps(
-                {"ok": False, "error": f"delivery_store_unavailable: {exc}"},
-                ensure_ascii=False,
-            )
-        )
-        return 2
-    if args.pre_w3_effect_keys or args.materialize_pre_w3_disposition:
+    if successor_store is not None:
+        store = successor_store
+        assert successor_capability is not None
+        capability = successor_capability
+    else:
         try:
-            return _run_pre_w3_effect_disposition_command(
-                args=args,
-                config=config,
-                store=store,
+            store = RcaDeliveryStore(
+                config.control_db_path,
+                require_current=True,
+                read_only=(reset_mode and not args.apply) or args.dry_run,
+                ensure_current_rows=not reset_mode and not args.dry_run,
+                allow_successor_read_only=(
+                    (reset_mode and not args.apply) or args.dry_run
+                ),
+                allow_successor_write=not (
+                    (reset_mode and not args.apply) or args.dry_run
+                ),
             )
-        except PreW3EffectDispositionReceiptMaterializationError as exc:
-            print(json.dumps({
-                "ok": False,
-                "error": type(exc).__name__,
-                "message": str(exc),
-                "recovery_required": True,
-                "disposition_id": exc.disposition_id,
-                "meta_key": exc.meta_key,
-                "receipt": str(exc.receipt_path),
-                "external_effects_triggered": False,
-                "provider_calls_performed": 0,
-            }, ensure_ascii=False))
+            capability = _schema_runtime_capability(store)
+        except (OSError, RuntimeError, sqlite3.Error) as exc:
+            print(
+                json.dumps(
+                    {"ok": False, "error": f"delivery_store_unavailable: {exc}"},
+                    ensure_ascii=False,
+                )
+            )
             return 2
-        except Exception as exc:
-            print(json.dumps({
-                "ok": False,
-                "error": type(exc).__name__,
-                "message": str(exc),
-                "external_effects_triggered": False,
-                "provider_calls_performed": 0,
-            }, ensure_ascii=False))
+    if capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
+        if args.dry_run:
+            print(
+                json.dumps(
+                    _successor_read_only_diagnostic(
+                        config,
+                        capability,
+                        operation="dry_run",
+                    ),
+                    ensure_ascii=False,
+                )
+            )
             return 2
+        if not reset_mode:
+            return run_successor_read_only_loop(
+                config,
+                store,
+                capability,
+                once=args.once,
+            )
     if args.clear_circuit or args.materialize_reset:
         try:
             return _run_circuit_reset_command(

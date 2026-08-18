@@ -20,6 +20,7 @@ from gateway.pnc_rca_conclusion_adjudication import (
     identifies_adjudication_effect,
     validate_adjudication_effect_claim,
 )
+from gateway.pnc_rca_control_store import RcaControlStore
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.pnc_group_binding import G1Q3_RCA_GROUP_ID
@@ -44,6 +45,10 @@ from scripts.pnc_rca_conclusion_adjudication_audit import (
     EXPECTED_DELIVERY_STORE_SCHEMA_VERSION,
     audit_conclusion_adjudications,
 )
+from tests.gateway.test_pnc_rca_control_store import (
+    _direct_steady_contract,
+    _migration_apply_kwargs,
+)
 
 
 # These hand-built delivery rows model the pre-W5 historical corpus.  New
@@ -54,12 +59,54 @@ ISSUE_ID = "7054691974"
 ORIGINAL_EFFECT_KEY = "g1q3-rca-effect-v1-" + "1" * 64
 
 
-def _seed_published_conclusion(tmp_path) -> RcaDeliveryStore:
-    store = RcaDeliveryStore(tmp_path / "control.sqlite3")
+def _seed_published_conclusion(
+    tmp_path,
+    *,
+    store: RcaDeliveryStore | None = None,
+    submission_key: str | None = None,
+    business_key: str | None = None,
+    generation: int = 7,
+    successor_write: bool = False,
+) -> RcaDeliveryStore:
+    if store is None:
+        db_path = tmp_path / "control.sqlite3"
+        control = RcaControlStore(db_path)
+        control.activate_direct_steady_epoch(
+            epoch_id="epoch-w16-active",
+            release_fingerprint_sha256="a" * 64,
+            release_note_sha256="b" * 64,
+            config_sha256="c" * 64,
+            db_logical_identity={"database": "conclusion-adjudication-test"},
+            partition_start_fence={},
+            operator="conclusion-adjudication-test",
+            reason="activate steady conclusion adjudication test runtime",
+            now=NOW,
+        )
+        if successor_write:
+            RcaDeliveryStore(db_path)
+            predecessor = control.direct_steady_predecessor()
+            assert predecessor is not None
+            contract = _direct_steady_contract(
+                predecessor=predecessor,
+                epoch_id="epoch-owner-review-v15",
+            )
+            RcaControlStore.migrate_v14_to_v15_and_activate(
+                db_path,
+                **_migration_apply_kwargs(contract),
+            )
+            store = RcaDeliveryStore(
+                db_path,
+                require_current=True,
+                allow_successor_write=True,
+            )
+        else:
+            store = RcaDeliveryStore(db_path)
+    else:
+        assert successor_write is False
     current = NOW.isoformat()
     delivery_id = "g1q3-rca-delivery-v1-" + "2" * 64
-    submission_key = "g1q3-rca-s1-" + "3" * 64
-    business_key = "g1q3-rca-b1-" + "4" * 64
+    submission_key = submission_key or ("g1q3-rca-s1-" + "3" * 64)
+    business_key = business_key or ("g1q3-rca-b1-" + "4" * 64)
     artifact_set_id = "g1q3-rca-artifact-v1-" + "5" * 64
     target_key = "g1q3-rca-target-v1-" + "6" * 64
     contract = {
@@ -113,47 +160,16 @@ def _seed_published_conclusion(tmp_path) -> RcaDeliveryStore:
     }
     with sqlite3.connect(store.db_path) as conn:
         conn.execute("PRAGMA foreign_keys=OFF")
-        conn.executescript(
-            """
-            CREATE TABLE rca_activation_epochs (
-                epoch_id TEXT PRIMARY KEY,
-                state TEXT NOT NULL,
-                is_current INTEGER NOT NULL
-            );
-            CREATE TABLE rca_activation_budget_slots (
-                epoch_id TEXT NOT NULL,
-                slot_kind TEXT NOT NULL,
-                consumed_ledger_id TEXT
-            );
-            CREATE TABLE rca_activation_admission_ledger (
-                ledger_id TEXT PRIMARY KEY,
-                epoch_id TEXT NOT NULL,
-                slot_kind TEXT NOT NULL,
-                decision TEXT NOT NULL,
-                bound_at TEXT,
-                business_key TEXT NOT NULL,
-                submission_key TEXT NOT NULL,
-                generation INTEGER NOT NULL
-            );
-            CREATE TABLE business_triggers (
-                business_key TEXT NOT NULL,
-                generation INTEGER NOT NULL,
-                activation_epoch_id TEXT,
-                activation_ledger_id TEXT
-            );
-            CREATE TABLE rca_outbox (
-                outbox_id INTEGER PRIMARY KEY,
-                business_key TEXT NOT NULL,
-                submission_key TEXT NOT NULL,
-                generation INTEGER NOT NULL,
-                activation_epoch_id TEXT,
-                activation_ledger_id TEXT
-            );
-            """
-        )
         conn.execute(
-            "INSERT INTO rca_activation_epochs(epoch_id, state, is_current) "
-            "VALUES('epoch-w16-active', 'bounded_active', 1)"
+            """
+            INSERT INTO business_triggers(
+                business_key, generation, submission_key,
+                creation_rule_version, work_item_id, project_key,
+                work_item_type_key, normalized_json, state, created_at
+            ) VALUES (?, ?, ?, 'conclusion-adjudication-fixture-v1', ?,
+                      't03o4q', 'issue', '{}', 'created', ?)
+            """,
+            (business_key, generation, submission_key, ISSUE_ID, current),
         )
         conn.execute(
             """
@@ -162,13 +178,14 @@ def _seed_published_conclusion(tmp_path) -> RcaDeliveryStore:
                 artifact_set_id, project_key, work_item_type_key, work_item_id,
                 target_key, issue_url, report_url, outcome, status,
                 manifest_json, contract_json, artifacts_json, created_at, updated_at
-            ) VALUES (?, ?, ?, 7, ?, 't03o4q', 'issue', ?, ?, ?, ?, 'success',
+            ) VALUES (?, ?, ?, ?, ?, 't03o4q', 'issue', ?, ?, ?, ?, 'success',
                       'delivered', ?, ?, '[]', ?, ?)
             """,
             (
                 delivery_id,
                 submission_key,
                 business_key,
+                generation,
                 artifact_set_id,
                 ISSUE_ID,
                 target_key,
@@ -223,6 +240,17 @@ def _add_published_conclusion(store: RcaDeliveryStore, issue_id: str) -> None:
     ).hexdigest()
     current = NOW.isoformat()
     with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO business_triggers(
+                business_key, generation, submission_key,
+                creation_rule_version, work_item_id, project_key,
+                work_item_type_key, normalized_json, state, created_at
+            ) VALUES (?, 7, ?, 'conclusion-adjudication-fixture-v1', ?,
+                      't03o4q', 'issue', '{}', 'created', ?)
+            """,
+            (business_key, submission_key, issue_id, current),
+        )
         template = conn.execute(
             "SELECT contract_json FROM rca_delivery_jobs LIMIT 1"
         ).fetchone()[0]
@@ -387,6 +415,34 @@ def _effect_attempt_snapshot(
             )
         ]
     return {"effect": effect, "attempts": attempts}
+
+
+def _force_rotate_activation_epoch(
+    store: RcaDeliveryStore,
+    *,
+    epoch_id: str,
+) -> dict:
+    retired_at = (NOW + timedelta(seconds=1)).isoformat()
+    with sqlite3.connect(store.db_path) as conn:
+        updated = conn.execute(
+            "UPDATE rca_activation_epochs "
+            "SET state = 'aborted', is_current = 0, aborted_at = ?, "
+            "superseded_at = ?, updated_at = ? "
+            "WHERE is_current = 1",
+            (retired_at, retired_at, retired_at),
+        )
+        assert updated.rowcount == 1
+    return RcaControlStore(store.db_path).activate_direct_steady_epoch(
+        epoch_id=epoch_id,
+        release_fingerprint_sha256="d" * 64,
+        release_note_sha256="e" * 64,
+        config_sha256="f" * 64,
+        db_logical_identity={"database": "conclusion-adjudication-rotation"},
+        partition_start_fence={},
+        operator="conclusion-adjudication-test",
+        reason="rotate conclusion adjudication test epoch",
+        now=NOW + timedelta(seconds=1),
+    )
 
 
 def _complete_artifact_repair(
@@ -809,7 +865,7 @@ def test_owner_group_batch_recognition_closes_five_item_queue(
         / "feishu_issue_kafka_rca"
     )
     control_dir.mkdir(parents=True)
-    store = _seed_published_conclusion(control_dir)
+    store = _seed_published_conclusion(control_dir, successor_write=True)
     issue_ids = (ISSUE_ID, "7054691975", "7054691976", "7054691977", "7054691978")
     for issue_id in issue_ids[1:]:
         _add_published_conclusion(store, issue_id)
@@ -868,7 +924,7 @@ def test_owner_group_correction_alias_reuses_medium_only_retraction(
         / "feishu_issue_kafka_rca"
     )
     control_dir.mkdir(parents=True)
-    store = _seed_published_conclusion(control_dir)
+    store = _seed_published_conclusion(control_dir, successor_write=True)
     monkeypatch.setenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", "ou_owner")
 
     result = handle_owner_review_message(
@@ -892,16 +948,15 @@ def test_owner_group_correction_alias_reuses_medium_only_retraction(
     ("epoch_mutation", "error"),
     [
         (
-            "DELETE FROM rca_activation_epochs",
+            "delete",
             "conclusion_adjudication_activation_unavailable",
         ),
         (
-            "UPDATE rca_activation_epochs SET state = 'inactive'",
+            "inactive",
             "conclusion_adjudication_activation_inactive",
         ),
         (
-            "INSERT INTO rca_activation_epochs VALUES "
-            "('epoch-w16-second', 'steady_active', 1)",
+            "ambiguous",
             "conclusion_adjudication_activation_ambiguous",
         ),
     ],
@@ -911,7 +966,29 @@ def test_retraction_requires_exactly_one_current_active_epoch(
 ):
     store = _seed_published_conclusion(tmp_path)
     with sqlite3.connect(store.db_path) as conn:
-        conn.execute(epoch_mutation)
+        if epoch_mutation == "delete":
+            conn.execute("DELETE FROM rca_activation_epochs")
+        elif epoch_mutation == "inactive":
+            conn.execute("UPDATE rca_activation_epochs SET state = 'confirmed'")
+        else:
+            conn.execute("DROP INDEX idx_rca_single_current_activation_epoch")
+            columns = [
+                str(row[1])
+                for row in conn.execute(
+                    "PRAGMA table_info(rca_activation_epochs)"
+                ).fetchall()
+            ]
+            row = conn.execute(
+                "SELECT * FROM rca_activation_epochs WHERE is_current = 1"
+            ).fetchone()
+            assert row is not None
+            values = list(row)
+            values[columns.index("epoch_id")] = "epoch-w16-second"
+            conn.execute(
+                f"INSERT INTO rca_activation_epochs({', '.join(columns)}) "
+                f"VALUES({', '.join('?' for _ in columns)})",
+                values,
+            )
 
     with pytest.raises(ConclusionAdjudicationError, match=error):
         _record_retraction(store)
@@ -930,15 +1007,7 @@ def test_epoch_rotation_after_claim_fails_before_remote_boundary(tmp_path):
         activation_required=False,
     )
     assert claim is not None
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_activation_epochs SET is_current = 0 "
-            "WHERE epoch_id = 'epoch-w16-active'"
-        )
-        conn.execute(
-            "INSERT INTO rca_activation_epochs VALUES "
-            "('epoch-w16-new', 'steady_active', 1)"
-        )
+    _force_rotate_activation_epoch(store, epoch_id="epoch-w16-new")
 
     with pytest.raises(
         ConclusionAdjudicationError,
@@ -957,15 +1026,7 @@ def test_dispatcher_epoch_rotation_after_claim_has_zero_effect_or_attempt_mutati
     real_validate = store.validate_adjudication_effect_binding
 
     def rotate_then_validate(*, claim, now):
-        with sqlite3.connect(store.db_path) as conn:
-            conn.execute(
-                "UPDATE rca_activation_epochs SET is_current = 0 "
-                "WHERE epoch_id = 'epoch-w16-active'"
-            )
-            conn.execute(
-                "INSERT INTO rca_activation_epochs VALUES "
-                "('epoch-w16-rotated', 'steady_active', 1)"
-            )
+        _force_rotate_activation_epoch(store, epoch_id="epoch-w16-rotated")
         frozen.update(
             _effect_attempt_snapshot(store, effect_key=result.correction_effect_key)
         )
@@ -1042,15 +1103,10 @@ def test_epoch_rotation_after_successful_remote_gate_fences_next_local_mutation(
         )
         if after_outward_boundary and not frozen:
             assert outcome is None
-            with sqlite3.connect(store.db_path) as conn:
-                conn.execute(
-                    "UPDATE rca_activation_epochs SET is_current = 0 "
-                    "WHERE epoch_id = 'epoch-w16-active'"
-                )
-                conn.execute(
-                    "INSERT INTO rca_activation_epochs VALUES "
-                    "('epoch-w16-after-gate', 'steady_active', 1)"
-                )
+            _force_rotate_activation_epoch(
+                store,
+                epoch_id="epoch-w16-after-gate",
+            )
             frozen.update(
                 _effect_attempt_snapshot(
                     store,
@@ -1578,6 +1634,8 @@ def test_post_cutoff_retract_correction_uses_current_w3_w5_fence(tmp_path):
             "activation_epoch_id": "epoch-w16-active",
             "activation_ledger_id": 7,
             "decision": "admit",
+            "reason": "activation_steady_active",
+            "state": "steady_active",
             "legacy_unconfigured": False,
         },
     }
@@ -1606,22 +1664,25 @@ def test_post_cutoff_retract_correction_uses_current_w3_w5_fence(tmp_path):
     }
     with sqlite3.connect(store.db_path) as conn:
         conn.execute(
-            "ALTER TABLE rca_activation_admission_ledger "
-            "ADD COLUMN admission_key TEXT"
-        )
-        conn.execute(
             """
             INSERT INTO rca_activation_admission_ledger(
-                ledger_id, epoch_id, admission_key, slot_kind, decision,
-                bound_at, business_key, submission_key, generation
+                ledger_id, epoch_id, admission_key, entrypoint, source_kind,
+                source_identity_sha256, decision, reason, business_key,
+                submission_key, generation, adjudication_count,
+                first_adjudicated_at, last_adjudicated_at, admitted_at, bound_at
             ) VALUES(7, 'epoch-w16-active', 'admission-w16-current',
-                     'manual_success', 'admit', ?, ?, ?, ?)
+                     'kafka_ingest', 'kafka', ?, 'admit',
+                     'activation_steady_active', ?, ?, ?, 1, ?, ?, ?, ?)
             """,
             (
-                fence_issued_at.isoformat(),
+                "e" * 64,
                 job["business_key"],
                 job["submission_key"],
                 job["generation"],
+                fence_issued_at.isoformat(),
+                fence_issued_at.isoformat(),
+                fence_issued_at.isoformat(),
+                fence_issued_at.isoformat(),
             ),
         )
         # This test uses a small, exact projection of the immutable W3 rows.
@@ -1629,6 +1690,8 @@ def test_post_cutoff_retract_correction_uses_current_w3_w5_fence(tmp_path):
         # effect; hand-built historical fixtures do not contain them.
         conn.executescript(
             """
+            DROP TABLE rca_snapshot_source_envelopes;
+            DROP TABLE rca_admission_snapshots;
             CREATE TABLE rca_admission_snapshots(
                 snapshot_sha256 TEXT,
                 snapshot_id TEXT,
@@ -1730,8 +1793,8 @@ def test_post_cutoff_retract_correction_uses_current_w3_w5_fence(tmp_path):
                 "epoch-w16-active",
                 7,
                 "admit",
-                "activation_bounded_slot_consumed",
-                "bounded_active",
+                "activation_steady_active",
+                "steady_active",
                 0,
                 source_envelope["source_envelope_sha256"],
                 source_envelope["source_authority_sha256"],
@@ -2027,15 +2090,10 @@ def test_consumed_comment_token_blocks_field_rewrite_after_epoch_rotates_on_read
     def get_fields(_project_key, _work_item_id, field_keys):
         calls["get"] += 1
         if calls["get"] == 3:
-            with sqlite3.connect(store.db_path) as conn:
-                conn.execute(
-                    "UPDATE rca_activation_epochs SET is_current = 0 "
-                    "WHERE epoch_id = 'epoch-w16-active'"
-                )
-                conn.execute(
-                    "INSERT INTO rca_activation_epochs VALUES "
-                    "('epoch-w16-rotated', 'steady_active', 1)"
-                )
+            _force_rotate_activation_epoch(
+                store,
+                epoch_id="epoch-w16-rotated",
+            )
             frozen.update(
                 _effect_attempt_snapshot(
                     store,
@@ -2175,7 +2233,7 @@ def test_unknown_field_update_is_never_repeated_on_adjudication_retry(
         [epoch] = conn.execute(
             "SELECT epoch_id, state, is_current FROM rca_activation_epochs"
         ).fetchall()
-    assert epoch == ("epoch-w16-active", "bounded_active", 1)
+    assert epoch == ("epoch-w16-active", "steady_active", 1)
 
 
 def test_definite_field_prewrite_failure_can_retry_normally(tmp_path):
@@ -2293,7 +2351,7 @@ def test_owner_review_retract_command_uses_shared_adjudication_entrypoint(
         tmp_path / "runtime" / "pnc_agent" / "feishu_issue_kafka_rca"
     )
     db_parent.mkdir(parents=True)
-    store = _seed_published_conclusion(db_parent)
+    store = _seed_published_conclusion(db_parent, successor_write=True)
     monkeypatch.setenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", "ou_owner")
     event = MessageEvent(
         text=f"rca 撤回 {ISSUE_ID} evaluator 归属有误",
@@ -2840,14 +2898,7 @@ def test_audit_keeps_succeeded_correction_valid_after_epoch_rotation(tmp_path):
             "WHERE effect_key = ?",
             (NOW.isoformat(), result.correction_effect_key),
         )
-        conn.execute(
-            "UPDATE rca_activation_epochs SET is_current = 0 "
-            "WHERE epoch_id = 'epoch-w16-active'"
-        )
-        conn.execute(
-            "INSERT INTO rca_activation_epochs VALUES "
-            "('epoch-w16-new', 'steady_active', 1)"
-        )
+    _force_rotate_activation_epoch(store, epoch_id="epoch-w16-new")
     with sqlite3.connect(store.db_path) as conn:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
@@ -2862,15 +2913,7 @@ def test_audit_rejects_unresolved_correction_after_epoch_rotation(tmp_path):
     store = _seed_published_conclusion(tmp_path)
     result = _record_retraction(store)
     _complete_artifact_repair(store, tmp_path, result)
-    with sqlite3.connect(store.db_path) as conn:
-        conn.execute(
-            "UPDATE rca_activation_epochs SET is_current = 0 "
-            "WHERE epoch_id = 'epoch-w16-active'"
-        )
-        conn.execute(
-            "INSERT INTO rca_activation_epochs VALUES "
-            "('epoch-w16-new', 'steady_active', 1)"
-        )
+    _force_rotate_activation_epoch(store, epoch_id="epoch-w16-new")
     with sqlite3.connect(store.db_path) as conn:
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
@@ -2888,7 +2931,7 @@ def test_owner_command_failure_after_enqueue_is_consumed_not_fallen_through(
         tmp_path / "runtime" / "pnc_agent" / "feishu_issue_kafka_rca"
     )
     db_parent.mkdir(parents=True)
-    store = _seed_published_conclusion(db_parent)
+    store = _seed_published_conclusion(db_parent, successor_write=True)
     monkeypatch.setenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", "ou_owner")
 
     def injected_ledger_failure(**_kwargs):
@@ -2934,7 +2977,7 @@ def test_owner_command_retry_repairs_postcommit_artifacts_once(
         tmp_path / "runtime" / "pnc_agent" / "feishu_issue_kafka_rca"
     )
     db_parent.mkdir(parents=True)
-    store = _seed_published_conclusion(db_parent)
+    store = _seed_published_conclusion(db_parent, successor_write=True)
     monkeypatch.setenv("HERMES_G1Q3_REVIEW_OWNER_USER_IDS", "ou_owner")
     real_write_sidecar = owner_review_module._write_business_state_sidecar
     calls = 0
