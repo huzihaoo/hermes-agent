@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import copy
+import fcntl
 import hashlib
 import hmac
 import json
@@ -10,6 +12,7 @@ import os
 import re
 import secrets
 import shlex
+import stat
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -39,6 +42,132 @@ MAX_MCAP_PROCESS_COUNT = 2
 MAX_CONCURRENCY = 4
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+HISTORICAL_REQUEST_SCHEMA = "g1q3-rca-historical-full-rerun-request/v2"
+HISTORICAL_PLAN_SCHEMA = "g1q3_rca_historical_full_chain_plan_v4"
+HISTORICAL_SHARD_PLAN_SCHEMA = "g1q3_rca_historical_shard_plan_v1"
+HISTORICAL_SELF_SEAL_SCHEMA = "g1q3_rca_canonical_self_seal_v1"
+HISTORICAL_BOOTSTRAP_SCHEMA = "g1q3-rca-prod-bootstrap/v1"
+HISTORICAL_LEDGER_SCHEMA = "g1q3-rca-global-evaluation-lane-ledger/v1"
+HISTORICAL_RESERVATION_SCHEMA = "g1q3-rca-evaluation-lane-reservation/v1"
+HISTORICAL_PREPARE = "/home/mini/data3/yj-evaluation-server/api/g1q3_rca/scripts/prepare_historical_full_chain.py"
+HISTORICAL_RUNNER = "api/g1q3_rca/scripts/run_historical_full_chain_batch.py"
+HISTORICAL_FROZEN_SOURCE_ROOT = Path("/home/mini/.local/state/g1q3-rca-frozen-source")
+HISTORICAL_HOST_TMP_ROOT = Path.home() / "Mounts/department-pnc_team-planning_algo-driving/tmp"
+HISTORICAL_STATE_ROOT = Path.home() / ".hermes/runtime/rca-prod/historical-full-rerun"
+HISTORICAL_REQUEST_FIELDS = frozenset({
+    "schema_version", "request_id", "owner", "remote_commit", "remote_tree",
+    "canonical_input_raw_sha256", "selection_raw_sha256",
+    "selection_identity_raw_sha256", "review_disposition_raw_sha256",
+    "ready_index_raw_sha256", "requirements_contract_hash",
+    "evaluator_fingerprints_sha256", "suite_receipt_sha256",
+    "w17_receipt_sha256",
+})
+HISTORICAL_RESERVATION_FIELDS = frozenset({
+    "schema_version", "receipt_id", "reservation_id", "ledger_sequence",
+    "task_id", "plan_sha256", "lane_count", "started_at",
+    "lease_expires_at", "observed_global_peak",
+    "max_global_evaluation_lanes", "queue_if_blocked",
+})
+HISTORICAL_FINAL_SEAL_SCHEMA = "g1q3_rca_historical_execution_final_seal_v3"
+HISTORICAL_FINAL_SEAL_FIELDS = frozenset({
+    "schema_version", "execution_manifest_sha256",
+    "execution_manifest_semantic_sha256", "run_identity", "source_identity",
+    "contract_identity", "input_identity", "authority_provenance", "scheduler",
+    "shards_semantic_sha256", "sealed_at", "item_count", "terminal_complete",
+    "all_pass", "ordered_work_item_ids_sha256",
+    "manifest_items_semantic_sha256", "self_seal",
+})
+HISTORICAL_SUCCESSOR_RELEASE_FIELDS = frozenset({
+    "source_commit", "source_tree", "requirements_contract_hash",
+    "evaluator_fingerprints", "evaluator_fingerprints_sha256",
+    "evaluator_version", "suite_receipt_path", "suite_receipt_sha256",
+    "w17_receipt_path", "w17_receipt_sha256",
+})
+HISTORICAL_MAX_CONTROL_BYTES = 16 * 1024 * 1024
+HISTORICAL_BOOTSTRAP_FIELDS = frozenset({
+    "schema_version", "receipt_id", "reservation_id", "issued_at",
+    "expires_at", "decision", "owner", "one_use", "bindings",
+    "receipt_fingerprint", "hmac_sha256",
+})
+HISTORICAL_BOOTSTRAP_BINDINGS = frozenset({
+    "request_sha256", "plan_sha256", "task_id", "host_reservation_path",
+    "max_global_evaluation_lanes", "queue_if_blocked",
+})
+HISTORICAL_LANES = 3
+HISTORICAL_ITEMS = 308
+HISTORICAL_SHARD_COUNTS = (103, 103, 102)
+HISTORICAL_BOOTSTRAP_TTL_SECONDS = 300
+HISTORICAL_LEASE_SECONDS = 24 * 60 * 60
+HISTORICAL_INPUT_CONTRACT = {
+    "canonical_input": {
+        "path": "/mnt/tmp/g1q3-dev-batch-tree-v5-202608151015/plan/blind-request-batch.json",
+        "raw_sha256": "6fbc884ff5f443c6af09bfac05fd0782f05254df8d3a39208ee705ce87f3797e",
+        "semantic_sha256": "656e1696e3ac6ebca8dbefed84e30d5db7d5e134d5e5babc87d920d7398e6c92", "item_count": 308,
+        "ordered_work_item_ids_sha256": "d93b1479dc5714cda3febaf723a9aa59b1e9338e1d478cf28c9fa5562a126a46",
+    },
+    "selection": {
+        "path": "/mnt/tmp/g1q3-rca-recovery-20260812/public-handoff/vm-b-selection-receipt-apply-v1/artifacts/goal312-selection.json",
+        "raw_sha256": "7a5679d3c35609c025e96ad84c8222336b4bb2126840cda42c947e697cd93a23",
+        "semantic_sha256": "d840920a6fb7aef9f236a492af6ebfc3f2e00d991cdcc095c813a2ee256d64ad", "item_count": 312,
+    },
+    "selection_identity": {
+        "path": "/mnt/tmp/g1q3-rca-recovery-20260812/public-handoff/vm-b-selection-receipt-apply-v1/artifacts/selection-identity.json",
+        "raw_sha256": "5343fa15d4752e308e0d27bf520431e6c8656540c15d214c672fcab12cc141ee",
+        "semantic_sha256": "82a18d89e8c252efc8e25310a84cc7b0394898aa252c1d175866912a14bf8c89",
+    },
+    "review_disposition": {
+        "path": "/mnt/tmp/g1q3-rca-recovery-20260812/public-handoff/vm-b-selection-receipt-apply-v1/artifacts/selected-review-disposition-v1.json",
+        "raw_sha256": "0fc7cf077148be4543ac066f137e8773a683deb4d81b14db9a87baae1cb204fd",
+        "semantic_sha256": "aa7bbc3a01154492010aa622b897873170b9ebcc6e7d3073b29523d647a26f21", "item_count": 4,
+        "review_ids": ["7058360591", "7058414896", "7058468189", "7058476613"],
+    },
+    "ready_index": {
+        "path": "/mnt/tmp/g1q3-rca-recovery-20260812/public-handoff/vm-b-selection-receipt-apply-v1-rerun/final-artifacts/selected-ready-index.jsonl",
+        "raw_sha256": "26b5f05d7653c61703b53272585c7e83dd3292e9c65c0dd6396116cccad5428a",
+        "semantic_sha256": "fcfa89ba160958c876f75ff81d8885139ecc87f66ac26442ecc4bb5cab20f40e", "item_count": 308,
+        "ordered_work_item_ids_sha256": "6862bb376bdf1fccb68810c041f2406384b5df24cc03d1d925cce74149cfb581",
+    },
+}
+HISTORICAL_EXECUTION_POLICY = {
+    "resource_class": "rca_prod", "max_lanes": 3, "workers_per_shard": 1,
+    "queue_if_blocked": False, "input_materialization": "forbidden",
+    "raw_s3b_fallback": False, "allow_feishu_writeback": False,
+    "allow_live_database_write": False, "allow_runtime_activation": False,
+}
+HISTORICAL_BUDGETS = {
+    "s2_max_clips_per_case": 16, "s2_max_messages_per_case": 1_000_000,
+    "s2_max_scanned_messages_per_case": 1_000_000,
+    "s2_timeout_seconds_per_case": 300, "s2_output_bytes_per_case": 749_000_000,
+    "s2_output_bytes_per_shard": 80_000_000_000,
+    "backing_output_bytes_per_shard": 80_000_000_000,
+    "decoder_output_bytes_per_case": 512 * 1024 * 1024,
+    "decoder_output_bytes_per_shard": 80_000_000_000,
+    "run_output_bytes": 750_000_000_000,
+    "free_space_admission_bytes": 800_000_000_000,
+}
+# Server-owned successor projection. Request payloads may repeat these pins,
+# but cannot select a different evaluator/source identity.
+HISTORICAL_SUCCESSOR_RELEASE: Mapping[str, Any] | None = {
+    "source_commit": "a64fa62b813ad6af0cb77537ba9b78e8c9defd11",
+    "source_tree": "c59ee37966b5afe3ff5eb0bc1ce51992aeae0214",
+    "requirements_contract_hash": "ca99f759c70b72b0836f956557ecc5e23c11538132b13f1d1bfe8a46ce7e6cb6",
+    "evaluator_fingerprints": {
+        "g1q3_rca/aeb_signal_parser.py": "fa227f22a684f2a4b0808fefe0d596a032c3a582e1571f67ede7937d5894e3d3",
+        "g1q3_rca/rca_evaluators/_raw_streams.py": "afba29499b1f02e0d477bee4ca07d76b5f482c910e9bee00e5341930e32b2729",
+        "g1q3_rca/rca_evaluators/acc_debug_spec.py": "a6eaf30252cf8f93843cfa24d69c29672b2334cedf81c482775554cc04028fc9",
+        "g1q3_rca/report_builder.py": "71ec50b43ae95b21029ed1f953e81e65e1f87c1de654d2c8500463b1759a953d",
+        "g1q3_rca/scripts/check_case_gate.py": "918be3270ef7cf2370b371abc20e05a4e4cbc65c2e086ffc926ab3fa1f318cd4",
+        "g1q3_rca/signal_access.py": "7da6555018c9c3c5e21e6eefddf5dcb1d74003036945387297cb6c16feb9297d",
+        "g1q3_rca/signal_registry.py": "ffd0a796c027df1d81e30a1727eea1d37ccfcd0c5b88a806a201a0c8f3d54f17",
+    },
+    "evaluator_fingerprints_sha256": "e492eaa8afd9348990cb2de265575211ff248fdebacd0fff72b2f7bafe7f18c0",
+    "evaluator_version": "g1q3_rca_evaluator_scope_v6",
+    "suite_receipt_path": "/mnt/tmp/g1q3-successor-full-v5-run3-20260818/suite-receipt.json",
+    "suite_receipt_sha256": "829cbf498f9d141f3548afba818504fb8e1d37fe80897161aba8bf5a73f32e11",
+    "w17_receipt_path": "/mnt/tmp/g1q3-successor-full-v5-run3-20260818/w17-receipt.json",
+    "w17_receipt_sha256": "bf18fac5ae8e65dee6d58dba457c4708f763e7bbcd42b9fc7e6de17e4c220ecb",
+}
 
 RECEIPT_FIELDS = {
     "schema_version", "receipt_id", "issued_at", "expires_at", "decision",
@@ -82,6 +211,21 @@ class RcaProdAdmission:
     receipt: dict[str, Any]
     meta: dict[str, Any]
     key_fingerprint: str
+
+
+@dataclass(frozen=True)
+class HistoricalFullRerunPlan:
+    request: dict[str, Any]
+    request_sha256: str
+    plan: dict[str, Any]
+    plan_bytes: bytes
+    plan_sha256: str
+    task_id: str
+    task_root: Path
+    plan_path: Path
+    output_root: Path
+    host_reservation_path: Path
+    shard_artifacts: tuple[tuple[Path, bytes], ...]
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -581,3 +725,669 @@ def validate_existing_rca_prod_meta(
         now=now,
         allow_historical=True,
     )
+
+
+def _seal_historical_document(payload: Mapping[str, Any]) -> tuple[dict[str, Any], bytes]:
+    document = copy.deepcopy(dict(payload))
+    document["self_seal"] = {
+        "schema_version": HISTORICAL_SELF_SEAL_SCHEMA,
+        "algorithm": "sha256",
+        "canonicalization": "json-sort-keys-compact-utf8-newline/v1",
+        "scope": "document_with_self_seal_sha256_empty",
+        "artifact_size_bytes": 0,
+        "sha256": "",
+    }
+    for _ in range(24):
+        projection = copy.deepcopy(document)
+        projection["self_seal"]["sha256"] = ""
+        document["self_seal"]["sha256"] = hashlib.sha256(
+            canonical_bytes(projection) + b"\n"
+        ).hexdigest()
+        data = canonical_bytes(document) + b"\n"
+        if document["self_seal"]["artifact_size_bytes"] == len(data):
+            return document, data
+        document["self_seal"]["artifact_size_bytes"] = len(data)
+    raise RcaProdAdmissionError("rca_historical_self_seal_unstable", retryable=False)
+
+
+def _read_historical_canonical_json(path: Path, label: str) -> tuple[dict[str, Any], bytes]:
+    try:
+        before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+            or before.st_size <= 0 or before.st_size > HISTORICAL_MAX_CONTROL_BYTES
+        ):
+            raise RcaProdAdmissionError(
+                "rca_historical_%s_identity_invalid" % label, retryable=False
+            )
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(fd)
+            if (
+                (opened.st_dev, opened.st_ino, opened.st_size)
+                != (before.st_dev, before.st_ino, before.st_size)
+                or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+            ):
+                raise RcaProdAdmissionError(
+                    "rca_historical_%s_identity_invalid" % label, retryable=False
+                )
+            chunks, remaining = [], opened.st_size
+            while remaining:
+                chunk = os.read(fd, min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(fd)
+        finally:
+            os.close(fd)
+    except RcaProdAdmissionError:
+        raise
+    except OSError as exc:
+        raise RcaProdAdmissionError(
+            "rca_historical_%s_unavailable" % label, retryable=True
+        ) from exc
+    data = b"".join(chunks)
+    if (
+        remaining != 0
+        or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+    ):
+        raise RcaProdAdmissionError(
+            "rca_historical_%s_identity_invalid" % label, retryable=False
+        )
+    try:
+        value = _strict_json_loads(data.decode("utf-8"))
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise RcaProdAdmissionError(
+            "rca_historical_%s_schema_invalid" % label, retryable=False
+        ) from exc
+    if not isinstance(value, dict) or data != canonical_bytes(value) + b"\n":
+        raise RcaProdAdmissionError(
+            "rca_historical_%s_schema_invalid" % label, retryable=False
+        )
+    return value, data
+
+
+def _historical_successor_release() -> Mapping[str, Any]:
+    value = HISTORICAL_SUCCESSOR_RELEASE
+    if not isinstance(value, Mapping) or set(value) != HISTORICAL_SUCCESSOR_RELEASE_FIELDS:
+        raise RcaProdAdmissionError("rca_historical_successor_release_not_configured", retryable=False)
+    fingerprints = value.get("evaluator_fingerprints")
+    if (
+        not isinstance(fingerprints, Mapping) or not fingerprints
+        or any(
+            not isinstance(key, str) or not key
+            or re.fullmatch(r"[0-9a-f]{64}", str(item or "")) is None
+            for key, item in fingerprints.items()
+        )
+        or not isinstance(value.get("evaluator_version"), str)
+        or not value["evaluator_version"]
+        or sha256_value(fingerprints) != value.get("evaluator_fingerprints_sha256")
+    ):
+        raise RcaProdAdmissionError("rca_historical_successor_release_invalid", retryable=False)
+    for field in (
+        "requirements_contract_hash", "evaluator_fingerprints_sha256",
+        "suite_receipt_sha256", "w17_receipt_sha256",
+    ):
+        _require_hex(value.get(field), "rca_historical_successor_release_invalid")
+    for field in ("source_commit", "source_tree"):
+        object_id = str(value.get(field) or "")
+        if len(object_id) not in {40, 64} or re.fullmatch(r"[0-9a-f]+", object_id) is None:
+            raise RcaProdAdmissionError("rca_historical_successor_release_invalid", retryable=False)
+    if len(str(value["source_commit"])) != len(str(value["source_tree"])):
+        raise RcaProdAdmissionError("rca_historical_successor_release_invalid", retryable=False)
+    for field in ("suite_receipt_path", "w17_receipt_path"):
+        path = Path(str(value.get(field) or ""))
+        try:
+            path.relative_to("/mnt/tmp")
+        except ValueError as exc:
+            raise RcaProdAdmissionError("rca_historical_successor_release_invalid", retryable=False) from exc
+        if not path.is_absolute():
+            raise RcaProdAdmissionError("rca_historical_successor_release_invalid", retryable=False)
+    return value
+
+
+def _historical_ready_ids(host_tmp_root: Path) -> list[str]:
+    reference = HISTORICAL_INPUT_CONTRACT["ready_index"]
+    vm_path = Path(reference["path"])
+    try:
+        host_path = host_tmp_root / vm_path.relative_to("/mnt/tmp")
+        data = host_path.read_bytes()
+        rows = [
+            _strict_json_loads(line.decode("utf-8"))
+            for line in data.splitlines()
+        ]
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise RcaProdAdmissionError("rca_historical_ready_index_unavailable", retryable=True) from exc
+    ids = [row.get("work_item_id") if isinstance(row, Mapping) else None for row in rows]
+    if (
+        not data.endswith(b"\n")
+        or hashlib.sha256(data).hexdigest() != reference["raw_sha256"]
+        or sha256_value(rows) != reference["semantic_sha256"]
+        or len(ids) != HISTORICAL_ITEMS
+        or len(set(ids)) != HISTORICAL_ITEMS
+        or any(not isinstance(item, str) or re.fullmatch(r"[0-9]{10}", item) is None for item in ids)
+        or sha256_value(ids) != reference["ordered_work_item_ids_sha256"]
+    ):
+        raise RcaProdAdmissionError("rca_historical_ready_index_invalid", retryable=False)
+    return ids
+
+
+def build_historical_full_rerun_plan(
+    request: Any, *, expected_request_sha256: str
+) -> HistoricalFullRerunPlan:
+    if not isinstance(request, Mapping) or set(request) != HISTORICAL_REQUEST_FIELDS:
+        raise RcaProdAdmissionError("rca_historical_request_schema_invalid", retryable=False)
+    value = dict(request)
+    if value.get("schema_version") != HISTORICAL_REQUEST_SCHEMA:
+        raise RcaProdAdmissionError("rca_historical_request_schema_invalid", retryable=False)
+    request_id = str(value.get("request_id") or "")
+    owner = str(value.get("owner") or "")
+    if not TASK_ID_RE.fullmatch(request_id) or not owner or owner != owner.strip():
+        raise RcaProdAdmissionError("rca_historical_request_identity_invalid", retryable=False)
+    value["request_id"], value["owner"] = request_id, owner
+    for field in ("remote_commit", "remote_tree"):
+        object_id = str(value.get(field) or "").lower()
+        if len(object_id) not in {40, 64} or re.fullmatch(r"[0-9a-f]+", object_id) is None:
+            raise RcaProdAdmissionError("rca_historical_source_identity_invalid", retryable=False)
+        value[field] = object_id
+    if len(value["remote_commit"]) != len(value["remote_tree"]):
+        raise RcaProdAdmissionError("rca_historical_source_identity_invalid", retryable=False)
+    for field in (
+        "canonical_input_raw_sha256", "selection_raw_sha256",
+        "selection_identity_raw_sha256", "review_disposition_raw_sha256",
+        "ready_index_raw_sha256", "requirements_contract_hash",
+        "evaluator_fingerprints_sha256", "suite_receipt_sha256",
+        "w17_receipt_sha256",
+    ):
+        value[field] = _require_hex(value.get(field), "rca_historical_request_identity_invalid")
+    raw_pins = {
+        "canonical_input_raw_sha256": "canonical_input",
+        "selection_raw_sha256": "selection",
+        "selection_identity_raw_sha256": "selection_identity",
+        "review_disposition_raw_sha256": "review_disposition",
+        "ready_index_raw_sha256": "ready_index",
+    }
+    if any(
+        value[field] != HISTORICAL_INPUT_CONTRACT[label]["raw_sha256"]
+        for field, label in raw_pins.items()
+    ):
+        raise RcaProdAdmissionError("rca_historical_input_pin_mismatch", retryable=False)
+    release = _historical_successor_release()
+    fingerprints = dict(release["evaluator_fingerprints"])
+    release_bindings = {
+        "remote_commit": release["source_commit"],
+        "remote_tree": release["source_tree"],
+        "requirements_contract_hash": release["requirements_contract_hash"],
+        "evaluator_fingerprints_sha256": release["evaluator_fingerprints_sha256"],
+        "suite_receipt_sha256": release["suite_receipt_sha256"],
+        "w17_receipt_sha256": release["w17_receipt_sha256"],
+    }
+    if any(value[field] != expected for field, expected in release_bindings.items()):
+        raise RcaProdAdmissionError(
+            "rca_historical_successor_identity_mismatch", retryable=False
+        )
+    request_sha256 = sha256_value(value)
+    if request_sha256 != _require_hex(expected_request_sha256, "rca_historical_request_hash_invalid"):
+        raise RcaProdAdmissionError("rca_historical_request_hash_mismatch", retryable=False)
+    task_id = "g1q3-rca-full308-" + request_sha256[:32]
+    task_root = Path("/mnt/tmp") / task_id
+    plan_path = task_root / "control/historical-full-chain-plan.json"
+    reservation_path = task_root / "control/host-lane-reservation.json"
+    plan_id = "plan-" + request_sha256[:32]
+    ready_ids = _historical_ready_ids(HISTORICAL_HOST_TMP_ROOT)
+    shards, shard_artifacts, offset = [], [], 0
+    for index, count in enumerate(HISTORICAL_SHARD_COUNTS, 1):
+        ids = ready_ids[offset:offset + count]
+        offset += count
+        shard_id = "shard-%03d" % index
+        shard_path = task_root / "control/shards" / shard_id / "shard-manifest.json"
+        shard, shard_data = _seal_historical_document({
+            "schema_version": HISTORICAL_SHARD_PLAN_SCHEMA,
+            "plan_id": plan_id,
+            "shard_id": shard_id,
+            "item_count": count,
+            "ordered_work_item_ids": ids,
+            "ordered_work_item_ids_sha256": sha256_value(ids),
+        })
+        shard_artifacts.append((shard_path, shard_data))
+        shards.append({
+            "shard_id": shard_id, "path": str(shard_path),
+            "raw_sha256": hashlib.sha256(shard_data).hexdigest(),
+            "semantic_sha256": sha256_value(shard), "item_count": count,
+            "ordered_work_item_ids_sha256": sha256_value(ids),
+        })
+    plan = {
+        "schema_version": HISTORICAL_PLAN_SCHEMA,
+        "plan_id": plan_id,
+        "task_id": task_id,
+        "run_id": "run-" + request_sha256[:32],
+        "attempt_id": "attempt-" + request_sha256[32:56],
+        "output_root": str(task_root),
+        "source": {"commit": value["remote_commit"], "tree": value["remote_tree"]},
+        "canonical_input": dict(HISTORICAL_INPUT_CONTRACT["canonical_input"]),
+        "selection": dict(HISTORICAL_INPUT_CONTRACT["selection"]),
+        "selection_identity": dict(HISTORICAL_INPUT_CONTRACT["selection_identity"]),
+        "review_disposition": copy.deepcopy(HISTORICAL_INPUT_CONTRACT["review_disposition"]),
+        "ready_index": dict(HISTORICAL_INPUT_CONTRACT["ready_index"]),
+        "requirements_contract_hash": value["requirements_contract_hash"],
+        "evaluator_fingerprints": fingerprints,
+        "evaluator_fingerprints_sha256": value["evaluator_fingerprints_sha256"],
+        "evaluator_version": release["evaluator_version"],
+        "release_evidence": {
+            "suite": {
+                "path": str(release["suite_receipt_path"]),
+                "raw_sha256": release["suite_receipt_sha256"],
+                "source_commit": release["source_commit"],
+                "source_tree": release["source_tree"],
+            },
+            "w17": {
+                "path": str(release["w17_receipt_path"]),
+                "raw_sha256": release["w17_receipt_sha256"],
+                "source_commit": release["source_commit"],
+                "source_tree": release["source_tree"],
+            },
+        },
+        "host_reservation": {
+            "schema_version": HISTORICAL_RESERVATION_SCHEMA,
+            "path": str(reservation_path),
+            "max_global_evaluation_lanes": 3,
+        },
+        "execution_policy": dict(HISTORICAL_EXECUTION_POLICY),
+        "budgets": dict(HISTORICAL_BUDGETS),
+        "shards": shards,
+    }
+    plan, plan_bytes = _seal_historical_document(plan)
+    return HistoricalFullRerunPlan(
+        value, request_sha256, plan, plan_bytes, hashlib.sha256(plan_bytes).hexdigest(),
+        task_id, task_root, plan_path, task_root, reservation_path,
+        tuple(shard_artifacts),
+    )
+
+
+def build_historical_full_rerun_execute_argv(plan: HistoricalFullRerunPlan) -> list[str]:
+    return [
+        "/usr/bin/python3.8", "-B", HISTORICAL_PREPARE, "execute",
+        "--plan", str(plan.plan_path), "--plan-sha256", plan.plan_sha256,
+    ]
+
+
+def build_historical_full_rerun_verify_argv(
+    plan: HistoricalFullRerunPlan, *, full_chain_output_seal_sha256: str
+) -> list[str]:
+    seal = _require_hex(full_chain_output_seal_sha256, "rca_historical_final_seal_invalid")
+    runner = (
+        HISTORICAL_FROZEN_SOURCE_ROOT / plan.task_id / "root" / HISTORICAL_RUNNER
+    )
+    return [
+        "/usr/bin/python3.8", "-B", str(runner), "verify",
+        "--run-root", str(plan.output_root),
+        "--final-execution-seal-sha256", seal,
+    ]
+
+
+def derive_historical_result_binding(
+    plan: HistoricalFullRerunPlan, *, host_tmp_root: Path | None = None,
+) -> dict[str, str]:
+    root = (host_tmp_root or HISTORICAL_HOST_TMP_ROOT) / plan.task_id
+    final, final_raw = _read_historical_canonical_json(
+        root / "final/execution-final-seal.json", "final_seal"
+    )
+    if set(final) != HISTORICAL_FINAL_SEAL_FIELDS:
+        raise RcaProdAdmissionError(
+            "rca_historical_final_seal_schema_invalid", retryable=False
+        )
+    run_identity = final.get("run_identity")
+    if (
+        final.get("schema_version") != HISTORICAL_FINAL_SEAL_SCHEMA
+        or not isinstance(run_identity, Mapping)
+        or run_identity.get("plan_sha256") != plan.plan_sha256
+        or final.get("item_count") != HISTORICAL_ITEMS
+        or final.get("terminal_complete") is not True
+    ):
+        raise RcaProdAdmissionError(
+            "rca_historical_final_seal_identity_invalid", retryable=False
+        )
+    reservation, reservation_raw = _read_historical_canonical_json(
+        root / "control/host-lane-reservation.json", "reservation_sidecar"
+    )
+    if (
+        set(reservation) != HISTORICAL_RESERVATION_FIELDS
+        or reservation.get("schema_version") != HISTORICAL_RESERVATION_SCHEMA
+        or reservation.get("task_id") != plan.task_id
+        or reservation.get("plan_sha256") != plan.plan_sha256
+    ):
+        raise RcaProdAdmissionError(
+            "rca_historical_sidecar_identity_invalid", retryable=False
+        )
+    return {
+        "full_chain_output_seal_sha256": hashlib.sha256(final_raw).hexdigest(),
+        "host_reservation_raw_sha256": hashlib.sha256(reservation_raw).hexdigest(),
+        "host_reservation_semantic_sha256": sha256_value(reservation),
+    }
+
+
+def materialize_historical_full_rerun_plan(
+    plan: HistoricalFullRerunPlan, *, host_tmp_root: Path = HISTORICAL_HOST_TMP_ROOT
+) -> Path:
+    def write(relative: Path, data: bytes) -> Path:
+        path = host_tmp_root / plan.task_id / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            if path.read_bytes() != data:
+                raise RcaProdAdmissionError("rca_historical_plan_identity_conflict", retryable=False)
+            return path
+        try:
+            with path.open("xb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except FileExistsError:
+            if path.read_bytes() != data:
+                raise RcaProdAdmissionError("rca_historical_plan_identity_conflict", retryable=False)
+        return path
+
+    for vm_path, data in plan.shard_artifacts:
+        write(vm_path.relative_to(plan.task_root), data)
+    return write(plan.plan_path.relative_to(plan.task_root), plan.plan_bytes)
+
+
+def _historical_bootstrap_bindings(plan: HistoricalFullRerunPlan) -> dict[str, Any]:
+    return {
+        "request_sha256": plan.request_sha256,
+        "plan_sha256": plan.plan_sha256,
+        "task_id": plan.task_id,
+        "host_reservation_path": str(plan.host_reservation_path),
+        "max_global_evaluation_lanes": 3,
+        "queue_if_blocked": False,
+    }
+
+
+def issue_historical_full_rerun_bootstrap(
+    plan: HistoricalFullRerunPlan, *, owner: str, hmac_key: str | bytes | None = None,
+    now: datetime | None = None, receipt_id: str | None = None,
+    reservation_id: str | None = None,
+) -> dict[str, Any]:
+    current = _now(now)
+    if owner != plan.request["owner"]:
+        raise RcaProdAdmissionError("rca_historical_bootstrap_owner_mismatch", retryable=False)
+    receipt_id = receipt_id or "bootstrap-" + secrets.token_hex(16)
+    reservation_id = reservation_id or "reservation-" + secrets.token_hex(16)
+    if not TASK_ID_RE.fullmatch(receipt_id) or not TASK_ID_RE.fullmatch(reservation_id):
+        raise RcaProdAdmissionError("rca_historical_bootstrap_identity_invalid", retryable=False)
+    body = {
+        "schema_version": HISTORICAL_BOOTSTRAP_SCHEMA,
+        "receipt_id": receipt_id, "reservation_id": reservation_id,
+        "issued_at": current.replace(microsecond=0).isoformat(),
+        "expires_at": (current + timedelta(seconds=HISTORICAL_BOOTSTRAP_TTL_SECONDS)).replace(microsecond=0).isoformat(),
+        "decision": "allow", "owner": owner, "one_use": True,
+        "bindings": _historical_bootstrap_bindings(plan),
+    }
+    return _sign_receipt(body, _load_hmac_key(hmac_key))
+
+
+def validate_historical_full_rerun_bootstrap(
+    receipt: Any, *, plan: HistoricalFullRerunPlan, expected_owner: str,
+    hmac_key: str | bytes | None = None, now: datetime | None = None,
+    allow_historical: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(receipt, Mapping) or set(receipt) != HISTORICAL_BOOTSTRAP_FIELDS:
+        raise RcaProdAdmissionError("rca_historical_bootstrap_schema_invalid", retryable=False)
+    bindings = receipt.get("bindings")
+    if not isinstance(bindings, Mapping) or set(bindings) != HISTORICAL_BOOTSTRAP_BINDINGS:
+        raise RcaProdAdmissionError("rca_historical_bootstrap_schema_invalid", retryable=False)
+    if (
+        receipt.get("schema_version") != HISTORICAL_BOOTSTRAP_SCHEMA
+        or receipt.get("decision") != "allow" or receipt.get("one_use") is not True
+        or receipt.get("owner") != expected_owner or expected_owner != plan.request["owner"]
+        or dict(bindings) != _historical_bootstrap_bindings(plan)
+    ):
+        raise RcaProdAdmissionError("rca_historical_bootstrap_policy_invalid", retryable=False)
+    key, body = _load_hmac_key(hmac_key), canonical_bytes(_receipt_body(receipt))
+    if (
+        receipt.get("receipt_fingerprint") != hashlib.sha256(body).hexdigest()
+        or not hmac.compare_digest(str(receipt.get("hmac_sha256") or ""), hmac.new(key, body, hashlib.sha256).hexdigest())
+    ):
+        raise RcaProdAdmissionError("rca_historical_bootstrap_signature_invalid", retryable=False)
+    current, issued, expires = _now(now), _timestamp(receipt["issued_at"]), _timestamp(receipt["expires_at"])
+    if (
+        (expires - issued).total_seconds() not in range(1, HISTORICAL_BOOTSTRAP_TTL_SECONDS + 1)
+        or issued > current + timedelta(seconds=5)
+        or (not allow_historical and not issued - timedelta(seconds=5) <= current <= expires)
+    ):
+        raise RcaProdAdmissionError("rca_historical_bootstrap_expired")
+    return dict(receipt)
+
+
+def _historical_ledger(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "schema_version": HISTORICAL_LEDGER_SCHEMA, "sequence": 0,
+            "max_global_evaluation_lanes": 3, "observed_global_peak": 0,
+            "active": {}, "consumed_receipts": {},
+        }
+    raw = path.read_bytes()
+    try:
+        value = _strict_json_loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise RcaProdAdmissionError("rca_historical_lane_ledger_invalid") from exc
+    if (
+        not isinstance(value, dict) or set(value) != {
+            "schema_version", "sequence", "max_global_evaluation_lanes",
+            "observed_global_peak", "active", "consumed_receipts",
+        } or value.get("schema_version") != HISTORICAL_LEDGER_SCHEMA
+        or value.get("max_global_evaluation_lanes") != 3
+        or raw != canonical_bytes(value) + b"\n"
+        or not isinstance(value.get("active"), dict)
+        or not isinstance(value.get("consumed_receipts"), dict)
+    ):
+        raise RcaProdAdmissionError("rca_historical_lane_ledger_invalid")
+    return value
+
+
+def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
+    data, temp = canonical_bytes(dict(value)) + b"\n", path.with_name(".%s.%s" % (path.name, secrets.token_hex(8)))
+    with temp.open("xb") as stream:
+        stream.write(data); stream.flush(); os.fsync(stream.fileno())
+    os.replace(temp, path)
+
+
+def consume_historical_bootstrap_and_reserve_lanes(
+    receipt: Any, *, plan: HistoricalFullRerunPlan, expected_owner: str,
+    hmac_key: str | bytes | None = None, now: datetime | None = None,
+    state_root: Path = HISTORICAL_STATE_ROOT, host_tmp_root: Path = HISTORICAL_HOST_TMP_ROOT,
+) -> dict[str, Any]:
+    current = _now(now)
+    validated = validate_historical_full_rerun_bootstrap(
+        receipt, plan=plan, expected_owner=expected_owner, hmac_key=hmac_key, now=current
+    )
+    state_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    if not stat.S_ISDIR(state_root.lstat().st_mode):
+        raise RcaProdAdmissionError("rca_historical_lane_ledger_root_invalid", retryable=False)
+    lock_fd = os.open(state_root / "evaluation-lanes.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        ledger_path, ledger = state_root / "evaluation-lanes.json", _historical_ledger(state_root / "evaluation-lanes.json")
+        active = dict(ledger["active"])
+        for reservation_id, record in list(active.items()):
+            if _timestamp(record["lease_expires_at"]) < current:
+                active.pop(reservation_id)
+        receipt_id = str(validated["receipt_id"])
+        if receipt_id in ledger["consumed_receipts"]:
+            raise RcaProdAdmissionError("rca_historical_bootstrap_already_consumed", retryable=False)
+        if sum(int(record["lane_count"]) for record in active.values()) + 3 > 3:
+            raise RcaProdAdmissionError("rca_historical_evaluation_lanes_unavailable")
+        sequence, reservation_id = int(ledger["sequence"]) + 1, str(validated["reservation_id"])
+        started = current.replace(microsecond=0).isoformat()
+        expires = (current + timedelta(seconds=HISTORICAL_LEASE_SECONDS)).replace(microsecond=0).isoformat()
+        sidecar = {
+            "schema_version": HISTORICAL_RESERVATION_SCHEMA,
+            "receipt_id": receipt_id, "reservation_id": reservation_id,
+            "ledger_sequence": sequence, "task_id": plan.task_id,
+            "plan_sha256": plan.plan_sha256, "lane_count": 3,
+            "started_at": started, "lease_expires_at": expires,
+            "observed_global_peak": 3, "max_global_evaluation_lanes": 3,
+            "queue_if_blocked": False,
+        }
+        raw, semantic = canonical_bytes(sidecar) + b"\n", sha256_value(sidecar)
+        sidecar_path = host_tmp_root / plan.task_id / "control/host-lane-reservation.json"
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        if sidecar_path.exists() and sidecar_path.read_bytes() != raw:
+            raise RcaProdAdmissionError("rca_historical_reservation_sidecar_conflict", retryable=False)
+        created_sidecar = not sidecar_path.exists()
+        if created_sidecar:
+            with sidecar_path.open("xb") as stream:
+                stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+        active[reservation_id] = {"lane_count": 3, "lease_expires_at": expires, "task_id": plan.task_id}
+        consumed = dict(ledger["consumed_receipts"])
+        consumed[receipt_id] = {
+            "reservation_id": reservation_id, "task_id": plan.task_id,
+            "plan_sha256": plan.plan_sha256,
+            "sidecar_raw_sha256": hashlib.sha256(raw).hexdigest(),
+            "sidecar_semantic_sha256": semantic,
+        }
+        try:
+            _atomic_json(ledger_path, {
+                **ledger, "sequence": sequence, "observed_global_peak": 3,
+                "active": active, "consumed_receipts": consumed,
+            })
+        except Exception:
+            if created_sidecar:
+                sidecar_path.unlink(missing_ok=True)
+            raise
+        return {
+            "reservation": sidecar, "path": str(plan.host_reservation_path),
+            "raw_sha256": hashlib.sha256(raw).hexdigest(), "semantic_sha256": semantic,
+        }
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN); os.close(lock_fd)
+
+
+def verify_historical_lane_reservation(
+    plan: HistoricalFullRerunPlan, *, raw_sha256: str, semantic_sha256: str,
+    state_root: Path = HISTORICAL_STATE_ROOT, host_tmp_root: Path = HISTORICAL_HOST_TMP_ROOT,
+) -> dict[str, Any]:
+    path = host_tmp_root / plan.task_id / "control/host-lane-reservation.json"
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != _require_hex(raw_sha256, "rca_historical_sidecar_hash_invalid"):
+        raise RcaProdAdmissionError("rca_historical_sidecar_hash_mismatch", retryable=False)
+    try:
+        value = _strict_json_loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise RcaProdAdmissionError(
+            "rca_historical_sidecar_schema_invalid", retryable=False
+        ) from exc
+    if (
+        not isinstance(value, dict)
+        or set(value) != HISTORICAL_RESERVATION_FIELDS
+        or raw != canonical_bytes(value) + b"\n"
+    ):
+        raise RcaProdAdmissionError("rca_historical_sidecar_schema_invalid", retryable=False)
+    if sha256_value(value) != _require_hex(semantic_sha256, "rca_historical_sidecar_hash_invalid"):
+        raise RcaProdAdmissionError("rca_historical_sidecar_semantic_mismatch", retryable=False)
+    try:
+        started_at = _timestamp(value["started_at"])
+        lease_expires_at = _timestamp(value["lease_expires_at"])
+    except (TypeError, ValueError) as exc:
+        raise RcaProdAdmissionError(
+            "rca_historical_sidecar_identity_invalid", retryable=False
+        ) from exc
+    if (
+        value["schema_version"] != HISTORICAL_RESERVATION_SCHEMA
+        or not isinstance(value["receipt_id"], str) or not value["receipt_id"]
+        or not isinstance(value["reservation_id"], str) or not value["reservation_id"]
+        or type(value["ledger_sequence"]) is not int or value["ledger_sequence"] < 1
+        or value["task_id"] != plan.task_id or value["plan_sha256"] != plan.plan_sha256
+        or type(value["lane_count"]) is not int or value["lane_count"] != 3
+        or type(value["max_global_evaluation_lanes"]) is not int
+        or value["max_global_evaluation_lanes"] != 3
+        or type(value["observed_global_peak"]) is not int
+        or value["observed_global_peak"] != 3
+        or value["queue_if_blocked"] is not False
+        or started_at >= lease_expires_at
+    ):
+        raise RcaProdAdmissionError("rca_historical_sidecar_identity_invalid", retryable=False)
+    ledger = _historical_ledger(state_root / "evaluation-lanes.json")
+    record = ledger["consumed_receipts"].get(value["receipt_id"])
+    expected = {
+        "reservation_id": value["reservation_id"], "task_id": plan.task_id,
+        "plan_sha256": plan.plan_sha256,
+        "sidecar_raw_sha256": raw_sha256, "sidecar_semantic_sha256": semantic_sha256,
+    }
+    if record != expected or value["ledger_sequence"] > ledger["sequence"]:
+        raise RcaProdAdmissionError("rca_historical_sidecar_ledger_mismatch", retryable=False)
+    return value
+
+
+def release_historical_lane_reservation(
+    plan: HistoricalFullRerunPlan, *, receipt_id: str, reservation_id: str,
+    raw_sha256: str, semantic_sha256: str, reason: str,
+    state_root: Path = HISTORICAL_STATE_ROOT,
+    host_tmp_root: Path = HISTORICAL_HOST_TMP_ROOT,
+) -> dict[str, Any]:
+    if reason not in {"create_failed_missing_reconfirmed", "verify_succeeded"}:
+        raise RcaProdAdmissionError(
+            "rca_historical_lane_release_reason_invalid", retryable=False
+        )
+    reservation = verify_historical_lane_reservation(
+        plan, raw_sha256=raw_sha256, semantic_sha256=semantic_sha256,
+        state_root=state_root, host_tmp_root=host_tmp_root,
+    )
+    if (
+        reservation.get("receipt_id") != receipt_id
+        or reservation.get("reservation_id") != reservation_id
+    ):
+        raise RcaProdAdmissionError(
+            "rca_historical_lane_release_identity_mismatch", retryable=False
+        )
+    lock_path = state_root / "evaluation-lanes.lock"
+    try:
+        if not stat.S_ISDIR(state_root.lstat().st_mode):
+            raise OSError("state root is not a directory")
+        lock_fd = os.open(lock_path, os.O_RDWR)
+    except OSError as exc:
+        raise RcaProdAdmissionError(
+            "rca_historical_lane_ledger_unavailable", retryable=True
+        ) from exc
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        ledger_path = state_root / "evaluation-lanes.json"
+        ledger = _historical_ledger(ledger_path)
+        expected_consumed = {
+            "reservation_id": reservation_id, "task_id": plan.task_id,
+            "plan_sha256": plan.plan_sha256,
+            "sidecar_raw_sha256": raw_sha256,
+            "sidecar_semantic_sha256": semantic_sha256,
+        }
+        if ledger["consumed_receipts"].get(receipt_id) != expected_consumed:
+            raise RcaProdAdmissionError(
+                "rca_historical_lane_release_identity_mismatch", retryable=False
+            )
+        active = dict(ledger["active"])
+        active_record = active.get(reservation_id)
+        if active_record is None:
+            return {
+                "released": False, "already_released": True,
+                "reservation_id": reservation_id, "reason": reason,
+            }
+        if active_record != {
+            "lane_count": 3,
+            "lease_expires_at": reservation["lease_expires_at"],
+            "task_id": plan.task_id,
+        }:
+            raise RcaProdAdmissionError(
+                "rca_historical_lane_release_identity_mismatch", retryable=False
+            )
+        active.pop(reservation_id)
+        _atomic_json(ledger_path, {
+            **ledger, "sequence": int(ledger["sequence"]) + 1,
+            "active": active,
+        })
+        return {
+            "released": True, "already_released": False,
+            "reservation_id": reservation_id, "reason": reason,
+        }
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
