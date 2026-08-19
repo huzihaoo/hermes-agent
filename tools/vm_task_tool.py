@@ -203,6 +203,7 @@ _RCA_VM_TASK_ROOT = "/home/mini/.hermes/shared-state/tasks"
 _RCA_HISTORICAL_OPERATIONS = frozenset({"plan", "execute", "verify"})
 _RCA_HISTORICAL_SERVICE_CAPABILITY = "run_g1q3_rca_historical_full308"
 _RCA_HISTORICAL_SERVICE_OWNER = "root_cause_analysis_agent"
+_RCA_HISTORICAL_TASK_TIMEOUT_SECONDS = 43200
 _RCA_HISTORICAL_GOAL_BEGIN = "<!-- G1Q3_RCA_HISTORICAL_FULL308:BEGIN -->"
 _RCA_HISTORICAL_GOAL_END = "<!-- G1Q3_RCA_HISTORICAL_FULL308:END -->"
 _RCA_STORAGE_ADMISSION_SCHEMA_VERSION = "pnc_rca_derived_capacity_admission_v2"
@@ -1419,6 +1420,7 @@ def _historical_meta(plan: HistoricalFullRerunPlan) -> dict[str, Any]:
         "service_capability": _RCA_HISTORICAL_SERVICE_CAPABILITY,
         "service_operation": "historical_full308",
         "rca_create_once": True,
+        "task_timeout_seconds": _RCA_HISTORICAL_TASK_TIMEOUT_SECONDS,
         "rca_service_owner": _RCA_HISTORICAL_SERVICE_OWNER,
         "rca_historical_owner": plan.request["owner"],
         "rca_historical_request_sha256": plan.request_sha256,
@@ -1542,6 +1544,7 @@ def _historical_goal(
     return canonicalize_rca_goal_text("\n".join((
         "Execute the fixed historical full308 comparison run.",
         "resource_class=rca_prod capacity_mode=bootstrap queue_if_blocked=false",
+        f"task_timeout_seconds={_RCA_HISTORICAL_TASK_TIMEOUT_SECONDS}",
         "authority_mode=development_only production_effects=false",
         _RCA_HISTORICAL_GOAL_BEGIN, contract, _RCA_HISTORICAL_GOAL_END,
         "PYTHONDONTWRITEBYTECODE=1 "
