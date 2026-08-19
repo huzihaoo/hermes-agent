@@ -31,6 +31,10 @@ if str(REPO_ROOT) not in sys.path:
 from gateway.pnc_rca_control_store import ActivationEpochError, RcaControlStore
 from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from gateway.pnc_rca_runtime_identity import runtime_identity_is_valid
+from gateway.pnc_rca_workspace_runtime import (
+    WorkspaceRuntimeError,
+    validate_workspace_runtime,
+)
 from gateway.pnc_rca_write_fence import (
     MINIMAL_RELEASE_HOST_REMOTE,
     MINIMAL_RELEASE_NOTE_SCHEMA_VERSION,
@@ -143,6 +147,7 @@ ReportReader = Callable[[Path], tuple[bytes, dict]]
 ProcessFactory = Callable[[int], Any]
 StoreFactory = Callable[[Path, bool], Any]
 DeliveryStoreFactory = Callable[[Path], Any]
+WorkspaceRuntimeResolver = Callable[[Path, Runner], Mapping[str, str]]
 
 
 class ReleaseError(RuntimeError):
@@ -948,7 +953,10 @@ def _activation_schema_pair(note: Mapping[str, Any]) -> tuple[str, str]:
         str(activation.get("expected_control_schema_version") or ""),
         str(activation.get("target_control_schema_version") or ""),
     )
-    if pair != (CONTROL_SCHEMA_V14, CONTROL_SCHEMA_V15):
+    if pair not in {
+        (CONTROL_SCHEMA_V14, CONTROL_SCHEMA_V15),
+        (CONTROL_SCHEMA_V15, CONTROL_SCHEMA_V15),
+    }:
         raise ReleaseError("activation_schema_transition_invalid")
     return pair
 
@@ -1036,8 +1044,17 @@ def _activation_plan(
                 and inflight["total"]
             ):
                 raise ReleaseError("activation_predecessor_inflight_not_drained")
+            if expected_schema == CONTROL_SCHEMA_V15:
+                if current is None or current.get("state") != "steady_active":
+                    raise ReleaseError("activation_predecessor_binding_changed")
+                if _activation_outcome(note, binding, outcome_probe) != "not_committed":
+                    raise ReleaseError("activation_successor_outcome_unknown")
             change = True
-            transition = "v14_to_v15_atomic"
+            transition = (
+                "v14_to_v15_atomic"
+                if expected_schema == CONTROL_SCHEMA_V14
+                else "v15_successor"
+            )
     except ReleaseError:
         raise
     except (ActivationEpochError, RuntimeError, ValueError) as exc:
@@ -1094,6 +1111,14 @@ def _activation_apply(
                 migration_apply or RcaControlStore.migrate_v14_to_v15_and_activate
             )
             migrate(Path(activation["control_db_path"]), **common)
+        elif transition == "v15_successor":
+            writer = store_factory(Path(activation["control_db_path"]), False)
+            _schema_runtime_capability(
+                writer,
+                expected_schema_version=CONTROL_SCHEMA_V15,
+                writable=True,
+            )
+            writer.activate_direct_steady_epoch(**common)
         elif transition != "v15_noop":
             raise ReleaseError("activation_transition_invalid")
 
@@ -2487,8 +2512,6 @@ def _prepare_control_binding(
             expected_schema_version=str(observed_schema),
             writable=False,
         )
-        if observed_schema != CONTROL_SCHEMA_V14:
-            raise ReleaseError("prepare_control_schema_already_v15")
         source = store.control_db_source_snapshot_identity()
         predecessor = store.direct_steady_predecessor()
         fence: dict[str, dict[str, int]] = {}
@@ -2526,7 +2549,11 @@ def _prepare_control_binding(
         if (
             not isinstance(predecessor, Mapping)
             or not IDENTIFIER.fullmatch(str(predecessor.get("epoch_id") or ""))
-            or predecessor.get("state") not in {"aborted", "steady_active"}
+            or predecessor.get("state") not in (
+                {"aborted", "steady_active"}
+                if observed_schema == CONTROL_SCHEMA_V14
+                else {"steady_active"}
+            )
             or not HEX64.fullmatch(str(predecessor.get("binding_fingerprint") or ""))
         ):
             raise ReleaseError("prepare_predecessor_invalid")
@@ -2540,7 +2567,7 @@ def _prepare_control_binding(
     if not predecessor_fields["expected_predecessor_epoch_id"]:
         raise ReleaseError("prepare_predecessor_required")
     return {
-        "expected_control_schema_version": CONTROL_SCHEMA_V14,
+        "expected_control_schema_version": str(observed_schema),
         "target_control_schema_version": CONTROL_SCHEMA_V15,
         "db_logical_identity": dict(logical),
         "partition_start_fence": fence,
@@ -2571,6 +2598,7 @@ def _prepare_manifest(
     live: Mapping[str, Any],
     *,
     host: Mapping[str, str],
+    workspace_runtime: Mapping[str, str],
     env_sha256: str,
     note_path: Path,
     release_id: str,
@@ -2599,7 +2627,72 @@ def _prepare_manifest(
         },
     })
     manifest.pop("rca_release_authority", None)
+    raw_gateway_binding = manifest.get("gateway_release_binding")
+    raw_production_bindings = manifest.get("production_branch_bindings")
+    if raw_gateway_binding is not None and not isinstance(raw_gateway_binding, Mapping):
+        raise ReleaseError("workspace_runtime_manifest_binding_invalid")
+    if raw_production_bindings is not None and not isinstance(
+        raw_production_bindings, Mapping
+    ):
+        raise ReleaseError("workspace_runtime_manifest_binding_invalid")
+    gateway_binding = dict(raw_gateway_binding or {})
+    production_bindings = dict(raw_production_bindings or {})
+    gateway_binding.update({
+        "workspace_runtime_manifest_sha256": workspace_runtime["manifest_sha256"],
+        "workspace_runtime_closure_sha256": workspace_runtime["closure_sha256"],
+        "workspace_runtime_source_commit": workspace_runtime["source_commit"],
+    })
+    raw_production_workspace = production_bindings.get("workspace_runtime")
+    if raw_production_workspace is not None and not isinstance(
+        raw_production_workspace, Mapping
+    ):
+        raise ReleaseError("workspace_runtime_manifest_binding_invalid")
+    production_workspace = dict(raw_production_workspace or {})
+    production_bindings["workspace_runtime"] = {
+        **dict(production_workspace),
+        "branch": "DETACHED",
+        "commit": workspace_runtime["source_commit"],
+        "tree": workspace_runtime["tree"],
+    }
+    manifest["gateway_release_binding"] = gateway_binding
+    manifest["production_branch_bindings"] = production_bindings
     return _pretty_json(manifest)
+
+
+def _workspace_runtime_projection(
+    home: Path, runner: Runner = _run
+) -> Mapping[str, str]:
+    try:
+        identity = validate_workspace_runtime(hermes_home=home)
+    except WorkspaceRuntimeError as exc:
+        raise ReleaseError(exc.code) from exc
+    source_root = home / "workspace-work"
+    remote = _call(
+        runner,
+        ("/usr/bin/git", "-C", str(source_root), "remote", "get-url", "origin"),
+        "workspace_runtime_source_remote",
+    ).strip()
+    if remote != "git@git.minieye.tech:planning_algo/pnc-agent-workspace-work.git":
+        raise ReleaseError("workspace_runtime_source_remote_mismatch")
+    tree = _call(
+        runner,
+        (
+            "/usr/bin/git",
+            "-C",
+            str(source_root),
+            "rev-parse",
+            f"{identity.source_commit}^{{tree}}",
+        ),
+        "workspace_runtime_source_tree",
+    ).strip()
+    if not HEX40.fullmatch(tree):
+        raise ReleaseError("workspace_runtime_source_tree_invalid")
+    return {
+        "manifest_sha256": identity.manifest_sha256,
+        "closure_sha256": identity.closure_sha256,
+        "source_commit": identity.source_commit,
+        "tree": tree,
+    }
 
 
 def _cleanup_prepared_outputs(created: Sequence[Mapping[str, Any]]) -> None:
@@ -2721,6 +2814,7 @@ def prepare_release(
     vm_runner: VmRunner = _run_vm_agent,
     report_reader: ReportReader | None = None,
     store_factory: StoreFactory = _open_store,
+    workspace_runtime_resolver: WorkspaceRuntimeResolver = _workspace_runtime_projection,
 ) -> dict:
     home = _absolute(home, "hermes_home_invalid")
     release_note = _absolute(release_note, "release_note_path_invalid")
@@ -2804,10 +2898,12 @@ def prepare_release(
     live_manifest_raw, live_manifest = _json(
         live_manifest_path, "live_manifest_template"
     )
+    workspace_runtime = workspace_runtime_resolver(home, runner)
     env_raw = _prepare_env(live_env_raw, release_note, control_db)
     manifest_raw = _prepare_manifest(
         live_manifest,
         host=identity["host"],
+        workspace_runtime=workspace_runtime,
         env_sha256=_sha(env_raw),
         note_path=release_note,
         release_id=release_id,
