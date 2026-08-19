@@ -1403,6 +1403,132 @@ def _install_known_legacy_v14_terminal_binding_guard(path):
     return strict, legacy
 
 
+def _install_slot_bound_v14_history(path, *, epoch_id):
+    slot_rows = [
+        (epoch_id, "kafka_success", None, None, None, None, None),
+        (
+            epoch_id,
+            "manual_success",
+            "manual",
+            "d" * 64,
+            "release-test",
+            "authorize historical manual success",
+            1,
+        ),
+        (
+            epoch_id,
+            "manual_terminal_failure",
+            "manual",
+            "e" * 64,
+            "release-test",
+            "authorize historical terminal failure",
+            2,
+        ),
+    ]
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """
+            CREATE TABLE rca_activation_budget_slots(
+                epoch_id TEXT NOT NULL,
+                slot_kind TEXT NOT NULL,
+                authorized_source_kind TEXT,
+                authorized_identity_sha256 TEXT,
+                authorized_at TEXT,
+                authorized_operator TEXT,
+                authorized_reason TEXT,
+                consumed_ledger_id INTEGER,
+                consumed_at TEXT,
+                PRIMARY KEY(epoch_id, slot_kind)
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO rca_activation_budget_slots("
+            "epoch_id, slot_kind, authorized_source_kind, "
+            "authorized_identity_sha256, authorized_operator, "
+            "authorized_reason, consumed_ledger_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            slot_rows,
+        )
+        epoch = conn.execute(
+            "SELECT * FROM rca_activation_epochs WHERE epoch_id = ?",
+            (epoch_id,),
+        ).fetchone()
+        audit = conn.execute(
+            "SELECT audit_id, from_state, to_state "
+            "FROM rca_activation_transition_audit WHERE epoch_id = ? "
+            "ORDER BY audit_id DESC LIMIT 1",
+            (epoch_id,),
+        ).fetchone()
+        assert epoch is not None and audit is not None
+        slots = [
+            {
+                "authorized_identity_sha256": str(
+                    row["authorized_identity_sha256"] or ""
+                ),
+                "authorized_operator": str(row["authorized_operator"] or ""),
+                "authorized_reason": str(row["authorized_reason"] or ""),
+                "authorized_source_kind": str(
+                    row["authorized_source_kind"] or ""
+                ),
+                "consumed_ledger_id": int(row["consumed_ledger_id"] or 0),
+                "slot_kind": str(row["slot_kind"]),
+            }
+            for row in conn.execute(
+                "SELECT slot_kind, authorized_source_kind, "
+                "authorized_identity_sha256, authorized_operator, "
+                "authorized_reason, consumed_ledger_id "
+                "FROM rca_activation_budget_slots "
+                "WHERE epoch_id = ? ORDER BY slot_kind",
+                (epoch_id,),
+            ).fetchall()
+        ]
+        material = {
+            "config_sha256": str(epoch["config_sha256"]),
+            "db_logical_identity_sha256": str(epoch["db_logical_identity_sha256"]),
+            "epoch_id": str(epoch["epoch_id"]),
+            "from_state": str(audit["from_state"]),
+            "partition_end_fence_sha256": str(
+                epoch["partition_end_fence_sha256"] or ""
+            ),
+            "partition_start_fence_sha256": str(
+                epoch["partition_start_fence_sha256"]
+            ),
+            "preauthorization_capsule_sha256": str(
+                epoch["preauthorization_capsule_sha256"]
+            ),
+            "preauthorization_fingerprint": str(
+                epoch["preauthorization_fingerprint"]
+            ),
+            "preauthorization_gate_receipt_sha256": str(
+                epoch["preauthorization_gate_receipt_sha256"]
+            ),
+            "preproduction_capsule_sha256": str(
+                epoch["preproduction_capsule_sha256"] or ""
+            ),
+            "preproduction_fingerprint": str(
+                epoch["preproduction_fingerprint"] or ""
+            ),
+            "preproduction_gate_receipt_sha256": str(
+                epoch["preproduction_gate_receipt_sha256"] or ""
+            ),
+            "production_fingerprint": str(epoch["production_fingerprint"] or ""),
+            "production_gate_receipt_sha256": str(
+                epoch["production_gate_receipt_sha256"] or ""
+            ),
+            "slot_bindings_sha256": control_store_module._canonical_sha256(slots),
+            "to_state": str(audit["to_state"]),
+        }
+        fingerprint = control_store_module._canonical_sha256(material)
+        conn.execute(
+            "UPDATE rca_activation_transition_audit "
+            "SET binding_fingerprint = ? WHERE audit_id = ?",
+            (fingerprint, int(audit["audit_id"])),
+        )
+    return fingerprint
+
+
 def test_nminus1_successor_flag_keeps_exact_v14_writable(tmp_path):
     path = tmp_path / "control.sqlite3"
     RcaControlStore(path)
@@ -1967,6 +2093,152 @@ def test_atomic_v14_to_v15_migration_preserves_audit_index_and_sequence(tmp_path
         ).fetchone()[0] == audit_count
 
 
+def test_v14_to_v15_migration_preserves_slot_bound_historical_audits(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    control = RcaControlStore(path)
+    historical = _activate_direct_steady_epoch(
+        control,
+        epoch_id="rca-a-slot-bound-history",
+    )
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    _activate_direct_steady_epoch(
+        control,
+        epoch_id="rca-z-current-direct",
+        start_offset=30,
+        expected_predecessor=predecessor,
+    )
+    _install_slot_bound_v14_history(path, epoch_id=historical["epoch_id"])
+    current = control.direct_steady_predecessor()
+    assert current is not None
+    contract = _direct_steady_contract(predecessor=current)
+    with sqlite3.connect(path) as conn:
+        old_audits = conn.execute(
+            "SELECT audit_id, epoch_id, from_state, to_state, operator, reason, "
+            "binding_fingerprint, transitioned_at "
+            "FROM rca_activation_transition_audit ORDER BY audit_id"
+        ).fetchall()
+
+    assert RcaControlStore.probe_v14_to_v15_migration_outcome(
+        path,
+        **contract,
+    ) == "not_committed"
+    migrated = RcaControlStore.migrate_v14_to_v15_and_activate(
+        path,
+        **_migration_apply_kwargs(contract),
+    )
+
+    assert migrated["epoch_id"] == contract["epoch_id"]
+    with sqlite3.connect(path) as conn:
+        preserved = conn.execute(
+            "SELECT audit_id, epoch_id, from_state, to_state, operator, reason, "
+            "binding_fingerprint, transitioned_at "
+            "FROM rca_activation_transition_audit "
+            "WHERE binding_schema_version = ? ORDER BY audit_id",
+            (ACTIVATION_TRANSITION_BINDING_SCHEMA_V14,),
+        ).fetchall()
+    assert preserved == old_audits
+
+
+def test_v14_to_v15_migration_rejects_slot_bound_history_drift_prewrite(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    control = RcaControlStore(path)
+    historical = _activate_direct_steady_epoch(
+        control,
+        epoch_id="rca-a-slot-bound-history",
+    )
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    _activate_direct_steady_epoch(
+        control,
+        epoch_id="rca-z-current-direct",
+        start_offset=30,
+        expected_predecessor=predecessor,
+    )
+    _install_slot_bound_v14_history(path, epoch_id=historical["epoch_id"])
+    current = control.direct_steady_predecessor()
+    assert current is not None
+    contract = _direct_steady_contract(predecessor=current)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE rca_activation_budget_slots SET authorized_reason = ? "
+            "WHERE epoch_id = ? AND slot_kind = 'manual_success'",
+            ("drifted historical authorization", historical["epoch_id"]),
+        )
+    before = _sqlite_storage_identity(path)
+
+    assert RcaControlStore.probe_v14_to_v15_migration_outcome(
+        path,
+        **contract,
+    ) == "unknown"
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_predecessor_binding_invalid",
+    ):
+        RcaControlStore.migrate_v14_to_v15_and_activate(
+            path,
+            **_migration_apply_kwargs(contract),
+        )
+
+    _assert_sqlite_payload_unchanged(before, _sqlite_storage_identity(path))
+
+
+def test_v14_to_v15_issue_only_empty_fence_ignores_unrelated_progress(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    record = _record(offset=25)
+    control.persist_raw(record, policy=_policy())
+    control.process_event(record.event_uid)
+    assert control.partition_progress(topic=TOPIC, partitions=[2]) == {2: 26}
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(
+        predecessor=predecessor,
+        partition_start_fence={},
+    )
+
+    assert RcaControlStore.probe_v14_to_v15_migration_outcome(
+        path,
+        **contract,
+    ) == "not_committed"
+    migrated = RcaControlStore.migrate_v14_to_v15_and_activate(
+        path,
+        **_migration_apply_kwargs(contract),
+    )
+    assert migrated["epoch_id"] == contract["epoch_id"]
+
+
+def test_v14_to_v15_declared_partition_fence_drift_is_prewrite_rejected(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    record = _record(offset=25)
+    control.persist_raw(record, policy=_policy())
+    control.process_event(record.event_uid)
+    assert control.partition_progress(topic=TOPIC, partitions=[2]) == {2: 26}
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(
+        predecessor=predecessor,
+        partition_start_fence={TOPIC: {"2": 27}},
+    )
+    before = _sqlite_storage_identity(path)
+
+    assert RcaControlStore.probe_v14_to_v15_migration_outcome(
+        path,
+        **contract,
+    ) == "unknown"
+    with pytest.raises(
+        ActivationEpochError,
+        match="activation_partition_fence_changed",
+    ):
+        RcaControlStore.migrate_v14_to_v15_and_activate(
+            path,
+            **_migration_apply_kwargs(contract),
+        )
+
+    _assert_sqlite_payload_unchanged(before, _sqlite_storage_identity(path))
+
+
 def test_known_legacy_v14_terminal_guard_is_read_only_predecessor_only(tmp_path):
     path = tmp_path / "control.sqlite3"
     _steady_control_store(path)
@@ -2005,7 +2277,7 @@ def test_known_legacy_v14_terminal_guard_migrates_to_strict_v15(tmp_path):
     assert RcaControlStore.probe_v14_to_v15_migration_outcome(
         path,
         **contract,
-    ) == "unknown"
+    ) == "not_committed"
 
     migrated = RcaControlStore.migrate_v14_to_v15_and_activate(
         path,
