@@ -5171,14 +5171,6 @@ class RcaControlStore:
         *,
         partition_start_fence: Mapping[str, Any],
     ) -> None:
-        observed: dict[str, dict[str, int]] = {}
-        for row in conn.execute(
-            "SELECT topic, partition_id, durable_next_offset "
-            "FROM kafka_partition_progress ORDER BY topic, partition_id"
-        ).fetchall():
-            observed.setdefault(str(row["topic"]), {})[
-                str(int(row["partition_id"]))
-            ] = int(row["durable_next_offset"])
         expected = {
             str(topic): {
                 str(partition): int(offset)
@@ -5186,8 +5178,15 @@ class RcaControlStore:
             }
             for topic, partitions in dict(partition_start_fence).items()
         }
-        if observed != expected:
-            raise ActivationEpochError("activation_partition_fence_changed")
+        for topic, partitions in expected.items():
+            for partition, offset in partitions.items():
+                row = conn.execute(
+                    "SELECT durable_next_offset FROM kafka_partition_progress "
+                    "WHERE topic = ? AND partition_id = ?",
+                    (topic, int(partition)),
+                ).fetchone()
+                if row is None or int(row["durable_next_offset"]) != offset:
+                    raise ActivationEpochError("activation_partition_fence_changed")
 
     @classmethod
     def _validate_v15_activation_schema_tx(cls, conn: sqlite3.Connection) -> None:
@@ -5975,7 +5974,60 @@ class RcaControlStore:
         conn.commit()
 
     @staticmethod
+    def _v14_compat_activation_slot_bindings_tx(
+        conn: sqlite3.Connection,
+        *,
+        epoch_id: str,
+    ) -> list[dict[str, Any]]:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'rca_activation_budget_slots'"
+        ).fetchone()
+        if table is None:
+            return []
+        required_columns = {
+            "epoch_id",
+            "slot_kind",
+            "authorized_source_kind",
+            "authorized_identity_sha256",
+            "authorized_operator",
+            "authorized_reason",
+            "consumed_ledger_id",
+        }
+        observed_columns = {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(rca_activation_budget_slots)"
+            ).fetchall()
+        }
+        if not required_columns.issubset(observed_columns):
+            return []
+        return [
+            {
+                "authorized_identity_sha256": str(
+                    row["authorized_identity_sha256"] or ""
+                ),
+                "authorized_operator": str(row["authorized_operator"] or ""),
+                "authorized_reason": str(row["authorized_reason"] or ""),
+                "authorized_source_kind": str(
+                    row["authorized_source_kind"] or ""
+                ),
+                "consumed_ledger_id": int(row["consumed_ledger_id"] or 0),
+                "slot_kind": str(row["slot_kind"]),
+            }
+            for row in conn.execute(
+                "SELECT slot_kind, authorized_source_kind, "
+                "authorized_identity_sha256, authorized_operator, "
+                "authorized_reason, consumed_ledger_id "
+                "FROM rca_activation_budget_slots "
+                "WHERE epoch_id = ? ORDER BY slot_kind",
+                (epoch_id,),
+            ).fetchall()
+        ]
+
+    @classmethod
     def _v14_compat_activation_transition_binding_material_tx(
+        cls,
         conn: sqlite3.Connection,
         *,
         epoch: sqlite3.Row,
@@ -6019,9 +6071,12 @@ class RcaControlStore:
             "production_gate_receipt_sha256": str(
                 epoch["production_gate_receipt_sha256"] or ""
             ),
-            # Direct-steady releases never authorize slots. Keep the empty-list
-            # digest in the fingerprint so existing direct bindings stay exact.
-            "slot_bindings_sha256": _canonical_sha256([]),
+            "slot_bindings_sha256": _canonical_sha256(
+                cls._v14_compat_activation_slot_bindings_tx(
+                    conn,
+                    epoch_id=str(epoch["epoch_id"]),
+                )
+            ),
             "to_state": to_state,
         }
 
@@ -6345,7 +6400,13 @@ class RcaControlStore:
             ).fetchone() is not None:
                 return "unknown", None
             observed = cls._activation_schema_version_tx(conn)
-            cls._validate_structural_contract(conn, integrity_check=True)
+            cls._validate_structural_contract(
+                conn,
+                integrity_check=True,
+                allow_known_legacy_binding_guard=(
+                    observed == CONTROL_STORE_SCHEMA_VERSION
+                ),
+            )
             cls._validate_activation_reference_contract_tx(conn)
             cls._validate_activation_child_rows_tx(conn)
             if observed == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:

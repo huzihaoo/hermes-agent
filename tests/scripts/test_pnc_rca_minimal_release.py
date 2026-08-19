@@ -2409,6 +2409,32 @@ def test_quiesce_persists_profile_and_recovers_loaded_service_without_pid(
     assert not runner.loaded & set(release.DISABLED_RESIDENTS)
 
 
+def test_quiesce_waits_for_asynchronous_launchd_bootout(release_files, monkeypatch):
+    runner = FakeRunner(release_files)
+    real_assert_stopped = release._assert_all_residents_stopped
+    attempts = 0
+    sleeps = []
+
+    def delayed_readback(current_runner):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise release.ReleaseError("resident_quiesce_readback_failed")
+        return real_assert_stopped(current_runner)
+
+    monkeypatch.setattr(release, "_assert_all_residents_stopped", delayed_readback)
+    monkeypatch.setattr(release.time, "sleep", sleeps.append)
+
+    quiesce = release._quiesce_residents(runner)
+
+    assert not runner.loaded
+    assert quiesce["stopped"] == [
+        {"label": label, "loaded": False, "pid": None}
+        for label in release._all_resident_labels()
+    ]
+    assert sleeps == [0.25, 0.25]
+
+
 class FakeProcess:
     def __init__(self, *, cwd, script, created):
         self._cwd = cwd

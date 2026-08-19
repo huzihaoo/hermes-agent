@@ -1923,6 +1923,24 @@ def _assert_all_residents_stopped(runner: Runner) -> list[dict]:
     return observed
 
 
+def _wait_for_all_residents_stopped(
+    runner: Runner,
+    *,
+    timeout: float = 60.0,
+) -> list[dict]:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return _assert_all_residents_stopped(runner)
+        except ReleaseError as exc:
+            if (
+                exc.code != "resident_quiesce_readback_failed"
+                or time.monotonic() >= deadline
+            ):
+                raise
+            time.sleep(0.25)
+
+
 def _stop_all_residents(runner: Runner) -> dict:
     errors: list[str] = []
     for label in _all_resident_labels():
@@ -1958,7 +1976,7 @@ def _quiesce_residents(runner: Runner) -> dict:
                 ("/bin/launchctl", "bootout", f"gui/{os.getuid()}/{label}"),
                 "resident_quiesce",
             )
-    stopped = _assert_all_residents_stopped(runner)
+    stopped = _wait_for_all_residents_stopped(runner)
     for label, *_rest in REQUIRED_RESIDENTS:
         _call(
             runner,
