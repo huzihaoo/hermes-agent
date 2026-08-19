@@ -1382,6 +1382,27 @@ def _migration_apply_kwargs(contract):
     }
 
 
+def _install_known_legacy_v14_terminal_binding_guard(path):
+    with sqlite3.connect(path) as conn:
+        observed = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'trg_terminal_rerun_delivery_authority_binding_guard'"
+        ).fetchone()
+        assert observed is not None
+        strict_raw = str(observed[0])
+        strict_state = "AND epoch.state = 'steady_active'"
+        legacy_state = "AND epoch.state IN ('bounded_active', 'steady_active')"
+        assert strict_raw.count(strict_state) == 1
+        legacy_raw = strict_raw.replace(strict_state, legacy_state, 1)
+        strict = RcaControlStore._normalized_schema_sql(strict_raw)
+        legacy = RcaControlStore._normalized_schema_sql(legacy_raw)
+        conn.execute(
+            "DROP TRIGGER trg_terminal_rerun_delivery_authority_binding_guard"
+        )
+        conn.execute(legacy_raw)
+    return strict, legacy
+
+
 def test_nminus1_successor_flag_keeps_exact_v14_writable(tmp_path):
     path = tmp_path / "control.sqlite3"
     RcaControlStore(path)
@@ -1944,6 +1965,160 @@ def test_atomic_v14_to_v15_migration_preserves_audit_index_and_sequence(tmp_path
         assert conn.execute(
             "SELECT COUNT(*) FROM rca_activation_transition_audit"
         ).fetchone()[0] == audit_count
+
+
+def test_known_legacy_v14_terminal_guard_is_read_only_predecessor_only(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    _steady_control_store(path)
+    _install_known_legacy_v14_terminal_binding_guard(path)
+    before = _sqlite_storage_identity(path)
+
+    reader = RcaControlStore(
+        path,
+        require_current=True,
+        read_only=True,
+        allow_successor_read_only=True,
+    )
+
+    assert reader.schema_runtime_capability()["mode"] == "explicit_read_only"
+    _assert_sqlite_payload_unchanged(before, _sqlite_storage_identity(path))
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:"
+        "terminal_rerun_authority_trigger_sql",
+    ):
+        RcaControlStore(
+            path,
+            require_current=True,
+            allow_successor_read_only=True,
+        )
+    _assert_sqlite_payload_unchanged(before, _sqlite_storage_identity(path))
+
+
+def test_known_legacy_v14_terminal_guard_migrates_to_strict_v15(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(predecessor=predecessor)
+    strict, legacy = _install_known_legacy_v14_terminal_binding_guard(path)
+    assert RcaControlStore.probe_v14_to_v15_migration_outcome(
+        path,
+        **contract,
+    ) == "unknown"
+
+    migrated = RcaControlStore.migrate_v14_to_v15_and_activate(
+        path,
+        **_migration_apply_kwargs(contract),
+    )
+
+    assert migrated["epoch_id"] == contract["epoch_id"]
+    with sqlite3.connect(path) as conn:
+        marker = conn.execute(
+            "SELECT value FROM control_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        observed = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'trg_terminal_rerun_delivery_authority_binding_guard'"
+        ).fetchone()[0]
+    normalized = RcaControlStore._normalized_schema_sql(observed)
+    assert marker == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION
+    assert normalized == strict
+    assert normalized != legacy
+
+
+def test_known_legacy_v14_terminal_guard_extra_difference_is_prewrite_rejected(
+    tmp_path,
+):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(predecessor=predecessor)
+    _, legacy = _install_known_legacy_v14_terminal_binding_guard(path)
+    changed = legacy.replace("; END", "; SELECT 1; END", 1)
+    assert changed != legacy
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "DROP TRIGGER trg_terminal_rerun_delivery_authority_binding_guard"
+        )
+        conn.execute(changed)
+    before = _sqlite_storage_identity(path)
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:"
+        "terminal_rerun_authority_trigger_sql",
+    ):
+        RcaControlStore.migrate_v14_to_v15_and_activate(
+            path,
+            **_migration_apply_kwargs(contract),
+        )
+
+    _assert_sqlite_payload_unchanged(before, _sqlite_storage_identity(path))
+
+
+def test_known_legacy_v14_terminal_guard_rollback_restores_legacy(
+    tmp_path,
+    monkeypatch,
+):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(predecessor=predecessor)
+    _, legacy = _install_known_legacy_v14_terminal_binding_guard(path)
+
+    def fail_after_epoch_swap(stage):
+        if stage == "after_epoch_swap":
+            raise RuntimeError("fault:after_epoch_swap")
+
+    monkeypatch.setattr(
+        RcaControlStore,
+        "_v15_migration_fault",
+        staticmethod(fail_after_epoch_swap),
+    )
+    with pytest.raises(RuntimeError, match="fault:after_epoch_swap"):
+        RcaControlStore.migrate_v14_to_v15_and_activate(
+            path,
+            **_migration_apply_kwargs(contract),
+        )
+
+    with sqlite3.connect(path) as conn:
+        marker = conn.execute(
+            "SELECT value FROM control_meta WHERE key = 'schema_version'"
+        ).fetchone()[0]
+        observed = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 'trg_terminal_rerun_delivery_authority_binding_guard'"
+        ).fetchone()[0]
+    assert marker == CONTROL_STORE_SCHEMA_VERSION
+    assert RcaControlStore._normalized_schema_sql(observed) == legacy
+
+
+def test_v15_rejects_known_legacy_terminal_binding_guard(tmp_path):
+    path = tmp_path / "control.sqlite3"
+    control = _steady_control_store(path)
+    predecessor = control.direct_steady_predecessor()
+    assert predecessor is not None
+    contract = _direct_steady_contract(predecessor=predecessor)
+    RcaControlStore.migrate_v14_to_v15_and_activate(
+        path,
+        **_migration_apply_kwargs(contract),
+    )
+    _install_known_legacy_v14_terminal_binding_guard(path)
+
+    with pytest.raises(
+        RuntimeError,
+        match="incompatible_control_store_schema:"
+        "terminal_rerun_authority_trigger_sql",
+    ):
+        RcaControlStore(
+            path,
+            require_current=True,
+            read_only=True,
+            allow_successor_read_only=True,
+        )
 
 
 @pytest.mark.parametrize(

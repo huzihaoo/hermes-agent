@@ -1378,6 +1378,21 @@ def test_activation_uses_atomic_migration_and_hides_legacy_columns(release_files
 
 def test_activation_real_store_atomic_migration_and_exact_v15_retry(release_files):
     note, _note_raw, binding = _seed_real_v14_predecessor_note(release_files)
+    strict_state = "AND epoch.state = 'steady_active'"
+    legacy_state = "AND epoch.state IN ('bounded_active', 'steady_active')"
+    with sqlite3.connect(release_files["control_db"]) as conn:
+        strict = str(
+            conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+                "AND name = "
+                "'trg_terminal_rerun_delivery_authority_binding_guard'"
+            ).fetchone()[0]
+        )
+        assert strict.count(strict_state) == 1
+        conn.execute(
+            "DROP TRIGGER trg_terminal_rerun_delivery_authority_binding_guard"
+        )
+        conn.execute(strict.replace(strict_state, legacy_state, 1))
 
     plan = release._activation_plan(note, binding, release._open_store)
     applied = release._activation_apply(note, binding, plan, release._open_store)
@@ -1389,6 +1404,16 @@ def test_activation_real_store_atomic_migration_and_exact_v15_retry(release_file
     assert applied == {"changed": True, "current_epoch": status}
     assert retry["transition"] == "v15_noop"
     assert retried == {"changed": False, "current_epoch": status}
+    with sqlite3.connect(release_files["control_db"]) as conn:
+        migrated_guard = str(
+            conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' "
+                "AND name = "
+                "'trg_terminal_rerun_delivery_authority_binding_guard'"
+            ).fetchone()[0]
+        )
+    assert strict_state in migrated_guard
+    assert legacy_state not in migrated_guard
     assert release._open_store(
         release_files["control_db"], False
     ).schema_runtime_capability() == {
