@@ -201,6 +201,8 @@ _RCA_VM_REPO_ROOT = RCA_PROD_VM_RELEASE_ROOT
 _RCA_FIXED_CLI_RELATIVE_PATH = f"./{RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH}"
 _RCA_VM_TASK_ROOT = "/home/mini/.hermes/shared-state/tasks"
 _RCA_HISTORICAL_OPERATIONS = frozenset({"plan", "execute", "verify"})
+_RCA_HISTORICAL_SERVICE_CAPABILITY = "run_g1q3_rca_historical_full308"
+_RCA_HISTORICAL_SERVICE_OWNER = "root_cause_analysis_agent"
 _RCA_HISTORICAL_GOAL_BEGIN = "<!-- G1Q3_RCA_HISTORICAL_FULL308:BEGIN -->"
 _RCA_HISTORICAL_GOAL_END = "<!-- G1Q3_RCA_HISTORICAL_FULL308:END -->"
 _RCA_STORAGE_ADMISSION_SCHEMA_VERSION = "pnc_rca_derived_capacity_admission_v2"
@@ -1390,11 +1392,35 @@ def _historical_title(plan: HistoricalFullRerunPlan) -> str:
     return "G1Q3 RCA governed historical full308: " + plan.request["request_id"]
 
 
+def _historical_receipt_binding_sha256(plan: HistoricalFullRerunPlan) -> str:
+    bindings = {
+        "request_sha256": plan.request_sha256,
+        "plan_sha256": plan.plan_sha256,
+        "task_id": plan.task_id,
+        "host_reservation_path": str(plan.host_reservation_path),
+        "max_global_evaluation_lanes": 3,
+        "queue_if_blocked": False,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            bindings,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _historical_meta(plan: HistoricalFullRerunPlan) -> dict[str, Any]:
     return {
         "actor_kind": "service",
         "business_line": "g1q3_rca",
+        "service_capability": _RCA_HISTORICAL_SERVICE_CAPABILITY,
         "service_operation": "historical_full308",
+        "rca_create_once": True,
+        "rca_service_owner": _RCA_HISTORICAL_SERVICE_OWNER,
+        "rca_historical_owner": plan.request["owner"],
         "rca_historical_request_sha256": plan.request_sha256,
         "rca_historical_plan_sha256": plan.plan_sha256,
         "rca_historical_source_commit": plan.request["remote_commit"],
@@ -1407,7 +1433,11 @@ def _historical_meta(plan: HistoricalFullRerunPlan) -> dict[str, Any]:
             build_historical_full_rerun_execute_argv(plan)
         ),
         "rca_historical_host_reservation_path": str(plan.host_reservation_path),
+        "rca_historical_receipt_binding_sha256": (
+            _historical_receipt_binding_sha256(plan)
+        ),
         "rca_prod_capacity_mode": "bootstrap",
+        "coding_agent_fallback_enabled": False,
         "queue_if_blocked": False,
         "resource_gate_bypass": False,
     }
