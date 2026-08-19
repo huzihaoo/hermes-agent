@@ -238,6 +238,9 @@ _V15_ACTIVATION_CROSS_TRIGGER_NAMES = (
     "trg_terminal_rerun_delivery_authority_binding_guard",
     "trg_historical_epoch_rerun_delivery_authority_binding_guard",
 )
+_KNOWN_V14_TERMINAL_RERUN_BINDING_GUARD_SHA256 = (
+    "d591104bdaa90523aaf57e29c7de8254612f321934eba537895a0deffd4eef1f"
+)
 _MINIMAL_RELEASE_EPOCH_CONTRACT_SCHEMA_VERSION = (
     "pnc_rca_minimal_release_epoch_contract_v1"
 )
@@ -4143,16 +4146,53 @@ class RcaControlStore:
             conn.execute(statement)
 
     @classmethod
+    def _v14_terminal_rerun_binding_guard_sql_contract(
+        cls,
+    ) -> tuple[str, str]:
+        prefix = "CREATE TRIGGER IF NOT EXISTS "
+        name = "trg_terminal_rerun_delivery_authority_binding_guard"
+        candidates = [
+            cls._normalized_schema_sql(statement)
+            for statement in cls._v14_terminal_rerun_delivery_authority_schema_statements()
+            if cls._normalized_schema_sql(statement).startswith(prefix + name + " ")
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError(
+                "incompatible_control_store_schema:terminal_rerun_authority_trigger_contract"
+            )
+        strict = candidates[0].replace(
+            prefix,
+            "CREATE TRIGGER ",
+            1,
+        )
+        strict_state = "AND epoch.state = 'steady_active'"
+        legacy_state = "AND epoch.state IN ('bounded_active', 'steady_active')"
+        if strict.count(strict_state) != 1:
+            raise RuntimeError(
+                "incompatible_control_store_schema:terminal_rerun_authority_trigger_contract"
+            )
+        legacy = strict.replace(strict_state, legacy_state, 1)
+        if (
+            hashlib.sha256(legacy.encode("utf-8")).hexdigest()
+            != _KNOWN_V14_TERMINAL_RERUN_BINDING_GUARD_SHA256
+        ):
+            raise RuntimeError(
+                "incompatible_control_store_schema:terminal_rerun_authority_trigger_contract"
+            )
+        return strict, legacy
+
+    @classmethod
     def _validate_v14_terminal_rerun_delivery_authority_schema(
         cls,
         conn: sqlite3.Connection,
+        *,
+        allow_known_legacy_binding_guard: bool = False,
     ) -> None:
-        normalize_sql = lambda value: " ".join(str(value).split()).rstrip(";")
         expected_tables: dict[str, str] = {}
         expected_indexes: dict[str, str] = {}
         expected_triggers: dict[str, str] = {}
         for statement in cls._v14_terminal_rerun_delivery_authority_schema_statements():
-            normalized = normalize_sql(statement)
+            normalized = cls._normalized_schema_sql(statement)
             for prefix, destination in (
                 ("CREATE TABLE IF NOT EXISTS ", expected_tables),
                 ("CREATE INDEX IF NOT EXISTS ", expected_indexes),
@@ -4167,7 +4207,7 @@ class RcaControlStore:
 
         def observed(kind: str, expected: Mapping[str, str]) -> dict[str, str]:
             return {
-                str(row["name"]): normalize_sql(row["sql"] or "")
+                str(row["name"]): cls._normalized_schema_sql(row["sql"] or "")
                 for row in conn.execute(
                     "SELECT name, sql FROM sqlite_master WHERE type = ?",
                     (kind,),
@@ -4183,10 +4223,30 @@ class RcaControlStore:
             raise RuntimeError(
                 "incompatible_control_store_schema:terminal_rerun_authority_index_sql"
             )
-        if observed("trigger", expected_triggers) != expected_triggers:
-            raise RuntimeError(
-                "incompatible_control_store_schema:terminal_rerun_authority_trigger_sql"
+        observed_triggers = observed("trigger", expected_triggers)
+        if observed_triggers != expected_triggers:
+            strict_binding, legacy_binding = (
+                cls._v14_terminal_rerun_binding_guard_sql_contract()
             )
+            binding_name = "trg_terminal_rerun_delivery_authority_binding_guard"
+            if expected_triggers.get(binding_name) != strict_binding:
+                raise RuntimeError(
+                    "incompatible_control_store_schema:terminal_rerun_authority_trigger_contract"
+                )
+            legacy_triggers = dict(expected_triggers)
+            legacy_triggers[binding_name] = legacy_binding
+            marker = conn.execute(
+                "SELECT value FROM control_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            marker_value = str(marker[0]) if marker is not None else ""
+            if (
+                not allow_known_legacy_binding_guard
+                or marker_value != CONTROL_STORE_SCHEMA_VERSION
+                or observed_triggers != legacy_triggers
+            ):
+                raise RuntimeError(
+                    "incompatible_control_store_schema:terminal_rerun_authority_trigger_sql"
+                )
         authority_tables = {
             str(row["name"])
             for row in conn.execute(
@@ -5294,11 +5354,27 @@ class RcaControlStore:
             conn.execute("PRAGMA recursive_triggers=ON")
             conn.execute("BEGIN")
             activation_schema_version = self._activation_schema_version_tx(conn)
+            allow_known_legacy_binding_guard = (
+                activation_schema_version == CONTROL_STORE_SCHEMA_VERSION
+                and self.read_only
+                and self.allow_successor_read_only
+            )
             if activation_schema_version == CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION:
                 self._validate_v15_activation_schema_tx(conn)
-            self._validate_structural_contract(conn, integrity_check=False)
+            self._validate_structural_contract(
+                conn,
+                integrity_check=False,
+                allow_known_legacy_binding_guard=(
+                    allow_known_legacy_binding_guard
+                ),
+            )
             self._validate_v12_learning_lane_schema(conn)
-            self._validate_v14_terminal_rerun_delivery_authority_schema(conn)
+            self._validate_v14_terminal_rerun_delivery_authority_schema(
+                conn,
+                allow_known_legacy_binding_guard=(
+                    allow_known_legacy_binding_guard
+                ),
+            )
             self._validate_historical_epoch_rerun_delivery_authority_schema(conn)
             self._validate_activation_reference_contract_tx(conn)
             self._validate_current_activation_binding_tx(
@@ -6660,7 +6736,11 @@ class RcaControlStore:
             conn.execute("BEGIN IMMEDIATE")
             if cls._activation_schema_version_tx(conn) != CONTROL_STORE_SCHEMA_VERSION:
                 raise RuntimeError("incompatible_control_store_schema:activation_layout")
-            cls._validate_structural_contract(conn, integrity_check=True)
+            cls._validate_structural_contract(
+                conn,
+                integrity_check=True,
+                allow_known_legacy_binding_guard=True,
+            )
             cls._validate_activation_reference_contract_tx(conn)
             cls._validate_activation_child_rows_tx(conn)
 
@@ -6733,6 +6813,17 @@ class RcaControlStore:
             ):
                 raise RuntimeError(
                     "incompatible_control_store_schema:activation_cross_triggers"
+                )
+            binding_guard = "trg_terminal_rerun_delivery_authority_binding_guard"
+            strict_binding, legacy_binding = (
+                cls._v14_terminal_rerun_binding_guard_sql_contract()
+            )
+            observed_binding = cls._normalized_schema_sql(trigger_sql[binding_guard])
+            if observed_binding == legacy_binding:
+                trigger_sql[binding_guard] = strict_binding
+            elif observed_binding != strict_binding:
+                raise RuntimeError(
+                    "incompatible_control_store_schema:terminal_rerun_authority_trigger_sql"
                 )
             transition_index_sql = conn.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'index' "
@@ -11005,6 +11096,7 @@ class RcaControlStore:
         conn: sqlite3.Connection,
         *,
         integrity_check: bool,
+        allow_known_legacy_binding_guard: bool = False,
     ) -> None:
         """Refuse to label a legacy lookalike as the current durable schema."""
         try:
@@ -11056,7 +11148,10 @@ class RcaControlStore:
             }
             or v14_table_present
         ):
-            RcaControlStore._validate_v14_terminal_rerun_delivery_authority_schema(conn)
+            RcaControlStore._validate_v14_terminal_rerun_delivery_authority_schema(
+                conn,
+                allow_known_legacy_binding_guard=allow_known_legacy_binding_guard,
+            )
         historical_epoch_rerun_table_present = RcaControlStore._table_exists(
             conn, "rca_historical_epoch_rerun_delivery_authorities"
         )
