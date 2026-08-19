@@ -149,8 +149,8 @@ HISTORICAL_BUDGETS = {
 # Server-owned successor projection. Request payloads may repeat these pins,
 # but cannot select a different evaluator/source identity.
 HISTORICAL_SUCCESSOR_RELEASE: Mapping[str, Any] | None = {
-    "source_commit": "a64fa62b813ad6af0cb77537ba9b78e8c9defd11",
-    "source_tree": "c59ee37966b5afe3ff5eb0bc1ce51992aeae0214",
+    "source_commit": "f8d348f0c28bcf0dd32f6f167f630b1184769bc9",
+    "source_tree": "ef87a6c84bb3eed2e6fedd63c0319431a69c4bf3",
     "requirements_contract_hash": "ca99f759c70b72b0836f956557ecc5e23c11538132b13f1d1bfe8a46ce7e6cb6",
     "evaluator_fingerprints": {
         "g1q3_rca/aeb_signal_parser.py": "fa227f22a684f2a4b0808fefe0d596a032c3a582e1571f67ede7937d5894e3d3",
@@ -162,11 +162,11 @@ HISTORICAL_SUCCESSOR_RELEASE: Mapping[str, Any] | None = {
         "g1q3_rca/signal_registry.py": "ffd0a796c027df1d81e30a1727eea1d37ccfcd0c5b88a806a201a0c8f3d54f17",
     },
     "evaluator_fingerprints_sha256": "e492eaa8afd9348990cb2de265575211ff248fdebacd0fff72b2f7bafe7f18c0",
-    "evaluator_version": "git-a64fa62b813ad6af0cb77537ba9b78e8c9defd11",
-    "suite_receipt_path": "/mnt/tmp/g1q3-successor-full-v5-run3-20260818/suite-receipt.json",
-    "suite_receipt_sha256": "829cbf498f9d141f3548afba818504fb8e1d37fe80897161aba8bf5a73f32e11",
-    "w17_receipt_path": "/mnt/tmp/g1q3-successor-full-v5-run3-20260818/w17-receipt.json",
-    "w17_receipt_sha256": "bf18fac5ae8e65dee6d58dba457c4708f763e7bbcd42b9fc7e6de17e4c220ecb",
+    "evaluator_version": "git-f8d348f0c28bcf0dd32f6f167f630b1184769bc9",
+    "suite_receipt_path": "/mnt/tmp/g1q3-rca-canonical-scoped-verification-20260819/suite-receipt.json",
+    "suite_receipt_sha256": "c86044cbf4daed5a9f8d9d2323af6c3246e7afdb2f389ebebd86315a65da3262",
+    "w17_receipt_path": "/mnt/tmp/g1q3-rca-canonical-scoped-verification-20260819/w17-receipt.json",
+    "w17_receipt_sha256": "953e331bdfc3ec6ab51cc90ad0bb57a11d902f533fb49c8d39fde9570d20885c",
 }
 
 RECEIPT_FIELDS = {
