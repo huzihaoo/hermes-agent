@@ -156,9 +156,26 @@ UAT 和其他环境项。环境文件必须是当前用户持有的绝对路径�
 在代码物化和发布门之前对 active home 运行 `tools enable`：
 
 1. 在候选工作树完成受影响测试并形成一个 clean commit。
-2. 在 owner-only staging home 中准备目标 `config.yaml`/`.env`；用候选版本 CLI
-   对 staging home 执行 `hermes tools enable feishu_aily_agent --platform feishu`，
-   计算目标 config/env SHA。预置凭据时 active toolset 必须继续关闭。
+2. 在 owner-only staging home 中准备目标 `config.yaml`/`.env`，两个文件路径都
+   必须为绝对路径。启用时清空继承环境，同时钉住 staging home、config
+   和 env，并调用候选工作树的 CLI，不能用全局 `hermes`：
+
+   ```bash
+   env -i \
+     HOME=/Users/songying USER=songying LOGNAME=songying \
+     PATH=/usr/local/bin:/usr/bin:/bin TMPDIR=/private/tmp LANG=zh_CN.UTF-8 \
+     HERMES_HOME=/Users/songying/.hermes-release-staging/feishu-aily-agent \
+     HERMES_CONFIG_PATH=/Users/songying/.hermes-release-staging/feishu-aily-agent/config.yaml \
+     HERMES_ENV_PATH=/Users/songying/.hermes-release-staging/feishu-aily-agent/.env \
+     /usr/local/bin/uv --directory \
+       /Users/songying/.codex-worktrees/feishu-aily-knowledge-qa-20260813 \
+       run --frozen hermes tools enable feishu_aily_agent --platform feishu
+   ```
+
+   命令前先以 owner-only 权限创建 staging 目录，并用受管流程写入目标
+   `.env`；不得从 active home 复制未经审查的其他凭据。然后回读三个路径
+   确认 CLI 只修改了 staging，计算目标 config/env SHA。预置凭据时
+   active toolset 必须继续关闭。
 3. 根据 owner 的明确发布意图，用受管 materializer 物化精确 commit；禁止直接
    修改 active detached runtime。对物化代码、staging 配置和目标 manifest 运行
    governance、strict drift、release fingerprint 及发布门。
@@ -168,7 +185,8 @@ UAT 和其他环境项。环境文件必须是当前用户持有的绝对路径�
    program/working directory 未变化，只重启 `ai.hermes.gateway`；若路径变化，按
    runbook 执行 `bootout/bootstrap`，不能只 `kickstart`。
 5. 核对新 PID、运行目录/commit、公开 health、`gateway_state.json` PID，以及
-   Feishu platform connected；回读 active config/env 语义 SHA 与 manifest 一致。
+   Feishu platform connected；回读 active config 的 raw SHA/semantic SHA 和 env 的
+   byte SHA，确认它们与 manifest 绑定一致。
 6. 由被固定授权的员工在真实飞书会话提问内部 canary，确认 session 只调用
    `feishu_aily_agent_chat`。同时保留 Aily 已发布版本/后台策略或活动日志的证据，
    证明知识未命中时不会走公网兜底；仅凭答案正文不能证明 grounded。默认回执

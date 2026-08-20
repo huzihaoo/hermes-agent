@@ -31,6 +31,18 @@ def test_documented_smoke_keeps_question_out_of_shell_arguments():
     assert "source /Users/songying/.hermes/.env" not in documentation
 
 
+def test_documented_staging_enable_is_explicitly_isolated_from_active_home():
+    documentation = DOC.read_text(encoding="utf-8")
+
+    assert "env -i" in documentation
+    assert "HERMES_HOME=/Users/songying/.hermes-release-staging/" in documentation
+    assert "HERMES_CONFIG_PATH=/Users/songying/.hermes-release-staging/" in documentation
+    assert "HERMES_ENV_PATH=/Users/songying/.hermes-release-staging/" in documentation
+    assert "/usr/local/bin/uv --directory" in documentation
+    assert "config 的 raw SHA/semantic SHA" in documentation
+    assert "env 的\n   byte SHA" in documentation
+
+
 def _env_file(tmp_path: Path, content: str) -> Path:
     path = tmp_path / ".env"
     path.write_text(content, encoding="utf-8")
