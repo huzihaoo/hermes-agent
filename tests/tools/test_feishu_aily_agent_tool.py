@@ -18,6 +18,7 @@ from hermes_cli.tools_config import (
 )
 from toolsets import resolve_toolset
 from tools import feishu_aily_agent_tool as agent
+from tools import feishu_aily_agent_user_transport as user_transport
 
 
 def _sse(*payloads):
@@ -55,10 +56,15 @@ def _clean_state(monkeypatch):
     for name in (
         "FEISHU_AILY_AUTH_APP_ID",
         "FEISHU_AILY_AUTH_APP_SECRET",
+        "FEISHU_AILY_AUTH_MODE",
         "FEISHU_AILY_AGENT_ID",
         "FEISHU_AILY_DOMAIN",
+        "FEISHU_AILY_USER_LARK_CONFIG_DIR",
+        "FEISHU_AILY_USER_OPEN_ID",
+        "FEISHU_AILY_USER_UNION_ID",
     ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("FEISHU_AILY_AUTH_MODE", "tenant")
     token = agent.set_client(None)
     monkeypatch.setattr(agent.time, "sleep", lambda _seconds: None)
     agent._reset_configured_client_cache()
@@ -209,7 +215,9 @@ def test_poll_failure_status_returns_tool_error(monkeypatch, fake_lark_sdk):
     assert "did not complete" in result["error"]
 
 
-def test_handler_explains_application_allowlist_error(monkeypatch, fake_lark_sdk):
+def test_handler_preserves_unknown_identity_business_code_and_message(
+    monkeypatch, fake_lark_sdk
+):
     client = _FakeClient(
         _response(
             json.dumps(
@@ -226,7 +234,7 @@ def test_handler_explains_application_allowlist_error(monkeypatch, fake_lark_sdk
     result = json.loads(agent._handle_feishu_aily_agent_chat({"content": "q"}))
 
     assert result["code"] == 10010
-    assert "application allowlist" in result["error"]
+    assert "permission denied" in result["error"]
 
 
 def test_poll_uses_bounded_backoff_for_queued_result(
@@ -402,6 +410,73 @@ def test_parser_accepts_non_stream_json_result():
     assert result["session_id"] == "conversation_1"
 
 
+def test_parser_deduplicates_identical_completed_content_items():
+    result = json.loads(
+        agent._parse_agent_response(
+            json.dumps(
+                {
+                    "code": 0,
+                    "data": {
+                        "status": "Completed",
+                        "content": [
+                            {"type": "text", "text": "OOI internal answer"},
+                            {"type": "text", "text": "OOI internal answer"},
+                        ],
+                    },
+                }
+            ).encode()
+        )
+    )
+
+    assert result["content"] == "OOI internal answer"
+
+
+def test_parser_preserves_nonadjacent_repeated_content_items():
+    result = json.loads(
+        agent._parse_agent_response(
+            json.dumps(
+                {
+                    "code": 0,
+                    "data": {
+                        "status": "Completed",
+                        "content": [
+                            {"type": "text", "text": "A"},
+                            {"type": "text", "text": "B"},
+                            {"type": "text", "text": "A"},
+                        ],
+                    },
+                }
+            ).encode()
+        )
+    )
+
+    assert result["content"] == "ABA"
+
+
+def test_parser_preserves_repeated_text_separated_by_non_text_items():
+    result = json.loads(
+        agent._parse_agent_response(
+            json.dumps(
+                {
+                    "code": 0,
+                    "data": {
+                        "status": "Completed",
+                        "content": [
+                            {"type": "text", "text": "A"},
+                            {"type": "artifact", "agent_artifact_id": "artifact_1"},
+                            {"type": "text", "text": "A"},
+                            {"type": "text", "text": "   "},
+                            {"type": "text", "text": "A"},
+                        ],
+                    },
+                }
+            ).encode()
+        )
+    )
+
+    assert result["content"] == "AAA"
+
+
 def test_handler_builds_agent_chat_request(fake_lark_sdk):
     client = _FakeClient(
         [
@@ -465,6 +540,209 @@ def test_handler_builds_agent_chat_request(fake_lark_sdk):
     assert get_request.paths == {"agent_id": "agent_test", "agent_chat_id": "chat_1"}
 
 
+def _configure_user_mode(monkeypatch, tmp_path):
+    monkeypatch.setenv("FEISHU_AILY_AUTH_MODE", "user")
+    monkeypatch.setenv("FEISHU_AILY_AUTH_APP_ID", "cli_expected")
+    monkeypatch.setenv("FEISHU_AILY_AGENT_ID", "agent_expected")
+    monkeypatch.setenv("FEISHU_AILY_USER_LARK_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("FEISHU_AILY_USER_OPEN_ID", "ou_expected")
+    monkeypatch.setenv("FEISHU_AILY_USER_UNION_ID", "on_expected")
+
+
+def test_missing_auth_mode_fails_before_tenant_client_resolution(monkeypatch):
+    monkeypatch.delenv("FEISHU_AILY_AUTH_MODE", raising=False)
+    monkeypatch.setenv("FEISHU_AILY_AGENT_ID", "agent_expected")
+    monkeypatch.setattr(
+        agent, "_resolve_client", lambda: pytest.fail("tenant auth must be explicit")
+    )
+
+    result = json.loads(agent._handle_feishu_aily_agent_chat({"content": "q"}))
+
+    assert "must be explicitly set" in result["error"]
+
+
+def _bind_session(*, platform="feishu", union_id="on_expected", user_name="胡子豪"):
+    from gateway.session_context import set_session_vars
+
+    return set_session_vars(
+        platform=platform,
+        user_id="ou_gateway_app_scoped",
+        user_id_alt=union_id,
+        user_name=user_name,
+    )
+
+
+def _clear_session(tokens):
+    from gateway.session_context import clear_session_vars
+
+    clear_session_vars(tokens)
+
+
+def test_user_mode_uses_bound_union_and_never_resolves_tenant_client(
+    monkeypatch, tmp_path
+):
+    _configure_user_mode(monkeypatch, tmp_path)
+    captured = {}
+
+    def fake_user_chat(config, **kwargs):
+        captured["config"] = config
+        captured.update(kwargs)
+        return {
+            "code": 0,
+            "data": {
+                "status": "Completed",
+                "agent_chat_id": "chat_1",
+                "content": [{"type": "text", "text": "enterprise answer"}],
+            },
+        }
+
+    monkeypatch.setattr(user_transport, "run_agent_chat_user", fake_user_chat)
+    monkeypatch.setattr(
+        agent, "_resolve_client", lambda: pytest.fail("tenant client must not be resolved")
+    )
+    tokens = _bind_session()
+    try:
+        result = json.loads(
+            agent._handle_feishu_aily_agent_chat(
+                {
+                    "content": "OOI是什么?",
+                    "session_id": "session_1",
+                    "agent_attachment_ids": ["attachment_1"],
+                }
+            )
+        )
+    finally:
+        _clear_session(tokens)
+
+    assert result["content"] == "enterprise answer"
+    assert captured["content"].endswith("用户问题：OOI是什么?")
+    assert "禁止使用公开网络" in captured["content"]
+    assert captured["session_id"] == "session_1"
+    assert captured["agent_attachment_ids"] == ["attachment_1"]
+    assert captured["config"] == user_transport.AilyAgentUserConfig(
+        config_dir=tmp_path,
+        profile="cli_expected",
+        expected_app_id="cli_expected",
+        expected_user_open_id="ou_expected",
+        expected_union_id="on_expected",
+        agent_id="agent_expected",
+    )
+
+
+@pytest.mark.parametrize(
+    ("platform", "union_id", "user_name"),
+    [
+        ("cli", "on_expected", "胡子豪"),
+        ("feishu", "on_other", "胡子豪"),
+        ("feishu", "", "胡子豪"),
+        ("feishu", "on_other", "on_expected"),
+    ],
+)
+def test_user_mode_rejects_untrusted_session_before_transport(
+    monkeypatch, tmp_path, platform, union_id, user_name
+):
+    _configure_user_mode(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        user_transport,
+        "run_agent_chat_user",
+        lambda *_args, **_kwargs: pytest.fail("user transport must not run"),
+    )
+    monkeypatch.setattr(
+        agent, "_resolve_client", lambda: pytest.fail("tenant fallback is forbidden")
+    )
+    tokens = _bind_session(platform=platform, union_id=union_id, user_name=user_name)
+    try:
+        result = json.loads(agent._handle_feishu_aily_agent_chat({"content": "q"}))
+    finally:
+        _clear_session(tokens)
+
+    assert "restricted to the pinned Feishu user" in result["error"]
+
+
+def test_user_mode_rejects_environment_spoof_without_bound_session(
+    monkeypatch, tmp_path
+):
+    _configure_user_mode(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID_ALT", "on_expected")
+    from gateway.session_context import reset_session_vars
+
+    reset_session_vars()
+    monkeypatch.setattr(
+        user_transport,
+        "run_agent_chat_user",
+        lambda *_args, **_kwargs: pytest.fail("user transport must not run"),
+    )
+
+    result = json.loads(agent._handle_feishu_aily_agent_chat({"content": "q"}))
+
+    assert "restricted to the pinned Feishu user" in result["error"]
+
+
+def test_user_transport_failure_never_falls_back_to_tenant(monkeypatch, tmp_path):
+    _configure_user_mode(monkeypatch, tmp_path)
+
+    def fail_user(*_args, **_kwargs):
+        raise user_transport.AilyAgentUserTransportError(
+            "auth", "authenticated user token is not server-verified"
+        )
+
+    monkeypatch.setattr(user_transport, "run_agent_chat_user", fail_user)
+    monkeypatch.setattr(
+        agent, "_resolve_client", lambda: pytest.fail("tenant fallback is forbidden")
+    )
+    tokens = _bind_session()
+    try:
+        result = json.loads(agent._handle_feishu_aily_agent_chat({"content": "q"}))
+    finally:
+        _clear_session(tokens)
+
+    assert "not server-verified" in result["error"]
+
+
+def test_enterprise_knowledge_prefix_is_on_by_default(monkeypatch, tmp_path):
+    _configure_user_mode(monkeypatch, tmp_path)
+    captured = {}
+
+    def fake_user_chat(_config, **kwargs):
+        captured.update(kwargs)
+        return {"code": 0, "data": {"status": "Completed", "content": []}}
+
+    monkeypatch.setattr(user_transport, "run_agent_chat_user", fake_user_chat)
+    tokens = _bind_session()
+    try:
+        result = json.loads(agent._handle_feishu_aily_agent_chat({"content": "OOI是什么?"}))
+    finally:
+        _clear_session(tokens)
+
+    assert result["success"] is True
+    assert captured["content"].endswith("用户问题：OOI是什么?")
+    assert "禁止使用公开网络" in captured["content"]
+
+
+def test_enterprise_knowledge_prefix_forbids_public_web_in_user_request(
+    monkeypatch, tmp_path
+):
+    _configure_user_mode(monkeypatch, tmp_path)
+    captured = {}
+
+    def fake_user_chat(_config, **kwargs):
+        captured.update(kwargs)
+        return {"code": 0, "data": {"status": "Completed", "content": []}}
+
+    monkeypatch.setattr(user_transport, "run_agent_chat_user", fake_user_chat)
+    tokens = _bind_session()
+    try:
+        result = json.loads(agent._handle_feishu_aily_agent_chat({"content": "OOI是什么?"}))
+    finally:
+        _clear_session(tokens)
+
+    assert result["success"] is True
+    assert captured["content"].endswith("用户问题：OOI是什么?")
+    assert "企业知识库" in captured["content"]
+    assert "禁止使用公开网络" in captured["content"]
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -497,7 +775,7 @@ def test_agent_toolset_is_explicitly_scoped_and_default_off():
     configurable = {name for name, _label, _description in CONFIGURABLE_TOOLSETS}
     assert "feishu_aily_agent" in configurable
     assert "feishu_aily_agent" in _DEFAULT_OFF_TOOLSETS
-    assert _toolset_allowed_for_platform("feishu_aily_agent", "cli")
+    assert not _toolset_allowed_for_platform("feishu_aily_agent", "cli")
     assert _toolset_allowed_for_platform("feishu_aily_agent", "feishu")
     assert not _toolset_allowed_for_platform("feishu_aily_agent", "telegram")
     assert "feishu_aily_agent_chat" in resolve_toolset("feishu_aily_agent")

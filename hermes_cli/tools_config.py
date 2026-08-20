@@ -159,7 +159,7 @@ _TOOLSET_PLATFORM_RESTRICTIONS: Dict[str, Set[str]] = {
     "discord": {"discord"},
     "discord_admin": {"discord"},
     "feishu_aily": {"cli", "feishu"},
-    "feishu_aily_agent": {"cli", "feishu"},
+    "feishu_aily_agent": {"feishu"},
 }
 
 # Optional SDKs that must be ready before the CLI persists a toolset enable.
@@ -168,6 +168,21 @@ _TOOLSET_PLATFORM_RESTRICTIONS: Dict[str, Set[str]] = {
 _TOOLSET_LAZY_DEPENDENCIES: Dict[str, str] = {
     "feishu_aily": "platform.feishu",
     "feishu_aily_agent": "platform.feishu",
+}
+
+_FEISHU_AILY_AGENT_AUTH_REQUIREMENTS: Dict[str, tuple[str, ...]] = {
+    "user": (
+        "FEISHU_AILY_AUTH_APP_ID",
+        "FEISHU_AILY_AGENT_ID",
+        "FEISHU_AILY_USER_LARK_CONFIG_DIR",
+        "FEISHU_AILY_USER_OPEN_ID",
+        "FEISHU_AILY_USER_UNION_ID",
+    ),
+    "tenant": (
+        "FEISHU_AILY_AUTH_APP_ID",
+        "FEISHU_AILY_AUTH_APP_SECRET",
+        "FEISHU_AILY_AGENT_ID",
+    ),
 }
 
 
@@ -220,6 +235,11 @@ def _preflight_toolset_enables(
     """Return dependency-preflight failures keyed by toolset name."""
     failed: Dict[str, str] = {}
     for ts_key in sorted(set(toolset_names)):
+        configuration_error = _toolset_configuration_error(ts_key)
+        if configuration_error:
+            failed[ts_key] = configuration_error
+            _print_error(f"Cannot enable toolset '{ts_key}': {configuration_error}")
+            continue
         try:
             _ensure_toolset_dependencies(ts_key, prompt=prompt)
         except Exception as exc:
@@ -651,11 +671,38 @@ TOOLSET_ENV_REQUIREMENTS = {
         ("FEISHU_AILY_TARGET_APP_ID", "https://aily.feishu.cn/"),
     ],
     "feishu_aily_agent": [
-        ("FEISHU_AILY_AUTH_APP_ID", "https://open.feishu.cn/"),
-        ("FEISHU_AILY_AUTH_APP_SECRET", "https://open.feishu.cn/"),
+        # Tenant and identity-pinned user modes have different auth inputs;
+        # the handler validates the selected mode fail-closed.
         ("FEISHU_AILY_AGENT_ID", "https://aily.feishu.cn/"),
     ],
 }
+
+
+def _toolset_configuration_error(ts_key: str) -> Optional[str]:
+    """Return an actionable error when a toolset's env config is incomplete."""
+    if ts_key != "feishu_aily_agent":
+        return None
+
+    mode_var = "FEISHU_AILY_AUTH_MODE"
+    mode = str(get_env_value(mode_var) or "").strip().lower()
+    if not mode:
+        return f"missing required configuration: {mode_var}"
+    requirements = _FEISHU_AILY_AGENT_AUTH_REQUIREMENTS.get(mode)
+    if requirements is None:
+        return f"invalid {mode_var}; expected 'user' or 'tenant'"
+
+    missing = [name for name in requirements if not str(get_env_value(name) or "").strip()]
+    if missing:
+        return f"{mode} mode is missing required configuration: {', '.join(missing)}"
+    return None
+
+
+def _enabled_toolset_status(ts_key: str) -> tuple[str, Optional[str]]:
+    """Return the display marker and safe configuration note for an enabled toolset."""
+    configuration_error = _toolset_configuration_error(ts_key)
+    if configuration_error:
+        return color("⚠ enabled, unconfigured", Colors.YELLOW), configuration_error
+    return color("✓ enabled", Colors.GREEN), None
 
 
 # ─── Post-Setup Hooks ─────────────────────────────────────────────────────────
@@ -2003,11 +2050,19 @@ def _get_platform_tools(
     return enabled_toolsets
 
 
-def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[str]):
+def _save_platform_tools(
+    config: dict,
+    platform: str,
+    enabled_toolset_keys: Set[str],
+    *,
+    selection_universe: Optional[Set[str]] = None,
+):
     """Save the selected toolset keys for a platform to config.
 
     Preserves any non-configurable toolset entries (like MCP server names)
-    that were already in the config for this platform.
+    that were already in the config for this platform. When a shared picker
+    exposes only a subset of configurable toolsets, ``selection_universe``
+    also preserves existing, platform-valid entries the user could not see.
     """
     config.setdefault("platform_toolsets", {})
 
@@ -2034,6 +2089,17 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
     if not isinstance(existing_toolsets, list):
         existing_toolsets = []
     existing_toolsets = [str(ts) for ts in existing_toolsets]
+
+    unoffered_entries: Set[str] = set()
+    if selection_universe is not None:
+        unoffered_entries = {
+            entry
+            for entry in existing_toolsets
+            if entry in configurable_keys
+            and entry not in selection_universe
+            and _toolset_allowed_for_platform(entry, platform)
+        }
+        enabled_toolset_keys |= unoffered_entries
 
     # Preserve any entries that are NOT configurable toolsets and NOT platform
     # defaults (i.e. only MCP server names should be preserved)
@@ -2073,7 +2139,9 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: Set[
     if isinstance(agent_cfg, dict):
         disabled_toolsets = agent_cfg.get("disabled_toolsets")
         if isinstance(disabled_toolsets, list) and disabled_toolsets:
-            newly_enabled = enabled_toolset_keys - preserved_entries
+            newly_enabled = (
+                enabled_toolset_keys - preserved_entries - unoffered_entries
+            )
             if newly_enabled:
                 remaining = [
                     ts for ts in disabled_toolsets
@@ -2094,6 +2162,9 @@ def _toolset_has_keys(
     """Check if a toolset's required API keys are configured."""
     if config is None:
         config = load_config()
+
+    if _toolset_configuration_error(ts_key):
+        return False
 
     if ts_key == "vision":
         try:
@@ -4070,7 +4141,14 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
             if enabled:
                 for ts_key in sorted(enabled):
                     label = next((l for k, l, _ in _get_effective_configurable_toolsets() if k == ts_key), ts_key)
-                    print(color(f"    ✓ {label}", Colors.GREEN))
+                    status, configuration_error = _enabled_toolset_status(ts_key)
+                    if configuration_error:
+                        print(
+                            f"    {status}  {label} "
+                            f"({configuration_error})"
+                        )
+                    else:
+                        print(color(f"    ✓ {label}", Colors.GREEN))
             else:
                 print(color("    (none enabled)", Colors.DIM))
         print()
@@ -4205,9 +4283,14 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
             all_current = set()
             for pk in platform_keys:
                 all_current |= _get_platform_tools(config, pk, include_default_mcp_servers=False)
+            # The global picker uses the CLI-visible common surface. Entries
+            # outside this universe (for example Feishu-only Aily Agent) must
+            # remain untouched on their owning platform.
+            global_selection_universe = _checklist_toolset_keys("cli")
             new_enabled = _prompt_toolset_checklist(
                 "All platforms",
                 all_current,
+                "cli",
                 force_fresh=True,
             )
             # The global selection is written to every platform. A toolset that
@@ -4215,13 +4298,15 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
             # on another, so validate every selected lazy dependency here.
             dependency_failures = _preflight_toolset_enables(new_enabled)
             new_enabled.difference_update(dependency_failures)
-            if new_enabled != all_current:
+            if new_enabled != (all_current & global_selection_universe):
                 for pk in platform_keys:
                     prev = _get_platform_tools(config, pk, include_default_mcp_servers=False)
                     # Scope the printed diff to the checklist's universe (see
                     # _checklist_toolset_keys) so non-configurable toolsets like
                     # ``kanban`` aren't reported as added/removed.
-                    _diff_universe = _checklist_toolset_keys(pk)
+                    _diff_universe = (
+                        _checklist_toolset_keys(pk) & global_selection_universe
+                    )
                     added = (new_enabled - prev) & _diff_universe
                     removed = (prev - new_enabled) & _diff_universe
                     pinfo_inner = PLATFORMS[pk]
@@ -4242,7 +4327,12 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
                                 force_fresh=True,
                             ):
                                 _configure_toolset(ts_key, config)
-                    _save_platform_tools(config, pk, new_enabled)
+                    _save_platform_tools(
+                        config,
+                        pk,
+                        new_enabled,
+                        selection_universe=global_selection_universe,
+                    )
                 save_config(config)
                 print(color("  ✓ Saved configuration for all platforms", Colors.GREEN))
                 # Update choice labels
@@ -4265,6 +4355,7 @@ def tools_command(args=None, first_install: bool = False, config: dict = None):
         new_enabled = _prompt_toolset_checklist(
             pinfo["label"],
             current_enabled,
+            pkey,
             force_fresh=True,
         )
 
@@ -4505,9 +4596,13 @@ def _print_tools_list(enabled_toolsets: set, mcp_servers: dict, platform: str = 
     for ts_key, label, _ in effective:
         if ts_key not in builtin_keys:
             continue
-        status = (color("✓ enabled", Colors.GREEN) if ts_key in enabled_toolsets
-                  else color("✗ disabled", Colors.RED))
-        print(f"  {status}  {ts_key}  {color(label, Colors.DIM)}")
+        configuration_error = None
+        if ts_key in enabled_toolsets:
+            status, configuration_error = _enabled_toolset_status(ts_key)
+        else:
+            status = color("✗ disabled", Colors.RED)
+        note = f"  ({configuration_error})" if configuration_error else ""
+        print(f"  {status}  {ts_key}  {color(label, Colors.DIM)}{note}")
 
     # Plugin toolsets
     plugin_entries = [(k, l) for k, l, _ in effective if k not in builtin_keys]
@@ -4515,9 +4610,13 @@ def _print_tools_list(enabled_toolsets: set, mcp_servers: dict, platform: str = 
         print()
         print(f"Plugin toolsets ({platform}):")
         for ts_key, label in plugin_entries:
-            status = (color("✓ enabled", Colors.GREEN) if ts_key in enabled_toolsets
-                      else color("✗ disabled", Colors.RED))
-            print(f"  {status}  {ts_key}  {color(label, Colors.DIM)}")
+            configuration_error = None
+            if ts_key in enabled_toolsets:
+                status, configuration_error = _enabled_toolset_status(ts_key)
+            else:
+                status = color("✗ disabled", Colors.RED)
+            note = f"  ({configuration_error})" if configuration_error else ""
+            print(f"  {status}  {ts_key}  {color(label, Colors.DIM)}{note}")
 
     if mcp_servers:
         print()

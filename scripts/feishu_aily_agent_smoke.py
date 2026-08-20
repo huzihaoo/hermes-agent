@@ -52,9 +52,6 @@ AILY_AGENT_ERROR_MESSAGES = {
         "or App ID access range, same-tenant requirement, and attachment ownership"
     ),
     10008: "This tenant has not enabled Aily OpenAPI access",
-    10009: "The Aily Agent OpenAPI channel has not enabled application identity",
-    10010: "The calling App ID is not in the Aily Agent OpenAPI application allowlist",
-    10011: "The calling user is outside the Aily Agent OpenAPI visibility range",
     2700001: "Aily Agent request parameters are invalid",
     50001: "Aily Agent returned an internal error; retry once later or contact support",
 }
@@ -257,11 +254,21 @@ def _api_error_text(
 def _agent_text(data: dict[str, Any]) -> str:
     content_items = data.get("content")
     if isinstance(content_items, list):
-        return "".join(
-            item.get("text", "")
-            for item in content_items
-            if isinstance(item, dict) and isinstance(item.get("text"), str)
-        )
+        parts: list[str] = []
+        previous: str | None = None
+        for item in content_items:
+            if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+                previous = None
+                continue
+            part = item["text"]
+            if not part.strip():
+                previous = None
+                continue
+            if part == previous:
+                continue
+            parts.append(part)
+            previous = part
+        return "".join(parts)
     return ""
 
 

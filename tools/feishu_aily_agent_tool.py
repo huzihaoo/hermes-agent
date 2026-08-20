@@ -12,8 +12,10 @@ import importlib.util
 import json
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
+from tools import feishu_aily_agent_user_transport as _user_transport
 from tools.registry import registry, tool_error, tool_result
 
 # Reuse the existing, scoped credential/client boundary and optional SSE
@@ -38,6 +40,11 @@ from tools.feishu_aily_knowledge_tool import (  # noqa: E402
 logger = logging.getLogger(__name__)
 
 _AGENT_ID_ENV = "FEISHU_AILY_AGENT_ID"
+_AUTH_APP_ID_ENV = "FEISHU_AILY_AUTH_APP_ID"
+_AUTH_MODE_ENV = "FEISHU_AILY_AUTH_MODE"
+_USER_CONFIG_DIR_ENV = "FEISHU_AILY_USER_LARK_CONFIG_DIR"
+_USER_OPEN_ID_ENV = "FEISHU_AILY_USER_OPEN_ID"
+_USER_UNION_ID_ENV = "FEISHU_AILY_USER_UNION_ID"
 _AGENT_CHAT_URI = "/open-apis/aily/v1/agents/:agent_id/chats"
 _AGENT_CHAT_RESULT_URI = "/open-apis/aily/v1/agents/:agent_id/chats/:agent_chat_id"
 _MAX_AGENT_ID_CHARS = 65
@@ -64,9 +71,6 @@ _AILY_AGENT_ERROR_MESSAGES = {
         "or App ID access range, same-tenant requirement, and attachment ownership"
     ),
     10008: "This tenant has not enabled Aily OpenAPI access",
-    10009: "The Aily Agent OpenAPI channel has not enabled application identity",
-    10010: "The calling App ID is not in the Aily Agent OpenAPI application allowlist",
-    10011: "The calling user is outside the Aily Agent OpenAPI visibility range",
     2700001: "Aily Agent request parameters are invalid",
     50001: "Aily Agent returned an internal error; retry once later or contact support",
 }
@@ -74,6 +78,11 @@ _AILY_AGENT_ERROR_MESSAGES = {
 _NON_TERMINAL_STATUSES = {"queued", "pending", "running", "processing"}
 _SUCCESS_STATUSES = {"completed"}
 _FAILED_STATUSES = {"failed", "failure", "error", "cancelled", "canceled"}
+
+_ENTERPRISE_KNOWLEDGE_PREFIX = (
+    "请仅基于已配置的企业知识库或知识空间回答。禁止使用公开网络、通用互联网知识或猜测；"
+    "如果企业知识库没有依据，请明确说明未检索到，不要补充外部信息。\n\n用户问题："
+)
 
 
 FEISHU_AILY_AGENT_CHAT_SCHEMA = {
@@ -119,6 +128,102 @@ def _resolve_client() -> Any | None:
     return configured if configured is not None else get_client()
 
 
+def _configured_auth_mode() -> str:
+    raw_value = _env(_AUTH_MODE_ENV)
+    if not raw_value:
+        raise ValueError(
+            f"{_AUTH_MODE_ENV} must be explicitly set to 'user' or 'tenant'"
+        )
+    value = raw_value.strip().lower()
+    if value not in {"tenant", "user"}:
+        raise ValueError(f"{_AUTH_MODE_ENV} must be 'tenant' or 'user'")
+    return value
+
+
+def _trusted_feishu_session_union_id() -> str | None:
+    """Return a bound Feishu union_id without using process-env fallbacks."""
+    try:
+        from gateway import session_context
+    except ImportError:
+        return None
+    if not session_context.session_context_engaged():
+        return None
+    platform = session_context.get_bound_session_env("HERMES_SESSION_PLATFORM")
+    union_id = session_context.get_bound_session_env("HERMES_SESSION_USER_ID_ALT")
+    if str(platform or "").strip().lower() != "feishu":
+        return None
+    return str(union_id or "").strip() or None
+
+
+def _handle_user_agent_chat(
+    *,
+    agent_id: str,
+    content: str,
+    session_id: str | None,
+    attachments: list[str],
+) -> str:
+    try:
+        expected_union_id = _env(_USER_UNION_ID_ENV)
+    except RuntimeError as exc:
+        return tool_error(f"Aily Agent user configuration error: {_safe_error_text(exc)}")
+    session_union_id = _trusted_feishu_session_union_id()
+    if not expected_union_id:
+        return tool_error(f"Aily Agent user mode requires {_USER_UNION_ID_ENV}")
+    if session_union_id != expected_union_id:
+        return tool_error(
+            "Aily Agent enterprise knowledge is restricted to the pinned Feishu user"
+        )
+
+    try:
+        expected_app_id = _env(_AUTH_APP_ID_ENV)
+        config_dir = _env(_USER_CONFIG_DIR_ENV)
+        expected_open_id = _env(_USER_OPEN_ID_ENV)
+    except RuntimeError as exc:
+        return tool_error(f"Aily Agent user configuration error: {_safe_error_text(exc)}")
+    missing = [
+        name
+        for name, value in (
+            (_AUTH_APP_ID_ENV, expected_app_id),
+            (_USER_CONFIG_DIR_ENV, config_dir),
+            (_USER_OPEN_ID_ENV, expected_open_id),
+        )
+        if not value
+    ]
+    if missing:
+        return tool_error(
+            "Aily Agent user mode is not configured; missing " + ", ".join(missing)
+        )
+
+    try:
+        payload = _user_transport.run_agent_chat_user(
+            _user_transport.AilyAgentUserConfig(
+                config_dir=Path(config_dir),
+                profile=expected_app_id,
+                expected_app_id=expected_app_id,
+                expected_user_open_id=expected_open_id,
+                expected_union_id=expected_union_id,
+                agent_id=agent_id,
+            ),
+            content=content,
+            session_id=session_id,
+            agent_attachment_ids=attachments,
+            timeout=_POLL_TIMEOUT_SECONDS,
+        )
+    except _user_transport.AilyAgentUserTransportError as exc:
+        if exc.code is not None:
+            return tool_error(
+                "Aily Agent user request failed: "
+                f"[{exc.code}] {_agent_api_error_text(exc.code, exc)}",
+                code=exc.code,
+            )
+        return tool_error(
+            f"Aily Agent user request failed during {exc.phase}: {_safe_error_text(exc)}"
+        )
+    except (RuntimeError, ValueError) as exc:
+        return tool_error(f"Aily Agent user configuration error: {_safe_error_text(exc)}")
+    return _parse_agent_response(json.dumps(payload, ensure_ascii=False))
+
+
 def _agent_api_error_text(code: Any, msg: Any) -> str:
     """Add channel/identity remediation while retaining a redacted API message."""
     mapped = (
@@ -159,8 +264,7 @@ def _extract_text(value: Any) -> str:
     if isinstance(value, str):
         return value
     if isinstance(value, list):
-        parts = [_extract_text(item) for item in value]
-        return "".join(part for part in parts if part)
+        return "".join(part for item in value if (part := _extract_text(item)))
     if not isinstance(value, dict):
         return ""
     direct = value.get("text")
@@ -172,6 +276,24 @@ def _extract_text(value: Any) -> str:
             if text:
                 return text
     return ""
+
+
+def _extract_completed_content(value: Any) -> str:
+    """Collapse only adjacent duplicate top-level answer items."""
+    if not isinstance(value, list):
+        return _extract_text(value)
+    parts: list[str] = []
+    previous: str | None = None
+    for item in value:
+        part = _extract_text(item)
+        if not part.strip():
+            previous = None
+            continue
+        if part == previous:
+            continue
+        parts.append(part)
+        previous = part
+    return "".join(parts)
 
 
 def _response_containers(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -186,7 +308,11 @@ def _extract_payload_text(payload: dict[str, Any]) -> str:
     for container in _response_containers(payload):
         for key in ("content", "message", "answer"):
             if key in container:
-                text = _extract_text(container[key])
+                text = (
+                    _extract_completed_content(container[key])
+                    if key == "content"
+                    else _extract_text(container[key])
+                )
                 if text:
                     return text
     return ""
@@ -518,6 +644,25 @@ def _handle_feishu_aily_agent_chat(args: dict, **kwargs) -> str:
             )
     try:
         attachments = _validate_attachments(args.get("agent_attachment_ids"))
+        auth_mode = _configured_auth_mode()
+    except (RuntimeError, ValueError) as exc:
+        return tool_error(f"Aily Agent configuration error: {_safe_error_text(exc)}")
+
+    if auth_mode == "user":
+        content = _ENTERPRISE_KNOWLEDGE_PREFIX + content
+        if len(content) > _MAX_MESSAGE_CHARS:
+            return tool_error(
+                "content plus the enterprise-knowledge constraint must be at most "
+                f"{_MAX_MESSAGE_CHARS} characters"
+            )
+        return _handle_user_agent_chat(
+            agent_id=agent_id,
+            content=content,
+            session_id=session_id,
+            attachments=attachments,
+        )
+
+    try:
         client = _resolve_client()
     except (RuntimeError, ValueError) as exc:
         return tool_error(f"Aily Agent configuration error: {_safe_error_text(exc)}")

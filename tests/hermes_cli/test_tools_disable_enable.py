@@ -2,6 +2,8 @@
 from argparse import Namespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.tools_config import tools_disable_enable_command
 
 
@@ -73,6 +75,149 @@ class TestToolsEnableBuiltin:
             tools_disable_enable_command(Namespace(tools_action="enable", names=["web"], platform="cli"))
         saved = mock_save.call_args[0][0]
         assert saved["platform_toolsets"]["cli"].count("web") == 1
+
+    def test_enable_feishu_aily_agent_requires_feishu_platform(self, capsys):
+        config = {"platform_toolsets": {"cli": []}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save, \
+             patch("tools.lazy_deps.ensure") as mock_ensure:
+            result = tools_disable_enable_command(
+                Namespace(
+                    tools_action="enable",
+                    names=["feishu_aily_agent"],
+                    platform="cli",
+                )
+            )
+
+        mock_ensure.assert_not_called()
+        saved = mock_save.call_args[0][0]
+        assert "feishu_aily_agent" not in saved["platform_toolsets"]["cli"]
+        assert result["failures"] == {
+            "feishu_aily_agent": "not available on this platform"
+        }
+        assert "only: feishu" in capsys.readouterr().out
+
+    def test_enable_feishu_aily_agent_on_feishu_platform(self):
+        config = {"platform_toolsets": {"feishu": []}}
+        aily_env = {
+            "FEISHU_AILY_AUTH_MODE": "user",
+            "FEISHU_AILY_AUTH_APP_ID": "cli_test",
+            "FEISHU_AILY_AGENT_ID": "agent_test",
+            "FEISHU_AILY_USER_LARK_CONFIG_DIR": "/tmp/lark-config",
+            "FEISHU_AILY_USER_OPEN_ID": "ou_test",
+            "FEISHU_AILY_USER_UNION_ID": "on_test",
+        }
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save, \
+             patch(
+                 "hermes_cli.tools_config.get_env_value",
+                 side_effect=lambda name: aily_env.get(name),
+             ), \
+             patch("tools.lazy_deps.ensure") as mock_ensure:
+            result = tools_disable_enable_command(
+                Namespace(
+                    tools_action="enable",
+                    names=["feishu_aily_agent"],
+                    platform="feishu",
+                )
+            )
+
+        mock_ensure.assert_called_once_with("platform.feishu", prompt=False)
+        saved = mock_save.call_args[0][0]
+        assert "feishu_aily_agent" in saved["platform_toolsets"]["feishu"]
+        assert result["successful"] == {"feishu_aily_agent"}
+
+    def test_enable_feishu_aily_agent_rejects_missing_auth_mode(self, capsys):
+        config = {"platform_toolsets": {"feishu": []}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save, \
+             patch("hermes_cli.tools_config.get_env_value", return_value=None), \
+             patch("tools.lazy_deps.ensure") as mock_ensure:
+            result = tools_disable_enable_command(
+                Namespace(
+                    tools_action="enable",
+                    names=["feishu_aily_agent"],
+                    platform="feishu",
+                )
+            )
+
+        mock_ensure.assert_not_called()
+        saved = mock_save.call_args[0][0]
+        assert "feishu_aily_agent" not in saved["platform_toolsets"]["feishu"]
+        assert result["failures"] == {
+            "feishu_aily_agent": (
+                "missing required configuration: FEISHU_AILY_AUTH_MODE"
+            )
+        }
+        assert "Cannot enable toolset 'feishu_aily_agent'" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        ("mode", "configured", "missing_name"),
+        [
+            (
+                "user",
+                {
+                    "FEISHU_AILY_AUTH_APP_ID": "cli_test",
+                    "FEISHU_AILY_AGENT_ID": "agent_test",
+                    "FEISHU_AILY_USER_LARK_CONFIG_DIR": "/tmp/lark-config",
+                    "FEISHU_AILY_USER_OPEN_ID": "ou_test",
+                },
+                "FEISHU_AILY_USER_UNION_ID",
+            ),
+            (
+                "tenant",
+                {
+                    "FEISHU_AILY_AUTH_APP_ID": "cli_test",
+                    "FEISHU_AILY_AGENT_ID": "agent_test",
+                },
+                "FEISHU_AILY_AUTH_APP_SECRET",
+            ),
+        ],
+    )
+    def test_enable_feishu_aily_agent_rejects_incomplete_mode(
+        self, capsys, mode, configured, missing_name
+    ):
+        config = {"platform_toolsets": {"feishu": []}}
+        aily_env = {"FEISHU_AILY_AUTH_MODE": mode, **configured}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save, \
+             patch(
+                 "hermes_cli.tools_config.get_env_value",
+                 side_effect=lambda name: aily_env.get(name),
+             ), \
+             patch("tools.lazy_deps.ensure") as mock_ensure:
+            result = tools_disable_enable_command(
+                Namespace(
+                    tools_action="enable",
+                    names=["feishu_aily_agent"],
+                    platform="feishu",
+                )
+            )
+
+        mock_ensure.assert_not_called()
+        saved = mock_save.call_args[0][0]
+        assert "feishu_aily_agent" not in saved["platform_toolsets"]["feishu"]
+        assert missing_name in result["failures"]["feishu_aily_agent"]
+        assert missing_name in capsys.readouterr().out
+
+    def test_enable_feishu_aily_agent_rejects_invalid_auth_mode(self):
+        config = {"platform_toolsets": {"feishu": []}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch("hermes_cli.tools_config.save_config") as mock_save, \
+             patch("hermes_cli.tools_config.get_env_value", return_value="oauth"), \
+             patch("tools.lazy_deps.ensure") as mock_ensure:
+            result = tools_disable_enable_command(
+                Namespace(
+                    tools_action="enable",
+                    names=["feishu_aily_agent"],
+                    platform="feishu",
+                )
+            )
+
+        mock_ensure.assert_not_called()
+        saved = mock_save.call_args[0][0]
+        assert "feishu_aily_agent" not in saved["platform_toolsets"]["feishu"]
+        assert "invalid FEISHU_AILY_AUTH_MODE" in result["failures"]["feishu_aily_agent"]
 
     def test_enable_feishu_aily_ensures_optional_sdk_for_cli(self, capsys):
         config = {"platform_toolsets": {"cli": []}}
@@ -274,6 +419,53 @@ class TestToolsList:
             tools_disable_enable_command(Namespace(tools_action="list", platform="cli"))
 
         mock_ensure.assert_not_called()
+
+    def test_list_marks_saved_aily_agent_unconfigured(self, capsys):
+        config = {
+            "platform_toolsets": {"feishu": ["feishu_aily_agent"]},
+        }
+        configured = {
+            "FEISHU_AILY_AUTH_MODE": "tenant",
+            "FEISHU_AILY_AUTH_APP_ID": "cli_test",
+            "FEISHU_AILY_AGENT_ID": "agent_test",
+        }
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch(
+                 "hermes_cli.tools_config.get_env_value",
+                 side_effect=lambda name: configured.get(name),
+             ):
+            tools_disable_enable_command(
+                Namespace(tools_action="list", platform="feishu")
+            )
+
+        out = capsys.readouterr().out
+        assert "⚠ enabled, unconfigured" in out
+        assert "feishu_aily_agent" in out
+        assert "FEISHU_AILY_AUTH_APP_SECRET" in out
+
+    def test_list_keeps_complete_aily_agent_green(self, capsys):
+        config = {
+            "platform_toolsets": {"feishu": ["feishu_aily_agent"]},
+        }
+        configured = {
+            "FEISHU_AILY_AUTH_MODE": "tenant",
+            "FEISHU_AILY_AUTH_APP_ID": "cli_test",
+            "FEISHU_AILY_AUTH_APP_SECRET": "secret",
+            "FEISHU_AILY_AGENT_ID": "agent_test",
+        }
+        with patch("hermes_cli.tools_config.load_config", return_value=config), \
+             patch(
+                 "hermes_cli.tools_config.get_env_value",
+                 side_effect=lambda name: configured.get(name),
+             ):
+            tools_disable_enable_command(
+                Namespace(tools_action="list", platform="feishu")
+            )
+
+        out = capsys.readouterr().out
+        assert "✓ enabled" in out
+        assert "feishu_aily_agent" in out
+        assert "unconfigured" not in out
 
 
 # ── Validation ───────────────────────────────────────────────────────────────

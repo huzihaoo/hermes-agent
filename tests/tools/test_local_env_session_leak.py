@@ -112,6 +112,31 @@ def test_set_session_vars_engages_and_overrides_foreign_global(monkeypatch):
     assert env.get("HERMES_SESSION_KEY") == "agent:main:discord:group:MY_BUGS_ROOT:111"
 
 
+def test_bound_union_id_is_never_exported_to_child_environments(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_USER_ID_ALT", "foreign-union")
+    tokens = set_session_vars(
+        platform="feishu",
+        user_id="open-id",
+        user_id_alt="bound-union",
+    )
+    try:
+        assert sc.get_bound_session_env("HERMES_SESSION_USER_ID_ALT") == "bound-union"
+        terminal_env = _make_run_env(
+            {"HERMES_SESSION_USER_ID_ALT": "explicit-tool-union"}
+        )
+        background_env = _sanitize_subprocess_env(
+            {
+                "PATH": "/usr/bin:/bin",
+                "HERMES_SESSION_USER_ID_ALT": "foreign-background-union",
+            }
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert "HERMES_SESSION_USER_ID_ALT" not in terminal_env
+    assert "HERMES_SESSION_USER_ID_ALT" not in background_env
+
+
 def test_engaged_strips_all_session_vars_when_unset(monkeypatch):
     """The strip covers every HERMES_SESSION_* mirror, not just the key."""
     _engage()
@@ -119,6 +144,7 @@ def test_engaged_strips_all_session_vars_when_unset(monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "foreign-thread")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "foreign-chat")
     monkeypatch.setenv("HERMES_SESSION_USER_ID", "foreign-user")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID_ALT", "foreign-union")
 
     env = _make_run_env({})
 
@@ -127,6 +153,7 @@ def test_engaged_strips_all_session_vars_when_unset(monkeypatch):
         "HERMES_SESSION_THREAD_ID",
         "HERMES_SESSION_CHAT_ID",
         "HERMES_SESSION_USER_ID",
+        "HERMES_SESSION_USER_ID_ALT",
     ):
         assert var not in env, f"{var} leaked from a foreign global: {env.get(var)!r}"
 

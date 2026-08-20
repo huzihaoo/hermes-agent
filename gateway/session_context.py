@@ -76,6 +76,7 @@ _SESSION_CHAT_ID: ContextVar = ContextVar("HERMES_SESSION_CHAT_ID", default=_UNS
 _SESSION_CHAT_NAME: ContextVar = ContextVar("HERMES_SESSION_CHAT_NAME", default=_UNSET)
 _SESSION_THREAD_ID: ContextVar = ContextVar("HERMES_SESSION_THREAD_ID", default=_UNSET)
 _SESSION_USER_ID: ContextVar = ContextVar("HERMES_SESSION_USER_ID", default=_UNSET)
+_SESSION_USER_ID_ALT: ContextVar = ContextVar("HERMES_SESSION_USER_ID_ALT", default=_UNSET)
 _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=_UNSET)
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
@@ -130,6 +131,14 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
 }
 
+# Stable cross-application identity is authorization material. Keep it inside
+# this process for exact requester binding; never bridge it into arbitrary
+# terminal, background, plugin, or MCP child environments.
+_BOUND_ONLY_VAR_MAP = {
+    "HERMES_SESSION_USER_ID_ALT": _SESSION_USER_ID_ALT,
+}
+_CONTEXT_VAR_MAP = {**_VAR_MAP, **_BOUND_ONLY_VAR_MAP}
+
 
 def set_current_session_id(session_id: str) -> None:
     """Synchronize ``HERMES_SESSION_ID`` across ContextVar and ``os.environ``.
@@ -160,6 +169,8 @@ def set_session_vars(
     profile: str = "",
     cwd: str = "",
     async_delivery: bool = True,
+    *,
+    user_id_alt: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -188,6 +199,7 @@ def set_session_vars(
         _SESSION_CHAT_NAME.set(chat_name),
         _SESSION_THREAD_ID.set(thread_id),
         _SESSION_USER_ID.set(user_id),
+        _SESSION_USER_ID_ALT.set(user_id_alt),
         _SESSION_USER_NAME.set(user_name),
         _SESSION_KEY.set(session_key),
         _SESSION_ID.set(session_id),
@@ -222,6 +234,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_CHAT_NAME,
         _SESSION_THREAD_ID,
         _SESSION_USER_ID,
+        _SESSION_USER_ID_ALT,
         _SESSION_USER_NAME,
         _SESSION_KEY,
         _SESSION_ID,
@@ -267,7 +280,7 @@ def reset_session_vars() -> None:
     tests/tools/test_local_env_session_leak.py and
     tests/gateway/test_session_context_inheritance.py.
 
-    Note ``_SESSION_ASYNC_DELIVERY`` lives outside ``_VAR_MAP`` (it is a bool
+    Note ``_SESSION_ASYNC_DELIVERY`` lives outside ``_CONTEXT_VAR_MAP`` (it is a bool
     capability flag read via :func:`async_delivery_supported`, not a string
     ``HERMES_SESSION_*`` env var read via :func:`get_session_env`), so it is
     reset explicitly below. Without it, a task spawned from a context where a
@@ -276,7 +289,7 @@ def reset_session_vars() -> None:
     ``async_delivery_supported`` wrongly reports the new turn's channel as
     unable to route a background completion until ``set_session_vars`` runs.
     """
-    for var in _VAR_MAP.values():
+    for var in _CONTEXT_VAR_MAP.values():
         var.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
@@ -307,13 +320,30 @@ def get_session_env(name: str, default: str = "") -> str:
     """
     import os
 
-    var = _VAR_MAP.get(name)
+    var = _CONTEXT_VAR_MAP.get(name)
     if var is not None:
         value = var.get()
         if value is not _UNSET:
             return value
+        if name in _BOUND_ONLY_VAR_MAP:
+            return default
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def get_bound_session_env(name: str, default: str = "") -> str:
+    """Read only the current ContextVar value, never process environment.
+
+    Security-sensitive callers use this when an ``os.environ`` fallback could
+    let a CLI/cron value impersonate the requester bound by the gateway.
+    """
+    var = _CONTEXT_VAR_MAP.get(name)
+    if var is None:
+        return default
+    value = var.get()
+    if value is _UNSET:
+        return default
+    return value
 
 
 def async_delivery_supported() -> bool:

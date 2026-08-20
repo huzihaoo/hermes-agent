@@ -229,6 +229,43 @@ def test_run_probe_hides_answer_by_default():
     assert "answer" not in result
 
 
+def test_agent_text_deduplicates_identical_completed_items():
+    assert smoke._agent_text(
+        {
+            "content": [
+                {"type": "text", "text": "OOI internal answer"},
+                {"type": "text", "text": "OOI internal answer"},
+            ]
+        }
+    ) == "OOI internal answer"
+
+
+def test_agent_text_preserves_nonadjacent_repeated_items():
+    assert smoke._agent_text(
+        {
+            "content": [
+                {"type": "text", "text": "A"},
+                {"type": "text", "text": "B"},
+                {"type": "text", "text": "A"},
+            ]
+        }
+    ) == "ABA"
+
+
+def test_agent_text_preserves_repeats_separated_by_non_text_items():
+    assert smoke._agent_text(
+        {
+            "content": [
+                {"type": "text", "text": "A"},
+                {"type": "artifact", "agent_artifact_id": "artifact_1"},
+                {"type": "text", "text": "A"},
+                {"type": "text", "text": "   "},
+                {"type": "text", "text": "A"},
+            ]
+        }
+    ) == "AAA"
+
+
 def test_run_probe_rejects_cancelled_stop_with_partial_text():
     responses = iter(
         [
@@ -273,7 +310,7 @@ def test_run_probe_rejects_bad_question_before_network():
     assert called is False
 
 
-def test_run_probe_explains_application_identity_allowlist_error():
+def test_run_probe_preserves_unknown_identity_business_code_and_message():
     responses = iter(
         [
             _Response(json.dumps({"code": 0, "tenant_access_token": "token"}).encode()),
@@ -292,7 +329,7 @@ def test_run_probe_explains_application_identity_allowlist_error():
         smoke.run_probe(_config(), "OOI是什么?", opener=opener)
 
     assert exc.value.payload["code"] == 10010
-    assert "application allowlist" in exc.value.payload["error"]
+    assert "permission denied" in exc.value.payload["error"]
 
 
 def test_redact_removes_explicit_secrets():

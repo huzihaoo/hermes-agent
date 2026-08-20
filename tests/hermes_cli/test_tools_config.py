@@ -1473,6 +1473,12 @@ def test_feishu_aily_is_explicitly_available_on_cli_and_feishu_only():
         assert not _toolset_allowed_for_platform("feishu_aily", platform)
 
 
+def test_feishu_aily_agent_is_available_on_feishu_only():
+    assert _toolset_allowed_for_platform("feishu_aily_agent", "feishu")
+    for platform in ["cli", "api_server", "telegram", "discord", "slack", "whatsapp"]:
+        assert not _toolset_allowed_for_platform("feishu_aily_agent", platform)
+
+
 def test_get_platform_tools_does_not_install_feishu_sdk(monkeypatch):
     monkeypatch.setattr(
         "tools.lazy_deps.ensure",
@@ -1494,6 +1500,69 @@ def test_toolset_status_check_does_not_install_feishu_sdk(monkeypatch):
     )
 
     assert _toolset_has_keys("feishu_aily") is True
+
+
+@pytest.mark.parametrize(
+    ("mode", "values"),
+    [
+        (
+            "user",
+            {
+                "FEISHU_AILY_AUTH_APP_ID": "cli_test",
+                "FEISHU_AILY_AGENT_ID": "agent_test",
+                "FEISHU_AILY_USER_LARK_CONFIG_DIR": "/tmp/lark-config",
+                "FEISHU_AILY_USER_OPEN_ID": "ou_test",
+                "FEISHU_AILY_USER_UNION_ID": "on_test",
+            },
+        ),
+        (
+            "tenant",
+            {
+                "FEISHU_AILY_AUTH_APP_ID": "cli_test",
+                "FEISHU_AILY_AUTH_APP_SECRET": "secret",
+                "FEISHU_AILY_AGENT_ID": "agent_test",
+            },
+        ),
+    ],
+)
+def test_feishu_aily_agent_status_accepts_complete_mode_config(monkeypatch, mode, values):
+    configured = {"FEISHU_AILY_AUTH_MODE": mode, **values}
+    monkeypatch.setattr(
+        "hermes_cli.tools_config.get_env_value",
+        lambda name: configured.get(name),
+    )
+
+    assert _toolset_has_keys("feishu_aily_agent", {}) is True
+
+
+@pytest.mark.parametrize(
+    "configured",
+    [
+        {},
+        {"FEISHU_AILY_AUTH_MODE": "oauth"},
+        {
+            "FEISHU_AILY_AUTH_MODE": "user",
+            "FEISHU_AILY_AUTH_APP_ID": "cli_test",
+            "FEISHU_AILY_AGENT_ID": "agent_test",
+            "FEISHU_AILY_USER_LARK_CONFIG_DIR": "/tmp/lark-config",
+            "FEISHU_AILY_USER_OPEN_ID": "ou_test",
+        },
+        {
+            "FEISHU_AILY_AUTH_MODE": "tenant",
+            "FEISHU_AILY_AUTH_APP_ID": "cli_test",
+            "FEISHU_AILY_AGENT_ID": "agent_test",
+        },
+    ],
+)
+def test_feishu_aily_agent_status_rejects_incomplete_or_invalid_config(
+    monkeypatch, configured
+):
+    monkeypatch.setattr(
+        "hermes_cli.tools_config.get_env_value",
+        lambda name: configured.get(name),
+    )
+
+    assert _toolset_has_keys("feishu_aily_agent", {}) is False
 
 
 def test_feishu_aily_check_fn_does_not_install_sdk(monkeypatch):
@@ -1873,6 +1942,155 @@ def test_real_configurable_changes_still_reported_in_diff():
     # User adds 'vision' (configurable) — must still report as added.
     new_enabled2 = (current - {"kanban"}) | {"vision"}
     assert ((new_enabled2 - current) & universe) == {"vision"}
+
+
+def test_feishu_interactive_picker_keeps_enabled_aily_agent(monkeypatch):
+    config = {
+        "platform_toolsets": {
+            "feishu": ["web", "feishu_aily_agent"],
+        }
+    }
+    choices = iter([0, 2])
+    seen = {}
+
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_enabled_platforms", lambda: ["feishu"]
+    )
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._prompt_choice",
+        lambda *args, **kwargs: next(choices),
+    )
+
+    def choose_feishu(label, enabled, platform="cli", **kwargs):
+        seen["platform"] = platform
+        seen["enabled"] = set(enabled)
+        return {"terminal", "feishu_aily_agent"}
+
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._prompt_toolset_checklist", choose_feishu
+    )
+    monkeypatch.setattr("hermes_cli.tools_config.save_config", lambda config: None)
+
+    tools_command(config=config)
+
+    assert seen["platform"] == "feishu"
+    assert "feishu_aily_agent" in seen["enabled"]
+    assert "feishu_aily_agent" in config["platform_toolsets"]["feishu"]
+    assert "terminal" in config["platform_toolsets"]["feishu"]
+    assert "web" not in config["platform_toolsets"]["feishu"]
+
+
+def test_global_picker_preserves_feishu_only_entries(monkeypatch):
+    config = {
+        "platform_toolsets": {
+            "cli": ["web"],
+            "feishu": ["web", "feishu_aily_agent"],
+        }
+    }
+    choices = iter([2, 4])
+    seen = {}
+
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_enabled_platforms",
+        lambda: ["cli", "feishu"],
+    )
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._prompt_choice",
+        lambda *args, **kwargs: next(choices),
+    )
+
+    def choose_global(label, enabled, platform="cli", **kwargs):
+        seen["platform"] = platform
+        return {"terminal"}
+
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._prompt_toolset_checklist", choose_global
+    )
+    monkeypatch.setattr("hermes_cli.tools_config.save_config", lambda config: None)
+
+    tools_command(config=config)
+
+    assert seen["platform"] == "cli"
+    assert config["platform_toolsets"]["cli"] == ["terminal"]
+    assert "feishu_aily_agent" in config["platform_toolsets"]["feishu"]
+    assert "terminal" in config["platform_toolsets"]["feishu"]
+    assert "web" not in config["platform_toolsets"]["feishu"]
+
+
+def test_global_preservation_does_not_reenable_unoffered_aily_agent(monkeypatch):
+    config = {
+        "platform_toolsets": {
+            "feishu": ["web", "feishu_aily_agent"],
+        },
+        "agent": {"disabled_toolsets": ["feishu_aily_agent"]},
+    }
+    monkeypatch.setattr("hermes_cli.tools_config.save_config", lambda config: None)
+
+    _save_platform_tools(
+        config,
+        "feishu",
+        {"terminal"},
+        selection_universe=_checklist_toolset_keys("cli"),
+    )
+
+    assert "feishu_aily_agent" in config["platform_toolsets"]["feishu"]
+    assert config["agent"]["disabled_toolsets"] == ["feishu_aily_agent"]
+
+
+def test_cli_interactive_picker_cannot_add_feishu_only_agent(monkeypatch):
+    config = {"platform_toolsets": {"cli": ["web"]}}
+    choices = iter([0, 2])
+    seen = {}
+
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_enabled_platforms", lambda: ["cli"]
+    )
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._prompt_choice",
+        lambda *args, **kwargs: next(choices),
+    )
+
+    def choose_cli(label, enabled, platform="cli", **kwargs):
+        seen["platform"] = platform
+        return {"web", "feishu_aily_agent"}
+
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._prompt_toolset_checklist", choose_cli
+    )
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._preflight_toolset_enables", lambda names: {}
+    )
+    monkeypatch.setattr("hermes_cli.tools_config.save_config", lambda config: None)
+
+    tools_command(config=config)
+
+    assert seen["platform"] == "cli"
+    assert "feishu_aily_agent" not in config["platform_toolsets"]["cli"]
+
+
+def test_tools_summary_marks_saved_aily_agent_unconfigured(monkeypatch, capsys):
+    config = {"platform_toolsets": {"feishu": ["feishu_aily_agent"]}}
+    configured = {
+        "FEISHU_AILY_AUTH_MODE": "user",
+        "FEISHU_AILY_AUTH_APP_ID": "cli_test",
+        "FEISHU_AILY_AGENT_ID": "agent_test",
+        "FEISHU_AILY_USER_LARK_CONFIG_DIR": "/tmp/lark-config",
+        "FEISHU_AILY_USER_OPEN_ID": "ou_test",
+    }
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_enabled_platforms", lambda: ["feishu"]
+    )
+    monkeypatch.setattr(
+        "hermes_cli.tools_config.get_env_value",
+        lambda name: configured.get(name),
+    )
+
+    tools_command(args=SimpleNamespace(summary=True), config=config)
+
+    out = capsys.readouterr().out
+    assert "⚠ enabled, unconfigured" in out
+    assert "Feishu Aily Agent" in out
+    assert "FEISHU_AILY_USER_UNION_ID" in out
 
 
 def test_vision_picker_writes_provider_and_model(tmp_path, monkeypatch):

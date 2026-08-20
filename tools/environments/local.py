@@ -324,6 +324,7 @@ def _inject_session_context_env(env: dict) -> None:
     """
     try:
         from gateway.session_context import (
+            _BOUND_ONLY_VAR_MAP,
             _UNSET,
             _VAR_MAP,
             session_context_engaged,
@@ -332,6 +333,8 @@ def _inject_session_context_env(env: dict) -> None:
         return
 
     _engaged = session_context_engaged()
+    for var_name in _BOUND_ONLY_VAR_MAP:
+        env.pop(var_name, None)
     for var_name, var in _VAR_MAP.items():
         value = var.get()
         if value is not _UNSET:

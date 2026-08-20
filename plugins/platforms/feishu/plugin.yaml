@@ -23,12 +23,12 @@ requires_env:
     password: true
 optional_env:
   - name: FEISHU_AILY_AUTH_APP_ID
-    description: "Dedicated Feishu app ID required for CLI/normal Feishu Aily calls (comment context may inject a client)"
+    description: "Feishu caller App ID used by Aily tenant auth or the pinned lark-cli user profile"
     prompt: "Aily auth app ID"
     url: "https://open.feishu.cn/"
     password: false
   - name: FEISHU_AILY_AUTH_APP_SECRET
-    description: "Dedicated Feishu app secret required for CLI/normal Feishu Aily calls (comment context may inject a client)"
+    description: "Feishu caller App Secret for tenant mode only; user mode keeps OAuth credentials in lark-cli storage"
     prompt: "Aily auth app secret"
     url: "https://open.feishu.cn/"
     password: true
@@ -41,6 +41,22 @@ optional_env:
     description: "Aily Agent ID from the agent detail URL (agent_...); required for the Aily Agent Chat tool (permissions aily:agent_chat:write/read)"
     prompt: "Aily Agent ID"
     url: "https://aily.feishu.cn/"
+    password: false
+  - name: FEISHU_AILY_AUTH_MODE
+    description: "Required for Aily Agent: explicit tenant or identity-pinned user auth mode"
+    prompt: "Aily Agent auth mode (tenant/user)"
+    password: false
+  - name: FEISHU_AILY_USER_LARK_CONFIG_DIR
+    description: "Absolute 0700 lark-cli config directory used only by Aily Agent user mode"
+    prompt: "Aily user lark-cli config directory"
+    password: false
+  - name: FEISHU_AILY_USER_OPEN_ID
+    description: "Pinned app-scoped Feishu open_id allowed to use Aily Agent user mode"
+    prompt: "Aily user open_id"
+    password: false
+  - name: FEISHU_AILY_USER_UNION_ID
+    description: "Pinned stable Feishu union_id required from the active Feishu session"
+    prompt: "Aily user union_id"
     password: false
   - name: FEISHU_AILY_DOMAIN
     description: "Optional Aily API domain: 'feishu' (China) or 'lark' (International)"

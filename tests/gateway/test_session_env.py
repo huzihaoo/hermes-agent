@@ -7,10 +7,11 @@ from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionContext, SessionSource
 from gateway.session_context import (
+    get_bound_session_env,
     get_session_env,
     set_session_vars,
     clear_session_vars,
-    _VAR_MAP,
+    _CONTEXT_VAR_MAP,
     _UNSET,
 )
 
@@ -25,7 +26,7 @@ def _reset_contextvars():
     would leak into test B.  This fixture ensures each test starts clean.
     """
     yield
-    for var in _VAR_MAP.values():
+    for var in _CONTEXT_VAR_MAP.values():
         # Can't use var.reset() without a token; just set back to sentinel.
         var.set(_UNSET)
 
@@ -39,6 +40,7 @@ def test_set_session_env_sets_contextvars(monkeypatch):
         chat_name="Group",
         chat_type="group",
         user_id="123456",
+        user_id_alt="union-123456",
         user_name="alice",
         thread_id="17585",
     )
@@ -49,6 +51,7 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_USER_ID_ALT", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
 
@@ -60,6 +63,8 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     assert get_session_env("HERMES_SESSION_CHAT_ID") == "-1001"
     assert get_session_env("HERMES_SESSION_CHAT_NAME") == "Group"
     assert get_session_env("HERMES_SESSION_USER_ID") == "123456"
+    assert get_session_env("HERMES_SESSION_USER_ID_ALT") == "union-123456"
+    assert get_bound_session_env("HERMES_SESSION_USER_ID_ALT") == "union-123456"
     assert get_session_env("HERMES_SESSION_USER_NAME") == "alice"
     assert get_session_env("HERMES_SESSION_THREAD_ID") == "17585"
 
@@ -70,6 +75,14 @@ def test_set_session_env_sets_contextvars(monkeypatch):
 
     # Clean up
     runner._clear_session_env(tokens)
+
+
+def test_get_bound_session_env_never_falls_back_to_process_env(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_USER_ID_ALT", "spoofed-union")
+    _CONTEXT_VAR_MAP["HERMES_SESSION_USER_ID_ALT"].set(_UNSET)
+
+    assert get_session_env("HERMES_SESSION_USER_ID_ALT") == ""
+    assert get_bound_session_env("HERMES_SESSION_USER_ID_ALT") == ""
 
 
 def test_session_source_uses_contextvars(monkeypatch):
@@ -92,6 +105,7 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_USER_ID_ALT", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
 
@@ -101,6 +115,7 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
         chat_name="Group",
         chat_type="group",
         user_id="123456",
+        user_id_alt="union-123456",
         user_name="alice",
         thread_id="17585",
     )
@@ -109,6 +124,7 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     tokens = runner._set_session_env(context)
     assert get_session_env("HERMES_SESSION_PLATFORM") == "telegram"
     assert get_session_env("HERMES_SESSION_USER_ID") == "123456"
+    assert get_session_env("HERMES_SESSION_USER_ID_ALT") == "union-123456"
 
     runner._clear_session_env(tokens)
 
@@ -117,6 +133,7 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     assert get_session_env("HERMES_SESSION_CHAT_ID") == ""
     assert get_session_env("HERMES_SESSION_CHAT_NAME") == ""
     assert get_session_env("HERMES_SESSION_USER_ID") == ""
+    assert get_session_env("HERMES_SESSION_USER_ID_ALT") == ""
     assert get_session_env("HERMES_SESSION_USER_NAME") == ""
     assert get_session_env("HERMES_SESSION_THREAD_ID") == ""
 
@@ -187,6 +204,31 @@ def test_session_key_set_via_contextvars(monkeypatch):
 
     clear_session_vars(tokens)
     assert get_session_env("HERMES_SESSION_KEY") == ""
+
+
+def test_set_session_vars_preserves_legacy_positional_argument_order():
+    tokens = set_session_vars(
+        "feishu",
+        "message",
+        "chat-id",
+        "chat-name",
+        "thread-id",
+        "open-id",
+        "Display Name",
+        "session-key",
+        "session-id",
+        "message-id",
+        "profile",
+        "",
+        False,
+    )
+    try:
+        assert get_session_env("HERMES_SESSION_USER_ID") == "open-id"
+        assert get_session_env("HERMES_SESSION_USER_ID_ALT") == ""
+        assert get_session_env("HERMES_SESSION_USER_NAME") == "Display Name"
+        assert get_session_env("HERMES_SESSION_KEY") == "session-key"
+    finally:
+        clear_session_vars(tokens)
 
 
 def test_session_key_falls_back_to_os_environ(monkeypatch):
@@ -393,4 +435,3 @@ async def test_gateway_executor_refuses_resurrection_after_shutdown():
             await runner._run_in_executor_with_context(lambda: "second")
     finally:
         runner._shutdown_executor()
-
