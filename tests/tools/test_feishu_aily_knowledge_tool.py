@@ -34,11 +34,15 @@ class _FakeClient:
         return self.response
 
 
-def _response(content, *, code=0, msg=""):
+def _response(content, *, code=0, msg="", status_code=None, headers=None):
     return SimpleNamespace(
         code=code,
         msg=msg,
-        raw=SimpleNamespace(content=content),
+        raw=SimpleNamespace(
+            content=content,
+            status_code=status_code,
+            headers=headers or {},
+        ),
     )
 
 
@@ -166,6 +170,8 @@ def test_sse_parser_returns_only_finished_answer():
         "success": True,
         "content": "OOI is the configured answer.",
         "has_answer": True,
+        "grounded": True,
+        "answer_available": True,
         "finish_type": "qa",
     }
 
@@ -216,6 +222,162 @@ def test_sse_parser_uses_faq_answer_when_message_is_empty():
     assert result["matched_question"] == "What is OOI?"
 
 
+def test_sse_parser_handles_comments_crlf_and_multiline_data_event():
+    raw = (
+        b": keep-alive\r\n"
+        b"event: message\r\n"
+        b'data: {"status":"finished",\r\n'
+        b'data: "finish_type":"qa",\r\n'
+        b'data: "has_answer":true,\r\n'
+        b'data: "message":{"content":"multiline"}}\r\n\r\n'
+    )
+
+    result = json.loads(aily._parse_sse_response(raw))
+
+    assert result["success"] is True
+    assert result["content"] == "multiline"
+
+
+def test_sse_parser_does_not_promote_processing_snapshot_to_final_answer():
+    result = json.loads(
+        aily._parse_sse_response(
+            _sse(
+                {"status": "processing", "message": {"content": "first"}},
+                {"status": "processing", "message": {"content": "complete"}},
+                {
+                    "status": "finished",
+                    "finish_type": "qa",
+                    "has_answer": True,
+                    "message": {"content": ""},
+                },
+            )
+        )
+    )
+
+    assert result["content"] == ""
+    assert result["message"] == "No answer content returned"
+
+
+def test_sse_parser_does_not_promote_processing_when_has_answer_is_false():
+    result = json.loads(
+        aily._parse_sse_response(
+            _sse(
+                {"status": "processing", "message": {"content": "partial"}},
+                {
+                    "status": "finished",
+                    "finish_type": "qa",
+                    "has_answer": False,
+                    "message": {"content": ""},
+                },
+            )
+        )
+    )
+
+    assert result["success"] is True
+    assert result["has_answer"] is False
+    assert result["content"] == ""
+
+
+def test_sse_parser_preserves_nonempty_content_when_has_answer_is_false():
+    result = json.loads(
+        aily._parse_sse_response(
+            _sse(
+                {
+                    "status": "finished",
+                    "finish_type": "qa",
+                    "has_answer": False,
+                    "message": {"content": "ungrounded fallback"},
+                }
+            )
+        )
+    )
+
+    assert result["success"] is True
+    assert result["has_answer"] is False
+    assert result["grounded"] is False
+    assert result["answer_available"] is True
+    assert result["content"] == "ungrounded fallback"
+
+
+@pytest.mark.parametrize("has_answer", ["false", 0, None])
+def test_sse_parser_rejects_non_boolean_has_answer(has_answer):
+    result = json.loads(
+        aily._parse_sse_response(
+            _sse(
+                {
+                    "status": "finished",
+                    "finish_type": "qa",
+                    "has_answer": has_answer,
+                    "message": {"content": "must not be trusted"},
+                }
+            )
+        )
+    )
+
+    assert "error" in result
+    assert "invalid has_answer" in result["error"]
+
+
+@pytest.mark.parametrize("finish_type", [None, "", "other"])
+def test_sse_parser_rejects_missing_or_unknown_finish_type(finish_type):
+    result = json.loads(
+        aily._parse_sse_response(
+            _sse(
+                {
+                    "status": "finished",
+                    "finish_type": finish_type,
+                    "has_answer": True,
+                    "message": {"content": "must not be trusted"},
+                }
+            )
+        )
+    )
+
+    assert "error" in result
+    assert "invalid finish_type" in result["error"]
+
+
+def test_sse_parser_fails_closed_when_stream_limits_are_exceeded():
+    with pytest.raises(aily.SSEProtocolError, match="event exceeded"):
+        list(
+            aily.iter_sse_payloads(
+                [b"data: " + (b"x" * 32) + b"\n\n"],
+                max_event_bytes=8,
+                max_total_bytes=128,
+            )
+        )
+
+    with pytest.raises(aily.SSEProtocolError, match="event count exceeded"):
+        list(
+            aily.iter_sse_payloads(
+                [b"data: {}\n", b"\n", b"data: {}\n", b"\n"],
+                max_events=1,
+            )
+        )
+
+
+def test_sse_parser_prefers_finished_faq_over_processing_snapshot():
+    result = json.loads(
+        aily._parse_sse_response(
+            _sse(
+                {"status": "processing", "message": {"content": "partial"}},
+                {
+                    "status": "finished",
+                    "finish_type": "faq",
+                    "has_answer": True,
+                    "message": {"content": ""},
+                    "faq_result": {
+                        "question": "What is OOI?",
+                        "answer": "authoritative FAQ",
+                    },
+                },
+            )
+        )
+    )
+
+    assert result["content"] == "authoritative FAQ"
+
+
 def test_handler_builds_json_request_from_operator_target(monkeypatch, fake_lark_sdk):
     finished = _sse(
         {
@@ -242,7 +404,10 @@ def test_handler_builds_json_request_from_operator_target(monkeypatch, fake_lark
     assert result["content"] == "answer"
     request = client.requests[0]
     assert request.paths == {"app_id": "spring_target"}
-    assert request.headers == {"Content-Type": "application/json; charset=utf-8"}
+    assert request.headers == {
+        "Accept": "text/event-stream",
+        "Content-Type": "application/json; charset=utf-8",
+    }
     assert request.body == {
         "message": {"content": "OOI是什么？"},
         "data_asset_ids": ["asset_1"],
@@ -264,6 +429,46 @@ def test_handler_surfaces_regular_json_api_error(monkeypatch, fake_lark_sdk):
 
     assert result["code"] == 2320008
     assert "Aily app is not published" in result["error"]
+
+
+def test_handler_surfaces_safe_http_rate_limit_diagnostics(monkeypatch, fake_lark_sdk):
+    client = _FakeClient(
+        _response(
+            json.dumps({"code": 2700033, "msg": "limited"}).encode(),
+            status_code=429,
+            headers={
+                "X-Tt-Logid": "log-safe-123",
+                "X-Ogw-Ratelimit-Reset": "17",
+            },
+        )
+    )
+    monkeypatch.setenv("FEISHU_AILY_TARGET_APP_ID", "spring_target")
+    aily.set_client(client)
+
+    result = json.loads(aily._handle_feishu_aily_knowledge_ask({"content": "question"}))
+
+    assert result["code"] == 2700033
+    assert "http_status=429" in result["error"]
+    assert "log_id=log-safe-123" in result["error"]
+    assert "rate_limit_reset=17" in result["error"]
+
+
+def test_handler_fails_closed_on_non_2xx_without_a_business_code(monkeypatch, fake_lark_sdk):
+    client = _FakeClient(
+        _response(
+            b"upstream unavailable",
+            status_code=400,
+            headers={"X-Tt-Logid": "log-400"},
+        )
+    )
+    monkeypatch.setenv("FEISHU_AILY_TARGET_APP_ID", "spring_target")
+    aily.set_client(client)
+
+    result = json.loads(aily._handle_feishu_aily_knowledge_ask({"content": "question"}))
+
+    assert result["code"] == 400
+    assert "http_status=400" in result["error"]
+    assert "log_id=log-400" in result["error"]
 
 
 def test_handler_redacts_configured_secret_from_transport_error(monkeypatch, fake_lark_sdk):

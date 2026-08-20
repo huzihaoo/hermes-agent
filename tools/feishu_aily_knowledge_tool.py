@@ -11,6 +11,7 @@ import importlib.util
 import json
 import logging
 import threading
+from collections.abc import Iterable, Iterator
 from contextvars import ContextVar, Token
 from typing import Any
 
@@ -24,6 +25,10 @@ _TARGET_APP_ID_ENV = "FEISHU_AILY_TARGET_APP_ID"
 _DOMAIN_ENV = "FEISHU_AILY_DOMAIN"
 _KNOWLEDGE_ASK_URI = "/open-apis/aily/v1/apps/:app_id/knowledges/ask"
 _AILY_API_TIMEOUT_SECONDS = 120
+_SSE_CONTENT_TYPE = "text/event-stream"
+MAX_SSE_EVENT_BYTES = 1 * 1024 * 1024
+MAX_SSE_TOTAL_BYTES = 8 * 1024 * 1024
+MAX_SSE_EVENTS = 4_096
 
 _injected_client: ContextVar[Any | None] = ContextVar(
     "feishu_aily_injected_client", default=None
@@ -127,6 +132,8 @@ FEISHU_AILY_KNOWLEDGE_ASK_SCHEMA = {
     "description": (
         "向当前 Hermes 已配置的飞书 Aily 智能伙伴发起数据知识问答。"
         "可通过 data_asset_ids 或 data_asset_tag_ids 限定知识范围。"
+        "has_answer=false 表示未命中配置知识，不应当作已验证知识答案。"
+        "普通 CLI/群聊需要 dedicated Aily 凭据；comment 上下文可显式注入客户端。"
         "使用 tenant_access_token 时无法查询以直连模式引入的飞书云文档。"
     ),
     "parameters": {
@@ -173,6 +180,37 @@ def _validated_string_list(args: dict, name: str) -> list[str] | None:
 def _raw_content(response: Any) -> bytes | str | None:
     raw = getattr(response, "raw", None)
     return getattr(raw, "content", None) if raw is not None else None
+
+
+def _raw_status_code(response: Any) -> int | None:
+    """Return the transport HTTP status without assuming SDK business code."""
+    raw = getattr(response, "raw", None)
+    status = getattr(raw, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def _raw_header(response: Any, name: str) -> str | None:
+    raw = getattr(response, "raw", None)
+    headers = getattr(raw, "headers", None)
+    if headers is None:
+        return None
+    try:
+        value = headers.get(name)
+    except AttributeError:
+        return None
+    if value is None:
+        try:
+            value = next(
+                (
+                    candidate
+                    for key, candidate in headers.items()
+                    if str(key).lower() == name.lower()
+                ),
+                None,
+            )
+        except AttributeError:
+            return None
+    return str(value) if value is not None else None
 
 
 def _parse_json_response(raw_content: bytes | str | None) -> dict | None:
@@ -244,7 +282,12 @@ def _handle_feishu_aily_knowledge_ask(args: dict, **kwargs) -> str:
         .uri(_KNOWLEDGE_ASK_URI)
         .token_types({AccessTokenType.TENANT})
         .paths({"app_id": target_app_id})
-        .headers({"Content-Type": "application/json; charset=utf-8"})
+        .headers(
+            {
+                "Accept": _SSE_CONTENT_TYPE,
+                "Content-Type": "application/json; charset=utf-8",
+            }
+        )
         .body(body)
         .build()
     )
@@ -259,14 +302,27 @@ def _handle_feishu_aily_knowledge_ask(args: dict, **kwargs) -> str:
     raw_content = _raw_content(response)
     code = getattr(response, "code", None)
     msg = getattr(response, "msg", None)
+    http_status = _raw_status_code(response)
+    log_id = _raw_header(response, "x-tt-logid")
     json_response = _parse_json_response(raw_content)
     if json_response:
         code = json_response.get("code", code)
         msg = json_response.get("msg", msg)
+    if http_status is not None and not 200 <= http_status < 300 and code in (None, 0):
+        code = http_status
+        msg = msg or f"HTTP {http_status}"
     if code != 0:
         safe_msg = _safe_error_text(msg or "unknown error")
+        details = [f"code={code}", f"msg={safe_msg}"]
+        if http_status is not None:
+            details.insert(0, f"http_status={http_status}")
+        if log_id:
+            details.append(f"log_id={_safe_error_text(log_id)}")
+        reset = _raw_header(response, "x-ogw-ratelimit-reset")
+        if reset:
+            details.append(f"rate_limit_reset={_safe_error_text(reset)}")
         return tool_error(
-            f"Aily knowledge ask failed: code={code} msg={safe_msg}",
+            "Aily knowledge ask failed: " + " ".join(details),
             code=code,
         )
     if raw_content is None:
@@ -283,14 +339,111 @@ _AILY_ERROR_MESSAGES = {
 }
 
 
+class SSEProtocolError(ValueError):
+    """Raised when an Aily SSE stream exceeds its safe protocol envelope."""
+
+
+def iter_sse_payloads(
+    lines: Iterable[bytes | str],
+    *,
+    max_event_bytes: int = MAX_SSE_EVENT_BYTES,
+    max_total_bytes: int = MAX_SSE_TOTAL_BYTES,
+    max_events: int = MAX_SSE_EVENTS,
+) -> Iterator[dict]:
+    """Yield decoded JSON payloads from an SSE line stream.
+
+    Aily currently emits one JSON object per ``data:`` line, but the SSE
+    protocol permits multiple data lines in one event.  Accumulating until a
+    blank line keeps the parser correct for both forms and for CRLF streams.
+    Invalid or non-object events are ignored so a diagnostic footer cannot turn
+    a valid finished answer into a false success.
+    """
+    data_lines: list[str] = []
+    event_bytes = 0
+    event_count = 0
+    total_bytes = 0
+
+    def flush() -> dict | None:
+        nonlocal event_bytes, event_count
+        if not data_lines:
+            return None
+        event_count += 1
+        if event_count > max_events:
+            raise SSEProtocolError("SSE event count exceeded the configured limit")
+        payload_text = "\n".join(data_lines)
+        data_lines.clear()
+        event_bytes = 0
+        try:
+            payload = json.loads(payload_text)
+        except (TypeError, ValueError):
+            logger.debug(
+                "feishu_aily_knowledge_ask: invalid SSE event length=%d",
+                len(payload_text),
+            )
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    for raw_line in lines:
+        if isinstance(raw_line, bytes):
+            line_bytes = len(raw_line)
+            line = raw_line.decode("utf-8", errors="replace")
+        else:
+            line = str(raw_line)
+            line_bytes = len(line.encode("utf-8", errors="replace"))
+        total_bytes += line_bytes
+        if total_bytes > max_total_bytes:
+            raise SSEProtocolError("SSE response exceeded the configured byte limit")
+        line = line.rstrip("\r\n")
+        if not line:
+            payload = flush()
+            if payload is not None:
+                yield payload
+            continue
+        if line.startswith(":"):
+            continue
+        if not line.startswith("data:"):
+            continue
+        value = line[5:]
+        if value.startswith(" "):
+            value = value[1:]
+        event_bytes += len(value.encode("utf-8", errors="replace"))
+        if event_bytes > max_event_bytes:
+            raise SSEProtocolError("SSE event exceeded the configured byte limit")
+        data_lines.append(value)
+
+    payload = flush()
+    if payload is not None:
+        yield payload
+
+
+def validate_aily_finished_payload(payload: dict) -> tuple[str, bool]:
+    """Validate trust-sensitive fields from an official finished event."""
+    finish_type = payload.get("finish_type")
+    if finish_type not in {"qa", "faq"}:
+        raise SSEProtocolError("finished event has an invalid finish_type")
+    has_answer = payload.get("has_answer")
+    if not isinstance(has_answer, bool):
+        raise SSEProtocolError("finished event has an invalid has_answer value")
+    return finish_type, has_answer
+
+
 def _parse_sse_response(raw_content: bytes | str) -> str:
     """Return only a completed Aily answer; never treat a partial stream as success."""
     try:
+        raw_size = (
+            len(raw_content)
+            if isinstance(raw_content, bytes)
+            else len(str(raw_content).encode("utf-8", errors="replace"))
+        )
+        if raw_size > MAX_SSE_TOTAL_BYTES:
+            raise SSEProtocolError("SSE response exceeded the configured byte limit")
         text = (
             raw_content.decode("utf-8", errors="replace")
             if isinstance(raw_content, bytes)
             else str(raw_content)
         )
+    except SSEProtocolError as exc:
+        return tool_error(f"Aily knowledge ask protocol error: {exc}")
     except Exception:
         return tool_error("Aily knowledge ask: failed to decode response")
 
@@ -298,33 +451,22 @@ def _parse_sse_response(raw_content: bytes | str) -> str:
     finished_payload: dict | None = None
     error_info: dict | None = None
 
-    for line in text.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        payload_text = line[5:].strip()
-        if not payload_text:
-            continue
-        try:
-            payload = json.loads(payload_text)
-        except json.JSONDecodeError:
-            logger.debug("feishu_aily_knowledge_ask: invalid SSE data line: %r", line[:200])
-            continue
-        if not isinstance(payload, dict):
-            continue
-
-        saw_event = True
-        sse_code = payload.get("code")
-        if sse_code not in (None, 0):
-            sse_msg = payload.get("msg", "")
-            error_info = {
-                "code": sse_code,
-                "msg": _AILY_ERROR_MESSAGES.get(
-                    sse_code, _safe_error_text(sse_msg or "unknown error")
-                ),
-            }
-        if payload.get("status") == "finished":
-            finished_payload = payload
+    try:
+        for payload in iter_sse_payloads(text.splitlines(keepends=True)):
+            saw_event = True
+            sse_code = payload.get("code")
+            if sse_code not in (None, 0):
+                sse_msg = payload.get("msg", "")
+                error_info = {
+                    "code": sse_code,
+                    "msg": _AILY_ERROR_MESSAGES.get(
+                        sse_code, _safe_error_text(sse_msg or "unknown error")
+                    ),
+                }
+            if payload.get("status") == "finished":
+                finished_payload = payload
+    except SSEProtocolError as exc:
+        return tool_error(f"Aily knowledge ask protocol error: {exc}")
 
     if error_info:
         return tool_error(
@@ -335,19 +477,29 @@ def _parse_sse_response(raw_content: bytes | str) -> str:
         detail = "stream ended before a finished event" if saw_event else "no valid SSE events"
         return tool_error(f"Aily knowledge ask: {detail}")
 
+    try:
+        finish_type, has_answer = validate_aily_finished_payload(finished_payload)
+    except SSEProtocolError as exc:
+        return tool_error(f"Aily knowledge ask protocol error: {exc}")
+
     message = finished_payload.get("message") or {}
     content = message.get("content", "") if isinstance(message, dict) else ""
     faq_result = finished_payload.get("faq_result") or {}
     if not content and isinstance(faq_result, dict):
         content = faq_result.get("answer", "")
+    if not isinstance(content, str):
+        content = ""
     result = {
         "success": True,
         "content": content,
-        "has_answer": bool(finished_payload.get("has_answer", False)),
-        "finish_type": finished_payload.get("finish_type", ""),
+        "has_answer": has_answer,
+        "grounded": has_answer,
+        "answer_available": bool(content),
+        "finish_type": finish_type,
     }
-    if isinstance(faq_result, dict) and faq_result.get("question"):
-        result["matched_question"] = faq_result["question"]
+    matched_question = faq_result.get("question") if isinstance(faq_result, dict) else None
+    if isinstance(matched_question, str) and matched_question:
+        result["matched_question"] = matched_question
     if not content:
         result["message"] = "No answer content returned"
     return tool_result(result)
