@@ -1053,15 +1053,18 @@ def _comment_agent_toolsets(config: dict | None = None) -> List[str]:
 
             config = load_config_readonly()
         raw = (config.get("platform_toolsets") or {}).get("feishu")
-        explicitly_enabled = isinstance(raw, list) and "feishu_aily" in raw
+        explicitly_enabled = isinstance(raw, list) and any(
+            name in raw for name in ("feishu_aily", "feishu_aily_agent")
+        )
         if explicitly_enabled:
             from hermes_cli.tools_config import _get_platform_tools
 
             resolved = _get_platform_tools(
                 config, "feishu", include_default_mcp_servers=False
             )
-            if "feishu_aily" in resolved:
-                enabled.append("feishu_aily")
+            for name in ("feishu_aily", "feishu_aily_agent"):
+                if name in resolved:
+                    enabled.append(name)
     except Exception:
         logger.warning(
             "[Feishu-Comment] Could not resolve optional Aily toolset; keeping it disabled",
@@ -1081,7 +1084,9 @@ def _run_comment_agent(prompt: str, client: Any, session_key: str = "") -> str:
     from run_agent import AIAgent
 
     enabled_toolsets = _comment_agent_toolsets()
-    aily_enabled = "feishu_aily" in enabled_toolsets
+    aily_enabled = any(
+        name in enabled_toolsets for name in ("feishu_aily", "feishu_aily_agent")
+    )
     logger.info(
         "[Feishu-Comment] _run_comment_agent: injecting lark client (aily_enabled=%s)",
         aily_enabled,

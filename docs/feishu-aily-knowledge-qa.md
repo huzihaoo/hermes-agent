@@ -1,5 +1,9 @@
 # 飞书 Aily 知识问答接入
 
+> 如果你的 Aily 地址是 `aily.feishu.cn/agents/agent_...`，请阅读
+> [Aily Agent + MCP 接入](feishu-aily-agent.md)。本页只对应旧的
+> Data Knowledge API（`spring_...` app ID）。
+
 这份说明对应 Hermes 的可选 `feishu_aily` toolset。当前实现位于候选工作树，默认关闭；没有把它绑定到 active release、LaunchAgent 或现有 `.env`。
 
 ## 两个 App ID

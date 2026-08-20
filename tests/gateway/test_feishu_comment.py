@@ -200,6 +200,12 @@ class TestCommentAgentTools(unittest.TestCase):
         )
         self.assertEqual(
             _comment_agent_toolsets(
+                {"platform_toolsets": {"feishu": ["feishu_aily_agent"]}}
+            ),
+            ["feishu_doc", "feishu_drive", "feishu_aily_agent"],
+        )
+        self.assertEqual(
+            _comment_agent_toolsets(
                 {
                     "platform_toolsets": {"feishu": ["feishu_aily"]},
                     "agent": {"disabled_toolsets": ["feishu_aily"]},

@@ -337,6 +337,11 @@ TOOLSETS = {
         "tools": ["feishu_aily_knowledge_ask"],
         "includes": []
     },
+    "feishu_aily_agent": {
+        "description": "Feishu Aily Agent chat — run the Agent's configured knowledge and MCP tools",
+        "tools": ["feishu_aily_agent_chat"],
+        "includes": []
+    },
 
     "spotify": {
         "description": "Native Spotify playback, search, playlist, album, and library tools",

@@ -37,6 +37,11 @@ optional_env:
     prompt: "Aily target app ID"
     url: "https://aily.feishu.cn/"
     password: false
+  - name: FEISHU_AILY_AGENT_ID
+    description: "Aily Agent ID from the agent detail URL (agent_...); required for the Aily Agent Chat tool (permissions aily:agent_chat:write/read)"
+    prompt: "Aily Agent ID"
+    url: "https://aily.feishu.cn/"
+    password: false
   - name: FEISHU_AILY_DOMAIN
     description: "Optional Aily API domain: 'feishu' (China) or 'lark' (International)"
     prompt: "Aily domain (feishu/lark)"

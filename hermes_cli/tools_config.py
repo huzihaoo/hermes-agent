@@ -82,6 +82,7 @@ CONFIGURABLE_TOOLSETS = [
     ("discord",         "💬 Discord (read/participate)", "fetch messages, search members, create thread"),
     ("discord_admin",   "🛡️  Discord Server Admin",    "list channels/roles, pin, assign roles"),
     ("feishu_aily",     "🧠 Feishu Aily Knowledge",    "knowledge Q&A for a configured Aily app"),
+    ("feishu_aily_agent", "🧠 Feishu Aily Agent",       "chat with an Aily Agent and its configured MCP tools"),
     ("yuanbao",          "🤖 Yuanbao",                  "group info, member queries, DM"),
     ("computer_use",     "🖱️  Computer Use (macOS/Windows/Linux)", "background desktop control via cua-driver"),
 ]
@@ -117,7 +118,7 @@ def gui_toolset_label(label: str) -> str:
 # setup. The tool's check_fn means the schema still won't appear to the
 # model if the credential later goes missing or expires.
 _DEFAULT_OFF_TOOLSETS = {
-    "homeassistant", "spotify", "discord", "discord_admin", "feishu_aily",
+    "homeassistant", "spotify", "discord", "discord_admin", "feishu_aily", "feishu_aily_agent",
     "video", "video_gen", "x_search",
 }
 
@@ -158,6 +159,7 @@ _TOOLSET_PLATFORM_RESTRICTIONS: Dict[str, Set[str]] = {
     "discord": {"discord"},
     "discord_admin": {"discord"},
     "feishu_aily": {"cli", "feishu"},
+    "feishu_aily_agent": {"cli", "feishu"},
 }
 
 # Optional SDKs that must be ready before the CLI persists a toolset enable.
@@ -165,6 +167,7 @@ _TOOLSET_PLATFORM_RESTRICTIONS: Dict[str, Set[str]] = {
 # schemas must remain side-effect free and must never trigger an install.
 _TOOLSET_LAZY_DEPENDENCIES: Dict[str, str] = {
     "feishu_aily": "platform.feishu",
+    "feishu_aily_agent": "platform.feishu",
 }
 
 
@@ -646,6 +649,11 @@ TOOLSET_ENV_REQUIREMENTS = {
         ("FEISHU_AILY_AUTH_APP_ID", "https://open.feishu.cn/"),
         ("FEISHU_AILY_AUTH_APP_SECRET", "https://open.feishu.cn/"),
         ("FEISHU_AILY_TARGET_APP_ID", "https://aily.feishu.cn/"),
+    ],
+    "feishu_aily_agent": [
+        ("FEISHU_AILY_AUTH_APP_ID", "https://open.feishu.cn/"),
+        ("FEISHU_AILY_AUTH_APP_SECRET", "https://open.feishu.cn/"),
+        ("FEISHU_AILY_AGENT_ID", "https://aily.feishu.cn/"),
     ],
 }
 

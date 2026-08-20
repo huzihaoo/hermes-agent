@@ -1,4 +1,4 @@
-"""Tests for feishu_doc_tool, feishu_drive_tool, and feishu_aily_knowledge_tool
+"""Tests for Feishu document, drive, and Aily tools
 — registration and schema validation."""
 
 import importlib
@@ -10,6 +10,7 @@ from tools.registry import registry
 importlib.import_module("tools.feishu_doc_tool")
 importlib.import_module("tools.feishu_drive_tool")
 importlib.import_module("tools.feishu_aily_knowledge_tool")
+importlib.import_module("tools.feishu_aily_agent_tool")
 
 
 class TestFeishuToolRegistration(unittest.TestCase):
@@ -22,6 +23,7 @@ class TestFeishuToolRegistration(unittest.TestCase):
         "feishu_drive_reply_comment": "feishu_drive",
         "feishu_drive_add_comment": "feishu_drive",
         "feishu_aily_knowledge_ask": "feishu_aily",
+        "feishu_aily_agent_chat": "feishu_aily_agent",
     }
 
     def test_all_tools_registered(self):
@@ -53,7 +55,11 @@ class TestFeishuToolRegistration(unittest.TestCase):
 
     def test_drive_tools_require_file_token(self):
         for tool_name in self.EXPECTED_TOOLS:
-            if tool_name in ("feishu_doc_read", "feishu_aily_knowledge_ask"):
+            if tool_name in (
+                "feishu_doc_read",
+                "feishu_aily_knowledge_ask",
+                "feishu_aily_agent_chat",
+            ):
                 continue
             entry = registry.get_entry(tool_name)
             props = entry.schema["parameters"].get("properties", {})
@@ -69,6 +75,16 @@ class TestFeishuToolRegistration(unittest.TestCase):
         self.assertIn("data_asset_tag_ids", props)
         self.assertNotIn("app_id", props)
         self.assertIn("content", required)
+
+    def test_aily_agent_chat_schema(self):
+        entry = registry.get_entry("feishu_aily_agent_chat")
+        props = entry.schema["parameters"].get("properties", {})
+        required = entry.schema["parameters"].get("required", [])
+        self.assertIn("content", props)
+        self.assertIn("session_id", props)
+        self.assertIn("agent_attachment_ids", props)
+        self.assertIn("content", required)
+        self.assertNotIn("agent_id", props)
 
 
 if __name__ == "__main__":
