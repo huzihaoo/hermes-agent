@@ -45,14 +45,35 @@ _MAX_MESSAGE_CHARS = 10_000
 _MAX_SESSION_ID_CHARS = 255
 _MAX_CHAT_ID_CHARS = 64
 _MAX_ATTACHMENTS = 8
-_MAX_ATTACHMENT_ID_CHARS = 255
+_MAX_ATTACHMENT_ID_CHARS = 256
 _MAX_SSE_BYTES = 8 * 1024 * 1024
 _MAX_ARTIFACTS = 32
-_MAX_ARTIFACT_ID_CHARS = 255
+_MAX_ARTIFACT_ID_CHARS = 256
 _MAX_ARTIFACT_TYPE_CHARS = 64
-_POLL_INTERVAL_SECONDS = 0.5
+_POLL_INITIAL_INTERVAL_SECONDS = 1.0
+_POLL_MAX_INTERVAL_SECONDS = 5.0
 _POLL_TIMEOUT_SECONDS = 120.0
 _MAX_POLL_REQUESTS = 120
+
+_AILY_AGENT_ERROR_MESSAGES = {
+    10001: "Aily Agent request validation failed; check path and body parameters",
+    10002: "Agent chat was not found; verify the agent_chat_id and calling identity",
+    10006: "The Aily Agent has not enabled the OpenAPI channel",
+    10007: (
+        "Access to the Aily Agent was denied; verify the OpenAPI identity type, user "
+        "or App ID access range, same-tenant requirement, and attachment ownership"
+    ),
+    10008: "This tenant has not enabled Aily OpenAPI access",
+    10009: "The Aily Agent OpenAPI channel has not enabled application identity",
+    10010: "The calling App ID is not in the Aily Agent OpenAPI application allowlist",
+    10011: "The calling user is outside the Aily Agent OpenAPI visibility range",
+    2700001: "Aily Agent request parameters are invalid",
+    50001: "Aily Agent returned an internal error; retry once later or contact support",
+}
+
+_NON_TERMINAL_STATUSES = {"queued", "pending", "running", "processing"}
+_SUCCESS_STATUSES = {"completed"}
+_FAILED_STATUSES = {"failed", "failure", "error", "cancelled", "canceled"}
 
 
 FEISHU_AILY_AGENT_CHAT_SCHEMA = {
@@ -96,6 +117,21 @@ def _check_feishu() -> bool:
 def _resolve_client() -> Any | None:
     configured = _build_configured_client()
     return configured if configured is not None else get_client()
+
+
+def _agent_api_error_text(code: Any, msg: Any) -> str:
+    """Add channel/identity remediation while retaining a redacted API message."""
+    mapped = (
+        _AILY_AGENT_ERROR_MESSAGES.get(code)
+        if isinstance(code, int) and not isinstance(code, bool)
+        else None
+    )
+    safe_msg = _safe_error_text(msg or "unknown error")
+    if not mapped:
+        return safe_msg
+    if not safe_msg or safe_msg == "unknown error" or safe_msg in mapped:
+        return mapped
+    return f"{mapped}; API: {safe_msg}"
 
 
 def _validate_attachments(value: Any) -> list[str]:
@@ -169,18 +205,14 @@ def _extract_payload_status(payload: dict[str, Any]) -> tuple[str | None, str | 
 
 
 def _is_terminal_payload(payload: dict[str, Any], *, event_name: str | None = None) -> bool:
-    status, finish_reason = _extract_payload_status(payload)
-    if isinstance(finish_reason, str) and finish_reason.strip():
-        return True
-    if isinstance(status, str) and status.lower() in {
-        "finished",
-        "complete",
-        "completed",
-        "done",
-        "success",
-        "succeeded",
-    }:
-        return True
+    status, _finish_reason = _extract_payload_status(payload)
+    if isinstance(status, str):
+        status_value = status.lower()
+        if status_value in _NON_TERMINAL_STATUSES:
+            return False
+        if status_value in _SUCCESS_STATUSES:
+            return True
+        return False
     return isinstance(event_name, str) and event_name.lower() in {
         "done",
         "finish",
@@ -190,16 +222,19 @@ def _is_terminal_payload(payload: dict[str, Any], *, event_name: str | None = No
 
 
 def _is_failed_payload(payload: dict[str, Any]) -> bool:
+    status, _reason = _extract_payload_status(payload)
+    status_value = status.lower() if isinstance(status, str) else ""
+    return status_value in _FAILED_STATUSES
+
+
+def _status_diagnostic(payload: dict[str, Any]) -> str:
     status, reason = _extract_payload_status(payload)
-    values = [value.lower() for value in (status, reason) if isinstance(value, str)]
-    # Aily's documented response example uses status="Cancelled" together
-    # with finish_reason="stop" for a successful answer.  Treat cancellation
-    # as failure only when it is itself the terminal reason.
-    if any(value in {"failed", "failure", "error"} for value in values):
-        return True
-    return any(value in {"cancelled", "canceled"} for value in values) and not (
-        isinstance(reason, str) and reason.lower() not in {"cancelled", "canceled"}
-    )
+    parts = []
+    if status:
+        parts.append(f"status={status}")
+    if reason:
+        parts.append(f"finish_reason={reason}")
+    return _safe_error_text(" ".join(parts) or "failed")
 
 
 def _payload_code_msg(payload: dict[str, Any]) -> tuple[Any, Any]:
@@ -253,6 +288,7 @@ def _agent_result(
     agent_chat_id: str | None = None,
     artifacts: list[dict[str, str]] | None = None,
     finish_reason: str | None = None,
+    status: str | None = None,
 ) -> str:
     result: dict[str, Any] = {
         "success": True,
@@ -265,6 +301,8 @@ def _agent_result(
         result["agent_chat_id"] = agent_chat_id
     if finish_reason:
         result["finish_reason"] = finish_reason
+    if status:
+        result["status"] = status
     if artifacts:
         result["artifacts"] = artifacts
     if not content:
@@ -289,24 +327,24 @@ def _parse_agent_response(raw_content: bytes | str) -> str:
         msg = parsed.get("msg", "")
         if code not in (None, 0):
             return tool_error(
-                f"Aily Agent chat failed: [{code}] {_safe_error_text(msg or 'unknown error')}",
+                f"Aily Agent chat failed: [{code}] {_agent_api_error_text(code, msg)}",
                 code=code,
             )
         if _is_failed_payload(parsed):
-            status, reason = _extract_payload_status(parsed)
             return tool_error(
                 "Aily Agent chat did not complete: "
-                + _safe_error_text(reason or status or "failed")
+                + _status_diagnostic(parsed)
             )
         data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
         content = _extract_payload_text(parsed)
-        if content or _is_terminal_payload(parsed):
+        if _is_terminal_payload(parsed):
             return _agent_result(
                 content,
                 session_id=data.get("session_id") if isinstance(data.get("session_id"), str) else None,
                 agent_chat_id=data.get("agent_chat_id") if isinstance(data.get("agent_chat_id"), str) else None,
                 artifacts=_bounded_artifacts(parsed),
                 finish_reason=data.get("finish_reason") if isinstance(data.get("finish_reason"), str) else None,
+                status=data.get("status") if isinstance(data.get("status"), str) else None,
             )
         return tool_error("Aily Agent chat returned no completed content")
 
@@ -315,6 +353,7 @@ def _parse_agent_response(raw_content: bytes | str) -> str:
     latest_text = ""
     latest_artifacts: list[dict[str, str]] = []
     finish_reason: str | None = None
+    completion_status: str | None = None
     session_id: str | None = None
     agent_chat_id: str | None = None
     try:
@@ -323,14 +362,13 @@ def _parse_agent_response(raw_content: bytes | str) -> str:
             code, msg = _payload_code_msg(payload)
             if code not in (None, 0):
                 return tool_error(
-                    f"Aily Agent chat failed: [{code}] {_safe_error_text(msg or 'unknown error')}",
+                    f"Aily Agent chat failed: [{code}] {_agent_api_error_text(code, msg)}",
                     code=code,
                 )
             if _is_failed_payload(payload):
-                status, reason = _extract_payload_status(payload)
                 return tool_error(
                     "Aily Agent chat did not complete: "
-                    + _safe_error_text(reason or status or "failed")
+                    + _status_diagnostic(payload)
                 )
             data = payload.get("data")
             if isinstance(data, dict):
@@ -344,6 +382,8 @@ def _parse_agent_response(raw_content: bytes | str) -> str:
                 if artifact not in latest_artifacts:
                     latest_artifacts.append(artifact)
             _status, reason = _extract_payload_status(payload)
+            if _status:
+                completion_status = _status
             if reason:
                 finish_reason = reason
             if _is_terminal_payload(payload):
@@ -360,6 +400,7 @@ def _parse_agent_response(raw_content: bytes | str) -> str:
         agent_chat_id=agent_chat_id,
         artifacts=latest_artifacts,
         finish_reason=finish_reason,
+        status=completion_status,
     )
 
 
@@ -376,7 +417,12 @@ def _poll_agent_chat(
     """Poll the documented JSON result endpoint until the Agent finishes."""
     deadline = time.monotonic() + _POLL_TIMEOUT_SECONDS
     poll_count = 0
+    poll_interval = _POLL_INITIAL_INTERVAL_SECONDS
+    time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+    poll_interval = min(_POLL_MAX_INTERVAL_SECONDS, poll_interval * 2)
     while True:
+        if time.monotonic() >= deadline:
+            return tool_error("Aily Agent chat timed out before a completed result")
         poll_count += 1
         if poll_count > _MAX_POLL_REQUESTS:
             return tool_error("Aily Agent chat exceeded the poll request limit")
@@ -404,7 +450,7 @@ def _poll_agent_chat(
             code = status_code
             msg = msg or f"HTTP {status_code}"
         if code not in (None, 0):
-            details = [f"code={code}", f"msg={_safe_error_text(msg or 'unknown error')}"]
+            details = [f"code={code}", f"msg={_agent_api_error_text(code, msg)}"]
             if status_code is not None:
                 details.insert(0, f"http_status={status_code}")
             log_id = _raw_header(response, "x-tt-logid")
@@ -418,10 +464,9 @@ def _poll_agent_chat(
             return tool_error("Aily Agent chat poll returned no data")
         wrapped = {"data": data}
         if _is_failed_payload(wrapped):
-            _status, reason = _extract_payload_status(wrapped)
             return tool_error(
                 "Aily Agent chat did not complete: "
-                + _safe_error_text(reason or _status or "failed")
+                + _status_diagnostic(wrapped)
             )
         if _is_terminal_payload(wrapped):
             status, reason = _extract_payload_status(wrapped)
@@ -432,10 +477,10 @@ def _poll_agent_chat(
                 agent_chat_id=agent_chat_id,
                 artifacts=_bounded_artifacts(wrapped),
                 finish_reason=reason,
+                status=status,
             )
-        if time.monotonic() >= deadline:
-            return tool_error("Aily Agent chat timed out before a completed result")
-        time.sleep(_POLL_INTERVAL_SECONDS)
+        time.sleep(min(poll_interval, max(0.0, deadline - time.monotonic())))
+        poll_interval = min(_POLL_MAX_INTERVAL_SECONDS, poll_interval * 2)
 
 
 def _handle_feishu_aily_agent_chat(args: dict, **kwargs) -> str:
@@ -457,6 +502,8 @@ def _handle_feishu_aily_agent_chat(args: dict, **kwargs) -> str:
             f"Aily Agent is not configured; set {_AGENT_ID_ENV} to the agent_... ID "
             "from the Aily agent detail URL"
         )
+    if not agent_id.startswith("agent_"):
+        return tool_error(f"{_AGENT_ID_ENV} must start with 'agent_'")
     if len(agent_id) > _MAX_AGENT_ID_CHARS:
         return tool_error(f"{_AGENT_ID_ENV} must be at most {_MAX_AGENT_ID_CHARS} characters")
 
@@ -532,7 +579,7 @@ def _handle_feishu_aily_agent_chat(args: dict, **kwargs) -> str:
         code = http_status
         msg = msg or f"HTTP {http_status}"
     if code not in (None, 0):
-        details = [f"code={code}", f"msg={_safe_error_text(msg or 'unknown error')}"]
+        details = [f"code={code}", f"msg={_agent_api_error_text(code, msg)}"]
         if http_status is not None:
             details.insert(0, f"http_status={http_status}")
         log_id = _raw_header(response, "x-tt-logid")

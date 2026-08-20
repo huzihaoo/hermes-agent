@@ -60,6 +60,7 @@ def _clean_state(monkeypatch):
     ):
         monkeypatch.delenv(name, raising=False)
     token = agent.set_client(None)
+    monkeypatch.setattr(agent.time, "sleep", lambda _seconds: None)
     agent._reset_configured_client_cache()
     yield
     agent._reset_configured_client_cache()
@@ -170,6 +171,23 @@ def test_parser_does_not_report_cancelled_agent_as_success():
     assert "did not complete" in result["error"]
 
 
+def test_parser_rejects_cancelled_stop_with_partial_text():
+    result = json.loads(
+        agent._parse_agent_response(
+            _sse(
+                {
+                    "data": {
+                        "status": "Cancelled",
+                        "finish_reason": "stop",
+                        "content": [{"type": "text", "text": "partial"}],
+                    }
+                }
+            )
+        )
+    )
+    assert "did not complete" in result["error"]
+
+
 def test_poll_failure_status_returns_tool_error(monkeypatch, fake_lark_sdk):
     client = _FakeClient(
         [
@@ -189,6 +207,169 @@ def test_poll_failure_status_returns_tool_error(monkeypatch, fake_lark_sdk):
     monkeypatch.setenv("FEISHU_AILY_AGENT_ID", "agent_test")
     result = json.loads(agent._handle_feishu_aily_agent_chat({"content": "q"}))
     assert "did not complete" in result["error"]
+
+
+def test_handler_explains_application_allowlist_error(monkeypatch, fake_lark_sdk):
+    client = _FakeClient(
+        _response(
+            json.dumps(
+                {"code": 10010, "msg": "permission denied"}
+            ).encode(),
+            code=10010,
+            msg="permission denied",
+            status_code=403,
+        )
+    )
+    agent.set_client(client)
+    monkeypatch.setenv("FEISHU_AILY_AGENT_ID", "agent_test")
+
+    result = json.loads(agent._handle_feishu_aily_agent_chat({"content": "q"}))
+
+    assert result["code"] == 10010
+    assert "application allowlist" in result["error"]
+
+
+def test_poll_uses_bounded_backoff_for_queued_result(
+    monkeypatch, fake_lark_sdk
+):
+    client = _FakeClient(
+        [
+            _response(
+                json.dumps(
+                    {"code": 0, "data": {"agent_chat_id": "chat_1"}}
+                ).encode()
+            ),
+            _response(json.dumps({"code": 0, "data": {"status": "Queued"}}).encode()),
+            _response(json.dumps({"code": 0, "data": {"status": "Queued"}}).encode()),
+            _response(
+                json.dumps(
+                    {
+                        "code": 0,
+                        "data": {
+                            "status": "Completed",
+                            "finish_reason": "stop",
+                            "content": [{"type": "text", "text": "answer"}],
+                        },
+                    }
+                ).encode()
+            ),
+        ]
+    )
+    sleeps = []
+    monkeypatch.setattr(agent.time, "sleep", sleeps.append)
+    agent.set_client(client)
+    monkeypatch.setenv("FEISHU_AILY_AGENT_ID", "agent_test")
+
+    result = json.loads(agent._handle_feishu_aily_agent_chat({"content": "q"}))
+
+    assert result["content"] == "answer"
+    assert sleeps == [1.0, 2.0, 4.0]
+
+
+def test_queued_status_is_not_terminal_even_with_finish_reason(
+    monkeypatch, fake_lark_sdk
+):
+    client = _FakeClient(
+        [
+            _response(
+                json.dumps(
+                    {"code": 0, "data": {"agent_chat_id": "chat_1"}}
+                ).encode()
+            ),
+            _response(
+                json.dumps(
+                    {
+                        "code": 0,
+                        "data": {
+                            "status": "Queued",
+                            "finish_reason": "failed",
+                            "content": [{"type": "text", "text": "partial"}],
+                        },
+                    }
+                ).encode()
+            ),
+            _response(
+                json.dumps(
+                    {
+                        "code": 0,
+                        "data": {
+                            "status": "Completed",
+                            "finish_reason": "stop",
+                            "content": [{"type": "text", "text": "final"}],
+                        },
+                    }
+                ).encode()
+            ),
+        ]
+    )
+    agent.set_client(client)
+    monkeypatch.setenv("FEISHU_AILY_AGENT_ID", "agent_test")
+
+    result = json.loads(agent._handle_feishu_aily_agent_chat({"content": "q"}))
+
+    assert result["content"] == "final"
+
+
+def test_completed_status_wins_over_diagnostic_finish_reason(
+    monkeypatch, fake_lark_sdk
+):
+    client = _FakeClient(
+        [
+            _response(
+                json.dumps(
+                    {"code": 0, "data": {"agent_chat_id": "chat_1"}}
+                ).encode()
+            ),
+            _response(
+                json.dumps(
+                    {
+                        "code": 0,
+                        "data": {
+                            "status": "Completed",
+                            "finish_reason": "error",
+                            "content": [{"type": "text", "text": "final"}],
+                        },
+                    }
+                ).encode()
+            ),
+        ]
+    )
+    agent.set_client(client)
+    monkeypatch.setenv("FEISHU_AILY_AGENT_ID", "agent_test")
+
+    result = json.loads(agent._handle_feishu_aily_agent_chat({"content": "q"}))
+
+    assert result["success"] is True
+    assert result["content"] == "final"
+
+
+def test_non_stream_parser_rejects_queued_partial_content():
+    result = json.loads(
+        agent._parse_agent_response(
+            json.dumps(
+                {
+                    "code": 0,
+                    "data": {
+                        "status": "Queued",
+                        "content": [{"type": "text", "text": "partial"}],
+                    },
+                }
+            ).encode()
+        )
+    )
+
+    assert "no completed content" in result["error"]
+
+
+def test_handler_rejects_non_agent_id_before_client_resolution(monkeypatch):
+    monkeypatch.setenv("FEISHU_AILY_AGENT_ID", "cli_wrong")
+    monkeypatch.setattr(
+        agent, "_resolve_client", lambda: pytest.fail("client must not be resolved")
+    )
+
+    result = json.loads(agent._handle_feishu_aily_agent_chat({"content": "q"}))
+
+    assert "must start with 'agent_'" in result["error"]
 
 
 def test_parser_surfaces_embedded_business_error():
@@ -240,7 +421,7 @@ def test_handler_builds_agent_chat_request(fake_lark_sdk):
                     {
                         "code": 0,
                         "data": {
-                            "status": "Cancelled",
+                            "status": "Completed",
                             "finish_reason": "stop",
                             "content": [{"type": "text", "text": "OOI answer"}],
                         },
