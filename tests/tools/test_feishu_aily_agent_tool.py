@@ -170,6 +170,27 @@ def test_parser_does_not_report_cancelled_agent_as_success():
     assert "did not complete" in result["error"]
 
 
+def test_poll_failure_status_returns_tool_error(monkeypatch, fake_lark_sdk):
+    client = _FakeClient(
+        [
+            _response(
+                json.dumps(
+                    {"code": 0, "data": {"agent_chat_id": "chat_1"}}
+                ).encode()
+            ),
+            _response(
+                json.dumps(
+                    {"code": 0, "data": {"status": "Failed"}}
+                ).encode()
+            ),
+        ]
+    )
+    agent.set_client(client)
+    monkeypatch.setenv("FEISHU_AILY_AGENT_ID", "agent_test")
+    result = json.loads(agent._handle_feishu_aily_agent_chat({"content": "q"}))
+    assert "did not complete" in result["error"]
+
+
 def test_parser_surfaces_embedded_business_error():
     result = json.loads(
         agent._parse_agent_response(

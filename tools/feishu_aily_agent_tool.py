@@ -421,7 +421,7 @@ def _poll_agent_chat(
             _status, reason = _extract_payload_status(wrapped)
             return tool_error(
                 "Aily Agent chat did not complete: "
-                + _safe_error_text(reason or status or "failed")
+                + _safe_error_text(reason or _status or "failed")
             )
         if _is_terminal_payload(wrapped):
             status, reason = _extract_payload_status(wrapped)

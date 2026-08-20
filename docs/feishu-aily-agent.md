@@ -102,6 +102,18 @@ release governance 物化和重启。
 请使用 Hermes 工具或本目录的 Python smoke。若自行使用 `stream=true`，
 官方只承诺返回 SSE，未公开固定的事件字段，不能假定 stock CLI 能解析。
 
+只做创建请求时，CLI 形状如下（不要把 secret 放进命令行）：
+
+```bash
+lark-cli api POST \
+  "/open-apis/aily/v1/agents/${FEISHU_AILY_AGENT_ID}/chats" \
+  --as bot \
+  --data '{"user_message":{"content":[{"type":"text","text":"OOI是什么?"}]},"stream":false}'
+```
+
+读取返回的 `agent_chat_id` 后，再调用对应 GET，并确认 `finish_reason`/终态
+`status`，不要把创建响应本身当作最终答案。
+
 ## 官方参考
 
 - [发起智能体对话](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/aily-v1/agent-agent_chat/create)

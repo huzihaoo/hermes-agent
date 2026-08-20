@@ -180,6 +180,22 @@ def _header(headers: Any, name: str) -> str | None:
     return str(value) if value is not None else None
 
 
+def _log_id(payload: Any, headers: Any = None) -> str | None:
+    """Return a bounded diagnostic log id without exposing response bodies."""
+    header_id = _header(headers, "x-tt-logid")
+    if header_id:
+        return _redact(header_id)
+    if isinstance(payload, dict):
+        for key in ("log_id", "logid"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return _redact(value)
+        error = payload.get("error")
+        if isinstance(error, dict):
+            return _log_id(error)
+    return None
+
+
 def _read_response(response: Any, *, limit: int) -> bytes:
     try:
         body = response.read(limit + 1)
@@ -265,14 +281,18 @@ def run_probe(
         }) from exc
     token_code = token_json.get("code", 0)
     if token_status < 200 or token_status >= 300 or token_code not in (None, 0):
-        raise ProbeFailure({
+        payload = {
             "ok": False,
             "phase": "api",
             "http_status": token_status,
             "code": token_code,
             "error": _redact(token_json.get("msg", "tenant token request failed")),
             "network_request_sent": True,
-        })
+        }
+        log_id = _log_id(token_json, _token_headers)
+        if log_id:
+            payload["log_id"] = log_id
+        raise ProbeFailure(payload)
     token = token_json.get("tenant_access_token")
     if not isinstance(token, str) or not token:
         data = token_json.get("data") if isinstance(token_json.get("data"), dict) else {}
@@ -323,7 +343,7 @@ def run_probe(
         if "code" in created:
             payload["code"] = created["code"]
         payload["error"] = _redact(created.get("msg", f"Agent chat HTTP {chat_status}"))
-        log_id = _header(chat_headers, "x-tt-logid")
+        log_id = _log_id(created, chat_headers)
         if log_id:
             payload["log_id"] = _redact(log_id)
         raise ProbeFailure(payload)
@@ -378,14 +398,18 @@ def run_probe(
                 "network_request_sent": True,
             }) from exc
         if result_status < 200 or result_status >= 300 or result_json.get("code", 0) not in (None, 0):
-            raise ProbeFailure({
+            payload = {
                 "ok": False,
                 "phase": "api",
                 "http_status": result_status,
                 "code": result_json.get("code"),
                 "error": _redact(result_json.get("msg", "Agent result request failed")),
                 "network_request_sent": True,
-            })
+            }
+            log_id = _log_id(result_json, result_headers)
+            if log_id:
+                payload["log_id"] = log_id
+            raise ProbeFailure(payload)
         candidate = result_json.get("data")
         if not isinstance(candidate, dict):
             raise ProbeFailure({
@@ -415,6 +439,14 @@ def run_probe(
                 "phase": "api",
                 "http_status": result_status,
                 "error": _redact(candidate.get("status")),
+                "network_request_sent": True,
+            })
+        elif status in {"cancelled", "canceled"}:
+            raise ProbeFailure({
+                "ok": False,
+                "phase": "api",
+                "http_status": result_status,
+                "error": "Agent result was cancelled without a finish_reason",
                 "network_request_sent": True,
             })
         elif time.monotonic() >= deadline:
