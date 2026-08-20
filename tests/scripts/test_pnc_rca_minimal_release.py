@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 from datetime import datetime, timezone
+import csv
 import json
 import os
 from pathlib import Path
@@ -9,6 +11,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 from types import SimpleNamespace
 
 import pytest
@@ -41,7 +44,7 @@ def test_script_path_help_is_executable_from_repository_root():
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert "{prepare,plan,apply,verify}" in completed.stdout
+    assert "{preflight,prepare,plan,apply,verify}" in completed.stdout
 
 
 def _write(path: Path, raw: bytes, mode: int = 0o600) -> Path:
@@ -199,6 +202,7 @@ class FakeRunner:
         bad_ref_round=1,
         bad_tag_type_face="",
         loaded_without_pid=(),
+        bad_ls_remote_face="",
     ):
         self.data = data
         self.pids = dict(
@@ -217,6 +221,7 @@ class FakeRunner:
         self.bad_tree_face = bad_tree_face
         self.bad_ref_round = bad_ref_round
         self.bad_tag_type_face = bad_tag_type_face
+        self.bad_ls_remote_face = bad_ls_remote_face
         self.fetch_faces = {}
         self.fetch_rounds = {}
         self.calls = []
@@ -224,6 +229,33 @@ class FakeRunner:
     def __call__(self, command):
         command = tuple(command)
         self.calls.append(command)
+        if len(command) > 3 and command[:2] == ("/usr/bin/git", "ls-remote"):
+            remote = next(
+                (value for value in command if value.startswith("git@git.minieye.tech:")),
+                "",
+            )
+            name = next(
+                (
+                    name
+                    for name, face in self.data["identity"].items()
+                    if isinstance(face, dict) and face.get("remote") == remote
+                ),
+                "",
+            )
+            face = self.data["identity"].get(name, {})
+            commit = face.get("commit", "0" * 40)
+            peeled_commit = (
+                "0" * 40 if name == self.bad_ls_remote_face else commit
+            )
+            rows = []
+            for ref in command[4:]:
+                if ref == face.get("remote_branch"):
+                    rows.append(f"{commit}\t{ref}")
+                elif ref == f"refs/tags/{face.get('remote_tag')}":
+                    rows.append(f"{face.get('remote_tag_object', '0' * 40)}\t{ref}")
+                elif ref == f"refs/tags/{face.get('remote_tag')}^{{}}":
+                    rows.append(f"{peeled_commit}\t{ref}")
+            return subprocess.CompletedProcess(command, 0, "\n".join(rows) + "\n", "")
         if (
             len(command) > 4
             and command[:2] == ("/usr/bin/git", "-C")
@@ -657,6 +689,12 @@ def _prepare_fixture(data, *, store=None, partition_topics=None, report=None):
             "source_commit": "3" * 40,
             "tree": "4" * 40,
         },
+        # Unit tests inject a deterministic read-only result. The CLI/default
+        # path reads the candidate contract and installed VM bytes directly.
+        "dependency_probe": lambda _pipeline_root, _pipeline_identity: {
+            "ok": True,
+            "status": "fixture_dependency_proof",
+        },
     }
     return {
         "args": args,
@@ -679,7 +717,8 @@ def test_prepare_derives_and_writes_deterministic_owner_only_outputs(release_fil
     assert result["mode"] == "prepare"
     assert result["applied"] is False
     assert runner.fetch_rounds == {"host": 2, "worker": 2, "pipeline": 2}
-    assert prepared["store_calls"] == [(release_files["control_db"], True)]
+    assert prepared["store_calls"]
+    assert all(read_only is True for _path, read_only in prepared["store_calls"])
     for path in (
         prepared["note_path"],
         prepared["env_output"],
@@ -737,6 +776,689 @@ def test_prepare_derives_and_writes_deterministic_owner_only_outputs(release_fil
     assert {path: path.read_bytes() for path in first} == first
 
 
+def test_preflight_is_read_only_non_short_circuit_and_structured(release_files):
+    prepared = _prepare_fixture(release_files)
+    runner = FakeRunner(release_files)
+    paths = (
+        prepared["note_path"],
+        prepared["env_output"],
+        prepared["manifest_output"],
+        release_files["control_db"],
+        Path(f"{release_files['control_db']}-wal"),
+        Path(f"{release_files['control_db']}-shm"),
+    )
+    prepared["args"]["pipeline_remote"] = "git@github.com:wrong/repository.git"
+    prepared["env_output"].write_bytes(b"existing\n")
+    before = {
+        path: (path.read_bytes() if path.exists() else None)
+        for path in paths
+    }
+    result = release.preflight_release(
+        **prepared["args"],
+        runner=runner,
+        require_canary_state=False,
+    )
+
+    assert result["preflight_ok"] is False
+    failed = {row["gate"] for row in result["failed"]}
+    assert "prepare_output_exists" in failed
+    assert "gitlab_face_input_invalid" in failed
+    assert "prepare_control_snapshot_invalid" not in failed
+    assert result["total"] == len(result["checks"])
+    assert result["checked"] + result["deferred"] == result["total"]
+    assert result["checked"] > len(result["failed"])
+    assert all(
+        {"gate", "actual", "expected", "hint", "passed"} <= row.keys()
+        for row in result["checks"]
+    )
+    with (Path(__file__).resolve().parents[2] / "preflight-gate-inventory.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        inventory_codes = {row["gate_code"] for row in csv.DictReader(handle)}
+    assert {row["gate"] for row in result["checks"]} <= inventory_codes
+    assert any(command[1:3] == ("ls-remote", "--exit-code") for command in runner.calls)
+    assert any(
+        "--no-optional-locks" in command and "status" in command
+        for command in runner.calls
+    )
+    assert not any(
+        command[1:] in {("init", "--bare"), ("fetch", "--quiet")} or "fetch" in command
+        for command in runner.calls
+    )
+    after = {
+        path: (path.read_bytes() if path.exists() else None)
+        for path in paths
+    }
+    assert after == before
+
+
+def test_preflight_real_store_preserves_db_wal_shm_and_cleans_snapshots(
+    release_files,
+):
+    release.RcaControlStore(release_files["control_db"])
+    prepared = _prepare_fixture(release_files)
+    prepared["args"]["store_factory"] = release._open_store
+    source_paths = (
+        release_files["control_db"],
+        Path(f"{release_files['control_db']}-wal"),
+        Path(f"{release_files['control_db']}-shm"),
+    )
+
+    def identity(path):
+        if not path.exists():
+            return None
+        observed = path.lstat()
+        return (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_mode,
+            observed.st_size,
+            observed.st_mtime_ns,
+            release._sha(path.read_bytes()),
+        )
+
+    before = {path: identity(path) for path in source_paths}
+    snapshot_parent = Path(tempfile.gettempdir())
+    snapshot_roots_before = set(snapshot_parent.glob("pnc-rca-control-ro-*"))
+    result = release.preflight_release(
+        **prepared["args"],
+        runner=FakeRunner(release_files),
+        require_canary_state=False,
+    )
+    after = {path: identity(path) for path in source_paths}
+    snapshot_roots_after = set(snapshot_parent.glob("pnc-rca-control-ro-*"))
+
+    assert result["checked"] > len(result["failed"])
+    assert after == before
+    assert snapshot_roots_after == snapshot_roots_before
+    assert not prepared["note_path"].exists()
+    assert not prepared["env_output"].exists()
+    assert not prepared["manifest_output"].exists()
+
+
+def test_prepare_failure_retains_full_preflight_report(release_files):
+    prepared = _prepare_fixture(release_files)
+    prepared["args"]["pipeline_remote"] = "git@github.com:wrong/repository.git"
+    prepared["env_output"].write_bytes(b"existing\n")
+    with pytest.raises(release.PreflightError) as caught:
+        release.prepare_release(
+            **prepared["args"],
+            runner=FakeRunner(release_files),
+        )
+    report = caught.value.result
+    assert report["preflight_ok"] is False
+    assert len(report["failed"]) >= 2
+    assert {row["gate"] for row in report["failed"]} >= {
+        "prepare_output_exists",
+        "gitlab_face_input_invalid",
+    }
+    assert not prepared["note_path"].exists()
+    assert not prepared["manifest_output"].exists()
+
+
+def test_preflight_subprocess_failure_is_one_structured_row(release_files):
+    prepared = _prepare_fixture(release_files)
+    base_runner = FakeRunner(release_files)
+
+    def runner(command):
+        if (
+            len(command) > 4
+            and command[0:2] == ("/usr/bin/git", "ls-remote")
+            and release_files["identity"]["worker"]["remote"] in command
+        ):
+            return subprocess.CompletedProcess(command, 128, "", "network down")
+        return base_runner(command)
+
+    result = release.preflight_release(
+        **prepared["args"],
+        runner=runner,
+        require_canary_state=False,
+    )
+    failed = {row["gate"] for row in result["failed"]}
+    assert "gitlab_identity_mismatch" in failed
+    assert any(
+        row.get("failure_code") == "gitlab_readback_failed"
+        for row in result["failed"]
+    )
+    assert result["checked"] > len(result["failed"])
+
+
+def test_preflight_invalid_partition_input_is_aggregated(release_files):
+    prepared = _prepare_fixture(release_files)
+    prepared["args"]["partition_topics"] = ("missing-separator",)
+    prepared["env_output"].write_bytes(b"existing\n")
+
+    result = release.preflight_release(
+        **prepared["args"],
+        runner=FakeRunner(release_files),
+        require_canary_state=False,
+    )
+
+    failed = {row["gate"]: row for row in result["failed"]}
+    assert {"prepare_partition_topics_invalid", "prepare_output_exists"} <= set(
+        failed
+    )
+    assert failed["prepare_partition_topics_invalid"]["actual"] == [
+        "missing-separator"
+    ]
+
+
+def test_default_dependency_probe_reports_vm_fingerprint_without_install(release_files):
+    prepared = _prepare_fixture(release_files)
+    prepared["args"].pop("dependency_probe")
+    calls = []
+    expected_dependencies = {
+        name: {
+            "version": "1.0.0",
+            "module": module,
+            "distribution_root": "/home/mini/.local/lib/python3.8/site-packages",
+            "module_source": (
+                "/home/mini/.local/lib/python3.8/site-packages/"
+                + module.replace(".", "/")
+                + "/__init__.py"
+            ),
+            "record_sha256": "a" * 64,
+            "critical_files_sha256": "d" * 64,
+            "critical_file_count": 17,
+        }
+        for name, module in release.REMOTE_READER_DEPENDENCY_MODULES.items()
+    }
+    actual_dependencies = {
+        name: {**expected, "distribution": name}
+        for name, expected in expected_dependencies.items()
+    }
+    actual_dependencies["mcap"] = {
+        **actual_dependencies["mcap"],
+        "version": "2.0.0",
+    }
+
+    def vm_runner(command, input_text):
+        calls.append((tuple(command), input_text))
+        assert command[1:] == ("run_py_json",)
+        assert input_text is not None
+        assert "subprocess.run" in input_text
+        assert "--no-optional-locks" in input_text
+        assert "--porcelain=v1" in input_text
+        assert "cat-file" in input_text
+        assert release_files["identity"]["pipeline"]["commit"] in input_text
+        assert "bootstrap_remote_reader_runtime.py" not in input_text
+        assert "--install-offline" not in input_text
+        assert release.REMOTE_READER_RUNTIME_CONTRACT_SCHEMA in input_text
+        for name in release.REMOTE_READER_SYSTEM_DEPENDENCIES:
+            assert name in input_text
+        response = {
+            "ok": False,
+            "expected": {
+                "source": {
+                    "runtime_root": str(
+                        release_files["identity"]["pipeline"]["runtime_root"]
+                    ),
+                    "commit": release_files["identity"]["pipeline"]["commit"],
+                    "clean": True,
+                },
+                "dependencies": expected_dependencies,
+            },
+            "actual": {
+                "source": {"clean": True, "stable": True},
+                "dependencies": actual_dependencies,
+            },
+            "source": {"ok": True},
+            "contract": {"ok": True},
+            "dependencies": {
+                name: {
+                    "ok": name != "mcap",
+                    "expected": expected_dependencies[name],
+                    "actual": actual_dependencies[name],
+                    "mismatched_fields": ["version"] if name == "mcap" else [],
+                }
+                for name in release.REMOTE_READER_SYSTEM_DEPENDENCIES
+            },
+            "mismatches": [
+                {
+                    "scope": "dependency",
+                    "dependency": "mcap",
+                    "fields": ["version"],
+                }
+            ],
+            "bootstrap": {"status": "deferred_execution_only"},
+        }
+        return subprocess.CompletedProcess(
+            command, 0, json.dumps(response, sort_keys=True) + "\n", ""
+        )
+
+    result = release.preflight_release(
+        **prepared["args"],
+        runner=FakeRunner(release_files),
+        vm_runner=vm_runner,
+        require_canary_state=False,
+    )
+    dependency_rows = [
+        row
+        for row in result["checks"]
+        if row["gate"] == "remote_reader_dependency_unavailable"
+    ]
+    assert len(dependency_rows) == 1
+    row = dependency_rows[0]
+    assert row["passed"] is False
+    assert row["failure_code"] == "remote_reader_dependency_unavailable"
+    assert set(row["expected"]["dependencies"]) == set(
+        release.REMOTE_READER_SYSTEM_DEPENDENCIES
+    )
+    assert row["actual"]["dependencies"]["mcap"]["ok"] is False
+    assert row["actual"]["dependencies"]["mcap"]["mismatched_fields"] == [
+        "version"
+    ]
+    assert row["actual"]["dependencies"]["pdcl-dss"]["ok"] is True
+    assert row["actual"]["bootstrap"]["status"] == "deferred_execution_only"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("source_failure", ["stale_commit", "dirty_worktree"])
+def test_default_dependency_probe_fails_closed_on_unbound_source(
+    release_files, source_failure
+):
+    prepared = _prepare_fixture(release_files)
+    prepared["args"].pop("dependency_probe")
+    expected_commit = release_files["identity"]["pipeline"]["commit"]
+
+    def vm_runner(command, input_text):
+        actual = {
+            "commit": "0" * 40 if source_failure == "stale_commit" else expected_commit,
+            "clean": source_failure != "dirty_worktree",
+            "stable": True,
+        }
+        response = {
+            "ok": False,
+            "expected": {
+                "source": {"commit": expected_commit, "clean": True},
+                "dependencies": {},
+            },
+            "actual": {"source": actual, "dependencies": {}},
+            "source": {
+                "ok": False,
+                "expected": {"commit": expected_commit, "clean": True},
+                "actual": actual,
+                "error": None,
+            },
+            "contract": {"ok": False},
+            "dependencies": {},
+            "mismatches": [
+                {
+                    "scope": "source",
+                    "fields": ["commit", "clean", "stable"],
+                }
+            ],
+            "bootstrap": {"status": "deferred_execution_only"},
+        }
+        return subprocess.CompletedProcess(command, 0, json.dumps(response) + "\n", "")
+
+    result = release.preflight_release(
+        **prepared["args"],
+        runner=FakeRunner(release_files),
+        vm_runner=vm_runner,
+        require_canary_state=False,
+    )
+
+    row = next(
+        row
+        for row in result["checks"]
+        if row["gate"] == "remote_reader_dependency_unavailable"
+    )
+    assert row["passed"] is False
+    assert row["actual"]["source"]["ok"] is False
+    assert row["actual"]["mismatches"][0]["scope"] == "source"
+
+
+def test_r4_behavioral_regression_collects_all_precheckable_historical_gates(
+    release_files,
+):
+    class ChangingStore(FakeStore):
+        snapshot_calls = 0
+
+        def control_db_source_snapshot_identity(self):
+            self.snapshot_calls += 1
+            value = super().control_db_source_snapshot_identity()
+            value["observation"] = self.snapshot_calls
+            return value
+
+    report = {
+        "schema_version": "pnc_rca_report_manifest_v1",
+        "runtime_root": release_files["identity"]["pipeline"]["runtime_root"],
+        "pipeline_commit": "0" * 40,
+        "pipeline_tree": release_files["identity"]["pipeline"]["tree"],
+        "report_script_sha256": "c" * 64,
+    }
+    store = ChangingStore(
+        source_snapshot={
+            "schema_version": "pnc_rca_control_store_source_snapshot_v1",
+            "path": str(release_files["control_db"].absolute()),
+            "present": True,
+            "logical_db_identity": {"database": "snapshot", "wal": "snapshot-wal"},
+        },
+        partition_progress={("feishu-project-workflow-event", 0): 1984},
+        observed_control_schema_version=release.CONTROL_SCHEMA_V15,
+        binary_write_schema_version=release.CONTROL_SCHEMA_V15,
+    )
+    prepared = _prepare_fixture(release_files, store=store, report=report)
+    prepared["args"]["worker_remote"] = "git@github.com:wrong/repository.git"
+    prepared["args"]["dependency_probe"] = (
+        lambda _root, _identity: (_ for _ in ()).throw(
+            release.ReleaseError("remote_reader_dependency_unavailable")
+        )
+    )
+
+    result = release.preflight_release(
+        **prepared["args"],
+        runner=FakeRunner(release_files, bad_ls_remote_face="host"),
+        require_canary_state=True,
+    )
+    failed = {row["gate"] for row in result["failed"]}
+    assert {
+        "gitlab_face_input_invalid",
+        "gitlab_identity_mismatch",
+        "report_manifest_pipeline_mismatch",
+        "rca_control_store_snapshot_source_changed",
+        "remote_reader_dependency_unavailable",
+        "canary_state_unavailable",
+    } <= failed
+    identity_failures = [
+        row
+        for row in result["failed"]
+        if row["gate"] == "gitlab_identity_mismatch"
+    ]
+    assert any(
+        row.get("failure_code") == "gitlab_identity_mismatch"
+        and row["actual"].get("peeled_tag_commit") == "0" * 40
+        for row in identity_failures
+    )
+    report_failure = next(
+        row
+        for row in result["failed"]
+        if row["gate"] == "report_manifest_pipeline_mismatch"
+    )
+    assert report_failure["actual"]["pipeline_commit"] == "0" * 40
+    assert report_failure["expected"]["pipeline_commit"] == (
+        release_files["identity"]["pipeline"]["commit"]
+    )
+    supersession = [
+        row
+        for row in result["checks"]
+        if row["gate"] == "prepare_control_schema_already_v15"
+    ]
+    assert supersession and supersession[0]["passed"] is True
+    deferred = {
+        row["gate"]: row
+        for row in result["checks"]
+        if row["gate"] in {"restart_readback_timeout", "bootstrap_install-offline_failed"}
+    }
+    assert set(deferred) == {"restart_readback_timeout", "bootstrap_install-offline_failed"}
+    assert all(row["precheckable"] is False and row["passed"] for row in deferred.values())
+    assert result["checked"] > len(result["failed"])
+
+
+def test_main_preserves_preflight_error_aggregate(monkeypatch, capsys):
+    aggregate = {
+        "schema_version": release.PREFLIGHT_SCHEMA,
+        "mode": "preflight",
+        "preflight_ok": False,
+        "ok": False,
+        "checked": 2,
+        "passed": 0,
+        "failed": [
+            {
+                "gate": "gitlab_identity_mismatch",
+                "actual": "bad",
+                "expected": "good",
+                "hint": "refresh identity",
+                "passed": False,
+                "failure_code": "gitlab_identity_mismatch",
+            },
+            {
+                "gate": "report_manifest_pipeline_mismatch",
+                "actual": "bad",
+                "expected": "good",
+                "hint": "rematerialize",
+                "passed": False,
+                "failure_code": "report_manifest_pipeline_mismatch",
+            },
+        ],
+        "checks": [],
+    }
+
+    class FakeParser:
+        def parse_args(self, _argv):
+            return SimpleNamespace(
+                command="prepare",
+                release_note=Path("/tmp/release-note.json"),
+                hermes_home=Path("/tmp/hermes"),
+                release_id="release-id",
+                epoch_id="epoch-id",
+                operator="owner:test",
+                reason="test",
+                canary_batch_id="canary-id",
+                canary_issue_id="123456",
+                canary_state_path=Path("/tmp/canary.json"),
+                host_branch="refs/heads/production/rca",
+                host_tag="host-tag",
+                host_runtime_root=Path("/tmp/host"),
+                worker_remote="git@git.minieye.tech:planning_algo/worker.git",
+                worker_branch="refs/heads/worker",
+                worker_tag="worker-tag",
+                worker_runtime_root=Path("/tmp/worker"),
+                pipeline_remote="git@git.minieye.tech:planning_algo/pipeline.git",
+                pipeline_branch="refs/heads/pipeline",
+                pipeline_tag="pipeline-tag",
+                pipeline_runtime_root=Path("/tmp/pipeline"),
+                report_manifest_path=Path("/home/mini/.config/g1q3-rca/report-runtime-manifest.json"),
+                partition_topic=[],
+                control_db=Path("/tmp/hermes/runtime/pnc_agent/feishu_issue_kafka_rca/control.sqlite3"),
+                manifest_output=Path("/tmp/manifest.json"),
+                env_output=Path("/tmp/env"),
+            )
+
+    monkeypatch.setattr(release, "_parser", lambda: FakeParser())
+
+    def blocked(**_kwargs):
+        raise release.PreflightError(aggregate)
+
+    monkeypatch.setattr(release, "prepare_release", blocked)
+    assert release.main([]) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["failed"] == aggregate["failed"]
+    assert payload["command"] == "prepare"
+
+    standalone_args = FakeParser().parse_args([])
+    standalone_args.command = "preflight"
+    standalone_args.partition_topic = ["missing-separator"]
+
+    class StandaloneParser:
+        def parse_args(self, _argv):
+            return standalone_args
+
+    monkeypatch.setattr(release, "_parser", lambda: StandaloneParser())
+
+    def standalone_preflight(**kwargs):
+        assert kwargs["partition_topics"] == ("missing-separator",)
+        return aggregate
+
+    monkeypatch.setattr(release, "preflight_release", standalone_preflight)
+    assert release.main([]) == 2
+    standalone_payload = json.loads(capsys.readouterr().out)
+    assert standalone_payload["failed"] == aggregate["failed"]
+    assert "command" not in standalone_payload
+
+    green = {**aggregate, "preflight_ok": True, "ok": True, "passed": 2, "failed": []}
+    monkeypatch.setattr(release, "preflight_release", lambda **_kwargs: green)
+    assert release.main([]) == 0
+    assert json.loads(capsys.readouterr().out)["preflight_ok"] is True
+
+
+R4_HISTORICAL_GATE_ATTEMPTS = (
+    ("r15bb", "apply", "restart_readback_timeout"),
+    ("r15bd", "prepare", "gitlab_identity_mismatch"),
+    ("r15bd-2", "prepare", "rca_control_store_snapshot_source_changed"),
+    ("r15bd-3", "prepare", "prepare_control_schema_already_v15"),
+    ("r15be", "prepare", "rca_control_store_snapshot_source_changed"),
+    ("r15be-2", "verify", "canary_state_unavailable"),
+    ("308", "execution", "remote_reader_dependency_unavailable"),
+    ("r15bg", "prepare", "gitlab_face_input_invalid"),
+    ("r15bg-b", "prepare", "gitlab_identity_mismatch"),
+    ("r15bg-c", "prepare", "report_manifest_pipeline_mismatch"),
+    ("materialize", "execution", "bootstrap_install-offline_failed"),
+)
+
+
+def test_r4_inventory_covers_all_historical_gate_attempts():
+    inventory_path = Path(__file__).resolve().parents[2] / "preflight-gate-inventory.csv"
+    with inventory_path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    by_code = {row["gate_code"]: row for row in rows}
+    assert {"gate_code", "stage", "precheckable", "check_method", "source_line"} <= set(
+        rows[0]
+    )
+    for _attempt, _stage, code in R4_HISTORICAL_GATE_ATTEMPTS:
+        assert code in by_code
+    allowed_misses = {"restart_readback_timeout", "bootstrap_install-offline_failed"}
+    for _attempt, _stage, code in R4_HISTORICAL_GATE_ATTEMPTS:
+        if code not in allowed_misses:
+            assert by_code[code]["precheckable"] == "true"
+
+
+def test_inventory_contains_every_current_literal_release_error():
+    repo_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse((repo_root / "scripts/pnc_rca_minimal_release.py").read_text())
+    current_codes = {
+        node.args[0].value
+        for node in ast.walk(tree)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "ReleaseError"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        )
+    }
+    with (repo_root / "preflight-gate-inventory.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        inventory_codes = {row["gate_code"] for row in csv.DictReader(handle)}
+    assert len(current_codes) >= 128
+    assert current_codes <= inventory_codes
+
+
+def test_inventory_precheckable_rows_are_reachable_from_preflight():
+    repo_root = Path(__file__).resolve().parents[2]
+    tree = ast.parse((repo_root / "scripts/pnc_rca_minimal_release.py").read_text())
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    reachable_names = set()
+    pending = ["preflight_release"]
+    while pending:
+        name = pending.pop()
+        if name in reachable_names or name not in functions:
+            continue
+        reachable_names.add(name)
+        for node in ast.walk(functions[name]):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in functions
+            ):
+                pending.append(node.func.id)
+
+    reachable_codes = {
+        node.args[0].value
+        for name in reachable_names
+        for node in ast.walk(functions[name])
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"ReleaseError", "_PreflightProbeFailure"}
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        )
+    }
+    preflight = functions["preflight_release"]
+    reachable_codes.update(
+        node.args[0].value
+        for node in ast.walk(preflight)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "check"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and not any(
+                keyword.arg == "precheckable"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is False
+                for keyword in node.keywords
+            )
+        )
+    )
+    reachable_codes.add("preflight_probe_failed")
+    registered_codes = {
+        node.args[0].value
+        for node in ast.walk(preflight)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "check"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        )
+    }
+    path_values = next(
+        node
+        for node in ast.walk(preflight)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "path_values"
+            for target in node.targets
+        )
+    )
+    assert isinstance(path_values.value, ast.Tuple)
+    dynamic_path_codes = {
+        item.elts[0].value
+        for item in path_values.value.elts
+        if (
+            isinstance(item, ast.Tuple)
+            and item.elts
+            and isinstance(item.elts[0], ast.Constant)
+            and isinstance(item.elts[0].value, str)
+        )
+    }
+    registered_codes.update(dynamic_path_codes)
+    reachable_codes.update(dynamic_path_codes)
+
+    with (repo_root / "preflight-gate-inventory.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        reader = csv.DictReader(handle)
+        assert reader.fieldnames == [
+            "gate_code",
+            "stage",
+            "precheckable",
+            "check_method",
+            "source_line",
+        ]
+        rows = list(reader)
+    assert len({row["gate_code"] for row in rows}) == len(rows)
+    inventory_precheckable = {
+        row["gate_code"] for row in rows if row["precheckable"] == "true"
+    }
+    inventory_codes = {row["gate_code"] for row in rows}
+    assert registered_codes <= inventory_codes
+    assert inventory_precheckable <= reachable_codes
+
+
 def test_prepare_current_v15_writes_successor_note(release_files):
     prepared = _prepare_fixture(release_files)
     prepared["store"].observed_control_schema_version = release.CONTROL_SCHEMA_V15
@@ -783,8 +1505,10 @@ def test_prepare_rejects_existing_output_and_cleans_new_reservations(release_fil
     assert prepared["env_output"].read_bytes() == b"preexisting\n"
     assert not prepared["note_path"].exists()
     assert not prepared["manifest_output"].exists()
-    assert not runner.calls
-    assert not prepared["store_calls"]
+    assert runner.calls
+    assert all("fetch" not in command for command in runner.calls)
+    assert prepared["store_calls"]
+    assert all(read_only is True for _path, read_only in prepared["store_calls"])
 
 
 def test_prepare_rejects_noncanonical_control_db(release_files):
@@ -876,7 +1600,12 @@ def test_prepare_derives_predecessor_and_all_partition_fences(release_files):
         "topic-a": {"0": 10, "2": 22},
         "topic-b": {"1": 31},
     }
-    assert store.partition_calls == [("topic-a", (0, 2)), ("topic-b", (1,))]
+    assert store.partition_calls == [
+        ("topic-a", (0, 2)),
+        ("topic-b", (1,)),
+        ("topic-a", (0, 2)),
+        ("topic-b", (1,)),
+    ]
 
 
 def test_prepare_accepts_kafka_disabled_empty_partition_fence(release_files):
@@ -903,7 +1632,7 @@ def test_prepare_removes_legacy_release_env_keys(release_files):
     assert not release.LEGACY_ENV & env.keys()
 
 
-def test_report_manifest_reader_uses_fixed_ssh_mini_doctor_and_read_protocol(
+def test_report_manifest_reader_uses_read_protocol_without_mutating_doctor_probe(
     release_files,
 ):
     pipeline = release_files["identity"]["pipeline"]
@@ -919,8 +1648,6 @@ def test_report_manifest_reader_uses_fixed_ssh_mini_doctor_and_read_protocol(
 
     def vm_runner(command, input_text):
         calls.append((tuple(command), input_text))
-        if command[1:] == ("doctor", "--json"):
-            return subprocess.CompletedProcess(command, 0, '{"ok":true}\n', "")
         assert command[1:] == ("run_py_json",)
         assert str(release.REPORT_MANIFEST_ROOT) in input_text
         response = {
@@ -936,10 +1663,7 @@ def test_report_manifest_reader_uses_fixed_ssh_mini_doctor_and_read_protocol(
 
     assert observed_raw == raw
     assert observed == report
-    assert [command[0][0] for command in calls] == [
-        release.SSH_MINI_AGENT,
-        release.SSH_MINI_AGENT,
-    ]
+    assert [command[0][0] for command in calls] == [release.SSH_MINI_AGENT]
 
 
 def test_vm_agent_runner_rejects_environment_overrides(monkeypatch):

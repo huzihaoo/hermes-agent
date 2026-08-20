@@ -47,6 +47,7 @@ from gateway.pnc_rca_write_fence import (
 
 
 SCHEMA = "pnc_rca_minimal_release_driver_v1"
+PREFLIGHT_SCHEMA = "pnc_rca_minimal_release_preflight_v1"
 NOTE_SCHEMA = MINIMAL_RELEASE_NOTE_SCHEMA_VERSION
 RECEIPT_SCHEMA = "pnc_rca_minimal_release_apply_receipt_v3"
 TERMINAL_FAILURE_SCHEMA = "pnc_rca_minimal_release_terminal_failure_v1"
@@ -60,6 +61,16 @@ MAX_FILE_BYTES = 4 * 1024 * 1024
 MAX_HEALTH_AGE_SECONDS = 120
 RELEASE_LOCK_NAME = ".pnc-rca-minimal-release.lock"
 SSH_MINI_AGENT = "/Users/songying/.local/bin/ssh-mini-agent"
+REMOTE_READER_RUNTIME_CONTRACT_SCHEMA = (
+    "g1q3_rca_remote_reader_runtime_contract_v1"
+)
+REMOTE_READER_SYSTEM_DEPENDENCIES = ("mcap", "protobuf", "pdcl-dss", "typer")
+REMOTE_READER_DEPENDENCY_MODULES = {
+    "mcap": "mcap",
+    "protobuf": "google.protobuf",
+    "pdcl-dss": "pdcl_dss",
+    "typer": "typer",
+}
 REPORT_MANIFEST_ROOT = PurePosixPath("/home/mini/.config/g1q3-rca")
 REPORT_MANIFEST_PATH = REPORT_MANIFEST_ROOT / "report-runtime-manifest.json"
 CONTROL_DB_RELATIVE_PATH = Path(
@@ -148,12 +159,240 @@ ProcessFactory = Callable[[int], Any]
 StoreFactory = Callable[[Path, bool], Any]
 DeliveryStoreFactory = Callable[[Path], Any]
 WorkspaceRuntimeResolver = Callable[[Path, Runner], Mapping[str, str]]
+DependencyProbe = Callable[[Path, Mapping[str, Any]], Mapping[str, Any]]
 
 
 class ReleaseError(RuntimeError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
+
+
+class PreflightError(ReleaseError):
+    """Prepare was blocked, retaining the complete independent check report."""
+
+    def __init__(self, result: Mapping[str, Any]):
+        self.result = dict(result)
+        failed = self.result.get("failed")
+        first_code = (
+            failed[0].get("failure_code")
+            if isinstance(failed, list) and failed and isinstance(failed[0], Mapping)
+            else None
+        )
+        super().__init__(str(first_code or "preflight_failed"))
+
+
+class _PreflightProbeFailure(ReleaseError):
+    """A probe failure with structured readback to retain in the report."""
+
+    def __init__(self, code: str, actual: object, expected: object | None = None):
+        self.actual = actual
+        self.expected = expected
+        super().__init__(code)
+
+
+def _preflight_json_value(value: object) -> object:
+    """Keep probe values JSON-safe without allowing a bad probe to abort others."""
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _preflight_json_value(child) for key, child in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_preflight_json_value(child) for child in value]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return repr(value)
+
+
+class _PreflightCollector:
+    """Run every registered probe and retain failures instead of short-circuiting."""
+
+    def __init__(self) -> None:
+        self.rows: list[dict[str, Any]] = []
+
+    def check(
+        self,
+        gate: str,
+        stage: str,
+        expected: object,
+        hint: str,
+        probe: Callable[[], object],
+        *,
+        subject: str | None = None,
+        precheckable: bool = True,
+    ) -> None:
+        row: dict[str, Any] = {
+            "gate": gate,
+            "stage": stage,
+            "precheckable": precheckable,
+            "status": "pending",
+            "expected": _preflight_json_value(expected),
+            "hint": hint,
+        }
+        if subject:
+            row["subject"] = subject
+        try:
+            row["actual"] = _preflight_json_value(probe())
+            row["status"] = "deferred" if not precheckable else "passed"
+            row["passed"] = True
+        except _PreflightProbeFailure as exc:
+            row["actual"] = _preflight_json_value(exc.actual)
+            if exc.expected is not None:
+                row["expected"] = _preflight_json_value(exc.expected)
+            row["failure_code"] = exc.code
+            row["status"] = "failed"
+            row["passed"] = False
+        except ReleaseError as exc:
+            row["actual"] = {"code": exc.code}
+            row["failure_code"] = exc.code
+            row["status"] = "failed"
+            row["passed"] = False
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            row["actual"] = {
+                "error_type": type(exc).__name__,
+                "error": str(exc) or type(exc).__name__,
+            }
+            row["failure_code"] = "preflight_probe_failed"
+            row["status"] = "failed"
+            row["passed"] = False
+        self.rows.append(row)
+
+    def finish(self) -> dict[str, Any]:
+        failed = [row for row in self.rows if not row["passed"]]
+        deferred = [row for row in self.rows if not row["precheckable"]]
+        checked = sum(1 for row in self.rows if row["precheckable"])
+        passed = sum(
+            1
+            for row in self.rows
+            if row["precheckable"] and row["passed"]
+        )
+        return {
+            "schema_version": PREFLIGHT_SCHEMA,
+            "mode": "preflight",
+            "preflight_ok": not failed,
+            "ok": not failed,
+            "checked": checked,
+            "passed": passed,
+            "deferred": len(deferred),
+            "deferred_count": len(deferred),
+            "total": len(self.rows),
+            "failed": failed,
+            "checks": list(self.rows),
+        }
+
+
+def _preflight_face_input(
+    name: str, face: Mapping[str, str]
+) -> dict[str, str]:
+    remote = str(face.get("remote") or "")
+    branch = str(face.get("remote_branch") or "")
+    remote_tag = str(face.get("remote_tag") or "")
+    if (
+        not remote.startswith("git@git.minieye.tech:")
+        or (name == "host" and remote != HOST_REMOTE)
+        or re.fullmatch(r"refs/heads/[A-Za-z0-9._/-]+", branch) is None
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", remote_tag)
+        is None
+    ):
+        raise _PreflightProbeFailure(
+            "gitlab_face_input_invalid",
+            {
+                "name": name,
+                "remote": remote,
+                "remote_branch": branch,
+                "remote_tag": remote_tag,
+            },
+            {
+                "remote": HOST_REMOTE
+                if name == "host"
+                else "git@git.minieye.tech:<group>/<repository>.git",
+                "remote_branch": "refs/heads/<branch>",
+                "remote_tag": "annotated tag name",
+            },
+        )
+    return {
+        "remote": remote,
+        "remote_branch": branch,
+        "remote_tag": remote_tag,
+    }
+
+
+def _gitlab_readonly_resolve_face(
+    name: str,
+    face: Mapping[str, str],
+    runner: Runner | None = None,
+) -> dict[str, str | None]:
+    """Resolve refs without creating a repository, refs, objects, or temp files."""
+    validated = _preflight_face_input(name, face)
+    branch = validated["remote_branch"]
+    tag = f"refs/tags/{validated['remote_tag']}"
+    peeled = f"{tag}^{{}}"
+    expected = {
+        "remote": validated["remote"],
+        "branch": branch,
+        "tag": tag,
+        "peeled_tag": peeled,
+        "constraint": "branch commit equals peeled annotated tag commit",
+    }
+    output = _call(
+        runner or _run,
+        (
+            "/usr/bin/git",
+            "ls-remote",
+            "--exit-code",
+            validated["remote"],
+            branch,
+            tag,
+            peeled,
+        ),
+        "gitlab_readback",
+    )
+    refs: dict[str, str] = {}
+    for line in output.splitlines():
+        object_id, separator, ref = line.partition("\t")
+        if not separator or ref not in {branch, tag, peeled} or ref in refs:
+            raise _PreflightProbeFailure(
+                "gitlab_identity_mismatch",
+                {"remote": validated["remote"], "refs": refs, "invalid_line": line},
+                expected,
+            )
+        refs[ref] = object_id.strip()
+    if set(refs) != {branch, tag, peeled}:
+        raise _PreflightProbeFailure(
+            "gitlab_identity_mismatch",
+            {"remote": validated["remote"], "refs": refs},
+            expected,
+        )
+    commit = refs[branch]
+    tag_object = refs[tag]
+    peeled_commit = refs[peeled]
+    if (
+        not all(HEX40.fullmatch(value) for value in (commit, tag_object, peeled_commit))
+        or peeled_commit != commit
+        or tag_object == commit
+    ):
+        raise _PreflightProbeFailure(
+            "gitlab_identity_mismatch",
+            {
+                "remote": validated["remote"],
+                "branch_commit": commit,
+                "tag_object": tag_object,
+                "peeled_tag_commit": peeled_commit,
+            },
+            expected,
+        )
+    return {
+        "remote": validated["remote"],
+        "remote_branch": branch,
+        "remote_tag": validated["remote_tag"],
+        "remote_tag_object": tag_object,
+        "commit": commit,
+        # ls-remote cannot prove a tree without downloading objects.
+        "tree": None,
+        "tree_source": "unavailable_without_object_fetch",
+    }
 
 
 def _sha(raw: bytes) -> str:
@@ -616,6 +855,337 @@ def _vm_call(
     return result.stdout
 
 
+def _preflight_vm_dependency_probe(
+    pipeline_root: Path,
+    pipeline_identity: Mapping[str, Any],
+    vm_runner: VmRunner = _run_vm_agent,
+) -> Mapping[str, Any]:
+    """Bind the candidate contract to clean source and compare every VM dependency."""
+    try:
+        root = _absolute(pipeline_root, "pipeline_runtime_root_invalid")
+    except ReleaseError as exc:
+        raise _PreflightProbeFailure(exc.code, {"path": str(pipeline_root)}) from exc
+    expected_commit = pipeline_identity.get("commit")
+    if not isinstance(expected_commit, str) or not HEX40.fullmatch(expected_commit):
+        raise _PreflightProbeFailure(
+            "remote_reader_dependency_unavailable",
+            {
+                "ok": False,
+                "source": {
+                    "ok": False,
+                    "expected": {"commit": expected_commit},
+                    "actual": None,
+                    "error": "pipeline_identity_commit_invalid",
+                },
+            },
+            {"source": {"commit": "resolved 40-hex pipeline commit"}},
+        )
+
+    # Keep all values inserted into the VM program as JSON literals. The
+    # program performs reads only and never executes candidate-controlled code.
+    script = (
+        "import hashlib\n"
+        "import importlib.metadata\n"
+        "import json\n"
+        "import os\n"
+        "import stat\n"
+        "import subprocess\n"
+        "from pathlib import Path\n"
+        f"root = {json.dumps(str(root))}\n"
+        f"expected_commit = {json.dumps(expected_commit)}\n"
+        f"contract_schema = {json.dumps(REMOTE_READER_RUNTIME_CONTRACT_SCHEMA)}\n"
+        f"required_dependencies = {json.dumps(REMOTE_READER_SYSTEM_DEPENDENCIES)}\n"
+        f"dependency_modules = {json.dumps(REMOTE_READER_DEPENDENCY_MODULES, sort_keys=True)}\n"
+        r'''
+root_path = Path(root)
+contract_relative = "api/g1q3_rca/vendor/remote_reader_runtime_contract.json"
+contract_path = root_path / contract_relative
+expected_keys = (
+    "version", "module", "distribution_root", "module_source",
+    "record_sha256", "critical_files_sha256", "critical_file_count",
+)
+git_env = {
+    "HOME": "/nonexistent", "PATH": "/usr/bin:/bin", "LC_ALL": "C",
+    "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+    "GIT_OPTIONAL_LOCKS": "0",
+}
+
+def git_read(arguments, binary=False):
+    process = subprocess.run(
+        ["/usr/bin/git", "-c", "core.fsmonitor=false", "-c",
+         "core.hooksPath=/dev/null", "--no-optional-locks", "-C", root]
+        + list(arguments),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=git_env,
+        timeout=30,
+    )
+    if process.returncode:
+        message = process.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError("git_read_failed:" + (message or str(process.returncode)))
+    return process.stdout if binary else process.stdout.decode("utf-8", "strict").strip()
+
+def source_snapshot():
+    status_bytes = git_read([
+        "status", "--porcelain=v1", "--untracked-files=all",
+        "--ignore-submodules=none",
+    ], binary=True)
+    return {
+        "commit": git_read(["rev-parse", "--verify", "HEAD"]),
+        "tree": git_read(["rev-parse", "--verify", "HEAD^{tree}"]),
+        "top_level": git_read(["rev-parse", "--show-toplevel"]),
+        "clean": not bool(status_bytes),
+        "status_sha256": hashlib.sha256(status_bytes).hexdigest(),
+        "status_entry_count": len(status_bytes.splitlines()),
+    }
+
+def stable_regular_file(path):
+    before = os.lstat(str(path))
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+        raise RuntimeError("contract_not_regular_file")
+    if before.st_size > 4 * 1024 * 1024:
+        raise RuntimeError("contract_too_large")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(str(path), flags)
+    try:
+        opened = os.fstat(descriptor)
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    after = os.lstat(str(path))
+    identities = [(value.st_dev, value.st_ino, value.st_mode, value.st_size)
+                  for value in (before, opened, after)]
+    if identities[0] != identities[1] or identities[1] != identities[2]:
+        raise RuntimeError("contract_source_changed")
+    return b"".join(chunks)
+
+def hash_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def fingerprint(distribution_name, module_name):
+    distribution = importlib.metadata.distribution(distribution_name)
+    distribution_root = Path(distribution.locate_file("")).resolve(strict=True)
+    module_relative = Path(*module_name.split(".")) / "__init__.py"
+    module_source = Path(distribution.locate_file(module_relative)).resolve(strict=True)
+    if (not module_source.is_file() or
+            (module_source != distribution_root and
+             distribution_root not in module_source.parents)):
+        raise RuntimeError("dependency_module_source_invalid")
+    record = None
+    files = []
+    for relative in distribution.files or []:
+        relative_text = str(relative)
+        source = Path(distribution.locate_file(relative)).resolve()
+        if relative_text.endswith(".dist-info/RECORD"):
+            record = source
+            continue
+        if "__pycache__" in relative.parts or relative_text.endswith((".pyc", ".pyo")):
+            continue
+        if (not source.is_file() or
+                (source != distribution_root and distribution_root not in source.parents)):
+            continue
+        files.append({"path": relative_text, "sha256": hash_file(source),
+                      "bytes": source.stat().st_size})
+    if record is None or not record.is_file():
+        raise RuntimeError("dependency_record_missing")
+    files.sort(key=lambda item: item["path"])
+    files_sha = hashlib.sha256(json.dumps(
+        files, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode()).hexdigest()
+    return {
+        "distribution": distribution_name,
+        "version": str(distribution.version or ""),
+        "module": module_name,
+        "distribution_root": str(distribution_root),
+        "module_source": str(module_source),
+        "record_sha256": hash_file(record),
+        "critical_files_sha256": files_sha,
+        "critical_file_count": len(files),
+    }
+
+source_expected = {"runtime_root": root, "commit": expected_commit, "clean": True}
+source_actual = None
+source_error = None
+source_ok = False
+contract = {}
+contract_error = None
+committed_bytes = None
+worktree_bytes = None
+try:
+    root_info = os.lstat(root)
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        raise RuntimeError("pipeline_root_not_real_directory")
+    if str(root_path.resolve(strict=True)) != root:
+        raise RuntimeError("pipeline_root_not_canonical")
+    first = source_snapshot()
+    committed_bytes = git_read(
+        ["cat-file", "blob", expected_commit + ":" + contract_relative],
+        binary=True,
+    )
+    worktree_bytes = stable_regular_file(contract_path)
+    second = source_snapshot()
+    source_actual = dict(second)
+    source_actual["stable"] = first == second
+    source_ok = bool(
+        first == second
+        and second["commit"] == expected_commit
+        and second["top_level"] == root
+        and second["clean"]
+        and len(second["tree"]) == 40
+    )
+    contract = json.loads(committed_bytes.decode("utf-8"))
+except Exception as exc:
+    source_error = type(exc).__name__ + ":" + (str(exc) or type(exc).__name__)
+
+contract_dependencies = (
+    contract.get("dependencies") if isinstance(contract, dict) else None
+)
+expected_dependencies = (
+    {name: dict(contract_dependencies.get(name) or {})
+     for name in required_dependencies}
+    if isinstance(contract_dependencies, dict) else
+    {name: {} for name in required_dependencies}
+)
+contract_shape_ok = bool(
+    isinstance(contract, dict)
+    and contract.get("schema_version") == contract_schema
+    and isinstance(contract_dependencies, dict)
+    and set(contract_dependencies) == set(required_dependencies)
+)
+for name in required_dependencies:
+    expected = expected_dependencies[name]
+    contract_shape_ok = bool(
+        contract_shape_ok
+        and all(key in expected for key in expected_keys)
+        and expected.get("module") == dependency_modules[name]
+        and isinstance(expected.get("version"), str)
+        and bool(expected.get("version"))
+        and Path(str(expected.get("distribution_root", ""))).is_absolute()
+        and Path(str(expected.get("module_source", ""))).is_absolute()
+        and isinstance(expected.get("record_sha256"), str)
+        and len(expected.get("record_sha256", "")) == 64
+        and isinstance(expected.get("critical_files_sha256"), str)
+        and len(expected.get("critical_files_sha256", "")) == 64
+        and isinstance(expected.get("critical_file_count"), int)
+        and not isinstance(expected.get("critical_file_count"), bool)
+        and expected.get("critical_file_count", 0) > 0
+    )
+bytes_match = bool(
+    committed_bytes is not None
+    and worktree_bytes is not None
+    and committed_bytes == worktree_bytes
+)
+contract_ok = bool(source_ok and bytes_match and contract_shape_ok)
+if not bytes_match and source_error is None:
+    contract_error = "worktree_contract_differs_from_committed_blob"
+
+dependency_results = {}
+actual_dependencies = {}
+mismatches = []
+if not source_ok:
+    mismatches.append({"scope": "source", "fields": ["commit", "clean", "stable"]})
+if not contract_ok:
+    mismatches.append({"scope": "contract", "fields": ["provenance", "schema", "dependencies"]})
+for name in required_dependencies:
+    expected = expected_dependencies[name]
+    try:
+        actual = fingerprint(name, dependency_modules[name])
+    except Exception as exc:
+        actual = {
+            "distribution": name,
+            "module": dependency_modules[name],
+            "error_type": type(exc).__name__,
+            "error": str(exc) or type(exc).__name__,
+        }
+    actual_dependencies[name] = actual
+    mismatched_fields = [
+        key for key in expected_keys if actual.get(key) != expected.get(key)
+    ]
+    if "error" in actual:
+        mismatched_fields.append("probe_error")
+    dependency_ok = bool(contract_ok and not mismatched_fields)
+    dependency_results[name] = {
+        "ok": dependency_ok,
+        "expected": expected,
+        "actual": actual,
+        "mismatched_fields": mismatched_fields,
+    }
+    if mismatched_fields:
+        mismatches.append({
+            "scope": "dependency", "dependency": name,
+            "fields": mismatched_fields,
+        })
+
+response = {
+    "ok": bool(contract_ok and all(
+        dependency_results[name]["ok"] for name in required_dependencies
+    )),
+    "expected": {
+        "source": source_expected,
+        "dependencies": expected_dependencies,
+    },
+    "actual": {
+        "source": source_actual,
+        "dependencies": actual_dependencies,
+    },
+    "source": {
+        "ok": source_ok,
+        "expected": source_expected,
+        "actual": source_actual,
+        "error": source_error,
+    },
+    "contract": {
+        "ok": contract_ok,
+        "path": str(contract_path),
+        "schema_version": contract.get("schema_version") if isinstance(contract, dict) else None,
+        "expected_schema_version": contract_schema,
+        "committed_sha256": (hashlib.sha256(committed_bytes).hexdigest()
+                             if committed_bytes is not None else None),
+        "worktree_sha256": (hashlib.sha256(worktree_bytes).hexdigest()
+                            if worktree_bytes is not None else None),
+        "required_dependencies": list(required_dependencies),
+        "error": contract_error,
+    },
+    "dependencies": dependency_results,
+    "mismatches": mismatches,
+    "bootstrap": {"status": "deferred_execution_only"},
+}
+print(json.dumps(response, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+'''
+    )
+    try:
+        response = _decode_json(
+            _vm_call(
+                vm_runner,
+                (SSH_MINI_AGENT, "run_py_json"),
+                "remote_reader_dependency_readback",
+                script,
+            ).encode(),
+            "remote_reader_dependency_readback",
+        )
+    except ReleaseError as exc:
+        raise _PreflightProbeFailure(exc.code, {"code": exc.code}) from exc
+    if response.get("ok") is not True:
+        raise _PreflightProbeFailure(
+            "remote_reader_dependency_unavailable",
+            response,
+            response.get("expected")
+            or "clean candidate-bound exact system dependency contract",
+        )
+    return response
+
+
 def _read_vm_report_manifest(
     path: Path, vm_runner: VmRunner = _run_vm_agent
 ) -> tuple[bytes, dict]:
@@ -626,14 +1196,6 @@ def _read_vm_report_manifest(
         or remote != REPORT_MANIFEST_PATH
     ):
         raise ReleaseError("report_manifest_path_invalid")
-    doctor_raw = _vm_call(
-        vm_runner,
-        (SSH_MINI_AGENT, "doctor", "--json"),
-        "ssh_mini_doctor",
-    ).encode()
-    doctor = _decode_json(doctor_raw, "ssh_mini_doctor")
-    if doctor.get("ok") is not True:
-        raise ReleaseError("ssh_mini_doctor_failed")
     script = f"""import base64
 import hashlib
 import json
@@ -2695,6 +3257,722 @@ def _workspace_runtime_projection(
     }
 
 
+def _preflight_runtime_identity(
+    root: Path, expected_commit: str, runner: Runner = _run
+) -> dict[str, Any]:
+    values = _call(
+        runner,
+        ("/usr/bin/git", "-C", str(root), "rev-parse", "HEAD", "HEAD^{tree}"),
+        "runtime_readback",
+    ).splitlines()
+    dirty = _call(
+        runner,
+        (
+            "/usr/bin/git",
+            "--no-optional-locks",
+            "-C",
+            str(root),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ),
+        "runtime_readback",
+    )
+    actual = {
+        "runtime_root": str(root),
+        "commit": values[0] if values else None,
+        "tree": values[1] if len(values) > 1 else None,
+        "clean": not bool(dirty),
+        "status": dirty,
+    }
+    if (
+        len(values) != 2
+        or values[0] != expected_commit
+        or HEX40.fullmatch(values[0]) is None
+        or HEX40.fullmatch(values[1]) is None
+        or dirty
+    ):
+        raise _PreflightProbeFailure(
+            "runtime_identity_mismatch",
+            actual,
+            {
+                "runtime_root": str(root),
+                "commit": expected_commit,
+                "tree": "40-hex tree",
+                "clean": True,
+            },
+        )
+    return actual
+
+
+def _preflight_report_manifest(
+    path: Path,
+    pipeline: Mapping[str, Any],
+    reader: ReportReader,
+) -> dict[str, Any]:
+    raw, manifest = reader(path)
+    actual = {
+        "schema_version": manifest.get("schema_version"),
+        "runtime_root": manifest.get("runtime_root"),
+        "pipeline_commit": manifest.get("pipeline_commit"),
+        "pipeline_tree": manifest.get("pipeline_tree"),
+        "report_script_sha256": manifest.get("report_script_sha256"),
+    }
+    expected = {
+        "schema_version": "pnc_rca_report_manifest_v1",
+        "runtime_root": pipeline.get("runtime_root"),
+        "pipeline_commit": pipeline.get("commit"),
+        "pipeline_tree": pipeline.get("tree") or "40-hex tree",
+        "report_script_sha256": "64-hex sha256",
+    }
+    if (
+        manifest.get("schema_version") != "pnc_rca_report_manifest_v1"
+        or manifest.get("runtime_root") != pipeline.get("runtime_root")
+        or manifest.get("pipeline_commit") != pipeline.get("commit")
+        or (
+            pipeline.get("tree")
+            and manifest.get("pipeline_tree") != pipeline.get("tree")
+        )
+        or HEX40.fullmatch(str(manifest.get("pipeline_commit") or "")) is None
+        or HEX40.fullmatch(str(manifest.get("pipeline_tree") or "")) is None
+        or not HEX64.fullmatch(str(manifest.get("report_script_sha256") or ""))
+    ):
+        raise _PreflightProbeFailure(
+            "report_manifest_pipeline_mismatch", actual, expected
+        )
+    return {
+        "manifest_sha256": _sha(raw),
+        "pipeline_commit": manifest["pipeline_commit"],
+        "pipeline_tree": manifest["pipeline_tree"],
+    }
+
+
+def _preflight_store_call(
+    control_db: Path,
+    store_factory: StoreFactory,
+    method: str,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    store = store_factory(control_db, True)
+    try:
+        return getattr(store, method)(*args, **kwargs)
+    finally:
+        _close_preflight_store(store)
+
+
+def _close_preflight_store(store: Any) -> None:
+    """Release any read-only schema snapshot without invoking store writes."""
+    close = getattr(store, "close", None)
+    if callable(close):
+        close()
+        return
+    snapshot = getattr(store, "_schema_probe_snapshot", None)
+    if snapshot is not None:
+        snapshot_close = getattr(snapshot, "close", None)
+        if callable(snapshot_close):
+            snapshot_close()
+        try:
+            setattr(store, "_schema_probe_snapshot", None)
+        except Exception:
+            pass
+
+
+def _preflight_store_value(
+    control_db: Path,
+    store_factory: StoreFactory,
+    callback: Callable[[Any], Any],
+) -> Any:
+    store = store_factory(control_db, True)
+    try:
+        return callback(store)
+    finally:
+        _close_preflight_store(store)
+
+
+def preflight_release(
+    *,
+    release_id: str,
+    epoch_id: str,
+    operator: str,
+    reason: str,
+    canary_batch_id: str,
+    canary_issue_id: str,
+    canary_state_path: Path,
+    host_branch: str,
+    host_tag: str,
+    host_runtime_root: Path,
+    worker_remote: str,
+    worker_branch: str,
+    worker_tag: str,
+    worker_runtime_root: Path,
+    pipeline_remote: str,
+    pipeline_branch: str,
+    pipeline_tag: str,
+    pipeline_runtime_root: Path,
+    report_manifest_path: Path,
+    partition_topics: Mapping[str, Sequence[int]],
+    control_db: Path,
+    release_note: Path,
+    manifest_output: Path,
+    env_output: Path,
+    home: Path,
+    runner: Runner = _run,
+    vm_runner: VmRunner = _run_vm_agent,
+    report_reader: ReportReader | None = None,
+    store_factory: StoreFactory = _open_store,
+    workspace_runtime_resolver: WorkspaceRuntimeResolver = _workspace_runtime_projection,
+    dependency_probe: DependencyProbe | None = None,
+    require_canary_state: bool | None = None,
+) -> dict[str, Any]:
+    """Read all statically knowable release gates without preparing any output."""
+    collector = _PreflightCollector()
+    if require_canary_state is None:
+        require_canary_state = True
+
+    def absolute(value: Path, code: str) -> Path:
+        try:
+            return _absolute(value, code)
+        except ReleaseError:
+            # Keep later independent probes running with a deterministic fallback.
+            return Path(str(value)).expanduser()
+
+    raw_home = Path(home).expanduser()
+    home_path = absolute(raw_home, "hermes_home_invalid")
+    release_note_path = absolute(release_note, "release_note_path_invalid")
+    manifest_output_path = absolute(manifest_output, "manifest_output_path_invalid")
+    env_output_path = absolute(env_output, "env_output_path_invalid")
+    control_db_path = absolute(control_db, "control_db_path_invalid")
+    canary_path = absolute(canary_state_path, "canary_state_path_invalid")
+    host_root = absolute(host_runtime_root, "host_runtime_root_invalid")
+    worker_root = absolute(worker_runtime_root, "worker_runtime_root_invalid")
+    pipeline_root = absolute(pipeline_runtime_root, "pipeline_runtime_root_invalid")
+    report_path = absolute(report_manifest_path, "report_manifest_path_invalid")
+
+    path_values = (
+        ("hermes_home_invalid", "home", home, "absolute owner-controlled Hermes home"),
+        ("release_note_path_invalid", "release_note", release_note, "absolute output path"),
+        ("manifest_output_path_invalid", "manifest_output", manifest_output, "absolute output path"),
+        ("env_output_path_invalid", "env_output", env_output, "absolute output path"),
+        ("control_db_path_invalid", "control_db", control_db, "canonical read-only control DB"),
+        ("canary_state_path_invalid", "canary_state", canary_state_path, "absolute canary state path"),
+        ("host_runtime_root_invalid", "host_runtime", host_runtime_root, "absolute host runtime root"),
+        ("worker_runtime_root_invalid", "worker_runtime", worker_runtime_root, "absolute worker runtime root"),
+        ("pipeline_runtime_root_invalid", "pipeline_runtime", pipeline_runtime_root, "absolute pipeline runtime root"),
+        ("report_manifest_path_invalid", "report_manifest", report_manifest_path, "fixed VM report manifest path"),
+    )
+    for code, subject, value, expected in path_values:
+        collector.check(
+            code,
+            "prepare",
+            expected,
+            "Use an absolute owner-controlled path matching the release contract.",
+            lambda value=value, code=code: str(_absolute(value, code)),
+            subject=subject,
+        )
+    collector.check(
+        "control_db_path_invalid",
+        "prepare",
+        str(home_path / CONTROL_DB_RELATIVE_PATH),
+        "Use the canonical control DB below Hermes home.",
+        lambda: str(control_db_path)
+        if control_db_path == home_path / CONTROL_DB_RELATIVE_PATH
+        else (_ for _ in ()).throw(ReleaseError("control_db_path_invalid")),
+    )
+    collector.check(
+        "report_manifest_path_invalid",
+        "prepare",
+        str(REPORT_MANIFEST_PATH),
+        "Read the fixed VM report manifest path only.",
+        lambda: str(report_path)
+        if PurePosixPath(str(report_path)) == REPORT_MANIFEST_PATH
+        else (_ for _ in ()).throw(ReleaseError("report_manifest_path_invalid")),
+    )
+
+    output_paths = (release_note_path, env_output_path, manifest_output_path)
+    collector.check(
+        "prepare_output_paths_invalid",
+        "prepare",
+        "three distinct output paths",
+        "Choose distinct release-note, env, and manifest output paths.",
+        lambda: [str(path) for path in output_paths]
+        if len(set(output_paths)) == 3
+        else (_ for _ in ()).throw(ReleaseError("prepare_output_paths_invalid")),
+    )
+    live_env_path = home_path / ".env"
+    live_manifest_path = home_path / "runtime/LIVE_MANIFEST.json"
+    collector.check(
+        "prepare_output_is_live_projection",
+        "prepare",
+        "outputs do not equal live projections",
+        "Keep prepared outputs separate from LIVE_MANIFEST and .env.",
+        lambda: [str(path) for path in output_paths]
+        if not set(output_paths) & {live_env_path, live_manifest_path}
+        else (_ for _ in ()).throw(ReleaseError("prepare_output_is_live_projection")),
+    )
+    collector.check(
+        "prepare_output_exists",
+        "prepare",
+        "all output paths absent",
+        "Use fresh output paths; preflight never removes existing files.",
+        lambda: [str(path) for path in output_paths]
+        if not any(path.exists() or path.is_symlink() for path in output_paths)
+        else (_ for _ in ()).throw(ReleaseError("prepare_output_exists")),
+    )
+
+    def output_parents():
+        observed: dict[str, str] = {}
+        for path in output_paths:
+            try:
+                parent = path.parent.lstat()
+            except FileNotFoundError as exc:
+                raise ReleaseError("prepare_output_unavailable") from exc
+            except OSError as exc:
+                raise ReleaseError("prepare_output_parent_invalid") from exc
+            if (
+                not stat.S_ISDIR(parent.st_mode)
+                or parent.st_uid != os.geteuid()
+                or stat.S_IMODE(parent.st_mode) & 0o022
+            ):
+                raise ReleaseError("prepare_output_parent_invalid")
+            observed[str(path)] = f"{stat.S_IMODE(parent.st_mode):04o}"
+        return observed
+
+    collector.check(
+        "prepare_output_parent_invalid",
+        "prepare",
+        "existing owner-controlled output parent directories",
+        "Create or select owner-controlled output directories before prepare.",
+        output_parents,
+    )
+
+    collector.check(
+        "release_note_contract_invalid",
+        "prepare",
+        "identifier-shaped release id",
+        "Use the governed release identifier format; preflight never creates a note.",
+        lambda: release_id
+        if IDENTIFIER.fullmatch(str(release_id or ""))
+        else (_ for _ in ()).throw(ReleaseError("release_note_contract_invalid")),
+    )
+    collector.check(
+        "release_note_activation_invalid",
+        "prepare",
+        "identifier epoch plus non-empty operator/reason",
+        "Provide a valid activation epoch, operator, and reason.",
+        lambda: {
+            "epoch_id": epoch_id,
+            "operator": str(operator).strip(),
+            "reason": str(reason).strip(),
+        }
+        if IDENTIFIER.fullmatch(str(epoch_id or ""))
+        and str(operator or "").strip()
+        and str(reason or "").strip()
+        else (_ for _ in ()).throw(ReleaseError("release_note_activation_invalid")),
+    )
+    collector.check(
+        "release_note_canary_invalid",
+        "prepare",
+        "identifier batch and numeric issue id",
+        "Provide the owner-approved canary batch and issue identifiers.",
+        lambda: {"batch_id": canary_batch_id, "issue_id": canary_issue_id}
+        if IDENTIFIER.fullmatch(str(canary_batch_id or ""))
+        and str(canary_issue_id or "").isdigit()
+        else (_ for _ in ()).throw(ReleaseError("release_note_canary_invalid")),
+    )
+
+    specs: dict[str, dict[str, str]] = {
+        "host": {
+            "remote": HOST_REMOTE,
+            "remote_branch": host_branch,
+            "remote_tag": host_tag,
+        },
+        "worker": {
+            "remote": worker_remote,
+            "remote_branch": worker_branch,
+            "remote_tag": worker_tag,
+        },
+        "pipeline": {
+            "remote": pipeline_remote,
+            "remote_branch": pipeline_branch,
+            "remote_tag": pipeline_tag,
+        },
+    }
+    resolved: dict[str, dict[str, Any]] = {}
+    for name in ("host", "worker", "pipeline"):
+        face = specs[name]
+        collector.check(
+            "gitlab_face_input_invalid",
+            "prepare",
+            "GitLab SSH remote, branch ref, and tag name",
+            "Correct the face remote/branch/tag arguments; host remote is fixed.",
+            lambda name=name, face=face: _preflight_face_input(name, face),
+            subject=name,
+        )
+
+        def resolve(name=name, face=face):
+            value = _gitlab_readonly_resolve_face(name, face, runner)
+            resolved[name] = dict(value)
+            return value
+
+        collector.check(
+            "gitlab_identity_mismatch",
+            "prepare",
+            "branch commit equals peeled annotated tag commit",
+            "Inspect the remote branch/tag; do not fetch or rewrite local refs.",
+            resolve,
+            subject=name,
+        )
+
+    runtime_expected = resolved.get("host", {}).get("commit")
+    collector.check(
+        "runtime_identity_mismatch",
+        "prepare",
+        runtime_expected or "resolved host commit",
+        "Materialize the host runtime at the exact resolved commit and keep it clean.",
+        lambda: _preflight_runtime_identity(host_root, str(runtime_expected), runner),
+        subject="host",
+    )
+
+    reader = report_reader or (
+        lambda path: _read_vm_report_manifest(path, vm_runner=vm_runner)
+    )
+    report_value: dict[str, Any] = {}
+    pipeline_identity = {
+        "runtime_root": str(pipeline_root),
+        "commit": resolved.get("pipeline", {}).get("commit"),
+        "tree": resolved.get("pipeline", {}).get("tree"),
+    }
+
+    def read_report():
+        value = _preflight_report_manifest(report_path, pipeline_identity, reader)
+        report_value.update(value)
+        return value
+
+    collector.check(
+        "report_manifest_pipeline_mismatch",
+        "prepare",
+        {
+            "runtime_root": str(pipeline_root),
+            "pipeline_commit": pipeline_identity["commit"],
+            "pipeline_tree": "40-hex tree",
+        },
+        "Re-materialize the VM report runtime from the exact pipeline commit/tree.",
+        read_report,
+        subject="pipeline",
+    )
+    collector.check(
+        "report_manifest_tree_identity",
+        "prepare",
+        "pipeline tree resolved from an object-bearing source",
+        "A ref-only preflight cannot fetch objects; verify the tree during governed readback.",
+        lambda: (
+            {"status": "deferred", "tree": report_value.get("pipeline_tree")}
+            if not pipeline_identity.get("tree")
+            else (
+                report_value
+                if report_value.get("pipeline_tree") == pipeline_identity["tree"]
+                else (_ for _ in ()).throw(
+                    ReleaseError("report_manifest_pipeline_mismatch")
+                )
+            )
+        ),
+        subject="pipeline",
+        precheckable=bool(pipeline_identity.get("tree")),
+    )
+
+    live_env_raw: bytes | None = None
+
+    def read_env():
+        nonlocal live_env_raw
+        live_env_raw = _read(live_env_path, "live_env_template")
+        _prepare_env(live_env_raw, release_note_path, control_db_path)
+        return {"sha256": _sha(live_env_raw)}
+
+    collector.check(
+        "live_env_template_invalid",
+        "prepare",
+        "parseable env with release bindings",
+        "Repair the live env through the governed materializer; preflight is read-only.",
+        read_env,
+    )
+
+    live_manifest_value: dict[str, Any] = {}
+
+    def read_manifest():
+        raw, value = _json(live_manifest_path, "live_manifest_template")
+        live_manifest_value.update(value)
+        return {"sha256": _sha(raw), "keys": sorted(value)}
+
+    collector.check(
+        "live_manifest_template_invalid",
+        "prepare",
+        "owner-readable JSON object",
+        "Repair the live manifest through the governed materializer; preflight is read-only.",
+        read_manifest,
+    )
+
+    workspace_value: dict[str, Any] = {}
+
+    def read_workspace():
+        value = dict(workspace_runtime_resolver(home_path, runner))
+        workspace_value.update(value)
+        return value
+
+    collector.check(
+        "workspace_runtime_manifest_binding_invalid",
+        "prepare",
+        "validated workspace runtime manifest and closure",
+        "Use the candidate-committed workspace runtime bundle; do not hand-edit it.",
+        read_workspace,
+    )
+    collector.check(
+        "workspace_runtime_source_remote_mismatch",
+        "prepare",
+        "canonical workspace-work origin",
+        "Point workspace-work at the canonical source remote.",
+        lambda: workspace_value if workspace_value else (_ for _ in ()).throw(
+            ReleaseError("workspace_runtime_source_remote_mismatch")
+        ),
+    )
+    collector.check(
+        "workspace_runtime_source_tree_invalid",
+        "prepare",
+        "40-hex workspace source tree",
+        "Resolve the workspace source tree from the candidate commit.",
+        lambda: workspace_value.get("tree")
+        if HEX40.fullmatch(str(workspace_value.get("tree") or ""))
+        else (_ for _ in ()).throw(ReleaseError("workspace_runtime_source_tree_invalid")),
+    )
+
+    try:
+        normalized_topics = _normalize_partition_topics(partition_topics)
+    except ReleaseError:
+        normalized_topics = {}
+
+    def partition_topic_readback():
+        try:
+            return _normalize_partition_topics(partition_topics)
+        except ReleaseError as exc:
+            raise _PreflightProbeFailure(
+                exc.code,
+                partition_topics,
+                "mapping of unique topics to unique non-negative integer partitions",
+            ) from exc
+
+    collector.check(
+        "prepare_partition_topics_invalid",
+        "prepare",
+        "normalized non-empty topic partition map",
+        "Supply unique non-negative integer partitions for each topic.",
+        partition_topic_readback,
+    )
+
+    def store_schema():
+        def inspect(store):
+            capability = store.schema_runtime_capability()
+            observed = capability.get("observed_control_schema_version")
+            if observed not in {CONTROL_SCHEMA_V14, CONTROL_SCHEMA_V15}:
+                raise ReleaseError("prepare_control_schema_unsupported")
+            return _schema_runtime_capability(
+                store, expected_schema_version=str(observed), writable=False
+            )
+
+        return _preflight_store_value(
+            control_db_path, store_factory, inspect
+        )
+
+    collector.check(
+        "prepare_control_schema_unsupported",
+        "prepare",
+        f"{CONTROL_SCHEMA_V14} or {CONTROL_SCHEMA_V15} read-only",
+        "Use a current control-store schema with read-only capability enabled.",
+        store_schema,
+    )
+
+    def store_snapshot():
+        source = _preflight_store_call(
+            control_db_path, store_factory, "control_db_source_snapshot_identity"
+        )
+        logical = source.get("logical_db_identity") if isinstance(source, Mapping) else None
+        expected_path = str(control_db_path.expanduser().absolute())
+        if (
+            not isinstance(source, Mapping)
+            or source.get("schema_version") != "pnc_rca_control_store_source_snapshot_v1"
+            or source.get("present") is not True
+            or source.get("path") != expected_path
+            or not isinstance(logical, Mapping)
+            or not logical
+        ):
+            raise ReleaseError("prepare_control_snapshot_invalid")
+        return source
+
+    collector.check(
+        "prepare_control_snapshot_invalid",
+        "prepare",
+        "stable read-only control DB source snapshot",
+        "Stop and obtain a fresh governed DB snapshot; do not mutate the source DB.",
+        store_snapshot,
+    )
+
+    def store_snapshot_stable():
+        first = _preflight_store_call(
+            control_db_path, store_factory, "control_db_source_snapshot_identity"
+        )
+        second = _preflight_store_call(
+            control_db_path, store_factory, "control_db_source_snapshot_identity"
+        )
+        if _canonical(first) != _canonical(second):
+            raise ReleaseError("rca_control_store_snapshot_source_changed")
+        return {"sha256": _sha(_canonical(first))}
+
+    collector.check(
+        "rca_control_store_snapshot_source_changed",
+        "prepare",
+        "two identical read-only source snapshot identities",
+        "Hold the source DB stable and retry; preflight never writes or repairs it.",
+        store_snapshot_stable,
+    )
+
+    def historical_schema_gate():
+        def inspect(store):
+            capability = store.schema_runtime_capability()
+            observed = capability.get("observed_control_schema_version")
+            if observed == CONTROL_SCHEMA_V15:
+                return {"status": "superseded_allowed", "observed": observed}
+            if observed == CONTROL_SCHEMA_V14:
+                return {"status": "not_applicable", "observed": observed}
+            raise ReleaseError("prepare_control_schema_already_v15")
+
+        return _preflight_store_value(control_db_path, store_factory, inspect)
+
+    collector.check(
+        "prepare_control_schema_already_v15",
+        "prepare",
+        "v15 is accepted as a successor read-only schema",
+        "Treat an already-v15 store as a valid successor; do not attempt legacy migration.",
+        historical_schema_gate,
+    )
+
+    def store_predecessor():
+        predecessor = _preflight_store_call(
+            control_db_path, store_factory, "direct_steady_predecessor"
+        )
+        if not isinstance(predecessor, Mapping):
+            raise ReleaseError("prepare_predecessor_required")
+        if (
+            not IDENTIFIER.fullmatch(str(predecessor.get("epoch_id") or ""))
+            or predecessor.get("state") not in {"aborted", "steady_active"}
+            or not HEX64.fullmatch(str(predecessor.get("binding_fingerprint") or ""))
+        ):
+            raise ReleaseError("prepare_predecessor_invalid")
+        return predecessor
+
+    collector.check(
+        "prepare_predecessor_required",
+        "prepare",
+        "direct steady predecessor with binding fingerprint",
+        "Use the current direct predecessor; do not invent or bypass activation state.",
+        store_predecessor,
+    )
+    for topic, partitions in normalized_topics.items():
+        collector.check(
+            "prepare_partition_progress_missing",
+            "prepare",
+            {topic: list(partitions)},
+            "Refresh the read-only partition progress snapshot before preparing.",
+            lambda topic=topic, partitions=partitions: _preflight_partition_progress(
+                control_db_path, store_factory, topic, partitions
+            ),
+            subject=topic,
+        )
+
+    if dependency_probe is None:
+        dependency_probe = lambda path, identity: _preflight_vm_dependency_probe(
+            path, identity, vm_runner=vm_runner
+        )
+
+    def dependency_readback():
+        value = dependency_probe(pipeline_root, pipeline_identity)
+        if not isinstance(value, Mapping) or value.get("ok") is not True:
+            raise _PreflightProbeFailure(
+                "remote_reader_dependency_unavailable",
+                value,
+                (
+                    value.get("expected")
+                    if isinstance(value, Mapping)
+                    else "clean candidate-bound exact system dependency contract"
+                ),
+            )
+        return value
+
+    collector.check(
+        "remote_reader_dependency_unavailable",
+        "prepare",
+        "clean candidate-bound exact system dependency contract",
+        "Restore the exact dependency through an owner-approved system-dependency transaction; preflight never installs.",
+        dependency_readback,
+    )
+
+    if require_canary_state:
+        collector.check(
+            "canary_state_unavailable",
+            "verify",
+            "owner-readable canary state JSON",
+            "Create the canary only through the governed activation workflow.",
+            lambda: _json(canary_path, "canary_state", owner_only=True)[1],
+        )
+    else:
+        collector.check(
+            "canary_state_unavailable",
+            "verify",
+            "future-stage canary state",
+            "Canary state is intentionally deferred until activation; no file is created.",
+            lambda: {"status": "deferred", "batch_id": canary_batch_id, "issue_id": canary_issue_id},
+            precheckable=False,
+        )
+
+    # These gates require effects that preflight is forbidden to perform.
+    collector.check(
+        "restart_readback_timeout",
+        "apply",
+        "resident restart and readback",
+        "Run only during governed apply; preflight never launches or restarts services.",
+        lambda: {"status": "deferred"},
+        precheckable=False,
+    )
+    collector.check(
+        "bootstrap_install-offline_failed",
+        "materialize",
+        "offline materializer execution",
+        "Run the bounded materializer; preflight never installs or switches runtimes.",
+        lambda: {"status": "deferred"},
+        precheckable=False,
+    )
+    return collector.finish()
+
+
+def _preflight_partition_progress(
+    control_db: Path,
+    store_factory: StoreFactory,
+    topic: str,
+    partitions: Sequence[int],
+) -> Mapping[int, int]:
+    progress = _preflight_store_call(
+        control_db,
+        store_factory,
+        "partition_progress",
+        topic=topic,
+        partitions=partitions,
+    )
+    if set(progress) != set(partitions) or any(
+        isinstance(offset, bool) or not isinstance(offset, int) or offset < 0
+        for offset in progress.values()
+    ):
+        raise ReleaseError("prepare_partition_progress_missing")
+    return progress
+
+
 def _cleanup_prepared_outputs(created: Sequence[Mapping[str, Any]]) -> None:
     failed = False
     parents: set[Path] = set()
@@ -2815,7 +4093,44 @@ def prepare_release(
     report_reader: ReportReader | None = None,
     store_factory: StoreFactory = _open_store,
     workspace_runtime_resolver: WorkspaceRuntimeResolver = _workspace_runtime_projection,
+    dependency_probe: DependencyProbe | None = None,
 ) -> dict:
+    preflight = preflight_release(
+        release_id=release_id,
+        epoch_id=epoch_id,
+        operator=operator,
+        reason=reason,
+        canary_batch_id=canary_batch_id,
+        canary_issue_id=canary_issue_id,
+        canary_state_path=canary_state_path,
+        host_branch=host_branch,
+        host_tag=host_tag,
+        host_runtime_root=host_runtime_root,
+        worker_remote=worker_remote,
+        worker_branch=worker_branch,
+        worker_tag=worker_tag,
+        worker_runtime_root=worker_runtime_root,
+        pipeline_remote=pipeline_remote,
+        pipeline_branch=pipeline_branch,
+        pipeline_tag=pipeline_tag,
+        pipeline_runtime_root=pipeline_runtime_root,
+        report_manifest_path=report_manifest_path,
+        partition_topics=partition_topics,
+        control_db=control_db,
+        release_note=release_note,
+        manifest_output=manifest_output,
+        env_output=env_output,
+        home=home,
+        runner=runner,
+        vm_runner=vm_runner,
+        report_reader=report_reader,
+        store_factory=store_factory,
+        workspace_runtime_resolver=workspace_runtime_resolver,
+        dependency_probe=dependency_probe,
+        require_canary_state=False,
+    )
+    if not preflight["preflight_ok"]:
+        raise PreflightError(preflight)
     home = _absolute(home, "hermes_home_invalid")
     release_note = _absolute(release_note, "release_note_path_invalid")
     manifest_output = _absolute(manifest_output, "manifest_output_path_invalid")
@@ -3864,36 +5179,40 @@ def _parser() -> argparse.ArgumentParser:
         target.add_argument("--release-note", type=Path, required=True)
         target.add_argument("--hermes-home", type=Path, default=Path.home() / ".hermes")
 
-    prepare = commands.add_parser("prepare")
-    common(prepare)
-    prepare.add_argument("--release-id", required=True)
-    prepare.add_argument("--epoch-id", required=True)
-    prepare.add_argument("--operator", required=True)
-    prepare.add_argument("--reason", required=True)
-    prepare.add_argument("--canary-batch-id", required=True)
-    prepare.add_argument("--canary-issue-id", required=True)
-    prepare.add_argument("--canary-state-path", type=Path, required=True)
-    prepare.add_argument("--host-branch", required=True)
-    prepare.add_argument("--host-tag", required=True)
-    prepare.add_argument("--host-runtime-root", type=Path, required=True)
-    prepare.add_argument("--worker-remote", required=True)
-    prepare.add_argument("--worker-branch", required=True)
-    prepare.add_argument("--worker-tag", required=True)
-    prepare.add_argument("--worker-runtime-root", type=Path, required=True)
-    prepare.add_argument("--pipeline-remote", required=True)
-    prepare.add_argument("--pipeline-branch", required=True)
-    prepare.add_argument("--pipeline-tag", required=True)
-    prepare.add_argument("--pipeline-runtime-root", type=Path, required=True)
-    prepare.add_argument("--report-manifest-path", type=Path, required=True)
-    prepare.add_argument(
-        "--partition-topic",
-        action="append",
-        default=[],
-        metavar="TOPIC=PARTITION[,PARTITION...]",
-    )
-    prepare.add_argument("--control-db", type=Path, required=True)
-    prepare.add_argument("--manifest-output", type=Path, required=True)
-    prepare.add_argument("--env-output", type=Path, required=True)
+    def prepare_arguments(target: argparse.ArgumentParser) -> None:
+        common(target)
+        target.add_argument("--release-id", required=True)
+        target.add_argument("--epoch-id", required=True)
+        target.add_argument("--operator", required=True)
+        target.add_argument("--reason", required=True)
+        target.add_argument("--canary-batch-id", required=True)
+        target.add_argument("--canary-issue-id", required=True)
+        target.add_argument("--canary-state-path", type=Path, required=True)
+        target.add_argument("--host-branch", required=True)
+        target.add_argument("--host-tag", required=True)
+        target.add_argument("--host-runtime-root", type=Path, required=True)
+        target.add_argument("--worker-remote", required=True)
+        target.add_argument("--worker-branch", required=True)
+        target.add_argument("--worker-tag", required=True)
+        target.add_argument("--worker-runtime-root", type=Path, required=True)
+        target.add_argument("--pipeline-remote", required=True)
+        target.add_argument("--pipeline-branch", required=True)
+        target.add_argument("--pipeline-tag", required=True)
+        target.add_argument("--pipeline-runtime-root", type=Path, required=True)
+        target.add_argument("--report-manifest-path", type=Path, required=True)
+        target.add_argument(
+            "--partition-topic",
+            action="append",
+            default=[],
+            metavar="TOPIC=PARTITION[,PARTITION...]",
+        )
+        target.add_argument("--control-db", type=Path, required=True)
+        target.add_argument("--manifest-output", type=Path, required=True)
+        target.add_argument("--env-output", type=Path, required=True)
+
+    for name in ("preflight", "prepare"):
+        target = commands.add_parser(name)
+        prepare_arguments(target)
 
     for name in ("plan", "apply"):
         target = commands.add_parser(name)
@@ -3918,32 +5237,45 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = _parser().parse_args(argv)
         command = args.command
         common = {"release_note": args.release_note, "home": args.hermes_home}
-        if command == "prepare":
-            result = prepare_release(
+        if command in {"preflight", "prepare"}:
+            try:
+                partition_topics: object = _partition_topic_arguments(
+                    args.partition_topic
+                )
+            except ReleaseError:
+                # Preserve invalid raw input so the collector can report this gate
+                # together with every other preflight failure.
+                partition_topics = tuple(args.partition_topic)
+            prepare_inputs = {
                 **common,
-                release_id=args.release_id,
-                epoch_id=args.epoch_id,
-                operator=args.operator,
-                reason=args.reason,
-                canary_batch_id=args.canary_batch_id,
-                canary_issue_id=args.canary_issue_id,
-                canary_state_path=args.canary_state_path,
-                host_branch=args.host_branch,
-                host_tag=args.host_tag,
-                host_runtime_root=args.host_runtime_root,
-                worker_remote=args.worker_remote,
-                worker_branch=args.worker_branch,
-                worker_tag=args.worker_tag,
-                worker_runtime_root=args.worker_runtime_root,
-                pipeline_remote=args.pipeline_remote,
-                pipeline_branch=args.pipeline_branch,
-                pipeline_tag=args.pipeline_tag,
-                pipeline_runtime_root=args.pipeline_runtime_root,
-                report_manifest_path=args.report_manifest_path,
-                partition_topics=_partition_topic_arguments(args.partition_topic),
-                control_db=args.control_db,
-                manifest_output=args.manifest_output,
-                env_output=args.env_output,
+                "release_id": args.release_id,
+                "epoch_id": args.epoch_id,
+                "operator": args.operator,
+                "reason": args.reason,
+                "canary_batch_id": args.canary_batch_id,
+                "canary_issue_id": args.canary_issue_id,
+                "canary_state_path": args.canary_state_path,
+                "host_branch": args.host_branch,
+                "host_tag": args.host_tag,
+                "host_runtime_root": args.host_runtime_root,
+                "worker_remote": args.worker_remote,
+                "worker_branch": args.worker_branch,
+                "worker_tag": args.worker_tag,
+                "worker_runtime_root": args.worker_runtime_root,
+                "pipeline_remote": args.pipeline_remote,
+                "pipeline_branch": args.pipeline_branch,
+                "pipeline_tag": args.pipeline_tag,
+                "pipeline_runtime_root": args.pipeline_runtime_root,
+                "report_manifest_path": args.report_manifest_path,
+                "partition_topics": partition_topics,
+                "control_db": args.control_db,
+                "manifest_output": args.manifest_output,
+                "env_output": args.env_output,
+            }
+            result = (
+                preflight_release(**prepare_inputs)
+                if command == "preflight"
+                else prepare_release(**prepare_inputs)
             )
         elif command == "verify":
             result = verify_release(**common, apply_receipt=args.apply_receipt)
@@ -3965,6 +5297,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     restart_timeout=args.restart_timeout,
                 )
             )
+    except PreflightError as exc:
+        result = dict(exc.result)
+        result["command"] = command
+        print(json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+        return 2
     except ReleaseError as exc:
         result = {
             "schema_version": SCHEMA,
@@ -3975,6 +5312,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
         return 2
     print(json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+    if command == "preflight" and result.get("preflight_ok") is not True:
+        return 2
     return 0
 
 

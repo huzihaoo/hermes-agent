@@ -1,0 +1,144 @@
+gate_code,stage,precheckable,check_method,source_line
+activation_changed_during_apply,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4837
+activation_changed_during_verify,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:5106
+activation_control_schema_changed,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1550
+activation_current_epoch_exists,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1579
+activation_direct_steady_binding_conflict,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1568
+activation_migration_outcome_unknown,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1570
+activation_not_steady,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1703
+activation_predecessor_binding_changed,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1587
+activation_predecessor_inflight_not_drained,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1608
+activation_predecessor_required,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1577
+activation_schema_transition_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1522
+activation_successor_outcome_unknown,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1613
+activation_transition_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1685
+apply_confirmation_mismatch,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4712
+apply_receipt_binding_mismatch,apply/verify,false,downstream apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4634
+apply_receipt_changed_during_verify,apply/verify,false,downstream apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:5121
+apply_receipt_identity_invalid,apply/verify,false,downstream apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2214
+apply_receipt_invalid,apply/verify,false,downstream apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2220
+apply_receipt_path_invalid,apply/verify,false,downstream apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:5050
+apply_receipt_resident_mismatch,apply/verify,false,downstream apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4404
+apply_receipt_schema_unsupported,apply/verify,false,downstream apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4609
+apply_receipt_unavailable,apply/verify,false,downstream apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2212
+artifact_cas_mismatch,plan/apply,false,downstream plan/apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1785
+artifact_expected_sha_invalid,plan/apply,false,downstream plan/apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1777
+bootstrap_install-offline_failed,materialize,false,offline install execution only; explicitly deferred,scripts/pnc_rca_minimal_release.py:3945
+canary_db_projection_mismatch,verify,false,downstream verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2824
+canary_db_readback_invalid,verify,false,downstream verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2822
+canary_reference_invalid,verify,false,downstream verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2811
+canary_state_path_invalid,prepare,true,direct absolute path collector,scripts/pnc_rca_minimal_release.py:3458
+canary_state_unavailable,verify,true,standalone read-only canary state collector; prepare defers it,scripts/pnc_rca_minimal_release.py:3919
+candidate_env_binding_invalid,plan/apply,false,downstream plan/apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1382
+candidate_env_invalid,prepare,true,grouped by live_env_template_invalid collector,scripts/pnc_rca_minimal_release.py:1261
+candidate_manifest_binding_invalid,plan/apply,false,downstream plan/apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1364
+control_db_path_invalid,prepare,true,direct path and canonical control DB collectors,scripts/pnc_rca_minimal_release.py:3474
+control_schema_capability_invalid,prepare,true,grouped by prepare_control_schema_unsupported collector,scripts/pnc_rca_minimal_release.py:1436
+control_schema_capability_unavailable,prepare,true,grouped by prepare_control_schema_unsupported collector,scripts/pnc_rca_minimal_release.py:1420
+control_schema_v15_write_unavailable,plan/apply,false,downstream plan/apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1459
+control_schema_version_invalid,plan/apply,false,downstream plan/apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1438
+disabled_resident_loaded,all,false,downstream all gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2453
+env_output_path_invalid,prepare,true,direct absolute path collector,scripts/pnc_rca_minimal_release.py:3456
+execution_identity_readback_invalid,verify,false,downstream verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2874
+execution_identity_readback_mismatch,verify,false,downstream verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2902
+gitlab_changed_during_apply,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4787
+gitlab_changed_during_prepare,prepare,false,prepare closeout race check after derivation; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4278
+gitlab_changed_during_verify,verify,false,downstream verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:5100
+gitlab_face_input_invalid,prepare,true,direct per-face GitLab input collector,scripts/pnc_rca_minimal_release.py:3605
+gitlab_face_set_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:696
+gitlab_identity_mismatch,prepare,true,direct git ls-remote branch and annotated tag collector,scripts/pnc_rca_minimal_release.py:3619
+gitlab_tree_identity_mismatch,plan/apply/verify,false,object-bearing Git tree check occurs downstream; ref-only preflight defers tree,scripts/pnc_rca_minimal_release.py:801
+hermes_home_invalid,prepare,true,direct absolute path collector,scripts/pnc_rca_minimal_release.py:3453
+host_runtime_root_invalid,prepare,true,direct absolute path collector,scripts/pnc_rca_minimal_release.py:3459
+install_artifact_set_invalid,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1831
+install_cas_mismatch,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1847
+install_pair_failed,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1962
+install_parent_invalid,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1837
+install_readback_mismatch,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1951
+install_rollback_cas_mismatch,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1915
+install_rollback_failed,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1928
+install_rollback_readback_mismatch,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1925
+json_value_invalid,prepare,true,grouped by rca_control_store_snapshot_source_changed collector,scripts/pnc_rca_minimal_release.py:412
+launchctl_identity_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2340
+launchctl_unavailable,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2334
+live_env_template_invalid,prepare,true,direct read-only live env collector,scripts/pnc_rca_minimal_release.py:3693
+live_manifest_template_invalid,prepare,true,direct read-only live manifest collector,scripts/pnc_rca_minimal_release.py:3708
+live_projection_changed_during_apply,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4851
+live_projection_changed_during_verify,verify,false,downstream verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:5097
+live_projection_mismatch,verify,false,downstream verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:5061
+live_template_changed_during_prepare,prepare,false,prepare closeout race check after derivation; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4288
+manifest_output_path_invalid,prepare,true,direct absolute path collector,scripts/pnc_rca_minimal_release.py:3455
+pipeline_runtime_root_invalid,prepare,true,direct absolute path collector,scripts/pnc_rca_minimal_release.py:3461
+preflight_probe_failed,preflight,true,collector exception boundary for any failed probe,scripts/pnc_rca_minimal_release.py:257
+prepare_control_schema_already_v15,prepare,true,direct historical schema supersession collector,scripts/pnc_rca_minimal_release.py:3850
+prepare_control_schema_unsupported,prepare,true,direct read-only control schema collector,scripts/pnc_rca_minimal_release.py:3786
+prepare_control_snapshot_invalid,prepare,true,direct read-only control snapshot collector,scripts/pnc_rca_minimal_release.py:3811
+prepare_output_cleanup_failed,prepare,false,prepare output write or cleanup phase; not preflight-reachable,scripts/pnc_rca_minimal_release.py:3998
+prepare_output_exists,prepare,true,direct output absence collector,scripts/pnc_rca_minimal_release.py:3514
+prepare_output_is_live_projection,prepare,true,direct output versus live projection collector,scripts/pnc_rca_minimal_release.py:3505
+prepare_output_parent_invalid,prepare,true,direct owner-controlled output parent collector,scripts/pnc_rca_minimal_release.py:3542
+prepare_output_paths_invalid,prepare,true,direct distinct output path collector,scripts/pnc_rca_minimal_release.py:3494
+prepare_output_readback_invalid,prepare,false,prepare output write or cleanup phase; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4041
+prepare_output_unavailable,prepare,true,grouped by prepare_output_parent_invalid collector,scripts/pnc_rca_minimal_release.py:3529
+prepare_output_write_failed,prepare,false,prepare output write or cleanup phase; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4054
+prepare_partition_progress_missing,prepare,true,direct read-only partition progress collector,scripts/pnc_rca_minimal_release.py:3880
+prepare_partition_topics_invalid,prepare,true,direct partition topic argument collector,scripts/pnc_rca_minimal_release.py:3764
+prepare_predecessor_invalid,prepare,true,grouped by prepare_predecessor_required collector,scripts/pnc_rca_minimal_release.py:3868
+prepare_predecessor_required,prepare,true,direct read-only predecessor collector,scripts/pnc_rca_minimal_release.py:3872
+rca_control_store_snapshot_source_changed,prepare,true,direct double snapshot identity collector,scripts/pnc_rca_minimal_release.py:3830
+receipt_changed,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2142
+receipt_exists,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2167
+receipt_identity_invalid,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2132
+receipt_parent_invalid,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2154
+receipt_path_invalid,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4727
+receipt_unavailable,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2182
+receipt_write_failed,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2147
+release_apply_locked,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1986
+release_lock_unavailable,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2070
+release_note_activation_binding_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1315
+release_note_activation_fence_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1277
+release_note_activation_invalid,prepare,true,direct epoch operator and reason collector,scripts/pnc_rca_minimal_release.py:3559
+release_note_canary_invalid,prepare,true,direct canary identifier collector,scripts/pnc_rca_minimal_release.py:3574
+release_note_changed,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4380
+release_note_contract_invalid,prepare,true,direct release identifier collector,scripts/pnc_rca_minimal_release.py:3550
+release_note_control_db_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:652
+release_note_epoch_contract_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1319
+release_note_host_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:604
+release_note_identity_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:616
+release_note_path_invalid,prepare,true,direct absolute path collector,scripts/pnc_rca_minimal_release.py:3454
+release_note_predecessor_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:666
+release_note_profile_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:680
+release_note_projection_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:623
+remote_reader_dependency_unavailable,prepare,true,direct candidate contract schema and installed-byte fingerprint VM collector,scripts/pnc_rca_minimal_release.py:3910
+report_manifest_changed_during_prepare,prepare,false,prepare closeout race check after derivation; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4283
+report_manifest_path_invalid,prepare,true,direct fixed VM report path collector,scripts/pnc_rca_minimal_release.py:3483
+report_manifest_pipeline_mismatch,prepare,true,direct read-only VM report manifest collector,scripts/pnc_rca_minimal_release.py:3653
+report_manifest_readback_invalid,prepare,true,grouped by report_manifest_pipeline_mismatch collector,scripts/pnc_rca_minimal_release.py:1251
+report_manifest_tree_identity,prepare,false,ref-only ls-remote cannot prove commit tree; explicitly deferred,scripts/pnc_rca_minimal_release.py:3665
+resident_binding_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2599
+resident_changed_during_apply,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4869
+resident_changed_during_verify,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:5118
+resident_freshness_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2357
+resident_health_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2440
+resident_identity_mismatch,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2401
+resident_not_restarted,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2391
+resident_persistent_profile_mismatch,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2502
+resident_persistent_readback_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2484
+resident_process_unreadable,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2398
+resident_quiesce_readback_failed,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2509
+resident_stale,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2406
+resident_transition_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2656
+restart_readback_timeout,all,false,resident restart execution only; explicitly deferred,scripts/pnc_rca_minimal_release.py:2757
+restart_timeout_invalid,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4714
+runtime_changed_during_apply,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4789
+runtime_changed_during_prepare,prepare,false,prepare closeout race check after derivation; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4280
+runtime_changed_during_verify,verify,false,downstream verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:5103
+runtime_identity_mismatch,prepare,true,direct read-only host runtime identity collector,scripts/pnc_rca_minimal_release.py:3629
+terminal_failure_marker_identity_invalid,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2263
+terminal_failure_marker_unavailable,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2269
+terminal_receipt_and_marker_write_failed,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:5007
+terminal_receipt_write_failed,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:5009
+worker_runtime_root_invalid,prepare,true,direct absolute path collector,scripts/pnc_rca_minimal_release.py:3460
+workspace_runtime_manifest_binding_invalid,prepare,true,direct read-only workspace runtime collector,scripts/pnc_rca_minimal_release.py:3723
+workspace_runtime_source_remote_mismatch,prepare,true,direct workspace source remote collector,scripts/pnc_rca_minimal_release.py:3730
+workspace_runtime_source_tree_invalid,prepare,true,direct workspace source tree collector,scripts/pnc_rca_minimal_release.py:3739
