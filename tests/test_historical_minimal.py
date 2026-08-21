@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 
 import pytest
 
@@ -25,6 +26,8 @@ NOW = datetime(2026, 8, 18, 6, 0, tzinfo=timezone.utc)
 FIXED_SMOKE10_IDS_SHA256 = admission.HISTORICAL_ORDERED_WORK_ITEM_IDS_SHA256
 VM_ADMISSION_MODULE_ENV = "HERMES_RCA_HISTORICAL_VM_ADMISSION_MODULE"
 VM_ADMISSION_SHA256_ENV = "HERMES_RCA_HISTORICAL_VM_ADMISSION_SHA256"
+PIPELINE_RUNNER_MODULE_ENV = "HERMES_RCA_HISTORICAL_PIPELINE_RUNNER_MODULE"
+PIPELINE_RUNNER_SHA256_ENV = "HERMES_RCA_HISTORICAL_PIPELINE_RUNNER_SHA256"
 RUNTIME = WorkspaceRuntimeIdentity(
     root=Path("/fixed/runtime"), manifest_path=Path("/fixed/runtime/manifest.json"),
     creator_path=Path("/fixed/runtime/bin/create_task_v2.py"),
@@ -95,6 +98,27 @@ def load_pinned_vm_admission():
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_pinned_pipeline_runner(monkeypatch: pytest.MonkeyPatch):
+    raw_path = os.environ.get(PIPELINE_RUNNER_MODULE_ENV, "").strip()
+    raw_sha256 = os.environ.get(PIPELINE_RUNNER_SHA256_ENV, "").strip().lower()
+    if not raw_path or not raw_sha256:
+        pytest.skip(
+            f"set {PIPELINE_RUNNER_MODULE_ENV} and {PIPELINE_RUNNER_SHA256_ENV} "
+            "to run the c366 runner timestamp compatibility test"
+        )
+    path = Path(raw_path).expanduser().absolute()
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == raw_sha256
+    monkeypatch.syspath_prepend(str(path.parents[3]))
+    spec = importlib.util.spec_from_file_location(
+        "pinned_c366_historical_full_chain_runner", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
     return module
 
@@ -443,6 +467,8 @@ def test_atomic_ledger_writes_exact_sidecar_and_verify_reads_history(tmp_path: P
     assert sidecar["lane_count"] == sidecar["observed_global_peak"] == 3
     assert sidecar["max_global_evaluation_lanes"] == 3
     assert sidecar["queue_if_blocked"] is False
+    assert sidecar["started_at"] == "2026-08-18T06:00:00.000000Z"
+    assert sidecar["lease_expires_at"] == "2026-08-19T06:00:00.000000Z"
     verified = admission.verify_historical_lane_reservation(
         value, raw_sha256=result["raw_sha256"],
         semantic_sha256=result["semantic_sha256"],
@@ -496,8 +522,39 @@ def test_release_is_exact_idempotent_and_frees_three_lanes(tmp_path: Path) -> No
     assert first_receipt["receipt_id"] in ledger["consumed_receipts"]
 
 
-def test_release_accepts_pending_rejected_before_claim(tmp_path: Path) -> None:
-    value = plan("pending-rejected-before-claim")
+def test_reservation_timestamps_pass_c366_runner_parser(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runner = load_pinned_pipeline_runner(monkeypatch)
+    value = plan("c366-runner-timestamp")
+    receipt = bootstrap(value)
+    reserved = admission.consume_historical_bootstrap_and_reserve_lanes(
+        receipt,
+        plan=value,
+        expected_owner="songying",
+        hmac_key=KEY,
+        now=NOW,
+        state_root=tmp_path / "state",
+        host_tmp_root=tmp_path / "hfs",
+    )
+
+    reservation = reserved["reservation"]
+    assert runner._utc(
+        reservation["started_at"], "host_reservation.started_at", canonical=True
+    ) == NOW
+    assert runner._utc(
+        reservation["lease_expires_at"],
+        "host_reservation.lease_expires_at",
+        canonical=True,
+    ) == NOW + timedelta(seconds=admission.HISTORICAL_LEASE_SECONDS)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["pending_rejected_before_claim", "execution_failed_before_case_start"],
+)
+def test_release_accepts_bounded_retry_reason(tmp_path: Path, reason: str) -> None:
+    value = plan(reason.replace("_", "-"))
     receipt = bootstrap(value)
     state_root, host_root = tmp_path / "state", tmp_path / "hfs"
     reserved = admission.consume_historical_bootstrap_and_reserve_lanes(
@@ -516,7 +573,7 @@ def test_release_accepts_pending_rejected_before_claim(tmp_path: Path) -> None:
         reservation_id=receipt["reservation_id"],
         raw_sha256=reserved["raw_sha256"],
         semantic_sha256=reserved["semantic_sha256"],
-        reason="pending_rejected_before_claim",
+        reason=reason,
         state_root=state_root,
         host_tmp_root=host_root,
     )
@@ -525,7 +582,7 @@ def test_release_accepts_pending_rejected_before_claim(tmp_path: Path) -> None:
         "released": True,
         "already_released": False,
         "reservation_id": receipt["reservation_id"],
-        "reason": "pending_rejected_before_claim",
+        "reason": reason,
     }
 
 

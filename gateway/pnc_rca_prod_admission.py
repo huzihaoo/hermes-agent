@@ -337,6 +337,10 @@ def _now(value: datetime | None = None) -> datetime:
     return current.astimezone(timezone.utc)
 
 
+def _canonical_utc_z(value: datetime) -> str:
+    return _now(value).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
 def _require_hex(value: Any, code: str) -> str:
     normalized = str(value or "").strip().lower()
     if not HEX64_RE.fullmatch(normalized):
@@ -1292,8 +1296,10 @@ def consume_historical_bootstrap_and_reserve_lanes(
         if sum(int(record["lane_count"]) for record in active.values()) + 3 > 3:
             raise RcaProdAdmissionError("rca_historical_evaluation_lanes_unavailable")
         sequence, reservation_id = int(ledger["sequence"]) + 1, str(validated["reservation_id"])
-        started = current.replace(microsecond=0).isoformat()
-        expires = (current + timedelta(seconds=HISTORICAL_LEASE_SECONDS)).replace(microsecond=0).isoformat()
+        started = _canonical_utc_z(current)
+        expires = _canonical_utc_z(
+            current + timedelta(seconds=HISTORICAL_LEASE_SECONDS)
+        )
         sidecar = {
             "schema_version": HISTORICAL_RESERVATION_SCHEMA,
             "receipt_id": receipt_id, "reservation_id": reservation_id,
@@ -1401,6 +1407,7 @@ def release_historical_lane_reservation(
 ) -> dict[str, Any]:
     if reason not in {
         "create_failed_missing_reconfirmed",
+        "execution_failed_before_case_start",
         "pending_rejected_before_claim",
         "verify_succeeded",
     }:
