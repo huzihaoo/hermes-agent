@@ -1,5 +1,15 @@
 # 飞书 Aily Agent 企业知识问答
 
+相关文档：
+
+- [候选测试报告](feishu-aily-agent-test-report.md)
+- [Hermes 统一知识检索路由](hermes-knowledge-retrieval-routing.md)
+
+当前 Aily 工具是独立、默认关闭的候选。用户身份 API canary 已打通，但生产 gateway
+尚未启用。目标体验不是让用户手工说“查企业知识库”，而是由统一路由根据关键词和
+任务上下文，在 Web、本地知识工程和 Aily 企业知识之间自动选择。RCA 属于企业知识
+强制检索任务；该自动路由仍待 RCA 正式生产分支实现。
+
 新版 Aily 智能体详情页地址中的 `agent_<...>` 是 Agent ID：
 
 ```text
@@ -81,7 +91,8 @@ tenant 身份。用户模式固定给每个问题增加“只允许企业知识�
 停止”的约束，不提供关闭开关。它只是客户端纵深防护，不是 grounded 证明；
 Aily 后台的工具和兜底策略仍是权威控制点。
 
-启用独立 toolset：
+仅在开发 home 或受管隔离 staging 中启用独立 toolset；不要对 active home
+直接执行该命令：
 
 ```bash
 hermes tools enable feishu_aily_agent --platform feishu
@@ -92,6 +103,38 @@ hermes tools enable feishu_aily_agent --platform feishu
 
 若另有明确的应用身份场景，可设置 `FEISHU_AILY_AUTH_MODE=tenant`，并配置
 `FEISHU_AILY_AUTH_APP_SECRET`。tenant 模式与本企业知识用户模式相互独立。
+
+## 任务内使用
+
+交互式任务中，主代理传入业务问题，用户不需要提供 Agent ID 或身份字段：
+
+```json
+{
+  "content": "OOI在ACC/AEB业务中的定义和正常切换规则是什么？"
+}
+```
+
+成功结果的核心字段为：
+
+```json
+{
+  "success": true,
+  "content": "...",
+  "answer_available": true,
+  "status": "Completed",
+  "session_id": "...",
+  "agent_chat_id": "..."
+}
+```
+
+`answer_available=true` 只表示返回了文本，不等于企业知识已命中或
+`grounded=true`。只在同一用户、同一任务需要连续追问时复用 `session_id`；
+不得跨用户或跨任务共享会话。`no_match`、身份或协议错误不能自动降级到
+Web 搜索内部含义。
+
+当前候选允许主代理显式选择此工具。未来统一路由上线后，业务关键词和
+RCA 任务上下文将自动触发；具体契约见
+[Hermes 统一知识检索路由](hermes-knowledge-retrieval-routing.md)。
 
 ## API 形状
 

@@ -15,6 +15,8 @@ import pytest
 
 SCRIPT = Path(__file__).parents[2] / "scripts" / "feishu_aily_agent_user_smoke.py"
 DOC = Path(__file__).parents[2] / "docs" / "feishu-aily-agent.md"
+TEST_REPORT_DOC = Path(__file__).parents[2] / "docs" / "feishu-aily-agent-test-report.md"
+ROUTING_DOC = Path(__file__).parents[2] / "docs" / "hermes-knowledge-retrieval-routing.md"
 SPEC = importlib.util.spec_from_file_location("feishu_aily_agent_user_smoke", SCRIPT)
 assert SPEC and SPEC.loader
 smoke = importlib.util.module_from_spec(SPEC)
@@ -41,6 +43,84 @@ def test_documented_staging_enable_is_explicitly_isolated_from_active_home():
     assert "/usr/local/bin/uv --directory" in documentation
     assert "config 的 raw SHA/semantic SHA" in documentation
     assert "env 的\n   byte SHA" in documentation
+
+
+def test_documentation_separates_verified_tool_from_future_automatic_routing():
+    main_documentation = DOC.read_text(encoding="utf-8")
+    test_report = TEST_REPORT_DOC.read_text(encoding="utf-8")
+    routing = ROUTING_DOC.read_text(encoding="utf-8")
+
+    assert "feishu-aily-agent-test-report.md" in main_documentation
+    assert "hermes-knowledge-retrieval-routing.md" in main_documentation
+    assert "生产 gateway\n尚未启用" in main_documentation
+    assert "answer_available=true" in main_documentation
+    assert "不等于企业知识已命中" in main_documentation
+    assert "不要对 active home" in main_documentation
+    assert "结果：" in test_report and " passed" in test_report
+    assert "尚未部署到生产 gateway" in test_report
+    assert "自动检索路由未实现" in test_report
+    assert "a1e4565ec7 -> e25ba59684 -> 4a0adaba91" in test_report
+    assert "HTTP 200 + 业务码 `2320008`" in test_report
+    assert "session-derived attestation" in test_report
+    assert "Web、本地知识工程和飞书 Aily 企业知识的同级触发机制" in routing
+    assert "RCA 的强制规则" in routing
+    assert "内部关键词未命中时不得降级 Web" in routing
+    assert "knowledge_context_v1" in routing
+    assert '"business": "required"' in routing
+    assert "answer_only" in routing
+    assert "identity_unavailable" in routing
+    assert "Kafka/outbox 自动 RCA" in routing
+    assert "不能把固定员工 UAT" in routing
+    assert "Aily Agent 及其 MCP 必须是只读能力" in routing
+    for stage in (
+        "盲区扫描",
+        "先出原型",
+        "反向采访",
+        "给参照物",
+        "实施计划",
+        "Log 笔记",
+        "交接文档",
+        "出题验收",
+    ):
+        assert stage in routing
+    assert "关键题未满分不得提交" in routing
+
+    contract_text = routing.split(
+        "<!-- knowledge-routing-contract:begin -->", 1
+    )[1].split("<!-- knowledge-routing-contract:end -->", 1)[0]
+    contract = json.loads(contract_text.split("```json", 1)[1].split("```", 1)[0])
+    assert contract["requirements"] == ["none", "auto", "required"]
+    assert contract["statuses"] == [
+        "grounded_match",
+        "answer_only",
+        "no_match",
+        "identity_unavailable",
+        "error",
+        "not_required",
+    ]
+    assert contract["rca_stage_order"] == [
+        "durable_admission",
+        "claim",
+        "official_issue_preread",
+        "identity_validation",
+        "business_lookup",
+        "seal",
+        "resource_reservation",
+        "vm_submit",
+    ]
+    assert {
+        "query_sha256",
+        "answer_sha256",
+        "knowledge_release_fingerprint",
+        "source_refs_sha256",
+        "retrieval_activity_receipt_sha256",
+    } <= set(contract["grounded_match_required"])
+    assert {
+        "query_sha256",
+        "knowledge_release_fingerprint",
+        "provider_no_hit_receipt_sha256",
+    } <= set(contract["no_match_required"])
+    assert "summary" in contract["shared_receipt_forbidden_fields"]
 
 
 def _env_file(tmp_path: Path, content: str) -> Path:
