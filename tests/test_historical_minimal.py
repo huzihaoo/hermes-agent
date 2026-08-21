@@ -20,6 +20,7 @@ from tools.registry import registry
 
 KEY = "hex:" + ("71" * 32)
 NOW = datetime(2026, 8, 18, 6, 0, tzinfo=timezone.utc)
+FIXED_SMOKE10_IDS_SHA256 = admission.HISTORICAL_ORDERED_WORK_ITEM_IDS_SHA256
 RUNTIME = WorkspaceRuntimeIdentity(
     root=Path("/fixed/runtime"), manifest_path=Path("/fixed/runtime/manifest.json"),
     creator_path=Path("/fixed/runtime/bin/create_task_v2.py"),
@@ -91,8 +92,10 @@ def result_artifacts(
         "authority_provenance": {}, "scheduler": {},
         "shards_semantic_sha256": "3" * 64,
         "sealed_at": "2026-08-18T06:10:00+00:00",
-        "item_count": 308, "terminal_complete": True, "all_pass": False,
-        "ordered_work_item_ids_sha256": "4" * 64,
+        "item_count": 10, "terminal_complete": True, "all_pass": False,
+        "ordered_work_item_ids_sha256": (
+            admission.HISTORICAL_ORDERED_WORK_ITEM_IDS_SHA256
+        ),
         "manifest_items_semantic_sha256": "5" * 64,
     }
     _final, final_data = admission._seal_historical_document(final_body)
@@ -117,6 +120,9 @@ def result_artifacts(
 
 @pytest.fixture(autouse=True)
 def fixed_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    assert FIXED_SMOKE10_IDS_SHA256 == (
+        "880d07a3d01e1307310121f23e18412560d5f0ee64711015da9f71d843d0517d"
+    )
     monkeypatch.setenv(admission.HMAC_ENV, KEY)
     monkeypatch.setattr(vm_task_tool, "validate_workspace_runtime", lambda: RUNTIME)
     host_root = tmp_path / "fixed-inputs"
@@ -133,10 +139,38 @@ def fixed_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         "semantic_sha256": admission.sha256_value(rows),
         "ordered_work_item_ids_sha256": admission.sha256_value(ready_ids),
     })
+    ranked = sorted(
+        (
+            hashlib.sha256(
+                (
+                    admission.HISTORICAL_PROFILE_DOMAIN
+                    + "\0"
+                    + contract["ready_index"]["raw_sha256"]
+                    + "\0"
+                    + work_item_id
+                ).encode("utf-8")
+            ).hexdigest(),
+            work_item_id,
+        )
+        for work_item_id in ready_ids
+    )
+    smoke10_ids_sha256 = admission.sha256_value(
+        [work_item_id for _rank, work_item_id in ranked[:10]]
+    )
     state_root = tmp_path / "state"
     monkeypatch.setattr(admission, "HISTORICAL_HOST_TMP_ROOT", host_root)
     monkeypatch.setattr(admission, "HISTORICAL_STATE_ROOT", state_root)
     monkeypatch.setattr(admission, "HISTORICAL_INPUT_CONTRACT", contract)
+    monkeypatch.setattr(
+        admission,
+        "HISTORICAL_READY_INDEX_RAW_SHA256",
+        contract["ready_index"]["raw_sha256"],
+    )
+    monkeypatch.setattr(
+        admission,
+        "HISTORICAL_ORDERED_WORK_ITEM_IDS_SHA256",
+        smoke10_ids_sha256,
+    )
     source_commit, source_tree = "a" * 40, "b" * 40
     fingerprints = {
         "g1q3_rca/aeb_signal_parser.py":
@@ -176,13 +210,38 @@ def test_plan_and_argv_are_exact_and_server_fixed(tmp_path: Path) -> None:
         "attempt_id", "budgets", "canonical_input", "evaluator_fingerprints",
         "evaluator_fingerprints_sha256", "evaluator_version", "execution_policy",
         "host_reservation", "output_root", "plan_id", "ready_index",
+        "execution_profile",
         "release_evidence", "requirements_contract_hash", "review_disposition",
         "run_id", "schema_version", "selection", "selection_identity",
         "self_seal", "shards", "source", "task_id",
     }
     assert value.output_root == value.task_root
     assert value.plan_path == value.task_root / "control/historical-full-chain-plan.json"
-    assert [item["item_count"] for item in value.plan["shards"]] == [103, 103, 102]
+    assert value.task_id.startswith("g1q3-rca-full308-")
+    assert [item["item_count"] for item in value.plan["shards"]] == [4, 3, 3]
+    assert value.plan["ready_index"]["item_count"] == 308
+    assert value.plan["execution_profile"] == {
+        "schema_version": admission.HISTORICAL_PROFILE_SCHEMA,
+        "profile": "production_smoke10_v1",
+        "domain": "g1q3-rca-production-smoke10/v1",
+        "ranking": (
+            "sha256(domain_nul_ready_index_raw_sha256_nul_work_item_id)_ascending/v1"
+        ),
+        "sample_count": 10,
+        "source_ready_index_raw_sha256": value.plan["ready_index"]["raw_sha256"],
+        "ordered_work_item_ids_sha256": (
+            admission.HISTORICAL_ORDERED_WORK_ITEM_IDS_SHA256
+        ),
+    }
+    shard_ids = [
+        work_item_id
+        for _path, data in value.shard_artifacts
+        for work_item_id in json.loads(data)["ordered_work_item_ids"]
+    ]
+    assert len(shard_ids) == len(set(shard_ids)) == 10
+    assert admission.sha256_value(shard_ids) == (
+        value.plan["execution_profile"]["ordered_work_item_ids_sha256"]
+    )
     assert value.plan["host_reservation"] == {
         "schema_version": admission.HISTORICAL_RESERVATION_SCHEMA,
         "path": f"/mnt/tmp/{value.task_id}/control/host-lane-reservation.json",
@@ -196,6 +255,7 @@ def test_plan_and_argv_are_exact_and_server_fixed(tmp_path: Path) -> None:
     assert "source_manifest_sha256" not in value.plan_bytes.decode("utf-8")
     assert "request_identity" not in value.plan
     assert value.plan["execution_policy"]["queue_if_blocked"] is False
+    assert value.plan["execution_policy"]["allow_feishu_writeback"] is False
     assert value.plan["budgets"] == admission.HISTORICAL_BUDGETS
     assert value.plan["self_seal"]["artifact_size_bytes"] == len(value.plan_bytes)
     materialized = admission.materialize_historical_full_rerun_plan(
@@ -230,6 +290,15 @@ def test_request_rejects_operator_controls_and_wrong_hash(
         admission.build_historical_full_rerun_plan(
             value, expected_request_sha256=admission.sha256_value(value)
         )
+    for control in ("sample_count", "limit", "subset"):
+        controlled = {**request(), control: 10}
+        with pytest.raises(
+            admission.RcaProdAdmissionError, match="request_schema_invalid"
+        ):
+            admission.build_historical_full_rerun_plan(
+                controlled,
+                expected_request_sha256=admission.sha256_value(controlled),
+            )
     with pytest.raises(admission.RcaProdAdmissionError, match="request_hash_mismatch"):
         admission.build_historical_full_rerun_plan(
             request(), expected_request_sha256="f" * 64
@@ -465,7 +534,7 @@ def test_verify_derives_binding_from_fixed_final_and_reservation_artifacts(
         "_run_historical_offline_verify",
         lambda *_args, **_kwargs: {
             "ok": True, "terminal_complete": True, "all_pass": False,
-            "item_count": 308, "source_manifest_sha256": "6" * 64,
+            "item_count": 10, "source_manifest_sha256": "6" * 64,
         },
     )
 
@@ -525,7 +594,7 @@ def test_verify_runs_offline_verifier_before_releasing_lane(
         "_run_historical_offline_verify",
         lambda *_a, **_k: events.append("offline") or {
             "ok": True, "terminal_complete": True, "all_pass": False,
-            "item_count": 308, "source_manifest_sha256": "6" * 64,
+            "item_count": 10, "source_manifest_sha256": "6" * 64,
         },
     )
     monkeypatch.setattr(
@@ -540,7 +609,9 @@ def test_verify_runs_offline_verifier_before_releasing_lane(
     assert result["verify_argv"][-1] == binding["full_chain_output_seal_sha256"]
 
 
-@pytest.mark.parametrize("mode", ["nonzero", "malformed", "ok_false"])
+@pytest.mark.parametrize(
+    "mode", ["nonzero", "malformed", "ok_false", "wrong_item_count"]
+)
 def test_offline_verifier_rejects_non_success_projections(
     mode: str,
 ) -> None:
@@ -553,11 +624,21 @@ def test_offline_verifier_rejects_non_success_projections(
         completed = subprocess.CompletedProcess(argv, 7, stdout="", stderr="denied")
     elif mode == "malformed":
         completed = subprocess.CompletedProcess(argv, 0, stdout="not-json", stderr="")
-    else:
+    elif mode == "ok_false":
         completed = subprocess.CompletedProcess(
             argv, 0,
             stdout=json.dumps({
                 "ok": False, "terminal_complete": True, "all_pass": False,
+                "item_count": 10, "source_manifest_sha256": "6" * 64,
+            }),
+            stderr="",
+        )
+    else:
+        completed = subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=json.dumps({
+                "ok": True, "terminal_complete": True, "all_pass": False,
                 "item_count": 308, "source_manifest_sha256": "6" * 64,
             }),
             stderr="",
@@ -577,7 +658,7 @@ def test_offline_verifier_uses_fixed_remote_boundary() -> None:
     captured = {}
     projection = {
         "ok": True, "terminal_complete": True, "all_pass": False,
-        "item_count": 308, "source_manifest_sha256": "6" * 64,
+        "item_count": 10, "source_manifest_sha256": "6" * 64,
     }
 
     def runner(command, **kwargs):
@@ -647,6 +728,26 @@ def test_result_binding_rejects_noncanonical_and_plan_drifted_final() -> None:
     _sealed, data = admission._seal_historical_document(final)
     final_path.write_bytes(data)
     with pytest.raises(admission.RcaProdAdmissionError, match="final_seal_identity_invalid"):
+        admission.derive_historical_result_binding(value)
+
+
+def test_result_binding_rejects_a_different_smoke10_id_set() -> None:
+    value = plan()
+    receipt = bootstrap(value)
+    result_artifacts(value, receipt)
+    final_path = (
+        admission.HISTORICAL_HOST_TMP_ROOT / value.task_id
+        / "final/execution-final-seal.json"
+    )
+    final = json.loads(final_path.read_bytes())
+    final.pop("self_seal")
+    final["ordered_work_item_ids_sha256"] = "f" * 64
+    _sealed, data = admission._seal_historical_document(final)
+    final_path.write_bytes(data)
+
+    with pytest.raises(
+        admission.RcaProdAdmissionError, match="final_seal_identity_invalid"
+    ):
         admission.derive_historical_result_binding(value)
 
 
@@ -728,7 +829,7 @@ def test_execute_retains_lane_when_failure_status_is_unavailable(
 
 def test_public_submit_cannot_bypass_historical_service() -> None:
     result = vm_task_tool.vm_task_submit(
-        title="ordinary", goal="ordinary", task_id="g1q3-rca-full308-" + "a" * 32,
+        title="ordinary", goal="ordinary", task_id="g1q3-rca-smoke10-" + "a" * 32,
     )
     assert result["success"] is False
     assert result["error_code"] == "g1q3_rca_service_boundary_required"

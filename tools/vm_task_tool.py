@@ -22,6 +22,7 @@ from gateway.pnc_rca_data_access import (
     validate_remote_data_access,
 )
 from gateway.pnc_rca_prod_admission import (
+    HISTORICAL_ITEMS,
     HISTORICAL_PLAN_SCHEMA,
     HISTORICAL_PREPARE,
     HISTORICAL_REQUEST_SCHEMA,
@@ -407,6 +408,7 @@ def _is_reserved_rca_service_submission(
         HISTORICAL_PREPARE.lower() in normalized_goal_lower,
         HISTORICAL_RUNNER.lower() in normalized_goal_lower,
         normalized_task_id.startswith("g1q3-rca-full308-"),
+        normalized_task_id.startswith("g1q3-rca-smoke10-"),
         "/api/g1q3_rca/scripts/run_rca_service_request.py" in normalized_goal_lower,
         "run_rca_auto_pipeline.py" in normalized_goal_lower,
         "/g1q3-rca-s1-" in normalized_artifact_root,
@@ -415,6 +417,8 @@ def _is_reserved_rca_service_submission(
         "/g1q3_rca_issue_intake_" in normalized_artifact_cifs_root,
         "/g1q3-rca-full308-" in normalized_artifact_root,
         "/g1q3-rca-full308-" in normalized_artifact_cifs_root,
+        "/g1q3-rca-smoke10-" in normalized_artifact_root,
+        "/g1q3-rca-smoke10-" in normalized_artifact_cifs_root,
     ))
 
 
@@ -1520,7 +1524,7 @@ def _run_historical_offline_verify(
         or value.get("terminal_complete") is not True
         or type(value.get("all_pass")) is not bool
         or type(value.get("item_count")) is not int
-        or value.get("item_count") != 308
+        or value.get("item_count") != HISTORICAL_ITEMS
         or re.fullmatch(r"[0-9a-f]{64}", str(value.get("source_manifest_sha256") or "")) is None
     ):
         raise RcaProdAdmissionError("rca_historical_offline_verify_schema_invalid", retryable=False)

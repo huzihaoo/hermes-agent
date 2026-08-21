@@ -43,9 +43,15 @@ MAX_CONCURRENCY = 4
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
-HISTORICAL_REQUEST_SCHEMA = "g1q3-rca-historical-full-rerun-request/v2"
-HISTORICAL_PLAN_SCHEMA = "g1q3_rca_historical_full_chain_plan_v4"
-HISTORICAL_SHARD_PLAN_SCHEMA = "g1q3_rca_historical_shard_plan_v1"
+HISTORICAL_REQUEST_SCHEMA = "g1q3-rca-production-smoke10-request/v1"
+HISTORICAL_PLAN_SCHEMA = "g1q3_rca_production_smoke10_plan_v1"
+HISTORICAL_SHARD_PLAN_SCHEMA = "g1q3_rca_production_smoke10_shard_plan_v1"
+HISTORICAL_PROFILE_SCHEMA = "g1q3_rca_production_smoke10_profile_v1"
+HISTORICAL_PROFILE = "production_smoke10_v1"
+HISTORICAL_PROFILE_DOMAIN = "g1q3-rca-production-smoke10/v1"
+HISTORICAL_PROFILE_RANKING = (
+    "sha256(domain_nul_ready_index_raw_sha256_nul_work_item_id)_ascending/v1"
+)
 HISTORICAL_SELF_SEAL_SCHEMA = "g1q3_rca_canonical_self_seal_v1"
 HISTORICAL_BOOTSTRAP_SCHEMA = "g1q3-rca-prod-bootstrap/v1"
 HISTORICAL_LEDGER_SCHEMA = "g1q3-rca-global-evaluation-lane-ledger/v1"
@@ -95,8 +101,15 @@ HISTORICAL_BOOTSTRAP_BINDINGS = frozenset({
     "max_global_evaluation_lanes", "queue_if_blocked",
 })
 HISTORICAL_LANES = 3
-HISTORICAL_ITEMS = 308
-HISTORICAL_SHARD_COUNTS = (103, 103, 102)
+HISTORICAL_READY_ITEMS = 308
+HISTORICAL_ITEMS = 10
+HISTORICAL_SHARD_COUNTS = (4, 3, 3)
+HISTORICAL_READY_INDEX_RAW_SHA256 = (
+    "26b5f05d7653c61703b53272585c7e83dd3292e9c65c0dd6396116cccad5428a"
+)
+HISTORICAL_ORDERED_WORK_ITEM_IDS_SHA256 = (
+    "880d07a3d01e1307310121f23e18412560d5f0ee64711015da9f71d843d0517d"
+)
 HISTORICAL_BOOTSTRAP_TTL_SECONDS = 300
 HISTORICAL_LEASE_SECONDS = 24 * 60 * 60
 HISTORICAL_INPUT_CONTRACT = {
@@ -124,7 +137,7 @@ HISTORICAL_INPUT_CONTRACT = {
     },
     "ready_index": {
         "path": "/mnt/tmp/g1q3-rca-recovery-20260812/public-handoff/vm-b-selection-receipt-apply-v1-rerun/final-artifacts/selected-ready-index.jsonl",
-        "raw_sha256": "26b5f05d7653c61703b53272585c7e83dd3292e9c65c0dd6396116cccad5428a",
+        "raw_sha256": HISTORICAL_READY_INDEX_RAW_SHA256,
         "semantic_sha256": "fcfa89ba160958c876f75ff81d8885139ecc87f66ac26442ecc4bb5cab20f40e", "item_count": 308,
         "ordered_work_item_ids_sha256": "6862bb376bdf1fccb68810c041f2406384b5df24cc03d1d925cce74149cfb581",
     },
@@ -149,8 +162,8 @@ HISTORICAL_BUDGETS = {
 # Server-owned successor projection. Request payloads may repeat these pins,
 # but cannot select a different evaluator/source identity.
 HISTORICAL_SUCCESSOR_RELEASE: Mapping[str, Any] | None = {
-    "source_commit": "363fb4b438c8bf12baaccf94bb03e9a678b7cb79",
-    "source_tree": "8f68f96f8c9b73ed00f49bbd5414373abeece0d1",
+    "source_commit": "c366945b39caa969bb5c7fddabe0e4683f8a4e8d",
+    "source_tree": "54d0d6e61759d1b96d330ba32196e0eb9c213e45",
     "requirements_contract_hash": "ca99f759c70b72b0836f956557ecc5e23c11538132b13f1d1bfe8a46ce7e6cb6",
     "evaluator_fingerprints": {
         "g1q3_rca/aeb_signal_parser.py": "fa227f22a684f2a4b0808fefe0d596a032c3a582e1571f67ede7937d5894e3d3",
@@ -162,11 +175,11 @@ HISTORICAL_SUCCESSOR_RELEASE: Mapping[str, Any] | None = {
         "g1q3_rca/signal_registry.py": "ffd0a796c027df1d81e30a1727eea1d37ccfcd0c5b88a806a201a0c8f3d54f17",
     },
     "evaluator_fingerprints_sha256": "e492eaa8afd9348990cb2de265575211ff248fdebacd0fff72b2f7bafe7f18c0",
-    "evaluator_version": "git-363fb4b438c8bf12baaccf94bb03e9a678b7cb79",
-    "suite_receipt_path": "/mnt/tmp/g1q3-rca-canonical-scoped-verification-20260819/blocked-contract-363fb4b438/suite-receipt.json",
-    "suite_receipt_sha256": "00247963de4b25eb9f030527c5899a0f7fb20c22126fe2e92eb98f1b0edddf0a",
-    "w17_receipt_path": "/mnt/tmp/g1q3-rca-canonical-scoped-verification-20260819/blocked-contract-363fb4b438/w17-receipt.json",
-    "w17_receipt_sha256": "2f6b5e9d82d75b9929d990fbe95e5c7d759643b6bdc10759a73676b60b4fef05",
+    "evaluator_version": "git-c366945b39caa969bb5c7fddabe0e4683f8a4e8d",
+    "suite_receipt_path": "/mnt/tmp/20260821-101727-rca-successor-evidence-c366945b39/suite-receipt.json",
+    "suite_receipt_sha256": "c2e11db0be1fd70755c4c8fd0d09cad153d6a86ec234a88972c19322ddfe5062",
+    "w17_receipt_path": "/mnt/tmp/20260821-101727-rca-successor-evidence-c366945b39/w17-receipt.json",
+    "w17_receipt_sha256": "9b72369f487b78cdd370a29acef484e4d06201d8a1ff82f9155a1e8ef194e6b6",
 }
 
 RECEIPT_FIELDS = {
@@ -866,13 +879,66 @@ def _historical_ready_ids(host_tmp_root: Path) -> list[str]:
         not data.endswith(b"\n")
         or hashlib.sha256(data).hexdigest() != reference["raw_sha256"]
         or sha256_value(rows) != reference["semantic_sha256"]
-        or len(ids) != HISTORICAL_ITEMS
-        or len(set(ids)) != HISTORICAL_ITEMS
+        or len(ids) != HISTORICAL_READY_ITEMS
+        or len(set(ids)) != HISTORICAL_READY_ITEMS
         or any(not isinstance(item, str) or re.fullmatch(r"[0-9]{10}", item) is None for item in ids)
         or sha256_value(ids) != reference["ordered_work_item_ids_sha256"]
     ):
         raise RcaProdAdmissionError("rca_historical_ready_index_invalid", retryable=False)
     return ids
+
+
+def _historical_smoke10_ids(ready_ids: list[str]) -> list[str]:
+    ready_raw_sha256 = _require_hex(
+        HISTORICAL_INPUT_CONTRACT["ready_index"].get("raw_sha256"),
+        "rca_historical_smoke10_profile_invalid",
+    )
+    if ready_raw_sha256 != HISTORICAL_READY_INDEX_RAW_SHA256:
+        raise RcaProdAdmissionError(
+            "rca_historical_smoke10_profile_invalid", retryable=False
+        )
+    ranked = [
+        (
+            hashlib.sha256(
+                (
+                    HISTORICAL_PROFILE_DOMAIN
+                    + "\0"
+                    + ready_raw_sha256
+                    + "\0"
+                    + work_item_id
+                ).encode("utf-8")
+            ).hexdigest(),
+            work_item_id,
+        )
+        for work_item_id in ready_ids
+    ]
+    if len({rank for rank, _work_item_id in ranked}) != HISTORICAL_READY_ITEMS:
+        raise RcaProdAdmissionError(
+            "rca_historical_smoke10_rank_collision", retryable=False
+        )
+    selected = [work_item_id for _rank, work_item_id in sorted(ranked)[:HISTORICAL_ITEMS]]
+    if (
+        len(selected) != HISTORICAL_ITEMS
+        or sha256_value(selected) != HISTORICAL_ORDERED_WORK_ITEM_IDS_SHA256
+    ):
+        raise RcaProdAdmissionError(
+            "rca_historical_smoke10_profile_invalid", retryable=False
+        )
+    return selected
+
+
+def _historical_execution_profile() -> dict[str, Any]:
+    return {
+        "schema_version": HISTORICAL_PROFILE_SCHEMA,
+        "profile": HISTORICAL_PROFILE,
+        "domain": HISTORICAL_PROFILE_DOMAIN,
+        "ranking": HISTORICAL_PROFILE_RANKING,
+        "sample_count": HISTORICAL_ITEMS,
+        "source_ready_index_raw_sha256": HISTORICAL_INPUT_CONTRACT["ready_index"][
+            "raw_sha256"
+        ],
+        "ordered_work_item_ids_sha256": HISTORICAL_ORDERED_WORK_ITEM_IDS_SHA256,
+    }
 
 
 def build_historical_full_rerun_plan(
@@ -932,15 +998,18 @@ def build_historical_full_rerun_plan(
     request_sha256 = sha256_value(value)
     if request_sha256 != _require_hex(expected_request_sha256, "rca_historical_request_hash_invalid"):
         raise RcaProdAdmissionError("rca_historical_request_hash_mismatch", retryable=False)
+    # Keep the installed shared-state creator ABI; the sealed execution_profile
+    # is the authoritative distinction between legacy full308 and smoke10.
     task_id = "g1q3-rca-full308-" + request_sha256[:32]
     task_root = Path("/mnt/tmp") / task_id
     plan_path = task_root / "control/historical-full-chain-plan.json"
     reservation_path = task_root / "control/host-lane-reservation.json"
     plan_id = "plan-" + request_sha256[:32]
     ready_ids = _historical_ready_ids(HISTORICAL_HOST_TMP_ROOT)
+    execution_ids = _historical_smoke10_ids(ready_ids)
     shards, shard_artifacts, offset = [], [], 0
     for index, count in enumerate(HISTORICAL_SHARD_COUNTS, 1):
-        ids = ready_ids[offset:offset + count]
+        ids = execution_ids[offset:offset + count]
         offset += count
         shard_id = "shard-%03d" % index
         shard_path = task_root / "control/shards" / shard_id / "shard-manifest.json"
@@ -972,6 +1041,7 @@ def build_historical_full_rerun_plan(
         "selection_identity": dict(HISTORICAL_INPUT_CONTRACT["selection_identity"]),
         "review_disposition": copy.deepcopy(HISTORICAL_INPUT_CONTRACT["review_disposition"]),
         "ready_index": dict(HISTORICAL_INPUT_CONTRACT["ready_index"]),
+        "execution_profile": _historical_execution_profile(),
         "requirements_contract_hash": value["requirements_contract_hash"],
         "evaluator_fingerprints": fingerprints,
         "evaluator_fingerprints_sha256": value["evaluator_fingerprints_sha256"],
@@ -1045,6 +1115,8 @@ def derive_historical_result_binding(
         or not isinstance(run_identity, Mapping)
         or run_identity.get("plan_sha256") != plan.plan_sha256
         or final.get("item_count") != HISTORICAL_ITEMS
+        or final.get("ordered_work_item_ids_sha256")
+        != HISTORICAL_ORDERED_WORK_ITEM_IDS_SHA256
         or final.get("terminal_complete") is not True
     ):
         raise RcaProdAdmissionError(
