@@ -1126,6 +1126,18 @@ def derive_historical_result_binding(
         raise RcaProdAdmissionError(
             "rca_historical_final_seal_identity_invalid", retryable=False
         )
+    return {
+        "full_chain_output_seal_sha256": hashlib.sha256(final_raw).hexdigest(),
+        **derive_historical_reservation_binding(
+            plan, host_tmp_root=host_tmp_root,
+        ),
+    }
+
+
+def derive_historical_reservation_binding(
+    plan: HistoricalFullRerunPlan, *, host_tmp_root: Path | None = None,
+) -> dict[str, str]:
+    root = (host_tmp_root or HISTORICAL_HOST_TMP_ROOT) / plan.task_id
     reservation, reservation_raw = _read_historical_canonical_json(
         root / "control/host-lane-reservation.json", "reservation_sidecar"
     )
@@ -1139,7 +1151,6 @@ def derive_historical_result_binding(
             "rca_historical_sidecar_identity_invalid", retryable=False
         )
     return {
-        "full_chain_output_seal_sha256": hashlib.sha256(final_raw).hexdigest(),
         "host_reservation_raw_sha256": hashlib.sha256(reservation_raw).hexdigest(),
         "host_reservation_semantic_sha256": sha256_value(reservation),
     }
@@ -1408,6 +1419,7 @@ def release_historical_lane_reservation(
     if reason not in {
         "create_failed_missing_reconfirmed",
         "execution_failed_before_case_start",
+        "execution_terminal_failed",
         "pending_rejected_before_claim",
         "verify_succeeded",
     }:

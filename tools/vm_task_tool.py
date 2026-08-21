@@ -36,6 +36,7 @@ from gateway.pnc_rca_prod_admission import (
     build_rca_prod_command_argv,
     command_sha256 as rca_prod_command_sha256,
     consume_historical_bootstrap_and_reserve_lanes,
+    derive_historical_reservation_binding,
     derive_historical_result_binding,
     goal_sha256 as rca_prod_goal_sha256,
     issue_rca_prod_admission,
@@ -201,7 +202,7 @@ _RCA_SHARED_STATE_GOAL_PREFIX = (
 _RCA_VM_REPO_ROOT = RCA_PROD_VM_RELEASE_ROOT
 _RCA_FIXED_CLI_RELATIVE_PATH = f"./{RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH}"
 _RCA_VM_TASK_ROOT = "/home/mini/.hermes/shared-state/tasks"
-_RCA_HISTORICAL_OPERATIONS = frozenset({"plan", "execute", "verify"})
+_RCA_HISTORICAL_OPERATIONS = frozenset({"plan", "execute", "release", "verify"})
 _RCA_HISTORICAL_SERVICE_CAPABILITY = "run_g1q3_rca_historical_full308"
 _RCA_HISTORICAL_SERVICE_OWNER = "root_cause_analysis_agent"
 _RCA_HISTORICAL_TASK_TIMEOUT_SECONDS = 43200
@@ -1566,7 +1567,8 @@ def vm_task_historical_full_rerun_service(
     operation = str(operation or "").strip()
     if operation not in _RCA_HISTORICAL_OPERATIONS:
         return _vm_task_service_denied_payload(
-            "rca_historical_operation_denied", "operation must be plan, execute, or verify"
+            "rca_historical_operation_denied",
+            "operation must be plan, execute, release, or verify",
         )
     if operation != "execute" and bootstrap_receipt is not None:
         return _vm_task_service_denied_payload(
@@ -1594,6 +1596,110 @@ def vm_task_historical_full_rerun_service(
         return {
             **_vm_task_service_denied_payload("rca_historical_status_unavailable", type(exc).__name__),
             "retryable": True,
+        }
+    if operation == "release":
+        if (
+            status.get("success") is not True
+            or status.get("state") != "failed"
+            or status.get("dispatch_queue") != "failed"
+        ):
+            return {
+                **_vm_task_service_denied_payload(
+                    "rca_historical_release_not_terminal_failed",
+                    "canonical task must be terminal failed and absent from pending/claimed",
+                ),
+                "retryable": True,
+                "status": status,
+            }
+        expected_vm_root = str(Path(_DEFAULT_VM_CANONICAL_ROOT))
+        status_paths = status.get("paths")
+        if (
+            not isinstance(status_paths, Mapping)
+            or status_paths.get("root") != expected_vm_root
+        ):
+            return {
+                **_vm_task_service_denied_payload(
+                    "rca_historical_release_vm_truth_unavailable",
+                    "terminal proof did not come from the VM canonical root",
+                ),
+                "retryable": True,
+                "status": status,
+            }
+        terminal_proof = status.get("dispatch_terminal")
+        if (
+            not isinstance(terminal_proof, Mapping)
+            or terminal_proof.get("queue") != "failed"
+            or terminal_proof.get("state") != "failed"
+            or type(terminal_proof.get("worker_pid")) is not int
+            or terminal_proof.get("worker_pid") <= 0
+            or type(terminal_proof.get("exit_code")) is not int
+            or terminal_proof.get("exit_code") == 0
+            or terminal_proof.get("lease_until") not in (None, "")
+        ):
+            return {
+                **_vm_task_service_denied_payload(
+                    "rca_historical_release_terminal_proof_invalid",
+                    "VM failed dispatch record does not prove an exited worker",
+                ),
+                "retryable": True,
+                "status": status,
+            }
+        if _rca_existing_identity_error(
+            dict(status), task_id=plan.task_id, title=_historical_title(plan),
+            owner=plan.request["owner"], expected_meta=_historical_meta(plan),
+        ):
+            return _vm_task_service_denied_payload(
+                "rca_historical_existing_identity_conflict",
+                "failed task identity drifted",
+            )
+        try:
+            meta = status.get("meta")
+            historical_receipt = (
+                meta.get("rca_prod_admission_receipt")
+                if isinstance(meta, Mapping) else None
+            )
+            validated_receipt = validate_historical_full_rerun_bootstrap(
+                historical_receipt, plan=plan,
+                expected_owner=plan.request["owner"], allow_historical=True,
+            )
+            binding = derive_historical_reservation_binding(plan)
+            reservation = verify_historical_lane_reservation(
+                plan, raw_sha256=binding["host_reservation_raw_sha256"],
+                semantic_sha256=binding["host_reservation_semantic_sha256"],
+            )
+            if (
+                reservation.get("receipt_id") != validated_receipt["receipt_id"]
+                or reservation.get("reservation_id")
+                != validated_receipt["reservation_id"]
+            ):
+                raise RcaProdAdmissionError(
+                    "rca_historical_sidecar_authority_mismatch", retryable=False
+                )
+            lane_release = release_historical_lane_reservation(
+                plan, receipt_id=validated_receipt["receipt_id"],
+                reservation_id=validated_receipt["reservation_id"],
+                raw_sha256=binding["host_reservation_raw_sha256"],
+                semantic_sha256=binding["host_reservation_semantic_sha256"],
+                reason="execution_terminal_failed",
+            )
+        except RcaProdAdmissionError as exc:
+            return {
+                **_vm_task_service_denied_payload(
+                    "rca_historical_release_blocked", exc.code,
+                ),
+                "retryable": exc.retryable,
+            }
+        return {
+            "success": True, "operation": "release", "task_id": plan.task_id,
+            "plan_sha256": plan.plan_sha256,
+            "terminal_proof": {
+                "state": "failed", "dispatch_queue": "failed",
+                "run_id": status.get("run_id"),
+                "updated_at": status.get("updated_at"),
+                **dict(terminal_proof),
+            },
+            "host_reservation": reservation,
+            "lane_release": lane_release,
         }
     if operation == "verify":
         if status.get("success") is not True or status.get("state") != "completed":
@@ -3063,6 +3169,16 @@ def vm_task_status(task_id: str, include_markdown: bool = True) -> Dict[str, Any
             "task_id": task_id,
             "state": state,
             "dispatch_queue": dispatch_queue,
+            "dispatch_terminal": {
+                "queue": dispatch_queue,
+                "state": dispatch_payload.get("state"),
+                "run_id": dispatch_payload.get("run_id"),
+                "worker_pid": dispatch_payload.get("worker_pid"),
+                "exit_code": dispatch_payload.get("exit_code"),
+                "failure_stage": dispatch_payload.get("failure_stage"),
+                "lease_until": dispatch_payload.get("lease_until"),
+                "updated_at": dispatch_payload.get("updated_at"),
+            },
             "summary": _first_non_empty(
                 dispatch_payload.get("summary"),
                 dispatch_payload.get("latest_summary"),
@@ -3103,7 +3219,13 @@ def vm_task_status(task_id: str, include_markdown: bool = True) -> Dict[str, Any
             payload["status_md"] = _read_text_if_present(status_path)
             payload["result_md"] = _read_text_if_present(result_path)
         if state in terminal_states:
-            return payload
+            # A Host mirror is only a fallback.  Continue to the mounted VM
+            # root before accepting terminal truth, since its dispatch record
+            # carries the worker exit/lease proof needed by RCA release gates.
+            if is_vm_root:
+                return payload
+            host_fallback = payload
+            continue
         if not is_vm_root:
             host_fallback = payload
             continue

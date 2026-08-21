@@ -135,7 +135,11 @@ def test_vm_task_status_reads_task_status_and_result(monkeypatch, tmp_path):
     failed = root / "dispatch" / "failed"
     failed.mkdir(parents=True)
     (failed / f"{task_id}.json").write_text(
-        json.dumps({"task_id": task_id, "state": "failed", "summary": "boom"}),
+        json.dumps({
+            "task_id": task_id, "state": "failed", "summary": "boom",
+            "run_id": "run-1", "worker_pid": 1234, "exit_code": 1,
+            "failure_stage": "execution", "lease_until": None,
+        }),
         encoding="utf-8",
     )
     monkeypatch.setattr(vm_task_tool, "_DEFAULT_VM_CANONICAL_ROOT", root)
@@ -146,6 +150,11 @@ def test_vm_task_status_reads_task_status_and_result(monkeypatch, tmp_path):
     assert result["task_id"] == task_id
     assert result["state"] == "failed"
     assert result["dispatch_queue"] == "failed"
+    assert result["dispatch_terminal"] == {
+        "queue": "failed", "state": "failed", "run_id": "run-1",
+        "worker_pid": 1234, "exit_code": 1, "failure_stage": "execution",
+        "lease_until": None, "updated_at": None,
+    }
     assert result["status_md"].startswith("# Status")
     assert result["result_md"].startswith("# Result")
     assert result["paths"]["task_dir"] == str(task_dir)
@@ -243,6 +252,41 @@ def test_vm_task_status_uses_vm_terminal_truth_over_stale_host_copy(
     assert result["paths"]["root"] == str(vm_root)
     assert result["paths"]["checked_roots"] == [str(host_root), str(vm_root)]
     assert result["meta"]["rca_prod_capacity_sample_eligible"] is True
+
+
+def test_vm_task_status_uses_vm_failed_dispatch_proof_over_host_mirror(
+    monkeypatch, tmp_path
+):
+    host_root = tmp_path / "host-shared-state"
+    vm_root = tmp_path / "vm-shared-state"
+    task_id = "g1q3-rca-s1-" + "b" * 64
+    for root in (host_root, vm_root):
+        (root / "tasks" / task_id).mkdir(parents=True)
+    (host_root / "tasks" / task_id / "status.md").write_text(
+        "state: failed\n", encoding="utf-8"
+    )
+    (vm_root / "tasks" / task_id / "status.md").write_text(
+        "state: failed\n", encoding="utf-8"
+    )
+    (host_root / "dispatch" / "failed").mkdir(parents=True)
+    (vm_root / "dispatch" / "failed").mkdir(parents=True)
+    (host_root / "dispatch" / "failed" / f"{task_id}.json").write_text(
+        json.dumps({"task_id": task_id, "state": "failed"}), encoding="utf-8"
+    )
+    (vm_root / "dispatch" / "failed" / f"{task_id}.json").write_text(
+        json.dumps({
+            "task_id": task_id, "state": "failed", "run_id": "run-vm",
+            "worker_pid": 9876, "exit_code": 1, "failure_stage": "execution",
+            "lease_until": None,
+        }), encoding="utf-8"
+    )
+    monkeypatch.setattr(vm_task_tool, "_DEFAULT_HOST_CANONICAL_ROOT", host_root)
+    monkeypatch.setattr(vm_task_tool, "_DEFAULT_VM_CANONICAL_ROOT", vm_root)
+
+    result = vm_task_tool.vm_task_status(task_id, include_markdown=False)
+
+    assert result["paths"]["root"] == str(vm_root)
+    assert result["dispatch_terminal"]["worker_pid"] == 9876
 
 
 def test_vm_task_status_reports_missing_task(monkeypatch, tmp_path):

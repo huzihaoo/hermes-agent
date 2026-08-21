@@ -551,7 +551,11 @@ def test_reservation_timestamps_pass_c366_runner_parser(
 
 @pytest.mark.parametrize(
     "reason",
-    ["pending_rejected_before_claim", "execution_failed_before_case_start"],
+    [
+        "pending_rejected_before_claim",
+        "execution_failed_before_case_start",
+        "execution_terminal_failed",
+    ],
 )
 def test_release_accepts_bounded_retry_reason(tmp_path: Path, reason: str) -> None:
     value = plan(reason.replace("_", "-"))
@@ -742,6 +746,113 @@ def test_verify_derives_binding_from_fixed_final_and_reservation_artifacts(
     result = call("verify")
     assert result["success"] is False
     assert result["error_code"] == "rca_historical_verify_blocked"
+
+
+def test_release_failed_terminal_uses_exact_receipt_sidecar_and_cas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value = plan()
+    receipt = bootstrap(value)
+    status = {
+        "success": True, "state": "failed", "dispatch_queue": "failed",
+        "task_id": value.task_id, "title": vm_task_tool._historical_title(value),
+        "owner": "songying", "run_id": "worker-" + value.task_id,
+        "updated_at": "2026-08-21T15:27:35.793086+00:00",
+        "paths": {"root": str(vm_task_tool._DEFAULT_VM_CANONICAL_ROOT)},
+        "dispatch_terminal": {
+            "queue": "failed", "state": "failed",
+            "run_id": "worker-" + value.task_id, "worker_pid": 3944448,
+            "exit_code": 1, "failure_stage": "execution",
+            "lease_until": None,
+            "updated_at": "2026-08-21T15:27:35.793086+00:00",
+        },
+        "meta": {
+            **vm_task_tool._historical_meta(value),
+            "rca_prod_admission_receipt": receipt,
+        },
+    }
+    checked: dict[str, object] = {}
+    released: dict[str, object] = {}
+    monkeypatch.setattr(vm_task_tool, "vm_task_status", lambda *_a, **_k: status)
+    monkeypatch.setattr(
+        vm_task_tool,
+        "derive_historical_reservation_binding",
+        lambda _plan: {
+            "host_reservation_raw_sha256": "1" * 64,
+            "host_reservation_semantic_sha256": "2" * 64,
+        },
+    )
+
+    def verify(plan_arg, **kwargs):
+        checked.update(kwargs)
+        assert plan_arg.plan_sha256 == value.plan_sha256
+        return {
+            "schema_version": admission.HISTORICAL_RESERVATION_SCHEMA,
+            "lane_count": 3,
+            "receipt_id": receipt["receipt_id"],
+            "reservation_id": receipt["reservation_id"],
+        }
+
+    monkeypatch.setattr(vm_task_tool, "verify_historical_lane_reservation", verify)
+    monkeypatch.setattr(
+        vm_task_tool,
+        "release_historical_lane_reservation",
+        lambda _plan, **kwargs: released.update(kwargs) or {
+            "released": True, "already_released": False,
+        },
+    )
+
+    result = call("release")
+
+    assert result["success"] is True
+    assert result["operation"] == "release"
+    assert result["terminal_proof"] == {
+        "state": "failed", "dispatch_queue": "failed",
+        "run_id": "worker-" + value.task_id,
+        "updated_at": "2026-08-21T15:27:35.793086+00:00",
+        "queue": "failed", "worker_pid": 3944448, "exit_code": 1,
+        "failure_stage": "execution", "lease_until": None,
+    }
+    assert checked == {
+        "raw_sha256": "1" * 64,
+        "semantic_sha256": "2" * 64,
+    }
+    assert released == {
+        "receipt_id": receipt["receipt_id"],
+        "reservation_id": receipt["reservation_id"],
+        "raw_sha256": "1" * 64,
+        "semantic_sha256": "2" * 64,
+        "reason": "execution_terminal_failed",
+    }
+
+
+@pytest.mark.parametrize(
+    ("state", "dispatch_queue"),
+    [("running", "claimed"), ("failed", "claimed"), ("failed", "pending")],
+)
+def test_release_requires_failed_queue_and_no_active_claim(
+    monkeypatch: pytest.MonkeyPatch, state: str, dispatch_queue: str,
+) -> None:
+    value = plan()
+    monkeypatch.setattr(
+        vm_task_tool,
+        "vm_task_status",
+        lambda *_a, **_k: {
+            "success": True, "state": state, "dispatch_queue": dispatch_queue,
+            "task_id": value.task_id,
+        },
+    )
+    monkeypatch.setattr(
+        vm_task_tool,
+        "release_historical_lane_reservation",
+        lambda *_a, **_k: pytest.fail("active or non-terminal task released lanes"),
+    )
+
+    result = call("release")
+
+    assert result["success"] is False
+    assert result["error_code"] == "rca_historical_release_not_terminal_failed"
+    assert result["retryable"] is True
 
 
 def test_verify_runs_offline_verifier_before_releasing_lane(
