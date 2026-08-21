@@ -5,13 +5,21 @@
 - [候选测试报告](feishu-aily-agent-test-report.md)
 - [Hermes 业务知识检索接入设计](hermes-knowledge-retrieval-routing.md)
 - [业务接入设计工作记录](feishu-aily-business-integration-worklog.md)
-- [正式分支集成交接](feishu-aily-business-integration-handoff.md)
+- [本机 RCA observer 交接](feishu-aily-business-integration-handoff.md)
 
-当前 Aily 工具是独立、默认关闭的候选。用户身份 API canary 已打通，但生产 gateway
-尚未启用。目标体验不是让用户手工说“查企业知识库”，而是由统一路由根据关键词和
-任务上下文，在 Web、本地知识工程和 Aily 企业知识之间自动选择。RCA 属于企业知识
-required-attempt 任务：必须尝试增强，但失败后继续原 RCA，绝不把知识回答当成证据。
-该自动路由仍待 RCA 正式生产分支实现。
+当前 Aily transport/tool 是独立、默认关闭的候选。固定员工用户身份 API canary 已
+打通；2026-08-21 还在无飞书 session context 的本机独立进程中通过 user smoke 完成了
+一次安全调用。但本机后台 RCA observer 尚未实现或启用，production gateway 也未启用
+该工具。
+
+Owner 最新决定把首版范围收敛为**仅本机 Hermes host 的 RCA observer**：可复用胡子豪
+固定 UAT，能力优先；权限代理、审计归属、ACL 漂移和 token 生命周期风险登记为
+`accepted/deferred`，不作为首版门禁。运行时能力不得进入 PNC/RCA 业务仓、VM、业务
+schema/产物，也不得成为普通 Hermes/飞书对话或其他调用方可借用的通用工具。Aily 回答
+只作 owner-only reference，失败继续原 RCA，不能当成执行证据。
+
+这项决定不等于 observer 已实现或已发布。本文件中现有 tool/smoke 只提供 API、身份和
+隔离参照；首版本机 observer 仍需单独完成实现和验收，不再等待正式 RCA 业务分支。
 
 新版 Aily 智能体详情页地址中的 `agent_<...>` 是 Agent ID：
 
@@ -30,11 +38,23 @@ Aily Agent Chat API 同时支持应用身份和用户身份：
 - `user_access_token` 代表完成 OAuth 的员工。直连企业知识按该用户的可搜
   权限过滤。
 
-本机企业知识问答采用固定用户模式：`lark-cli` 只作为 OAuth token broker，
-Hermes 不读取、不落盘或打印 UAT。每次请求先以 `--as user` 调用
+候选交互路径采用固定用户模式：`lark-cli` 只作为 OAuth token broker，Hermes 不读取、
+不落盘或打印 UAT。每次请求先以 `--as user` 调用
 `/open-apis/authen/v1/user_info`，同时核对调用应用内的 `open_id` 和跨应用稳定的
-`union_id`。只有来自飞书、且当前会话 `union_id` 精确匹配该固定用户时才可调用；
-CLI、cron、API、其他飞书用户和缺失身份的上下文全部失败关闭，且不会回退 TAT。
+`union_id`。候选工具还要求当前飞书会话匹配该用户；这项历史实现已用于 canary，
+但不会作为首版后台入口。独立 user smoke 可以在没有飞书 session context 时直接验证
+固定 profile 和用户身份，这条路径只用于验收/诊断；它已证明 standalone transport
+能力，不代表通用 CLI/API 被授权借权。
+
+首版后台 observer 没有可继承的飞书会话身份，因此必须由**隔离的 observer 专用
+broker**在每次 create 前核对 token 实际用户与配置中的胡子豪 `open_id + union_id`。
+任一字段缺失或不匹配都在发问题前失败，且不回退 TAT。该 broker 只能服务本机 RCA
+observer；普通对话、其他用户、CLI/API、resident 业务 worker、Kafka/outbox 和 VM 都
+不能借用。owner-only 人工 smoke 是唯一允许的非运行时使用，仅用于验收和诊断。
+
+首版接受并延后的风险包括：查询权限按胡子豪权限过滤、飞书侧审计主体显示胡子豪、
+权限可能漂移，以及 OAuth 到期/撤权可能导致增强不可用。这些风险未被消除，但不阻断
+首版；身份错配、token 泄露、扩大调用面和把答案写给更广受众仍不在风险接受范围内。
 
 ## 飞书侧配置
 
@@ -53,10 +73,11 @@ MCP 是 Agent 后台配置的服务端能力，请求体不传 MCP URL、工具�
 是否执行 MCP 取决于 Agent 的对话模式和已发布技能。下游 MCP 使用什么身份、
 访问什么数据必须单独核验；外层 UAT 不自动等价于 MCP 的用户委托。
 
-## Hermes 用户模式配置
+## 本机固定用户配置
 
 UAT 保存在隔离的 `lark-cli` 凭据目录中。目录必须归当前用户所有且权限为
-`0700`；配置文件保持 `0600`。以下值放入受管 Hermes 配置，绝不写入仓库：
+`0700`；配置文件保持 `0600`。以下值只放入 owner-only 本机 Hermes 配置，绝不写入
+仓库、业务 schema、RCA artifact、VM 输入或共享 receipt：
 
 ```text
 FEISHU_AILY_AUTH_MODE=user
@@ -89,27 +110,22 @@ lark-cli --profile "$CALLER_APP_ID" api GET \
 `union_id` 登记到受管配置。姓名只用于人工核对，不能作为授权键。不要切换全局
 active profile，也不要把 user-info 输出放进共享日志。
 
-`FEISHU_AILY_AUTH_MODE` 必须显式配置；缺失时工具失败关闭，不会静默回退到
+`FEISHU_AILY_AUTH_MODE` 必须显式配置；缺失时 broker 失败关闭，不会静默回退到
 tenant 身份。用户模式固定给每个问题增加“只允许企业知识、禁止公网、未命中即
-停止”的约束，不提供关闭开关。它只是客户端纵深防护，不是 grounded 证明；
-Aily 后台的工具和兜底策略仍是权威控制点。
+停止”的约束，不提供关闭开关。它只是客户端纵深防护，不是 grounded 证明；Aily
+后台的工具和兜底策略仍是权威控制点。
 
-仅在开发 home 或受管隔离 staging 中启用独立 toolset；不要对 active home
-直接执行该命令：
+首版 RCA observer **不得**在 active gateway 或普通对话 profile 中执行
+`hermes tools enable feishu_aily_agent`。候选工具名 `feishu_aily_agent_chat` 只保留作
+实现和测试参照，不是首版运行时暴露面。observer 必须通过自己的本机 broker API 调用，
+且该 API 不注册到通用模型 tool schema。
 
-```bash
-hermes tools enable feishu_aily_agent --platform feishu
-```
+tenant 模式不属于首版 RCA observer，不能在 user identity 失败时作为 fallback。
 
-该 toolset 只允许飞书平台使用。工具名为 `feishu_aily_agent_chat`，输入
-`content`，可选 `session_id` 和已上传的 `agent_attachment_ids`。
+## 本机 RCA observer 使用边界
 
-若另有明确的应用身份场景，可设置 `FEISHU_AILY_AUTH_MODE=tenant`，并配置
-`FEISHU_AILY_AUTH_APP_SECRET`。tenant 模式与本企业知识用户模式相互独立。
-
-## 任务内使用
-
-交互式任务中，主代理传入业务问题，用户不需要提供 Agent ID 或身份字段：
+observer 构造的业务问题不包含 Agent ID 或身份字段；以下只展示有界问题内容的形状，
+不是允许普通对话直接调用固定 UAT 的接口：
 
 ```json
 {
@@ -131,18 +147,24 @@ hermes tools enable feishu_aily_agent --platform feishu
 ```
 
 `answer_available=true` 只表示返回了文本，不等于企业知识已命中或
-`grounded=true`。只在同一用户、同一任务需要连续追问时复用 `session_id`；
-不得跨用户或跨任务共享会话。`no_match`、身份或协议错误不能自动降级到
-Web 搜索内部含义。
+`grounded=true`。每个 observer job 使用全新 session，不跨 task/generation 共享对话
+历史。`no_match`、身份或协议错误不能自动降级到 Web 搜索内部含义。
 
-当前候选允许主代理显式选择此工具。未来统一路由上线后，业务关键词和
-RCA 任务上下文将自动触发；具体契约见
-[Hermes 业务知识检索接入设计](hermes-knowledge-retrieval-routing.md)。交互式固定员工
-UAT 不用于 Kafka/outbox；自动 RCA 将使用独立、最小权限、只读服务身份。
+首版有两个本机、异步且不影响原链的机会点：
 
-RCA 中的 Aily 内容只用于解释术语、提示待验证假设和聚焦后续分析。查询超时、
-未命中、身份不可用或仅返回无来源文本时，原 VM、报告和投递链继续，不回退 Web，
-也不降低或提高现有证据结论。
+1. 每个 eligible RCA job 都执行一次第一阶段 required attempt，从既有只读 RCA
+   locator/允许字段构造至多一条 query；关键词只决定查什么，不决定是否尝试；
+2. 原报告完成后，observer 用版本化确定性规则从允许字段提取、排序、去重和截断术语，
+   仅在出现新注册术语时执行至多一轮、两条补查 query。
+
+第二阶段不要求 VM 生成 gap，不增加业务 schema 或 artifact，也不恢复、重跑或重新投递
+主任务。报告内容按不可信数据处理；完整 issue/report、ID、URL、PDCL、帧、日志、用户、
+评论、附件和既有 root cause 都不能进入 query。
+
+RCA 中的 Aily 内容只用于解释术语、提示待验证假设和聚焦人工后续分析。结果只写
+owner-only 本机 reference/receipt，不回写原报告、事项或投递。查询超时、未命中、身份
+不可用或仅返回无来源文本时，原 VM、报告和投递链保持不变，也不降低或提高现有证据
+结论。
 
 ## API 形状
 
@@ -195,53 +217,32 @@ UAT 和其他环境项。环境文件必须是当前用户持有的绝对路径�
 调用方 App ID。
 
 本机人工验收时可显式增加 `--show-answer`，最多显示 300 字；答案是内部知识，
-禁止把该输出写入共享日志或公开产物。smoke 只验证凭据、endpoint 和知识回答，
-不等价于 resident gateway 发布门禁。
+禁止把该输出写入共享日志、业务仓或 RCA 产物。smoke 只验证凭据、endpoint 和知识
+回答，不证明后台 observer 已实现或已启用。
 
-## 发布与生效
+## 本机 observer 生效边界
 
-`gateway/*.py` 和 `tools/*.py` 需要重启常驻 gateway 才能生效；当前 gateway 会在
-每轮重新读取 `config.yaml`，并重新加载当前 profile 的凭据。因此 active home 的
-配置修改可能先于代码切换被旧 resident 观察到。正式发布必须遵循
-`HERMES_RUNTIME_GOVERNANCE_RUNBOOK.md` 和 `pnc-business-prod-effect-chain.md`，禁止
-在代码物化和发布门之前对 active home 运行 `tools enable`：
+本任务没有发布或生产生效动作。当前 production gateway toolset 保持关闭，不执行
+gateway restart、受管 materialize、业务分支合入、VM 下发或业务 schema migration。
 
-1. 在候选工作树完成受影响测试并形成一个 clean commit。
-2. 在 owner-only staging home 中准备目标 `config.yaml`/`.env`，两个文件路径都
-   必须为绝对路径。启用时清空继承环境，同时钉住 staging home、config
-   和 env，并调用候选工作树的 CLI，不能用全局 `hermes`：
+后续实现本机 observer 时，至少满足以下条件才能在本机显式启用：
 
-   ```bash
-   env -i \
-     HOME=/Users/songying USER=songying LOGNAME=songying \
-     PATH=/usr/local/bin:/usr/bin:/bin TMPDIR=/private/tmp LANG=zh_CN.UTF-8 \
-     HERMES_HOME=/Users/songying/.hermes-release-staging/feishu-aily-agent \
-     HERMES_CONFIG_PATH=/Users/songying/.hermes-release-staging/feishu-aily-agent/config.yaml \
-     HERMES_ENV_PATH=/Users/songying/.hermes-release-staging/feishu-aily-agent/.env \
-     /usr/local/bin/uv --directory \
-       /Users/songying/.codex-worktrees/feishu-aily-knowledge-qa-20260813 \
-       run --frozen hermes tools enable feishu_aily_agent --platform feishu
-   ```
+1. 能力代码、配置、凭据引用和新增状态都位于 owner-only Hermes 本机边界，业务仓和
+   RCA artifact root 的 before/after diff 为零。
+2. observer 专用 broker 每次 create 前精确核验胡子豪 `open_id + union_id`，不把 UAT
+   或 App Secret 暴露给 observer 进程、日志和 receipt。
+3. 通用 Hermes/飞书对话、其他用户、CLI/API、Kafka/outbox、dispatcher 和 VM 都没有
+   broker 调用入口；候选 toolset 保持关闭。
+4. 第一阶段 required attempt 与 completed-report 确定性 extractor 通过 allowlist、
+   幂等、注册术语、固定排序/上限和 prompt-like 文本负例测试；二阶段最多一轮两条 query。
+5. timeout、403、429、5xx、no-match、bad JSON、oversize、crash、create-unknown 和本地
+   存储失败都只终止 observer job，不改变原 RCA、报告或投递。
+6. owner-only 人工 `OOI是什么?` canary 重新证明真实能力，默认 receipt 不记录问题、
+   答案正文、身份或 token；缺少 provenance 时只标 `answer_only`。
 
-   命令前先以 owner-only 权限创建 staging 目录，并用受管流程写入目标
-   `.env`；不得从 active home 复制未经审查的其他凭据。然后回读三个路径
-   确认 CLI 只修改了 staging，计算目标 config/env SHA。预置凭据时
-   active toolset 必须继续关闭。
-3. 根据 owner 的明确发布意图，用受管 materializer 物化精确 commit；禁止直接
-   修改 active detached runtime。对物化代码、staging 配置和目标 manifest 运行
-   governance、strict drift、release fingerprint 及发布门。
-4. 在同一个受管 promotion transaction 中原子切换 active config/env、更新
-   `LIVE_MANIFEST.json` 绑定并重载 resident，不能把这些步骤拆成提前生效的手工修改。
-   若 LaunchAgent 的
-   program/working directory 未变化，只重启 `ai.hermes.gateway`；若路径变化，按
-   runbook 执行 `bootout/bootstrap`，不能只 `kickstart`。
-5. 核对新 PID、运行目录/commit、公开 health、`gateway_state.json` PID，以及
-   Feishu platform connected；回读 active config 的 raw SHA/semantic SHA 和 env 的
-   byte SHA，确认它们与 manifest 绑定一致。
-6. 由被固定授权的员工在真实飞书会话提问内部 canary，确认 session 只调用
-   `feishu_aily_agent_chat`。同时保留 Aily 已发布版本/后台策略或活动日志的证据，
-   证明知识未命中时不会走公网兜底；仅凭答案正文不能证明 grounded。默认回执
-   不得记录内部答案正文。
+专用服务身份、细粒度 ACL、审计触发者映射和 token 生命周期自动化已由 owner 延后，
+不属于上述首版门禁。若未来扩大到多用户、通用对话、远端服务、业务仓或 VM，必须重新
+评审，不能沿用本次风险接受。
 
 ## lark-cli 边界
 

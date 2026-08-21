@@ -44,16 +44,17 @@ def test_documented_smoke_keeps_question_out_of_shell_arguments():
     assert "source /Users/songying/.hermes/.env" not in documentation
 
 
-def test_documented_staging_enable_is_explicitly_isolated_from_active_home():
+def test_documented_rca_observer_is_explicitly_host_only_and_not_a_tool():
     documentation = DOC.read_text(encoding="utf-8")
 
-    assert "env -i" in documentation
-    assert "HERMES_HOME=/Users/songying/.hermes-release-staging/" in documentation
-    assert "HERMES_CONFIG_PATH=/Users/songying/.hermes-release-staging/" in documentation
-    assert "HERMES_ENV_PATH=/Users/songying/.hermes-release-staging/" in documentation
-    assert "/usr/local/bin/uv --directory" in documentation
-    assert "config 的 raw SHA/semantic SHA" in documentation
-    assert "env 的\n   byte SHA" in documentation
+    assert "仅本机 Hermes host 的 RCA observer" in documentation
+    assert "可复用胡子豪" in documentation
+    assert "固定 UAT" in documentation
+    assert "`accepted/deferred`" in documentation
+    assert "不得成为普通 Hermes/飞书对话" in documentation
+    assert "不注册到通用模型 tool schema" in documentation
+    assert "业务仓、VM、业务" in documentation
+    assert "schema/产物" in documentation
 
 
 def test_documentation_separates_verified_tool_from_future_automatic_routing():
@@ -65,13 +66,13 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
 
     assert "feishu-aily-agent-test-report.md" in main_documentation
     assert "hermes-knowledge-retrieval-routing.md" in main_documentation
-    assert "生产 gateway\n尚未启用" in main_documentation
+    assert "本机后台 RCA observer 尚未实现或启用" in main_documentation
     assert "answer_available=true" in main_documentation
     assert "不等于企业知识已命中" in main_documentation
-    assert "不要对 active home" in main_documentation
+    assert "active gateway" in main_documentation
     assert "结果：" in test_report and " passed" in test_report
-    assert "尚未部署到生产 gateway" in test_report
-    assert "自动检索路由未实现" in test_report
+    assert "尚未部署到 production gateway" in test_report
+    assert "本机自动路由未实现" in test_report
     assert "a1e4565ec7 -> e25ba59684 -> 4a0adaba91" in test_report
     assert "HTTP 200 + 业务码 `2320008`" in test_report
     assert "session-derived attestation" in test_report
@@ -81,12 +82,13 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
     assert "business_knowledge_context_v1" in routing
     assert "answer_only" in routing
     assert "identity_unavailable" in routing
-    assert "专用 RCA 服务用户/UAT" in routing
-    assert "固定员工 UAT" in routing
+    assert "胡子豪固定 UAT" in routing
+    assert "Keychain/lark-cli broker" in routing
+    assert "不能通用借权" in routing
     assert "关闭公开网络" in routing
     assert "继续原链" in routing
     assert "host-mediated" in routing
-    assert "绑定同一 `submission_key`、generation" in routing
+    assert "sealed report" in routing
     for stage in (
         "盲区扫描",
         "先出原型",
@@ -100,8 +102,8 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
         assert stage in worklog
     assert "不是运行时流程" in worklog
     assert "证据 Quiz" in handoff
-    assert "必须 9/9" in handoff
-    assert "八步方法不进入 runtime contract" in handoff
+    assert "本机启用前逐题提供代码、测试或 owner-only receipt" in handoff
+    assert "不是当前上线门" in handoff
 
     contract_text = routing.split(
         "<!-- knowledge-routing-contract:begin -->", 1
@@ -128,6 +130,35 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
     assert contract["gates_original_chain"] is False
     assert contract["failure_policy"] == "continue_original_chain"
     assert contract["business_knowledge_is_execution_evidence"] is False
+    assert contract["local_host_only"] is True
+    assert contract["business_repo_changes"] is False
+    assert contract["vm_changes"] is False
+    assert contract["credentials_and_provider_host_only"] is True
+    assert contract["owner_only_reference"] is True
+    assert contract["web_fallback_for_business"] is False
+    assert contract["identity_strategy"] == (
+        "reuse_pre_registered_huzhihao_fixed_uat"
+    )
+    assert contract["capability_priority"] is True
+    assert contract["risk_deferred"] is True
+    assert contract["deferred_items"] == [
+        "dedicated_service_identity",
+        "identity_and_delegation_risk_review",
+    ]
+    assert contract["identity_controls"] == {
+        "pre_registered_owner": "胡子豪",
+        "exact_match_required": ["profile", "open_id", "union_id"],
+        "verify_before_each_create": True,
+        "credential_broker": "keychain_lark_cli",
+        "raw_token_export": False,
+        "token_to_vm": False,
+        "rca_host_observer_provider_only": True,
+        "general_session_delegation": False,
+    }
+    assert contract["initial_runtime_scope"] == (
+        "rca_local_host_observer_provider_only"
+    )
+    assert contract["ordinary_task_provider_enabled"] is False
     assert contract["original_chain_mutations"] == {
         "dispatcher": False,
         "execution_request_v2": False,
@@ -165,36 +196,29 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
         "identity_policy_fingerprint",
     ]
     assert contract["rca_enhancement_points"] == [
-        "post_vm_materialization_async_preflight",
-        "post_core_gap_async_lookup",
-        "owner_only_reference_appendix",
+        "post_vm_materialization_host_async_preflight",
+        "post_completed_sealed_report_host_async_followup",
+        "host_private_owner_only_reference",
     ]
-    assert contract["second_stage_fork"] == {
-        "after": "s6_report_seal_and_optional_gap_attempt",
-        "main_branch": [
-            "main_task_completion_without_host_wait",
-            "original_required_delivery",
-        ],
-        "reference_branch_requires": "valid_gap_atomic_seal",
-        "reference_branch": [
-            "host_gap_observer_claim",
-            "host_business_lookup_create_once",
-            "owner_only_addendum_seal",
-        ],
-    }
-    assert contract["second_stage_gap_outcomes"] == {
-        "valid_gap": ["main_branch", "reference_branch"],
-        "gap_absent": ["main_branch"],
-        "gap_build_or_seal_error": ["main_branch", "knowledge_local_metric_only"],
+    assert contract["rca_phases"] == ["preflight", "report_followup:1"]
+    assert contract["second_stage_host_observer"] == {
+        "trigger": "completed_sealed_report",
+        "source_access": "read_only",
+        "term_extraction": "deterministic_registry",
+        "provider_execution": "local_host_only",
+        "output": "host_private_owner_only_addendum",
+        "original_task_wait": False,
     }
     assert contract["second_stage_controls"] == {
-        "vm_direct_access": False,
+        "sealed_report_required": True,
         "same_generation_binding": True,
         "cross_generation_reuse": False,
         "human_blocking_state": False,
+        "main_task_wait": False,
         "main_task_resume": False,
         "required_delivery_effect": False,
-        "gap_artifact_failure_blocks_main": False,
+        "business_schema_write": False,
+        "report_observation_failure_blocks_main": False,
         "max_rounds": 1,
         "max_queries": 2,
     }
@@ -269,8 +293,8 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
         "length_field": "answer_bytes",
         "sha256_field": "answer_sha256",
     }
-    shared_common = set(contract["shared_receipt_common_fields_exact"])
-    assert shared_common == {
+    host_audit_common = set(contract["host_audit_receipt_common_fields_exact"])
+    assert host_audit_common == {
         "schema_version",
         "submission_key",
         "generation",
@@ -285,7 +309,7 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
         "retrieved_at",
         "latency_ms",
     }
-    assert contract["shared_receipt_status_fields_exact"] == {
+    assert contract["host_audit_receipt_status_fields_exact"] == {
         "grounded_match": ["answer_bytes"],
         "answer_only": ["answer_bytes"],
         "no_match": [],
@@ -293,32 +317,28 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
         "timeout": ["error_code"],
         "error": ["error_code"],
     }
-    assert "summary" in contract["shared_receipt_forbidden_fields"]
-    assert "query" in contract["shared_receipt_forbidden_fields"]
-    assert "agent_chat_id" in contract["shared_receipt_forbidden_fields"]
-    assert "lookup_receipt_relpath" in contract["shared_receipt_forbidden_fields"]
-    assert "source_refs_relpath" in contract["shared_receipt_forbidden_fields"]
+    host_audit_forbidden = contract["host_audit_receipt_forbidden_fields"]
+    assert "summary" in host_audit_forbidden
+    assert "query" in host_audit_forbidden
+    assert "agent_chat_id" in host_audit_forbidden
+    assert "lookup_receipt_relpath" in host_audit_forbidden
+    assert "source_refs_relpath" in host_audit_forbidden
     assert "## 从检索到交付的八步闭环" not in routing
     assert "### 闭环状态机" not in routing
-
-    gap_section = routing.split("`business_knowledge_gap_v1` 只允许：", 1)[1]
-    gap = json.loads(gap_section.split("```json", 1)[1].split("```", 1)[0])
-    assert gap["phase"] == "gap:1"
-    assert gap["submission_key"]
-    assert gap["gap_id"]
-    assert gap["run_id"]
-    assert gap["artifact_set_id"]
-    assert gap["request_sha256"]
-    assert gap["rca_contract_sha256"]
-    assert gap["s6_stage_receipt_sha256"]
-    assert "<artifact_root>/business_knowledge/gaps/gap-1.json" in routing
-    assert "<artifact_root>/stage_lineage/s6_report.json" in routing
-    assert "business_knowledge_canonical_json_v1" in routing
-    assert "`validate_stage_lineage_receipt` 不够" in routing
-    assert "六个字段全部等于当前 task/goal" in routing
-    assert "排除 `gap_id` 后的 normalized gap" in routing
-    assert "不能用新 helper 重算" in routing
-    assert "不得进入 `delivery_contract.json`" in routing
+    for obsolete_contract in (
+        "business_knowledge_gap_v1",
+        "second_stage_fork",
+        "second_stage_gap_outcomes",
+        "valid_gap_atomic_seal",
+        "gateway/pnc_rca_stage_lineage.py",
+        "<artifact_root>/business_knowledge/gaps/gap-1.json",
+        '"phase": "gap:1"',
+        "专用 RCA 服务用户/UAT",
+        "绝不借用固定员工 UAT",
+        "不用该 UAT",
+        "正式 RCA 分支回归",
+    ):
+        assert obsolete_contract not in routing
 
     receipt_section = routing.split("`answer_only` receipt 示例：", 1)[1]
     receipt = json.loads(
@@ -371,46 +391,41 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
     assert addendum["mode"] == "active"
     assert addendum["status"] == "answer_only"
     assert addendum["influence"] == "reference_only"
-    assert addendum["phase"] == "gap:1"
-    assert addendum["run_id"]
-    assert addendum["artifact_set_id"]
-    assert addendum["request_sha256"]
+    assert addendum["phase"] == "report_followup:1"
     assert addendum["rca_contract_sha256"]
-    assert addendum["s6_stage_receipt_sha256"]
+    assert addendum["sealed_report_sha256"]
+    assert addendum["report_seal_receipt_sha256"]
+    assert addendum["term_registry_fingerprint"]
     for field in contract["lookup_receipt_status_fields_exact"]["answer_only"]:
         assert addendum[field]
     for field in contract["consumer_receipt_binding_required"]:
         assert addendum[field]
-    assert addendum["lookup_receipt_relpath"].startswith("gap-1/")
+    assert addendum["lookup_receipt_relpath"].startswith("report-followup-1/")
     addendum_bytes = addendum["content"].encode("utf-8")
     assert len(addendum_bytes) == addendum["answer_bytes"]
     assert hashlib.sha256(addendum_bytes).hexdigest() == addendum["answer_sha256"]
 
     safe_section = routing.split(
-        "Shared/audit 层使用 exact `business_knowledge_safe_receipt_v1`，例如：", 1
+        "Host-private audit 层使用 exact "
+        "`business_knowledge_safe_receipt_v1`，例如：",
+        1,
     )[1]
     safe_receipt = json.loads(
         safe_section.split("```json", 1)[1].split("```", 1)[0]
     )
     safe_status_fields = set(
-        contract["shared_receipt_status_fields_exact"][safe_receipt["status"]]
+        contract["host_audit_receipt_status_fields_exact"][safe_receipt["status"]]
     )
-    assert set(safe_receipt) == shared_common | safe_status_fields
-    assert not (set(safe_receipt) & set(contract["shared_receipt_forbidden_fields"]))
+    assert set(safe_receipt) == host_audit_common | safe_status_fields
+    assert not (set(safe_receipt) & set(host_audit_forbidden))
     assert set({**safe_receipt, "raw_provider_payload": {}}) != (
-        shared_common | safe_status_fields
+        host_audit_common | safe_status_fields
     )
 
-    exact_key = (
-        "(submission_key,generation,phase,query_hmac_sha256,\n"
-        "  provider_policy_fingerprint,identity_policy_fingerprint)"
-    )
-    assert exact_key in worklog
-    assert "同一 phase、同一授权主体/范围内去重" in worklog
     assert "同一 `phase` 内相同 query digest 不重复调用" in routing
-    assert "main branch: complete original task and required delivery without host wait" in routing
-    assert "不得把 gap 变成 S6、task completion 或 delivery gate" in routing
-    assert "ENOSPC、permission、schema/hash、existing-target conflict" in routing
+    assert "complete original task and required delivery without host wait" in routing
+    assert "observer 只读，不创建或修改 VM" in routing
+    assert "不要求业务仓库或 VM 新增 helper" in routing
     assert "现有一次性 `run_agent_chat_user()` 不能原样承担" in routing
     assert "现有 transport 的可选 `session_id` 参数" in routing
     assert "POST 前先 durable seal `creating` job state" in routing
@@ -418,8 +433,13 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
     assert "只校验 `lookup_receipt_sha256` 而不校验正文绑定不合格" in routing
     assert "reserved -> identity_check -> identity_unavailable" in routing
     assert "这些状态以 lookup receipt 终止且不创建" in routing
-    assert "最多一轮 host gap、两条 lookup" in routing
-    assert "不创建 failure addendum" in handoff
+    assert "最多一轮、最多两条 query" in routing
+    assert "原任务不等待、不 resume、不重投递" in routing
+    assert "每次 Aily create 前" in routing
+    assert "profile/open_id/union_id 任一不符" in routing
+    assert "每个六元 job 获得全新 Aily session" in routing
+    assert "## 普通飞书任务（首版不启用）" in routing
+    assert "普通任务的 `auto` 只是未来路由语义" in routing
     assert "base_contract_sha256" not in routing
     assert "core_result_sha256" not in routing
 
@@ -431,17 +451,16 @@ def test_business_integration_handoff_quiz_is_complete_and_evidence_bounded():
 
     for number in range(1, 10):
         assert f"{number}. **" in quiz
-    assert "继续原 RCA" in quiz
-    assert "只作 reference" in quiz
-    assert "专用最小权限服务身份" in quiz
-    assert "不能借员工 UAT" in quiz
-    assert "host 查询" in quiz
-    assert "主 task 不等待、不 resume" in quiz
-    assert "v2 request/hash" in quiz
-    assert "非空文本不够" in quiz
+    assert "胡子豪固定 UAT" in quiz
+    assert "接受并延后" in quiz
+    assert "只有本机 RCA observer" in quiz
+    assert "不依赖 VM gap" in quiz
+    assert "owner-only reference" in quiz
+    assert "业务 schema/artifact" in quiz
+    assert "历史 `Completed + content` 本身不够" in quiz
     assert "不是运行时流程" in worklog
-    assert "设计合同自检：**9/9**" in worklog
-    assert "不代表 production release" in worklog
+    assert "文档自检不代表实现验收" in worklog
+    assert "不得把 Quiz 答案解释为 observer 已实现" in worklog
 
 
 def _env_file(tmp_path: Path, content: str) -> Path:
