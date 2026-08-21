@@ -61,6 +61,9 @@ MAX_FILE_BYTES = 4 * 1024 * 1024
 MAX_HEALTH_AGE_SECONDS = 120
 RELEASE_LOCK_NAME = ".pnc-rca-minimal-release.lock"
 SSH_MINI_AGENT = "/Users/songying/.local/bin/ssh-mini-agent"
+REMOTE_READER_RUNTIME_BUNDLE_SCHEMA = (
+    "g1q3_rca_remote_reader_generated_bundle_v1"
+)
 REMOTE_READER_RUNTIME_CONTRACT_SCHEMA = (
     "g1q3_rca_remote_reader_runtime_contract_v1"
 )
@@ -893,13 +896,18 @@ def _preflight_vm_dependency_probe(
         "from pathlib import Path\n"
         f"root = {json.dumps(str(root))}\n"
         f"expected_commit = {json.dumps(expected_commit)}\n"
+        f"bundle_schema = {json.dumps(REMOTE_READER_RUNTIME_BUNDLE_SCHEMA)}\n"
         f"contract_schema = {json.dumps(REMOTE_READER_RUNTIME_CONTRACT_SCHEMA)}\n"
         f"required_dependencies = {json.dumps(REMOTE_READER_SYSTEM_DEPENDENCIES)}\n"
         f"dependency_modules = {json.dumps(REMOTE_READER_DEPENDENCY_MODULES, sort_keys=True)}\n"
         r'''
 root_path = Path(root)
-contract_relative = "api/g1q3_rca/vendor/remote_reader_runtime_contract.json"
-contract_path = root_path / contract_relative
+bundle_relative = "api/g1q3_rca/vendor/remote_reader_runtime_bundle.generated.json"
+bundle_path = root_path / bundle_relative
+bundle_keys = {
+    "schema_version", "runtime_contract", "runtime_contract_sha256",
+    "vendor_manifest", "vendor_manifest_sha256",
+}
 expected_keys = (
     "version", "module", "distribution_root", "module_source",
     "record_sha256", "critical_files_sha256", "critical_file_count",
@@ -942,9 +950,9 @@ def source_snapshot():
 def stable_regular_file(path):
     before = os.lstat(str(path))
     if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
-        raise RuntimeError("contract_not_regular_file")
+        raise RuntimeError("bundle_not_regular_file")
     if before.st_size > 4 * 1024 * 1024:
-        raise RuntimeError("contract_too_large")
+        raise RuntimeError("bundle_too_large")
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -963,8 +971,14 @@ def stable_regular_file(path):
     identities = [(value.st_dev, value.st_ino, value.st_mode, value.st_size)
                   for value in (before, opened, after)]
     if identities[0] != identities[1] or identities[1] != identities[2]:
-        raise RuntimeError("contract_source_changed")
+        raise RuntimeError("bundle_source_changed")
     return b"".join(chunks)
+
+def canonical_sha256(value):
+    return hashlib.sha256(json.dumps(
+        value, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
 
 def hash_file(path):
     digest = hashlib.sha256()
@@ -1018,7 +1032,9 @@ source_expected = {"runtime_root": root, "commit": expected_commit, "clean": Tru
 source_actual = None
 source_error = None
 source_ok = False
+bundle = {}
 contract = {}
+vendor_manifest = {}
 contract_error = None
 committed_bytes = None
 worktree_bytes = None
@@ -1030,10 +1046,10 @@ try:
         raise RuntimeError("pipeline_root_not_canonical")
     first = source_snapshot()
     committed_bytes = git_read(
-        ["cat-file", "blob", expected_commit + ":" + contract_relative],
+        ["cat-file", "blob", expected_commit + ":" + bundle_relative],
         binary=True,
     )
-    worktree_bytes = stable_regular_file(contract_path)
+    worktree_bytes = stable_regular_file(bundle_path)
     second = source_snapshot()
     source_actual = dict(second)
     source_actual["stable"] = first == second
@@ -1044,9 +1060,22 @@ try:
         and second["clean"]
         and len(second["tree"]) == 40
     )
-    contract = json.loads(committed_bytes.decode("utf-8"))
+    bundle = json.loads(committed_bytes.decode("utf-8"))
+    if isinstance(bundle, dict):
+        contract = bundle.get("runtime_contract")
+        vendor_manifest = bundle.get("vendor_manifest")
 except Exception as exc:
     source_error = type(exc).__name__ + ":" + (str(exc) or type(exc).__name__)
+
+bundle_shape_ok = bool(
+    isinstance(bundle, dict)
+    and set(bundle) == bundle_keys
+    and bundle.get("schema_version") == bundle_schema
+    and isinstance(contract, dict)
+    and isinstance(vendor_manifest, dict)
+    and bundle.get("runtime_contract_sha256") == canonical_sha256(contract)
+    and bundle.get("vendor_manifest_sha256") == canonical_sha256(vendor_manifest)
+)
 
 contract_dependencies = (
     contract.get("dependencies") if isinstance(contract, dict) else None
@@ -1058,7 +1087,8 @@ expected_dependencies = (
     {name: {} for name in required_dependencies}
 )
 contract_shape_ok = bool(
-    isinstance(contract, dict)
+    bundle_shape_ok
+    and isinstance(contract, dict)
     and contract.get("schema_version") == contract_schema
     and isinstance(contract_dependencies, dict)
     and set(contract_dependencies) == set(required_dependencies)
@@ -1086,16 +1116,19 @@ bytes_match = bool(
     and worktree_bytes is not None
     and committed_bytes == worktree_bytes
 )
-contract_ok = bool(source_ok and bytes_match and contract_shape_ok)
+bundle_ok = bool(source_ok and bytes_match and bundle_shape_ok)
+contract_ok = bool(bundle_ok and contract_shape_ok)
 if not bytes_match and source_error is None:
-    contract_error = "worktree_contract_differs_from_committed_blob"
+    contract_error = "worktree_bundle_differs_from_committed_blob"
 
 dependency_results = {}
 actual_dependencies = {}
 mismatches = []
 if not source_ok:
     mismatches.append({"scope": "source", "fields": ["commit", "clean", "stable"]})
-if not contract_ok:
+if not bundle_ok:
+    mismatches.append({"scope": "bundle", "fields": ["provenance", "schema", "hashes"]})
+if bundle_ok and not contract_ok:
     mismatches.append({"scope": "contract", "fields": ["provenance", "schema", "dependencies"]})
 for name in required_dependencies:
     expected = expected_dependencies[name]
@@ -1145,15 +1178,30 @@ response = {
         "actual": source_actual,
         "error": source_error,
     },
-    "contract": {
-        "ok": contract_ok,
-        "path": str(contract_path),
-        "schema_version": contract.get("schema_version") if isinstance(contract, dict) else None,
-        "expected_schema_version": contract_schema,
+    "bundle": {
+        "ok": bundle_ok,
+        "path": str(bundle_path),
+        "schema_version": bundle.get("schema_version") if isinstance(bundle, dict) else None,
+        "expected_schema_version": bundle_schema,
         "committed_sha256": (hashlib.sha256(committed_bytes).hexdigest()
                              if committed_bytes is not None else None),
         "worktree_sha256": (hashlib.sha256(worktree_bytes).hexdigest()
                             if worktree_bytes is not None else None),
+        "runtime_contract_sha256": (
+            bundle.get("runtime_contract_sha256") if isinstance(bundle, dict) else None
+        ),
+        "vendor_manifest_sha256": (
+            bundle.get("vendor_manifest_sha256") if isinstance(bundle, dict) else None
+        ),
+        "error": contract_error,
+    },
+    "contract": {
+        "ok": contract_ok,
+        "source": str(bundle_path),
+        "projection": "runtime_contract",
+        "schema_version": contract.get("schema_version") if isinstance(contract, dict) else None,
+        "expected_schema_version": contract_schema,
+        "sha256": canonical_sha256(contract) if isinstance(contract, dict) else None,
         "required_dependencies": list(required_dependencies),
         "error": contract_error,
     },

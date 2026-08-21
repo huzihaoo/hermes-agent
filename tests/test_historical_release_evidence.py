@@ -16,6 +16,8 @@ def test_blocked_receipt_successor_projection_is_exact() -> None:
         for key in (
             "source_commit",
             "source_tree",
+            "requirements_contract_hash",
+            "evaluator_fingerprints_sha256",
             "evaluator_version",
             "suite_receipt_path",
             "suite_receipt_sha256",
@@ -23,26 +25,50 @@ def test_blocked_receipt_successor_projection_is_exact() -> None:
             "w17_receipt_sha256",
         )
     } == {
-        "source_commit": "38552b91c67ed5f5ad2e90c0dda8f8f2fe833597",
-        "source_tree": "cda4224decbd2a504a6f00e6dd1397bb842f4da7",
-        "evaluator_version": "git-38552b91c67ed5f5ad2e90c0dda8f8f2fe833597",
+        "source_commit": "1364e0d0cf59bcdb4a04ace506903fd07899f7b9",
+        "source_tree": "70dea7edddc052fe8f8e246bcaf206952a3fa049",
+        "requirements_contract_hash": (
+            "319b1000f0317345c834f6b9387646f822fb78c372e88529e8d14ce233c4ed87"
+        ),
+        "evaluator_fingerprints_sha256": (
+            "352e8d07611e4006c12ef3a847080c3d520ba2e6c7d759142beb574c137160ad"
+        ),
+        "evaluator_version": "git-1364e0d0cf59bcdb4a04ace506903fd07899f7b9",
         "suite_receipt_path": (
-            "/mnt/tmp/20260822-rca-timeout-retry/evidence-run-38552b9/"
-            "successor-evidence-38552b9/"
+            "/mnt/tmp/20260822-rca-integrated-1364e0d/evidence-run-1364e0d/"
+            "successor-evidence-1364e0d/"
             "suite-receipt.json"
         ),
         "suite_receipt_sha256": (
-            "6e457eceb316a9a873b4c3867408b6e71159caa9c65320b2c6d79a3de1103611"
+            "2f274635757946c577abadb0cf1526a67f6b07b9360f2a2e4fab813c665188e6"
         ),
         "w17_receipt_path": (
-            "/mnt/tmp/20260822-rca-timeout-retry/evidence-run-38552b9/"
-            "successor-evidence-38552b9/"
+            "/mnt/tmp/20260822-rca-integrated-1364e0d/evidence-run-1364e0d/"
+            "successor-evidence-1364e0d/"
             "w17-receipt.json"
         ),
         "w17_receipt_sha256": (
-            "e2dc2d64979be5e22ca4d88eb21618d38d3c9d51d6a12a1102d8015a01ef56c5"
+            "9cc8042bd85503508fa07a66d6f21a3a7dcc471f20f084809c14a33b053dadeb"
         ),
     }
+    assert set(release["evaluator_fingerprints"]) == {
+        "g1q3_rca/aeb_signal_parser.py",
+        "g1q3_rca/rca_evaluators/_raw_streams.py",
+        "g1q3_rca/rca_evaluators/acc_debug_spec.py",
+        "g1q3_rca/rca_evaluators/hmi_front_target_output.py",
+        "g1q3_rca/report_builder.py",
+        "g1q3_rca/scripts/check_case_gate.py",
+        "g1q3_rca/signal_access.py",
+        "g1q3_rca/signal_registry.py",
+    }
+    assert hashlib.sha256(
+        json.dumps(
+            release["evaluator_fingerprints"],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest() == release["evaluator_fingerprints_sha256"]
 
 
 def test_scoped_receipts_keep_full_suite_claim_explicit() -> None:

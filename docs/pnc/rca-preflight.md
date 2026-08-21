@@ -109,18 +109,19 @@ receipt, service state, or Feishu state.
 The remote-reader dependency gate uses the mandatory default read-only VM
 probe.  It requires the candidate runtime root to be a stable, clean checkout
 at the pipeline commit resolved by the read-only remote identity probe.  It
-reads the contract blob from that commit and requires the checked-out
-`api/g1q3_rca/vendor/remote_reader_runtime_contract.json` bytes to match.  It
-then validates the exact `mcap`, `protobuf`, `pdcl-dss`, and `typer` dependency
-set and independently fingerprints every installed VM distribution without
-short-circuiting.  Each dependency retains its own version, path, RECORD, and
-critical-file mismatch details.  It never imports the dependencies or executes
-candidate-controlled code.  Bootstrap execution is explicitly deferred to the
-execution-only `bootstrap_install-offline_failed` gate.  A stale or dirty
-checkout, missing contract, schema mismatch, or byte/version mismatch is a
-structured failure; the probe never installs.  The clean committed-contract
-binding does not upgrade the separately deferred report-manifest tree-identity
-gate.  Canary state is
+reads the generated bundle blob from that commit and requires the checked-out
+`api/g1q3_rca/vendor/remote_reader_runtime_bundle.generated.json` bytes to
+match.  It validates the bundle schema plus both embedded semantic hashes,
+then projects `runtime_contract` for the exact `mcap`, `protobuf`, `pdcl-dss`,
+and `typer` dependency checks.  It independently fingerprints every installed
+VM distribution without short-circuiting.  Each dependency retains its own
+version, path, RECORD, and critical-file mismatch details.  It never imports
+the dependencies or executes candidate-controlled code.  Bootstrap execution
+is explicitly deferred to the execution-only `bootstrap_install-offline_failed`
+gate.  A stale or dirty checkout, missing bundle, schema/hash mismatch, or
+byte/version mismatch is a structured failure; the probe never installs.  The
+clean committed-bundle binding does not upgrade the separately deferred
+report-manifest tree-identity gate.  Canary state is
 checked by standalone preflight and intentionally deferred for `prepare`,
 because prepare must not create a future activation artifact.
 

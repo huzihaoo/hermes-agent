@@ -162,24 +162,25 @@ HISTORICAL_BUDGETS = {
 # Server-owned successor projection. Request payloads may repeat these pins,
 # but cannot select a different evaluator/source identity.
 HISTORICAL_SUCCESSOR_RELEASE: Mapping[str, Any] | None = {
-    "source_commit": "38552b91c67ed5f5ad2e90c0dda8f8f2fe833597",
-    "source_tree": "cda4224decbd2a504a6f00e6dd1397bb842f4da7",
-    "requirements_contract_hash": "ca99f759c70b72b0836f956557ecc5e23c11538132b13f1d1bfe8a46ce7e6cb6",
+    "source_commit": "1364e0d0cf59bcdb4a04ace506903fd07899f7b9",
+    "source_tree": "70dea7edddc052fe8f8e246bcaf206952a3fa049",
+    "requirements_contract_hash": "319b1000f0317345c834f6b9387646f822fb78c372e88529e8d14ce233c4ed87",
     "evaluator_fingerprints": {
-        "g1q3_rca/aeb_signal_parser.py": "fa227f22a684f2a4b0808fefe0d596a032c3a582e1571f67ede7937d5894e3d3",
+        "g1q3_rca/aeb_signal_parser.py": "cfebee699fb211a7b7457fb0cdda736b886294a30ba484416a210ed0a12739a6",
         "g1q3_rca/rca_evaluators/_raw_streams.py": "afba29499b1f02e0d477bee4ca07d76b5f482c910e9bee00e5341930e32b2729",
         "g1q3_rca/rca_evaluators/acc_debug_spec.py": "a6eaf30252cf8f93843cfa24d69c29672b2334cedf81c482775554cc04028fc9",
-        "g1q3_rca/report_builder.py": "71ec50b43ae95b21029ed1f953e81e65e1f87c1de654d2c8500463b1759a953d",
+        "g1q3_rca/rca_evaluators/hmi_front_target_output.py": "ee53ae6aa2cf19e8239b7c94f659f56144bd678022b0585d71ac5f57ad78ced0",
+        "g1q3_rca/report_builder.py": "36ae8ad841397ae76e9f137bda33c7f7a68ff33c92e0388384ef813b360c08a1",
         "g1q3_rca/scripts/check_case_gate.py": "918be3270ef7cf2370b371abc20e05a4e4cbc65c2e086ffc926ab3fa1f318cd4",
         "g1q3_rca/signal_access.py": "7da6555018c9c3c5e21e6eefddf5dcb1d74003036945387297cb6c16feb9297d",
         "g1q3_rca/signal_registry.py": "ffd0a796c027df1d81e30a1727eea1d37ccfcd0c5b88a806a201a0c8f3d54f17",
     },
-    "evaluator_fingerprints_sha256": "e492eaa8afd9348990cb2de265575211ff248fdebacd0fff72b2f7bafe7f18c0",
-    "evaluator_version": "git-38552b91c67ed5f5ad2e90c0dda8f8f2fe833597",
-    "suite_receipt_path": "/mnt/tmp/20260822-rca-timeout-retry/evidence-run-38552b9/successor-evidence-38552b9/suite-receipt.json",
-    "suite_receipt_sha256": "6e457eceb316a9a873b4c3867408b6e71159caa9c65320b2c6d79a3de1103611",
-    "w17_receipt_path": "/mnt/tmp/20260822-rca-timeout-retry/evidence-run-38552b9/successor-evidence-38552b9/w17-receipt.json",
-    "w17_receipt_sha256": "e2dc2d64979be5e22ca4d88eb21618d38d3c9d51d6a12a1102d8015a01ef56c5",
+    "evaluator_fingerprints_sha256": "352e8d07611e4006c12ef3a847080c3d520ba2e6c7d759142beb574c137160ad",
+    "evaluator_version": "git-1364e0d0cf59bcdb4a04ace506903fd07899f7b9",
+    "suite_receipt_path": "/mnt/tmp/20260822-rca-integrated-1364e0d/evidence-run-1364e0d/successor-evidence-1364e0d/suite-receipt.json",
+    "suite_receipt_sha256": "2f274635757946c577abadb0cf1526a67f6b07b9360f2a2e4fab813c665188e6",
+    "w17_receipt_path": "/mnt/tmp/20260822-rca-integrated-1364e0d/evidence-run-1364e0d/successor-evidence-1364e0d/w17-receipt.json",
+    "w17_receipt_sha256": "9cc8042bd85503508fa07a66d6f21a3a7dcc471f20f084809c14a33b053dadeb",
 }
 
 RECEIPT_FIELDS = {

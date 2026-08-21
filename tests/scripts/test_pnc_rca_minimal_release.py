@@ -983,7 +983,15 @@ def test_default_dependency_probe_reports_vm_fingerprint_without_install(release
         assert release_files["identity"]["pipeline"]["commit"] in input_text
         assert "bootstrap_remote_reader_runtime.py" not in input_text
         assert "--install-offline" not in input_text
+        assert release.REMOTE_READER_RUNTIME_BUNDLE_SCHEMA in input_text
         assert release.REMOTE_READER_RUNTIME_CONTRACT_SCHEMA in input_text
+        assert (
+            'bundle_relative = "api/g1q3_rca/vendor/'
+            'remote_reader_runtime_bundle.generated.json"'
+        ) in input_text
+        assert "remote_reader_runtime_contract.json" not in input_text
+        assert 'bundle.get("runtime_contract_sha256") == canonical_sha256(contract)' in input_text
+        assert 'bundle.get("vendor_manifest_sha256") == canonical_sha256(vendor_manifest)' in input_text
         for name in release.REMOTE_READER_SYSTEM_DEPENDENCIES:
             assert name in input_text
         response = {
