@@ -6,13 +6,29 @@ provider (Chronos) re-provisions/cancels. The built-in's no-op default means
 the default path is unchanged.
 """
 
+import os
+from pathlib import Path
+
 import pytest
 
 
 @pytest.fixture
-def temp_home(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    yield tmp_path
+def temp_home():
+    return Path(os.environ["HERMES_HOME"])
+
+
+@pytest.fixture(autouse=True)
+def isolate_cached_cron_store(temp_home, monkeypatch):
+    """Keep collection-time cron imports bound to this test's temp home."""
+    import cron.jobs as jobs
+
+    cron_dir = temp_home / "cron"
+    monkeypatch.setattr(jobs, "HERMES_DIR", temp_home)
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+    monkeypatch.setattr(jobs, "TICKER_HEARTBEAT_FILE", cron_dir / "ticker_heartbeat")
+    monkeypatch.setattr(jobs, "TICKER_SUCCESS_FILE", cron_dir / "ticker_last_success")
 
 
 def test_notify_helper_calls_provider_on_jobs_changed(monkeypatch):
@@ -76,11 +92,20 @@ def test_tool_create_notifies_provider(temp_home, monkeypatch):
                         lambda: calls.append("changed"))
 
     from tools.cronjob_tools import cronjob
+    import cron.jobs as jobs
     import json
 
     out = json.loads(cronjob(action="create", prompt="echo hi", schedule="every 5m", name="w"))
     assert out["success"] is True
     assert calls == ["changed"]
+    cron_dir = temp_home / "cron"
+    assert jobs.HERMES_DIR == temp_home
+    assert jobs.CRON_DIR == cron_dir
+    assert jobs.JOBS_FILE == cron_dir / "jobs.json"
+    assert jobs.OUTPUT_DIR == cron_dir / "output"
+    assert jobs.TICKER_HEARTBEAT_FILE == cron_dir / "ticker_heartbeat"
+    assert jobs.TICKER_SUCCESS_FILE == cron_dir / "ticker_last_success"
+    assert jobs.JOBS_FILE.exists()
 
 
 def test_tool_remove_notifies_provider(temp_home, monkeypatch):

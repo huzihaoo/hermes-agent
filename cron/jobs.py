@@ -79,6 +79,14 @@ TICKER_SUCCESS_FILE = CRON_DIR / "ticker_last_success"
 # drift apart.
 TICKER_INTERVAL_SECONDS = 60
 
+# A recurring job that fails before it can do useful work must not be retried
+# at its original cadence forever.  Keep the retry state in jobs.json so the
+# cooldown survives gateway restarts and applies equally to the built-in and
+# external scheduler providers.  The normal schedule remains the floor; the
+# backoff only stretches retries that would happen sooner.
+CRON_FAILURE_BACKOFF_BASE_SECONDS = 5 * 60
+CRON_FAILURE_BACKOFF_MAX_SECONDS = 60 * 60
+
 # In-process lock protecting load_jobs→modify→save_jobs cycles.
 # Required when tick() runs jobs in parallel threads — without this,
 # concurrent mark_job_run / advance_next_run calls can clobber each other.
@@ -476,6 +484,82 @@ def _ensure_aware(dt: datetime) -> datetime:
         local_tz = datetime.now().astimezone().tzinfo
         return dt.replace(tzinfo=local_tz).astimezone(target_tz)
     return dt.astimezone(target_tz)
+
+
+def _failure_backoff_seconds(consecutive_failures: Any) -> int:
+    """Return a bounded exponential delay for a recurring job failure."""
+    try:
+        failures = max(1, int(consecutive_failures))
+    except (TypeError, ValueError, OverflowError):
+        failures = 1
+    # Clamp the exponent before exponentiation so a malformed legacy value
+    # cannot allocate an enormous integer while calculating a delay.
+    exponent = min(failures - 1, 31)
+    return min(
+        CRON_FAILURE_BACKOFF_MAX_SECONDS,
+        CRON_FAILURE_BACKOFF_BASE_SECONDS * (2 ** exponent),
+    )
+
+
+def _stored_failure_backoff_until(job: Dict[str, Any]) -> Optional[datetime]:
+    """Parse a persisted cooldown; malformed legacy data is treated as absent."""
+    raw_until = job.get("failure_backoff_until")
+    if not raw_until:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw_until).replace("Z", "+00:00"))
+        return _ensure_aware(parsed)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _failure_backoff_active(job: Dict[str, Any], now: Optional[datetime] = None) -> bool:
+    """Return whether a recurring job is currently inside its failure cooldown."""
+    schedule = job.get("schedule")
+    if (
+        not isinstance(schedule, dict)
+        or schedule.get("kind") not in {"cron", "interval"}
+    ):
+        return False
+    until = _stored_failure_backoff_until(job)
+    if until is None:
+        return False
+    current = _ensure_aware(now) if now is not None else _hermes_now()
+    return until > current
+
+
+def _apply_failure_backoff_to_next_run(
+    job: Dict[str, Any],
+    next_run: Optional[str],
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    """Keep a computed recurring next run outside the persisted cooldown."""
+    until = _stored_failure_backoff_until(job)
+    if until is None:
+        return next_run
+    current = _ensure_aware(now) if now is not None else _hermes_now()
+    if until <= current:
+        return next_run
+    if not next_run:
+        # Preserve the existing missing-next-run recovery/error path (for
+        # example when croniter is unavailable).  The separate persisted field
+        # still gates due scans while the cooldown is active.
+        return None
+    try:
+        candidate = _ensure_aware(
+            datetime.fromisoformat(str(next_run).replace("Z", "+00:00"))
+        )
+    except (TypeError, ValueError, OverflowError):
+        return next_run
+    return until.isoformat() if until > candidate else next_run
+
+
+def _clear_failure_backoff(job: Dict[str, Any]) -> None:
+    """Reset additive failure state after an explicit operator re-arm/update."""
+    if "consecutive_failures" in job or "failure_backoff_until" in job:
+        job["consecutive_failures"] = 0
+        job["failure_backoff_until"] = None
 
 
 def _timezone_offset_mismatch(stored: datetime, current: datetime) -> bool:
@@ -1071,6 +1155,10 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
+        # Persisted failure cooldown state.  Older jobs may omit these fields;
+        # readers treat omission as zero failures/no cooldown.
+        "consecutive_failures": 0,
+        "failure_backoff_until": None,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
@@ -1178,6 +1266,23 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
             ) and _normalized_inference_axes(updated) != previous_inference_axes
+
+            # A schedule/provider edit is an explicit operator intervention,
+            # so do not strand a corrected job behind an old failure cooldown.
+            # ``trigger_job``/``resume_job`` also set next_run_at explicitly and
+            # therefore intentionally re-arm the job immediately.
+            explicit_rearm = (
+                schedule_changed
+                or inference_fields_changed
+                or ("enabled" in updates and updated.get("enabled") is True)
+                or (
+                    "next_run_at" in updates
+                    and updated.get("enabled", True)
+                    and updated.get("state") != "paused"
+                )
+            )
+            if explicit_rearm:
+                _clear_failure_backoff(updated)
 
             if "skills" in updates or "skill" in updates:
                 normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
@@ -1343,12 +1448,42 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
-                now = _hermes_now().isoformat()
+                now_dt = _hermes_now()
+                now = now_dt.isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+
+                kind = job.get("schedule", {}).get("kind")
+                recurring = kind in {"cron", "interval"}
+                if recurring and not success:
+                    # Keep this state durable so a restart cannot immediately
+                    # resume the same failing cadence.  Legacy/malformed values
+                    # degrade to the first backoff step rather than crashing the
+                    # jobs-store mutation.
+                    try:
+                        previous_failures = max(
+                            0, int(job.get("consecutive_failures", 0))
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        previous_failures = 0
+                    consecutive_failures = previous_failures + 1
+                    job["consecutive_failures"] = consecutive_failures
+                    backoff_until = now_dt + timedelta(
+                        seconds=_failure_backoff_seconds(consecutive_failures)
+                    )
+                    job["failure_backoff_until"] = backoff_until.isoformat()
+                elif success and (
+                    "consecutive_failures" in job
+                    or "failure_backoff_until" in job
+                ):
+                    # A successful run closes the failure streak. Keep the keys
+                    # on records that already have them so state is explicit and
+                    # old readers can safely ignore the additive fields.
+                    job["consecutive_failures"] = 0
+                    job["failure_backoff_until"] = None
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
@@ -1387,6 +1522,12 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
+                if recurring and not success:
+                    job["next_run_at"] = _apply_failure_backoff_to_next_run(
+                        job,
+                        job["next_run_at"],
+                        now=now_dt,
+                    )
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
@@ -1505,7 +1646,10 @@ def advance_next_run(job_id: str) -> bool:
                 kind = job.get("schedule", {}).get("kind")
                 if kind not in {"cron", "interval"}:
                     return False
-                now = _hermes_now().isoformat()
+                now_dt = _hermes_now()
+                if _failure_backoff_active(job, now_dt):
+                    return False
+                now = now_dt.isoformat()
                 new_next = compute_next_run(job["schedule"], now)
                 if new_next and new_next != job.get("next_run_at"):
                     job["next_run_at"] = new_next
@@ -1561,6 +1705,8 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
             if not job.get("enabled", True) or job.get("state") == "paused":
                 return False
             now = _hermes_now()
+            if _failure_backoff_active(job, now):
+                return False
             existing = job.get("fire_claim")
             if existing:
                 try:
@@ -1611,6 +1757,13 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
 
     for job in jobs:
         if not job.get("enabled", True):
+            continue
+
+        # Failure cooldown is checked before any stale/missing next-run
+        # recovery.  Otherwise a failed job with a past or missing
+        # ``next_run_at`` could be reconstructed and dispatched during the
+        # very window the persisted backoff is meant to suppress.
+        if _failure_backoff_active(job, now):
             continue
 
         # Cross-process running-claim guard (#59229): if another scheduler

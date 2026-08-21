@@ -20,9 +20,30 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-HEALTH_PATH = Path("/Users/songying/.hermes/runtime/shared-state/bin/feishu_credential_health.py")
+HEALTH_PATH = REPO_ROOT / "scripts" / "feishu_credential_health.py"
 ESCALATE_PATH = REPO_ROOT / "scripts" / "feishu_credential_escalate.py"
 DEFAULT_OUTPUT_DIR = Path("/Users/songying/.hermes/workspace-work/knowledge/outputs/feishu-credential-health")
+EXPECTED_HEALTH_SURFACES = frozenset({"doc", "project", "meegle_cli"})
+VALID_HEALTH_STATES = frozenset(
+    {"OK", "REAUTH_REQUIRED", "EXPIRED", "EXPIRING(<7d)", "PROBE_FAILED"}
+)
+
+
+def health_rows_valid(rows: Any) -> bool:
+    if not isinstance(rows, list) or len(rows) != len(EXPECTED_HEALTH_SURFACES):
+        return False
+    if any(not isinstance(row, dict) for row in rows):
+        return False
+    surfaces = [row.get("surface") for row in rows]
+    return (
+        all(isinstance(surface, str) for surface in surfaces)
+        and set(surfaces) == EXPECTED_HEALTH_SURFACES
+        and all(
+            isinstance(row.get("health"), str)
+            and row.get("health") in VALID_HEALTH_STATES
+            for row in rows
+        )
+    )
 
 
 def load_send_environment() -> list[Path]:
@@ -61,10 +82,18 @@ def orchestrate(*, send: bool = False, output_dir: Path = DEFAULT_OUTPUT_DIR) ->
     # post-expiry keepwarm run where before/after expiresAt can be compared.
     rotated = {row.get("surface"): None for row in rows}
     non_ok = [row for row in rows if row.get("health") != "OK"]
-    escalation_errors = [
-        item for item in escalation.get("results", [])
-        if item.get("refused") or item.get("sent") is False or item.get("send_result", {}).get("error")
-    ]
+    escalation_errors = []
+    for item in escalation.get("results", []):
+        send_result = item.get("send_result")
+        send_error = send_result.get("error") if isinstance(send_result, dict) else None
+        if (
+            item.get("refused")
+            or item.get("sent") is False
+            or send_error
+            or item.get("state_error")
+            or item.get("fallback_error")
+        ):
+            escalation_errors.append(item)
     payload = {
         "output_path": str(output_path),
         "health_rows": rows,
@@ -74,7 +103,7 @@ def orchestrate(*, send: bool = False, output_dir: Path = DEFAULT_OUTPUT_DIR) ->
         "rotated_observed": rotated,
         "send": send,
     }
-    rc = 2 if non_ok or escalation_errors else 0
+    rc = 2 if not health_rows_valid(rows) or non_ok or escalation_errors or escalation.get("ok") is not True else 0
     return rc, payload
 
 
@@ -85,7 +114,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     args = parser.parse_args(argv)
     try:
-        load_send_environment()
+        if args.send:
+            load_send_environment()
         rc, payload = orchestrate(send=args.send, output_dir=Path(args.output_dir))
     except Exception as exc:  # noqa: BLE001 - launchd logs need compact failure.
         payload = {"error_class": type(exc).__name__, "error": str(exc)[:240], "send": args.send}

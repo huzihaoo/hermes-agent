@@ -8,6 +8,7 @@ These exercise the real store against a temp HERMES_HOME (no mocks) per the
 E2E-over-mocks discipline for file-touching code.
 """
 import pytest
+from datetime import datetime, timezone
 
 
 @pytest.fixture
@@ -82,3 +83,20 @@ def test_mark_job_run_clears_claim(temp_home):
     assert get_job(jid).get("fire_claim") is None
     # …and the re-armed recurring job is claimable again.
     assert claim_job_for_fire(jid) is True
+
+
+def test_failure_cooldown_blocks_external_fire_claim(temp_home, monkeypatch):
+    """An external provider cannot bypass a persisted recurring failure cooldown."""
+    from cron.jobs import create_job, claim_job_for_fire, get_job, mark_job_run
+
+    clock = [datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)]
+    monkeypatch.setattr("cron.jobs._hermes_now", lambda: clock[0])
+    job = create_job(prompt="x", schedule="every 1m", name="cooldown")
+    mark_job_run(job["id"], success=False, error="missing model")
+
+    failed = get_job(job["id"])
+    cooldown = datetime.fromisoformat(failed["failure_backoff_until"])
+    assert claim_job_for_fire(job["id"]) is False
+
+    clock[0] = cooldown
+    assert claim_job_for_fire(job["id"]) is True

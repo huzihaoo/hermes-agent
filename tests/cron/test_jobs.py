@@ -5,6 +5,8 @@ import pytest
 from datetime import datetime, timedelta, timezone
 
 from cron.jobs import (
+    CRON_FAILURE_BACKOFF_BASE_SECONDS,
+    CRON_FAILURE_BACKOFF_MAX_SECONDS,
     parse_duration,
     parse_schedule,
     compute_next_run,
@@ -409,6 +411,24 @@ class TestUpdateJob:
         fetched = get_job(job["id"])
         assert fetched["enabled"] is False
 
+    def test_explicit_enable_rearms_failure_backoff(self, tmp_cron_dir, monkeypatch):
+        """An operator PATCH that enables a job must clear an old cooldown."""
+        now = datetime(2026, 7, 6, 12, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="Re-enable me", schedule="every 1h")
+        mark_job_run(job["id"], success=False, error="bad provider")
+        failed = get_job(job["id"])
+        assert failed["failure_backoff_until"] is not None
+
+        updated = update_job(job["id"], {"enabled": True})
+
+        assert updated["consecutive_failures"] == 0
+        assert updated["failure_backoff_until"] is None
+        scheduled_run = datetime.fromisoformat(updated["next_run_at"])
+        assert scheduled_run > now
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: scheduled_run)
+        assert [item["id"] for item in get_due_jobs()] == [job["id"]]
+
     def test_update_nonexistent_returns_none(self, tmp_cron_dir):
         result = update_job("nonexistent_id", {"name": "X"})
         assert result is None
@@ -599,6 +619,109 @@ class TestMarkJobRun:
         updated = get_job(job["id"])
         assert updated["last_status"] == "error"
         assert updated["last_error"] == "timeout"
+
+    def test_recurring_failure_persists_cooldown_and_blocks_due_scan(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A failed recurring run is durably delayed, including recovery with
+        a missing next_run_at (the state that used to re-fire immediately)."""
+        now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="Failing recurring", schedule="every 1m")
+
+        mark_job_run(job["id"], success=False, error="missing model")
+        updated = get_job(job["id"])
+        assert updated["consecutive_failures"] == 1
+        cooldown = datetime.fromisoformat(updated["failure_backoff_until"])
+        assert cooldown - now == timedelta(seconds=CRON_FAILURE_BACKOFF_BASE_SECONDS)
+        # The ordinary one-minute schedule is stretched to the five-minute
+        # first backoff step.
+        assert datetime.fromisoformat(updated["next_run_at"]) == cooldown
+
+        # Even if a legacy writer leaves next_run_at empty, the persisted
+        # cooldown is checked before recurring recovery logic.
+        updated["next_run_at"] = None
+        save_jobs([updated])
+        assert get_due_jobs() == []
+
+        monkeypatch.setattr(
+            "cron.jobs._hermes_now", lambda: cooldown - timedelta(seconds=1)
+        )
+        assert get_due_jobs() == []
+        updated["next_run_at"] = cooldown.isoformat()
+        save_jobs([updated])
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: cooldown)
+        assert [item["id"] for item in get_due_jobs()] == [job["id"]]
+
+    def test_recurring_failure_backoff_is_exponential_and_capped(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        clock = [datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)]
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: clock[0])
+        job = create_job(prompt="Fail repeatedly", schedule="every 1m")
+        expected_delays = [
+            CRON_FAILURE_BACKOFF_BASE_SECONDS,
+            CRON_FAILURE_BACKOFF_BASE_SECONDS * 2,
+            CRON_FAILURE_BACKOFF_BASE_SECONDS * 4,
+            CRON_FAILURE_BACKOFF_BASE_SECONDS * 8,
+            CRON_FAILURE_BACKOFF_MAX_SECONDS,
+            CRON_FAILURE_BACKOFF_MAX_SECONDS,
+        ]
+
+        for failure_number, expected_seconds in enumerate(expected_delays, start=1):
+            mark_job_run(job["id"], success=False, error="still failing")
+            updated = get_job(job["id"])
+            assert updated["consecutive_failures"] == failure_number
+            cooldown = datetime.fromisoformat(updated["failure_backoff_until"])
+            assert cooldown - clock[0] == timedelta(seconds=expected_seconds)
+            clock[0] = cooldown
+
+    def test_success_resets_recurring_failure_backoff(self, tmp_cron_dir, monkeypatch):
+        clock = [datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)]
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: clock[0])
+        job = create_job(prompt="Recovering job", schedule="every 1m")
+
+        mark_job_run(job["id"], success=False, error="temporary")
+        failed = get_job(job["id"])
+        clock[0] = datetime.fromisoformat(failed["failure_backoff_until"])
+        mark_job_run(job["id"], success=True)
+
+        recovered = get_job(job["id"])
+        assert recovered["consecutive_failures"] == 0
+        assert recovered["failure_backoff_until"] is None
+        assert datetime.fromisoformat(recovered["next_run_at"]) == (
+            clock[0] + timedelta(minutes=1)
+        )
+
+    def test_one_shot_failure_does_not_add_failure_backoff(self, tmp_cron_dir):
+        """One-shot retry/completion behavior remains independent of cooldown state."""
+        job = create_job(prompt="One shot", schedule="30m")
+        # Simulate a pre-feature record and retain it after the run so the
+        # additive fields can be observed without changing one-shot semantics.
+        job.pop("consecutive_failures", None)
+        job.pop("failure_backoff_until", None)
+        job["repeat"] = {"times": None, "completed": 0}
+        save_jobs([job])
+
+        mark_job_run(job["id"], success=False, error="failed once")
+        updated = get_job(job["id"])
+        assert "consecutive_failures" not in updated
+        assert "failure_backoff_until" not in updated
+        assert updated["enabled"] is False
+        assert updated["state"] == "completed"
+
+    def test_explicit_rearm_clears_failure_backoff(self, tmp_cron_dir, monkeypatch):
+        now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="Rearm me", schedule="every 1m")
+        mark_job_run(job["id"], success=False, error="bad config")
+
+        from cron.jobs import trigger_job
+
+        rearmed = trigger_job(job["id"])
+        assert rearmed["consecutive_failures"] == 0
+        assert rearmed["failure_backoff_until"] is None
+        assert [item["id"] for item in get_due_jobs()] == [job["id"]]
 
     def test_delivery_error_tracked_separately(self, tmp_cron_dir):
         """Agent succeeds but delivery fails — both tracked independently."""

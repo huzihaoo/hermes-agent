@@ -38,20 +38,19 @@ def test_cron_storage_anchors_at_profile_home(tmp_path, monkeypatch):
     profile_home = root / "profiles" / "coder"
     profile_home.mkdir(parents=True)
 
-    _set_profile_env(monkeypatch, root, profile_home)
-
+    import cron.jobs as jobs
     import hermes_constants
 
-    # Sanity: the override is wired the way the gateway sees it.
-    assert hermes_constants.get_hermes_home().resolve() == profile_home.resolve()
-    assert hermes_constants.get_default_hermes_root().resolve() == root.resolve()
+    with monkeypatch.context() as profile_patch:
+        _set_profile_env(profile_patch, root, profile_home)
 
-    # cron/jobs.py computes HERMES_DIR from get_hermes_home() at import, so a
-    # fresh import under this env anchors the store at <profile>/cron.
-    import cron.jobs as jobs
+        # Sanity: the override is wired the way the gateway sees it.
+        assert hermes_constants.get_hermes_home().resolve() == profile_home.resolve()
+        assert hermes_constants.get_default_hermes_root().resolve() == root.resolve()
 
-    importlib.reload(jobs)
-    try:
+        # cron/jobs.py computes HERMES_DIR from get_hermes_home() at import,
+        # so a fresh import under this env anchors the store at <profile>/cron.
+        importlib.reload(jobs)
         assert jobs.HERMES_DIR.resolve() == profile_home.resolve()
         assert (
             jobs.JOBS_FILE.resolve()
@@ -62,9 +61,9 @@ def test_cron_storage_anchors_at_profile_home(tmp_path, monkeypatch):
         assert (
             jobs.JOBS_FILE.resolve() != (root / "cron" / "jobs.json").resolve()
         )
-    finally:
-        monkeypatch.undo()
-        importlib.reload(jobs)
+
+    # Restore the autouse fixture's isolated HERMES_HOME, not the real profile.
+    importlib.reload(jobs)
 
 
 def test_cron_lock_path_anchors_at_profile_home(tmp_path, monkeypatch):
@@ -108,19 +107,16 @@ def test_cron_storage_unaffected_when_no_profile(tmp_path, monkeypatch):
     root = tmp_path / "hermes_home"
     root.mkdir(parents=True)
 
+    import cron.jobs as jobs
     import hermes_constants
 
-    monkeypatch.setattr(
-        hermes_constants, "_get_platform_default_hermes_home", lambda: root
-    )
-    monkeypatch.setenv("HERMES_HOME", str(root))
-
-    import cron.jobs as jobs
-
-    importlib.reload(jobs)
-    try:
+    with monkeypatch.context() as root_patch:
+        root_patch.setattr(
+            hermes_constants, "_get_platform_default_hermes_home", lambda: root
+        )
+        root_patch.setenv("HERMES_HOME", str(root))
+        importlib.reload(jobs)
         assert jobs.HERMES_DIR.resolve() == root.resolve()
         assert jobs.JOBS_FILE.resolve() == (root / "cron" / "jobs.json").resolve()
-    finally:
-        monkeypatch.undo()
-        importlib.reload(jobs)
+
+    importlib.reload(jobs)
