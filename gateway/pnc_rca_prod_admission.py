@@ -162,8 +162,8 @@ HISTORICAL_BUDGETS = {
 # Server-owned successor projection. Request payloads may repeat these pins,
 # but cannot select a different evaluator/source identity.
 HISTORICAL_SUCCESSOR_RELEASE: Mapping[str, Any] | None = {
-    "source_commit": "82e5eb2b8dffc9f5e7907d4edc46a2958d86c8e2",
-    "source_tree": "277cc972b3fd32fbc00569029162e97d0566b178",
+    "source_commit": "a4d021f8c3ef52229416967e6f2bc98bb531f0c7",
+    "source_tree": "ad399ad920eef2f78b654b079fae2aac360630f4",
     "requirements_contract_hash": "ca99f759c70b72b0836f956557ecc5e23c11538132b13f1d1bfe8a46ce7e6cb6",
     "evaluator_fingerprints": {
         "g1q3_rca/aeb_signal_parser.py": "fa227f22a684f2a4b0808fefe0d596a032c3a582e1571f67ede7937d5894e3d3",
@@ -175,11 +175,11 @@ HISTORICAL_SUCCESSOR_RELEASE: Mapping[str, Any] | None = {
         "g1q3_rca/signal_registry.py": "ffd0a796c027df1d81e30a1727eea1d37ccfcd0c5b88a806a201a0c8f3d54f17",
     },
     "evaluator_fingerprints_sha256": "e492eaa8afd9348990cb2de265575211ff248fdebacd0fff72b2f7bafe7f18c0",
-    "evaluator_version": "git-82e5eb2b8dffc9f5e7907d4edc46a2958d86c8e2",
-    "suite_receipt_path": "/mnt/tmp/20260821-rca-runtime-env-forward/successor-evidence-82e5eb2b/suite-receipt.json",
-    "suite_receipt_sha256": "9ef63ae22ee1bc008168d1c834f3deb48bc59b105cbdcde0db2bcb41dc8503da",
-    "w17_receipt_path": "/mnt/tmp/20260821-rca-runtime-env-forward/successor-evidence-82e5eb2b/w17-receipt.json",
-    "w17_receipt_sha256": "b381ed36e435fc5c592e74f536d8c2963481b02b987970656fc8a7eb53c4f4e6",
+    "evaluator_version": "git-a4d021f8c3ef52229416967e6f2bc98bb531f0c7",
+    "suite_receipt_path": "/mnt/tmp/20260821-rca-cwd-fix/successor-evidence-a4d021f8/suite-receipt.json",
+    "suite_receipt_sha256": "c6bea0cd7b11dd821977c0c90fcd075e08fc93a016723f02a4cb43d2b217c69f",
+    "w17_receipt_path": "/mnt/tmp/20260821-rca-cwd-fix/successor-evidence-a4d021f8/w17-receipt.json",
+    "w17_receipt_sha256": "8de723173336823fbdb02b4170e446308ed61e320c32dfefd870ba89db438397",
 }
 
 RECEIPT_FIELDS = {

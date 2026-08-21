@@ -23,22 +23,22 @@ def test_blocked_receipt_successor_projection_is_exact() -> None:
             "w17_receipt_sha256",
         )
     } == {
-        "source_commit": "82e5eb2b8dffc9f5e7907d4edc46a2958d86c8e2",
-        "source_tree": "277cc972b3fd32fbc00569029162e97d0566b178",
-        "evaluator_version": "git-82e5eb2b8dffc9f5e7907d4edc46a2958d86c8e2",
+        "source_commit": "a4d021f8c3ef52229416967e6f2bc98bb531f0c7",
+        "source_tree": "ad399ad920eef2f78b654b079fae2aac360630f4",
+        "evaluator_version": "git-a4d021f8c3ef52229416967e6f2bc98bb531f0c7",
         "suite_receipt_path": (
-            "/mnt/tmp/20260821-rca-runtime-env-forward/successor-evidence-82e5eb2b/"
+            "/mnt/tmp/20260821-rca-cwd-fix/successor-evidence-a4d021f8/"
             "suite-receipt.json"
         ),
         "suite_receipt_sha256": (
-            "9ef63ae22ee1bc008168d1c834f3deb48bc59b105cbdcde0db2bcb41dc8503da"
+            "c6bea0cd7b11dd821977c0c90fcd075e08fc93a016723f02a4cb43d2b217c69f"
         ),
         "w17_receipt_path": (
-            "/mnt/tmp/20260821-rca-runtime-env-forward/successor-evidence-82e5eb2b/"
+            "/mnt/tmp/20260821-rca-cwd-fix/successor-evidence-a4d021f8/"
             "w17-receipt.json"
         ),
         "w17_receipt_sha256": (
-            "b381ed36e435fc5c592e74f536d8c2963481b02b987970656fc8a7eb53c4f4e6"
+            "8de723173336823fbdb02b4170e446308ed61e320c32dfefd870ba89db438397"
         ),
     }
 
