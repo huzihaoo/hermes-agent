@@ -1,52 +1,40 @@
-# Hermes 统一知识检索路由
+# Hermes 业务知识检索接入设计
 
-本文定义 Web、本地知识工程和飞书 Aily 企业知识的同级触发机制。目标是让用户直接
-提问或发起任务，不需要额外说“请查知识库”；Hermes 在开始推理前根据关键词和任务
-上下文选择正确的知识源。
+本文只定义运行时方案：Hermes 如何像触发 Web Search 和本地知识检索一样，自动触发
+飞书 Aily 企业知识问答，并把结果作为业务增强上下文接入普通任务和 RCA。
 
-> 当前状态：设计契约，尚未接入生产 gateway。Aily 工具本身已经形成候选并完成
-> UAT canary；自动路由必须等待 RCA 正式生产分支后实现和发布。
+用于形成本文的盲区扫描、原型、反向采访、工作记录和验收方法，单独记录在
+[设计工作记录](feishu-aily-business-integration-worklog.md)；它们不是产品状态机，
+也不会成为每次 RCA 必须执行的步骤。
 
-## 目标与非目标
+> 当前状态：设计候选，尚未接入生产 gateway 或正式 RCA 分支。现有 Aily Agent
+> 工具只完成固定员工 UAT 的交互式候选和 API canary。
 
-目标：
+## 目标与原则
 
-- 公开、时效性问题触发 Web 检索。
-- 本机代码、运行态、任务历史和本地知识工程问题触发本地检索。
-- 公司缩写、产品、功能、流程、组织、项目字段和内部规范触发 Aily 企业知识检索。
-- RCA 等强业务任务始终执行企业知识检索，即使正文没有显式关键词。
-- 检索结果在任务开始前形成结构化上下文，后续阶段无感复用。
+- 用户不需要显式说“查企业知识库”。内部术语、业务上下文或正式 RCA 会自动触发。
+- Web、本地知识和企业知识是并列来源，不互相冒充或静默降级。
+- 企业知识只帮助理解术语、预期行为、边界条件和聚焦分析方向。
+- 企业知识不是原始证据，不能替代 issue、MCAP、日志、代码或 live runtime。
+- 企业知识查询失败时，普通任务和 RCA 都继续原有链路，不新增业务阻断。
+- 内部术语未命中时不能改用公网搜索猜测公司含义。
+- 自动 RCA 使用单独受审的最小权限服务身份，绝不借用固定员工 UAT。
 
-非目标：
+## 三类检索来源
 
-- 不把企业知识答案当成生产运行证据或 RCA 原始数据。
-- 不在企业知识未命中时静默改用公网搜索猜测内部含义。
-- 不把用户 UAT 传入 VM、MCP、terminal、cron 或后台 worker。
-- 不在数据库事务、外部写入或报告发布阶段临时发起不可重放的网络检索。
-
-## 三类同级检索源
-
-| route | 适用内容 | 典型能力 | 可信边界 |
+| route | 触发内容 | 运行时能力 | 可信边界 |
 | --- | --- | --- | --- |
-| `web` | 公开且可能变化的信息、官方外部文档、新闻、标准版本 | `web_search` / `web_extract` | 外部参考；必须保留来源和时间。 |
-| `local` | 当前代码、live runtime、任务 checkpoint、本地知识工程、历史会话 | 文件/代码搜索、`session_search`、memory、受管 context retrieval | live 证据优先；wiki/memory 仍需按 source class 裁决。 |
-| `business` | 公司术语、产品行为、业务规则、内部流程、项目/RCA 语义 | `feishu_aily_agent_chat` | 用户权限过滤的企业参考知识；不能替代 live/原始证据。 |
+| `web` | 公开且可能变化的信息、外部标准、新闻、官方公开文档 | `web_search` / `web_extract` | 外部参考，保留 URL 和时间。 |
+| `local` | 代码、live runtime、任务状态、本地知识工程、历史会话 | 文件/代码搜索、受管 context retrieval、`session_search` | live 证据优先，wiki/memory 仍是参考层。 |
+| `business` | 公司术语、产品行为、业务规则、内部流程、项目/RCA 语义 | Aily business knowledge provider | 内部参考知识，不是执行真相。 |
 
-三个 route 是同一检索路由器的候选输出，不是彼此的 fallback 链。一个任务可以并行
-选择多个 route，但每份结果必须保持来源边界。例如 RCA 可以同时需要本地 live
-证据和企业业务定义；只有明确涉及公开标准时才额外选择 Web。
+一个任务可以同时选择多个 route。例如 RCA 默认需要 local/live 证据，也尝试获取
+business 上下文；只有问题确实涉及公开标准时才额外选择 Web。
 
-## 触发模型
+## 机器契约
 
-每个 route 的需求级别只能是：
-
-| requirement | 含义 |
-| --- | --- |
-| `none` | 本任务不需要该来源，路由决策仍记录。 |
-| `auto` | 关键词/歧义规则命中后自动检索；用户无需显式下令。 |
-| `required` | 任务契约强制检索；模型分类不得降级。RCA 的 business 属于此级。 |
-
-以下 block 是文档测试会解析的最小机器契约：
+`required` 表示必须**尝试** business lookup 并记录结果，不表示检索成功是任务继续的
+门禁。RCA 的失败策略固定为 `continue_original_chain`。
 
 <!-- knowledge-routing-contract:begin -->
 ```json
@@ -57,437 +45,671 @@
     "answer_only",
     "no_match",
     "identity_unavailable",
+    "timeout",
     "error",
     "not_required"
   ],
-  "rca_stage_order": [
-    "durable_admission",
-    "claim",
-    "official_issue_preread",
-    "identity_validation",
-    "business_lookup",
-    "seal",
-    "resource_reservation",
-    "vm_submit"
+  "influences": ["observe_only", "reference_only", "none"],
+  "canonical_json_v1": {
+    "encoding": "utf-8",
+    "ensure_ascii": false,
+    "sort_keys": true,
+    "separators": [",", ":"],
+    "allow_nan": false
+  },
+  "effective_influence_by_mode": {
+    "shadow": {
+      "grounded_match": "observe_only",
+      "answer_only": "observe_only",
+      "no_match": "none",
+      "identity_unavailable": "none",
+      "timeout": "none",
+      "error": "none",
+      "not_required": "none"
+    },
+    "active": {
+      "grounded_match": "reference_only",
+      "answer_only": "reference_only",
+      "no_match": "none",
+      "identity_unavailable": "none",
+      "timeout": "none",
+      "error": "none",
+      "not_required": "none"
+    }
+  },
+  "enhancement_only": true,
+  "gates_original_chain": false,
+  "failure_policy": "continue_original_chain",
+  "business_knowledge_is_execution_evidence": false,
+  "original_chain_mutations": {
+    "dispatcher": false,
+    "execution_request_v2": false,
+    "vm_goal": false,
+    "core_result": false,
+    "required_delivery": false
+  },
+  "design_method_runtime": false,
+  "lookup_unique_key": [
+    "submission_key",
+    "generation",
+    "phase",
+    "query_hmac_sha256",
+    "provider_policy_fingerprint",
+    "identity_policy_fingerprint"
   ],
-  "grounded_match_required": [
-    "query_sha256",
+  "rca_enhancement_points": [
+    "post_vm_materialization_async_preflight",
+    "post_core_gap_async_lookup",
+    "owner_only_reference_appendix"
+  ],
+  "second_stage_fork": {
+    "after": "s6_report_seal_and_optional_gap_attempt",
+    "main_branch": [
+      "main_task_completion_without_host_wait",
+      "original_required_delivery"
+    ],
+    "reference_branch_requires": "valid_gap_atomic_seal",
+    "reference_branch": [
+      "host_gap_observer_claim",
+      "host_business_lookup_create_once",
+      "owner_only_addendum_seal"
+    ]
+  },
+  "second_stage_gap_outcomes": {
+    "valid_gap": ["main_branch", "reference_branch"],
+    "gap_absent": ["main_branch"],
+    "gap_build_or_seal_error": ["main_branch", "knowledge_local_metric_only"]
+  },
+  "second_stage_controls": {
+    "vm_direct_access": false,
+    "same_generation_binding": true,
+    "cross_generation_reuse": false,
+    "human_blocking_state": false,
+    "main_task_resume": false,
+    "required_delivery_effect": false,
+    "gap_artifact_failure_blocks_main": false,
+    "max_rounds": 1,
+    "max_queries": 2
+  },
+  "rca_provider_session_policy": {
+    "create_request_session_id": null,
+    "fresh_session_per_job": true,
+    "cross_job_session_reuse": false
+  },
+  "lookup_receipt_common_required": [
+    "schema_version",
+    "submission_key",
+    "generation",
+    "phase",
+    "mode",
+    "status",
+    "influence",
+    "rca_contract_sha256",
+    "query_hmac_sha256",
+    "provider_policy_fingerprint",
+    "identity_policy_fingerprint",
+    "retrieved_at",
+    "latency_ms"
+  ],
+  "lookup_receipt_status_fields_exact": {
+    "grounded_match": [
+      "answer_sha256",
+      "answer_bytes",
+      "source_refs_relpath",
+      "source_refs_sha256",
+      "retrieval_activity_receipt_relpath",
+      "retrieval_activity_receipt_sha256"
+    ],
+    "answer_only": ["answer_sha256", "answer_bytes"],
+    "no_match": [
+      "provider_no_hit_receipt_relpath",
+      "provider_no_hit_receipt_sha256"
+    ],
+    "identity_unavailable": ["error_code"],
+    "timeout": ["error_code"],
+    "error": ["error_code"]
+  },
+  "failure_statuses": ["identity_unavailable", "timeout", "error"],
+  "consumer_receipt_binding_required": [
+    "lookup_receipt_relpath",
+    "lookup_receipt_sha256"
+  ],
+  "consumer_lookup_fields_must_equal": [
+    "submission_key",
+    "generation",
+    "phase",
+    "mode",
+    "status",
+    "influence",
+    "rca_contract_sha256",
+    "query_hmac_sha256",
     "answer_sha256",
-    "knowledge_release_fingerprint",
-    "source_refs_sha256",
-    "retrieval_activity_receipt_sha256"
+    "answer_bytes",
+    "provider_policy_fingerprint",
+    "identity_policy_fingerprint"
   ],
-  "no_match_required": [
-    "query_sha256",
-    "knowledge_release_fingerprint",
-    "provider_no_hit_receipt_sha256"
+  "consumer_content_binding": {
+    "business_knowledge_context_v1": "answer",
+    "business_knowledge_addendum_v1": "content",
+    "encoding": "utf-8",
+    "length_field": "answer_bytes",
+    "sha256_field": "answer_sha256"
+  },
+  "shared_receipt_common_fields_exact": [
+    "schema_version",
+    "submission_key",
+    "generation",
+    "phase",
+    "mode",
+    "status",
+    "influence",
+    "query_hmac_sha256",
+    "provider_policy_fingerprint",
+    "identity_policy_fingerprint",
+    "lookup_receipt_sha256",
+    "retrieved_at",
+    "latency_ms"
   ],
+  "shared_receipt_status_fields_exact": {
+    "grounded_match": ["answer_bytes"],
+    "answer_only": ["answer_bytes"],
+    "no_match": [],
+    "identity_unavailable": ["error_code"],
+    "timeout": ["error_code"],
+    "error": ["error_code"]
+  },
   "shared_receipt_forbidden_fields": [
+    "query",
     "summary",
     "content",
     "raw_answer",
     "open_id",
     "union_id",
-    "token"
+    "token",
+    "agent_chat_id",
+    "session_id",
+    "lookup_receipt_relpath",
+    "source_refs_relpath",
+    "retrieval_activity_receipt_relpath",
+    "provider_no_hit_receipt_relpath"
   ]
 }
 ```
 <!-- knowledge-routing-contract:end -->
 
-### 第一层：确定性关键词规则
+状态只描述增强结果，不改变原任务 disposition：
 
-维护一个版本化、可审计的关键词注册表，不放在 `.env`。每条规则至少包含：
+| status | 可用方式 | 原任务 disposition |
+| --- | --- | --- |
+| `grounded_match` | 可生成 `reference_only` 业务参考，仍不是执行证据。 | continue |
+| `answer_only` | 可生成显式“未验证业务参考”，只提示方向，不当成已证实事实。 | continue |
+| `no_match` | 不注入企业事实，不 fallback Web。 | continue |
+| `identity_unavailable` | 不借其他员工、tenant 或其他 Agent 身份。 | continue |
+| `timeout` / `error` | 只进入增强自身指标和 safe receipt。 | continue |
+| `not_required` | 不执行 business provider。 | continue |
+
+## 无感触发
+
+### 确定性路由
+
+路由发生在主模型开始推理前，先使用本地、版本化规则，不额外调用大模型：
+
+1. `task_type=rca` 或正式 RCA intake：`business=required`。
+2. 命中内部缩写、功能名、车型/项目代号、内部字段、组织流程或内部域名：
+   `business=auto`。
+3. 当前代码、runtime、日志和配置问题：`local=required`；出现业务术语时并行 business。
+4. 公开时效问题：`web=required`；同时出现内部术语时拆成 business 与 web 两个查询。
+5. 纯通用编程、数学或语言转换：business=`none`。
+
+RCA 是否尝试检索由任务类型决定，关键词只决定“查什么”。因此 issue 标题没有显式
+业务缩写也不会漏掉 business route。
+
+### 关键词注册表
+
+规则存放在版本化、可评审的配置中，不放 `.env`：
 
 ```yaml
-id: pnc-rca-ooi
-patterns: [RCA, OOI, CIPV, AEB, ACC, LCC]
-route: business
-strength: required
-domains: [pnc, rca]
-query_template: "解释这些术语在当前业务中的定义、约束和预期行为：{terms}"
+id: pnc-ooi
+patterns: [OOI]
+aliases: [关注目标, 感兴趣目标]
+domains: [pnc, planning, rca]
+query_kinds: [term_definition, expected_behavior, abnormal_boundary]
 ```
 
-匹配要求：
+- ASCII 缩写按 token/词边界匹配，短词必须同时命中 domain 上下文。
+- 中文别名做规范化精确匹配，不使用无界模糊子串。
+- 注册表只保存词、domain、查询模板和版本，不保存知识正文、用户 ID 或 secret。
+- 内部词未命中 business 时不 fallback Web；公开同名概念必须作为独立 web query。
 
-- ASCII 缩写按 token/词边界匹配，不能简单 substring。
-- 中文产品名、流程名和字段名使用规范化别名集合。
-- 短缩写必须带 domain 或任务上下文，避免把普通单词误判为业务术语。
-- 规则命中、规则版本和生成的查询都写入任务 receipt。
-- 关键词注册表更新走代码评审；secret、用户 ID 和知识正文不得进入注册表。
+## 普通飞书任务
 
-建议的业务强信号包括但不限于：
+在飞书 session identity 已绑定、首轮主模型调用开始前执行 route decision：
 
-- 内部缩写、功能名、车型/项目代号、模块名。
-- 飞书项目链接、内部 issue 字段、组织/值班/流程名称。
-- “公司内”“业务定义”“内部规范”“历史方案”等明确范围词。
-- RCA、故障归因、责任域、预期功能行为和结案判断。
+1. route 未命中：完全保持原行为。
+2. route 命中且当前用户有受审 UAT：执行至多一条有界 business query。
+3. 将 `grounded_match` 或 `answer_only` 作为带边界的 `business_reference` 注入主任务；
+   后者必须显式标记“未验证业务参考”，两者都不是执行证据。
+4. `no_match`、身份不可用、超时或错误：不注入答案，主任务继续。
+5. 只有用户的问题明确依赖内部含义而检索失败时，最终答复才说明“企业知识未验证”；
+   不为每次后台检索展示工具过程。
 
-### 第二层：任务上下文规则
+当前固定员工 UAT 仍只允许对应飞书会话使用。多人场景必须采用逐用户 OAuth、稳定
+身份映射、撤权和并发隔离，不能共享该 UAT。
 
-任务类型比关键词优先级更高，用来覆盖没有显式关键词的情况：
+## RCA 首轮增强
 
-| 上下文 | 路由要求 |
-| --- | --- |
-| `task_type=rca` 或正式 RCA intake | `business=required`，同时保留 `local=required`。 |
-| 飞书项目/内部 issue 分析 | 至少 `business=auto`；出现业务字段或产品行为时升级为 required。 |
-| 当前仓库、runtime、日志、配置排查 | `local=required`；业务术语出现时并行 business。 |
-| 公开时效性问题 | `web=required`；若同时包含公司术语，Web 与 business 分开查询。 |
-| 纯通用编程、数学、语言转换 | 默认不检索；出现内部关键词时重新路由。 |
+### 插入位置
 
-RCA 的强制规则不能被正文中的“不要查知识库”绕过。用户可以要求不展示检索过程，
-但不能让正式 RCA 在缺失业务语义校验的情况下产生确定性结论。
+首版不修改 host outbox dispatcher。独立 observer 在 VM task 成功物化后，只读 sealed
+goal 和最终 v2 request，再异步执行企业知识增强：
 
-### 第三层：歧义分类
+```text
+durable admission
+  -> claim
+  -> official issue preread / enrich
+  -> original v2 request / reservation / VM submit
+  -> original VM core / report / required delivery
 
-关键词和任务上下文都没有明确结论时，才让模型做一次轻量分类：
+independent host coordinator
+  -> observe materialized VM task read-only
+  -> async preflight business lookup
+  -> observe optional completed core gap artifact
+  -> async supplemental lookup
+  -> owner-only reference appendix + safe receipt
+```
 
-- 该问题是否依赖公司特有定义？
-- 错把公司含义当作通用含义是否会改变结论？
-- 是否需要最新公开信息？
-- 是否需要当前机器/任务/live 证据？
+Observer 复用 task-owned 定位符读取已经封存的 request，不向 control DB、outbox、VM
+goal 或原 delivery store 写入。Aily create/poll 不占用 outbox lease，也不能打开原
+dispatcher circuit。不能把网络调用放入 Kafka consumer、SQLite transaction、飞书
+callback、VM、报告渲染或投递阶段。
 
-分类器只输出 route 和 reason code，不生成事实答案。任何内部缩写无法确认时优先
-选择 `business`，不能先去 Web 搜索同名公开概念。
+这意味着首版 RCA 增强是独立参考 lane：它能给人工复核、后续追问或下一次受控分析
+提供术语和聚焦方向，但不会改变当前一次性 VM core。若未来要求 Aily 参与当前 core
+的 hypothesis/evaluator 顺序，必须另行设计 staged VM workflow；当前 sealed fixed-goal
+任务没有可安全 resume 的 pre-render 阶段。
 
-## 路由优先级与冲突
+### 查询范围
 
-1. **范围先于便利性**：公司语义只由 business 解释，不以 Web 作为未命中兜底；
-   可以并行 local/live 来核对当前实现和运行证据。
-2. **live 先于说明性知识**：当前运行状态、代码和任务结果以 local/live evidence 为准。
-3. **业务知识解释语义**：business 用来解释术语、预期行为和流程，不覆盖原始信号。
-4. **Web 只回答公开问题**：公开标准可辅助 RCA，但必须与内部业务规则分栏呈现。
-5. **冲突不自动融合**：business 与 local/live 冲突时标记 `knowledge_conflict`，继续采集
-   原始证据并要求人工裁决；不得挑一个更顺眼的答案。
+首轮只使用经过 allowlist 的最小字段：
 
-## 统一结果契约
+- `business_profile.profile_id` 和版本；
+- `function_category` / `function_domain`；
+- title 中命中的注册术语和有界业务摘要。
 
-路由器为每个任务生成一个有界的 `knowledge_context_v1`。示例只展示字段结构：
+默认禁止发送 work item ID/URL、负责人、车辆信息、PDCL 地址、frame、完整描述、评论、
+附件和人工填写的根因。业务查询只问：
+
+1. 术语在当前业务域的定义；
+2. 预期状态或目标切换行为；
+3. 正常/异常边界以及不能单独作为异常依据的现象。
+
+### 对 RCA 的影响
+
+原 VM core 不读取 Aily，先独立封存原始证据和 core result。成功上下文只能进入独立
+reference appendix：
+
+- 展开术语；
+- 提示应关注的信号和时间窗口；
+- 提供待验证的业务假设和后续聚焦方向；
+- 为人工复核或后续追问提供正确业务措辞。
+
+它不能直接将某个模块定为根因、证明责任归属、覆盖 evaluator 输出或把任务标记完成。
+所有业务假设仍必须由原始数据、代码或 live 证据独立验证。
+
+检索失败时写入脱敏状态并继续原链。`identity_unavailable`、`no_match`、`timeout`、
+`error` 和只有文本但缺少 provenance 的 `answer_only` 都不修改 core result，也不是
+VM submit、原报告或投递门禁。只有 `grounded_match` 或明确标记的 `answer_only` 才能
+生成 owner-only 独立参考附录；其他状态没有附录，原输出始终保持原行为。首版不自动
+把附录写回飞书；后续若需要通知，必须使用独立 best-effort store/circuit，不能复用
+required delivery。首版附录通过 host-private、task-bound artifact 和后续 Hermes 追问读取。
+
+## 二阶段业务补查
+
+首版契约预留一次 host-mediated 补查，用于 VM core 结果中才暴露的内部术语或业务
+盲点。VM 始终不持有 UAT，也不直接访问 Aily；它只额外产出有界 gap artifact，随后
+继续并完成原任务，不等待知识结果。
+
+```text
+VM core
+  -> seal original S6 report
+  -> best-effort optional business_knowledge_gap_v1 atomic seal
+  +-> main branch: complete original task and required delivery without host wait
+
+  +-> valid-gap-only reference branch: host observer validates and claims gap
+        -> host performs create-once lookup
+        -> seals owner-only business_knowledge_addendum_v1
+```
+
+`business_knowledge_gap_v1` 只允许：
 
 ```json
 {
-  "schema_version": "knowledge_context_v1",
-  "decision": {
-    "routes": ["business", "local"],
-    "requirements": {"business": "required", "local": "required", "web": "none"},
-    "reason_codes": ["task_rca", "keyword_ooi"],
-    "rule_version": "..."
-  },
-  "lookups": [
-    {
-      "route": "business",
-      "query_sha256": "...",
-      "status": "grounded_match",
-      "grounding_basis": "source_bound_retrieval_receipt",
-      "source_refs_sha256": "...",
-      "retrieval_activity_receipt_sha256": "...",
-      "summary": "bounded task context",
-      "answer_sha256": "...",
-      "retrieved_at": "...",
-      "latency_ms": 0,
-      "attempts": 1,
-      "cache_hit": false,
-      "identity_scope": "user",
-      "auth_principal_fingerprint": "...",
-      "knowledge_release_fingerprint": "...",
-      "raw_answer_logged": false
-    }
-  ],
-  "controls": {
-    "public_web_forbidden_for_internal_terms": true,
-    "may_override_live_evidence": false
-  }
+  "schema_version": "business_knowledge_gap_v1",
+  "submission_key": "...",
+  "generation": 1,
+  "phase": "gap:1",
+  "gap_id": "...",
+  "run_id": "...",
+  "artifact_set_id": "...",
+  "request_sha256": "...",
+  "rca_contract_sha256": "...",
+  "s6_stage_receipt_sha256": "...",
+  "round": 1,
+  "terms": ["OOI"],
+  "question_kind": "abnormal_boundary",
+  "reason_code": "unknown_business_semantics",
+  "context_hint": "目标选择状态切换的业务边界不明确",
+  "evidence_locator_refs": ["signal-window:target-selection"]
 }
 ```
 
-`status` 只能取：
+约束：
 
-| status | 含义 |
-| --- | --- |
-| `grounded_match` | source-bound receipt 同时绑定 query、命中来源、知识/Agent 版本和 answer hash。 |
-| `answer_only` | Agent 返回了文本，但没有足够证据证明来自知识检索；只能作弱参考。 |
-| `no_match` | 有结构化 provider no-hit/活动证据证明未命中；不能根据模型的“未检索到”文字自行判定。 |
-| `identity_unavailable` | 当前入口没有可用于该任务的受审身份；不得借用其他员工权限。 |
-| `error` | 身份、权限、超时或协议错误。 |
-| `not_required` | 路由器有记录地判定该 route 不需要执行。 |
+- 首版最多一轮、最多两条 query；同一 `phase` 内相同 query digest 不重复调用。
+- gap 不能包含原始帧、日志正文、附件、PDCL、用户信息或自定义 prompt 指令。
+- gap 本地生成、校验或 seal 失败时直接跳过 reference branch，主 task completion 和
+  required delivery 继续；不得把 gap 变成 S6、task completion 或 delivery gate。
+- VM helper 必须捕获 gap 的 ENOSPC、permission、schema/hash、existing-target conflict 和
+  fsync 错误，写有界 knowledge-local metric 后返回原 fixed CLI disposition；禁止让这些
+  异常改变原 exit code、result/report 或 required delivery。
+- host 重新按注册表和业务 profile 构造最终问题，不能原样执行 VM 文本。
+- lookup job/receipt 无论成功或失败都是终态；只有 `grounded_match`/`answer_only` 生成
+  addendum，同一 hash 不允许形成查询循环。
+- addendum 绑定同一 `submission_key`、generation、RCA contract 和 S6 stage receipt，但不
+  resume、不改写也不重新投递主 RCA。
+- 补查失败时只记录“本轮业务增强不可用”，原 RCA 无需恢复，因为从未等待它。
+- 第二阶段默认 feature flag 关闭；完成幂等、artifact lineage 和故障注入测试后再开启。
 
-当前 Aily 工具能返回 `Completed`、文本、chat/session ID 和有界 artifact 标识，但没有
-完整 grounded provenance。因此在扩展工具结果契约前，自动流程最多把它标为
-`answer_only`；不能根据 `answer_available=true` 自行升级为 `grounded_match`。
-旧 Data Knowledge API 的 `has_answer=true` 仍归为 `answer_only`，只在
-`grounding_basis` 记录 `provider_asserted_has_answer`；没有来源/活动证据时不能
-升级为 `grounded_match`。
+字段上限：`terms<=8`、`context_hint<=400`、`evidence_locator_refs<=8`。正式实现必须在
+`gateway/pnc_rca_stage_lineage.py` 暴露并由 VM/host 共用版本化
+`business_knowledge_canonical_json_v1` helper，其行为严格等于机器契约中的 UTF-8、
+`ensure_ascii=false`、sorted keys、compact separators、禁止 NaN；不得分别调用默认
+`json.dumps`。`gap_id` 是以该 helper 编码“排除 `gap_id` 后的 normalized gap”再取
+SHA-256。VM 只可在 S6 receipt 已封存后，将 gap 写到
+`<artifact_root>/business_knowledge/gaps/gap-1.json`；其中 `artifact_root` 必须是现有
+RCA contract 的 `/mnt/tmp/<submission_key>/`。`rca_contract_sha256` 必须等于
+`vm_task_status(...).meta.rca_contract_sha256`。observer 必须先用
+`validate_stage_lineage_chain` 校验完整 S3A->S6 hash chain、expected finished timestamps、
+当前 required final outputs，以及 S6 identity 的 `task_id/submission_key/run_id/artifact_set_id/
+request_sha256/rca_contract_sha256` 六个字段全部等于当前 task/goal 的 expected identity；只调
+`validate_stage_lineage_receipt` 不够。`s6_stage_receipt_sha256` 是对 full-chain validator
+返回的 normalized S6 receipt 使用同一 helper 计算的 canonical JSON SHA-256，对应文件为
+`<artifact_root>/stage_lineage/s6_report.json`。现有
+`rca_contract_sha256` 则直接与 task meta 的既有值比较，不能用新 helper 重算。
 
-## 从检索到交付的八步闭环
+gap 使用同目录 `0600` 临时文件，完成 bounded JSON、owner、regular-file、no-symlink、
+size 和 hash 校验后，以 no-replace 的同文件系统原子 seal 写入最终路径并 `fsync` 父目录；
+已存在目标只能按 hash 幂等读取，不能覆盖。该文件不得进入 `delivery_contract.json`、
+`delivery_manifest.json` 或 required delivery artifact 集。observer 只接受已完成 task、
+generation、RCA contract 和 S6 receipt 全部匹配的 gap；迟到或不匹配的结果只能写
+knowledge-local stale receipt。
 
-检索不是一次性的前置动作。substantial 或 required-knowledge 任务在理解加深时
-会不断暴露新关键词和新盲区，因此统一路由要嵌入以下闭环。简单问答使用
-`route decision -> lookup -> answer` 轻量路径，其余阶段记为不适用，不创建多余
-worklog 或验收仪式。闭环中每一步都有有界产物，并能触发下一轮检索。
-
-### 1. 盲区扫描：寻找“未知的未知”
-
-在制定方案前，先从用户问题、任务类型、issue、代码和现有材料中抽取：
-
-- 未定义缩写、内部产品/模块/流程名称。
-- 看似通用但可能有公司特有含义的词。
-- 会改变方案或 RCA 结论的业务假设。
-- 缺失的角色、权限、数据范围、版本和成功标准。
-- business、local、web 证据之间的冲突。
-
-所有新术语重新经过关键词路由。RCA 至少生成“术语/预期行为”“业务约束/异常判定”
-两类查询；扫描结果写成 `blind_spots`，不能只留在模型上下文中。
-
-### 2. 先出原型：看完最小闭环再决定要什么
-
-盲区扫描后先做最小、可逆、无生产副作用的原型或 dry-run：
-
-- API 接入先做脱敏 smoke，不先改 resident。
-- RCA 接入先生成一份 shadow `knowledge_context_v1`，不先改变归因结果。
-- 文档/交互先用一个真实问题走完整流程，再决定字段和 UI。
-
-原型的目的不是提前交付，而是让返回形状、延迟、权限和无匹配行为变得可观察。
-原型发现的新字段或术语回到盲区扫描，不允许拿首次猜测直接扩成生产方案。
-
-### 3. 反向采访：只问会改变做法的问题
-
-AI 根据 `blind_spots`、原型结果和来源冲突生成少量高价值问题。每个问题必须附带：
-
-- 哪个答案会改变 route、数据边界、实现顺序或验收标准。
-- 不回答时采用什么可逆默认值。
-- 是否会阻断生产、外部写入或确定性 RCA 结论。
-
-例如：“OOI 的异常判定以哪份内部规范为准？”会改变 RCA evaluator 和报告口径，应
-提问；“标题喜欢哪个措辞？”通常不应打断执行。已能从 business/local 权威来源确定
-的问题不再询问用户。
-
-### 4. 给参照物：说不清时使用文件或样例
-
-用户可以提供现有报告、issue、截图、接口响应或期望样例。路由器先分类材料：
-
-- 当前代码/配置/日志进入 local，并按 live/reference/memory 分级。
-- 企业内部文档进入 business 或受控本地解析。
-- 公开标准和官方外部文档进入 web。
-
-参照物不是默认正确答案；必须记录来源、版本、适用范围和与 live 的差异。不能未经
-确认把本地文件自动上传到 Aily；`agent_attachment_ids` 只接受已经通过受控附件流程
-上传、且归属当前身份的材料。
-
-### 5. 实施计划：先验证最可能反悔的决定
-
-计划按“返工代价和反悔概率”排序，而不是只按代码依赖排序：
-
-1. 先验证身份、知识范围、接口形状、grounded 证据和失败策略。
-2. 再锁定任务契约、schema 和 host/VM 边界。
-3. 然后实现可逆的路由、shadow 和测试。
-4. 最后才做 manifest、resident restart、外部写入等生产效果。
-
-“放前面”指尽早验证高风险假设，不代表提前执行不可逆操作。数据删除、历史改写、
-生产切换和敏感授权仍遵守单独审批与治理门。
-
-### 6. Log 笔记：边做边记
-
-每个任务维护有界 `knowledge_worklog_v1`，checkpoint 覆盖更新而不是追加原始长日志：
+Owner-only addendum 使用 exact schema：
 
 ```json
 {
-  "route_decisions": [],
-  "blind_spots": [],
-  "assumptions": [],
-  "questions_that_change_plan": [],
-  "reference_artifacts": [],
-  "knowledge_context_sha256": "...",
-  "conflicts": [],
-  "verification": [],
-  "remaining_gaps": []
+  "schema_version": "business_knowledge_addendum_v1",
+  "mode": "active",
+  "submission_key": "...",
+  "generation": 1,
+  "phase": "gap:1",
+  "gap_id": "...",
+  "run_id": "...",
+  "artifact_set_id": "...",
+  "request_sha256": "...",
+  "rca_contract_sha256": "...",
+  "s6_stage_receipt_sha256": "...",
+  "status": "answer_only",
+  "influence": "reference_only",
+  "query_hmac_sha256": "...",
+  "answer_sha256": "656584fa205311b0846a70271f1778fce74d0990a9992967a1288040ec68c04c",
+  "answer_bytes": 33,
+  "provider_policy_fingerprint": "...",
+  "identity_policy_fingerprint": "...",
+  "lookup_receipt_relpath": "gap-1/<job_id>/lookup-receipt.json",
+  "lookup_receipt_sha256": "...",
+  "content": "owner-only bounded reference text"
 }
 ```
 
-笔记记录决策、hash、状态和定位符，不复制 secret、UAT、完整内部答案或大段原始日志。
-新证据推翻旧结论时标记 `superseded`，不能把两套叙事揉在一起。
+Observer 对 `(submission_key,generation,phase,gap_id)` 做原子 claim/CAS；同一 key 只有
+一个 worker 可 create。每 generation 的 ledger 最多 `1` 条 preflight 和 `2` 条 gap
+query，create 总数不超过 `3`。重复 gap、继续 poll 和读取已完成 context 不消耗新额度。
 
-### 7. 交接文档：给人看，也给下一次任务恢复
+## Provider 与身份
 
-交接包至少包含：
+交互式和后台 provider 必须分离：
 
-- 目标、范围和当前状态。
-- route decision、关键词规则版本和检索状态。
-- 已确认事实、source class、证据定位符和 hash。
-- 原型结果、关键决策、未回答问题和已拒绝方案。
-- 测试命令、结果、未覆盖项、发布与回滚步骤。
-- 下一步唯一入口，以及哪些操作仍需 owner 授权。
+| 场景 | 身份 | 边界 |
+| --- | --- | --- |
+| 普通飞书任务 | 当前请求用户的 UAT | 仅该用户会话；按用户权限过滤。 |
+| Kafka/outbox RCA | 专用 RCA 服务用户/UAT | 无人值守、最小知识范围、可轮换、可审计。 |
 
-交接文档不能把候选测试写成 live 已生效，也不能用知识摘要替代当前 task/shared-state。
+后台服务用户只允许访问已批准可用于 RCA 报告受众的知识范围，不能凭服务账号扩大
+最终接收者原本不应看到的内容。专用 Aily Agent 必须：
 
-### 8. 出题验收：关键题满分才能提交
+- 只启用企业知识检索；
+- 关闭公开网络；
+- 不绑定写型 MCP、飞书写工具或其他有副作用技能；
+- 发布版本、知识范围和工具策略可形成 fingerprint；
+- 调用应用和服务用户在 Aily OpenAPI 用户范围内。
 
-提交或发布前，根据目标、业务知识、原型和验收标准生成一组带依据的题目。题库至少
-覆盖：
+如果后台身份或等价知识范围尚未就绪，provider 返回 `identity_unavailable`，RCA
+继续原链，绝不能回退固定员工 UAT、tenant identity、Web 或另一个 Agent。
 
-- 是否能解释所有影响实现的内部术语，并指出业务知识依据？
-- 是否知道哪些字段是 reference knowledge，哪些是 live execution truth？
-- `no_match`、`answer_only`、身份错误和超时分别怎样处理？
-- 是否存在内部问题降级 Web、跨用户缓存或 UAT 进入 VM 的路径？
-- RCA 在业务上下文缺失时，哪些步骤可以继续，哪些结论必须 abstain？
-- 测试、发布、回读和回滚是否能由交接文档复现？
+## 结果与持久化
 
-每题必须有可定位的答案依据，不能由模型凭自信自评。任一关键题错误、无依据或只靠
-猜测，就把对应 gap 写回 worklog，回到盲区扫描；关键题未满分不得提交。非关键的
-措辞偏好可以记录为 follow-up，不能伪装成发布 blocker。
+每次 RCA provider job 都使用 active governed Hermes home 的 host 私有根
+`$HERMES_HOME/runtime/rca-prod/business-knowledge/<submission_key>/<generation>/`
+持久化状态。POST 前先 durable seal `creating` job state；获得 terminal status 后、任何
+消费者读取前，再封存 owner-only `business_knowledge_lookup_receipt_v1`。`phase_path` 只能是
+`preflight` 或 `gap-<round>`，`job_id` 是机器契约中六元 create-once key 的 canonical
+JSON SHA-256；因此最终 receipt 路径固定为
+`<phase_path>/<job_id>/lookup-receipt.json`。目录为 `0700`、文件为 `0600`，使用与 gap
+相同的 bounded、no-symlink、no-replace、fsync 原子 seal 规则。
 
-### 闭环状态机
+`answer_only` receipt 示例：
 
-```text
-blind_spot_scan
-  -> reversible_prototype
-  -> reverse_interview
-  -> reference_intake
-  -> regret_first_plan
-  -> implementation_with_worklog
-  -> handoff_package
-  -> evidence_quiz
-       | pass: ready_for_review_or_release
-       ` fail: blind_spot_scan
+```json
+{
+  "schema_version": "business_knowledge_lookup_receipt_v1",
+  "submission_key": "...",
+  "generation": 1,
+  "phase": "preflight",
+  "mode": "active",
+  "status": "answer_only",
+  "influence": "reference_only",
+  "rca_contract_sha256": "...",
+  "query_hmac_sha256": "...",
+  "answer_sha256": "656584fa205311b0846a70271f1778fce74d0990a9992967a1288040ec68c04c",
+  "answer_bytes": 33,
+  "provider_policy_fingerprint": "...",
+  "identity_policy_fingerprint": "...",
+  "retrieved_at": "...",
+  "latency_ms": 0
+}
 ```
 
-为了避免无限检索，每轮按 query hash 去重并使用任务级查询预算；只有新证据、新关键词、
-来源冲突或 quiz gap 才能开启下一轮。
+状态字段是条件合同，不允许只改 `status` 标签：
 
-## 无感交互流程
+receipt 顶层字段集合必须严格等于 `lookup_receipt_common_required` 与对应
+`lookup_receipt_status_fields_exact[status]` 的并集；未知字段、`answer`、`content`、
+`raw_answer`、内联 source/activity/no-hit payload 一律拒绝。
 
-### 普通对话与任务
+- `grounded_match` 还必须包含 `source_refs_relpath/source_refs_sha256` 和
+  `retrieval_activity_receipt_relpath/retrieval_activity_receipt_sha256`；两个相对路径
+  都必须位于同一 job 目录，且目标已按同一规则不可变封存。
+- `answer_only` 必须包含 answer hash 和正数 `answer_bytes`，但不得包含 source/no-hit 字段。
+- `no_match` 必须包含 `provider_no_hit_receipt_relpath/provider_no_hit_receipt_sha256`，
+  且不得包含 answer/content/source 字段。
+- `identity_unavailable`、`timeout`、`error` 必须包含 bounded `error_code`，只允许安全诊断，
+  不得包含 answer/content/source/no-hit 字段；这些状态以 lookup receipt 终止且不创建
+  context/addendum。`not_required` 不创建 provider job。
 
-1. 收到消息后先运行本地 route decision，不向用户展示中间提示。
-2. 有 required route 时并行发起有界检索；同时可继续做不依赖结果的本地读取。
-3. 将有界 summary 作为独立、带来源标签的上下文注入主任务，不把检索文本当指令。
-4. 正常回答时无需逐条播报工具调用；只有 `no_match`、`error` 或来源冲突才明确告知。
-5. owner-only task execution pack 可保存有界 context；共享/audit receipt 只记录
-   route、reason、状态、hash、长度、provenance、时间和耗时，不记录问题/答案正文。
+生产 coordinator 必须绑定 reviewed active home，不能接受每个 job 的 `HERMES_HOME` 或
+状态根覆盖。所有 `*_relpath` 都以 generation 根为基准，规范化后不得绝对化、穿越父目录
+或指向符号链接。
 
-### RCA
+当前 Agent Chat 无稳定 source/activity/no-hit artifact，因此只能产生 `answer_only` 或失败
+状态。只有 owner-only lookup receipt 通过 schema、条件字段、路径和 hash 校验后，消费者
+才可生成 context/addendum；共享 safe receipt 只记录其 SHA-256，不记录私有路径或正文。
 
-RCA 采用 host-side preflight，不能让 VM worker 自行携带 UAT 查询：
+成功返回正文的查询再生成 owner-only `business_knowledge_context_v1`：
 
-1. **intake**：读取 issue 元数据时同时设置 `task_type=rca`，无条件触发 business。
-2. **query build**：从标题、业务 profile、功能域和已注册缩写生成最多若干条有界查询；
-   默认不把整份 issue 描述发送给 Aily。
-3. **lookup**：durable admission 和 claim 完成后，先做官方 issue preread 与 identity
-   validation；只有拿到 title/profile/domain 后才构造查询。随后由受管、只读的后台
-   business provider 执行 lookup，可与只读 storage/resource preflight 并行；资源预留
-   和任何外部副作用仍必须等 seal 完成后才允许。
-4. **seal**：把结构化状态、summary、hash、规则版本写入 task-owned receipt。
-5. **handoff**：只把有界 `business_knowledge_context` 加入固定 VM execution request；
-   UAT、open_id、union_id、原始答案不得进入 VM。
-6. **analysis**：VM 原始信号和工具链仍是 RCA execution truth；业务上下文只解释
-   预期行为、术语和责任域。
-7. **report gate**：enforced 模式下，`error`/`identity_unavailable` 有界重试后必须在
-   resource reservation/VM submit 前停止；`answer_only`/`no_match` 只能进入未来明确
-   定义的 `evidence_only` execution mode，依赖业务语义的根因、责任归属和结案结论
-   必须 abstain。该 mode 未进入正式 execution schema 前同样停止提交。
-8. **delivery**：报告生成和飞书投递只消费已封存上下文，不在写入阶段再次调用 Aily。
-
-不应直接加网络调用的位置：ControlStore/SQLite 事务内部、durable outbox settle、Feishu
-写入 guard、VM worker、报告渲染器和 completion/delivery dispatcher。
-
-当前固定员工 UAT 只允许对应的活跃飞书会话，不能用于 Kafka/outbox 自动 RCA。后台
-provider 必须是单独审批的 service principal，并满足：只读、知识范围等价、可无人
-值守轮换、可审计、不能代表任意员工。若 Aily 应用身份只能访问导入知识而不能访问
-所需直连知识，则必须先解决等价知识范围或平台支持的服务身份；不能把固定员工 UAT
-装进 resident 充当替代。该身份未就绪时，RCA `business=required` 的 shadow decision
-可以记录，但 enforced gate 必须保持 blocked。
-
-## 查询构造
-
-查询应短、明确、最小披露。RCA 示例：
-
-```text
-请基于企业知识说明 OOI 在 ACC/AEB 业务中的定义、关键字段、正常目标切换规则，
-以及哪些现象不能单独判定为目标选择异常。未检索到时请明确返回未命中。
+```json
+{
+  "schema_version": "business_knowledge_context_v1",
+  "mode": "active",
+  "status": "answer_only",
+  "influence": "reference_only",
+  "submission_key": "...",
+  "generation": 1,
+  "phase": "preflight",
+  "rca_contract_sha256": "...",
+  "query_kind": "expected_behavior",
+  "query_hmac_sha256": "...",
+  "answer_sha256": "656584fa205311b0846a70271f1778fce74d0990a9992967a1288040ec68c04c",
+  "answer_bytes": 33,
+  "provider_policy_fingerprint": "...",
+  "identity_policy_fingerprint": "...",
+  "lookup_receipt_relpath": "preflight/<job_id>/lookup-receipt.json",
+  "lookup_receipt_sha256": "...",
+  "retrieved_at": "...",
+  "latency_ms": 0,
+  "answer": "owner-only bounded reference text"
+}
 ```
 
-不要默认发送完整聊天记录、完整 issue 描述、日志、客户信息或原始数据路径。一个任务
-内的多个查询使用同一个任务 correlation ID；是否复用 Aily session 必须由污染风险
-测试决定，不能为了省调用而让不同任务共享会话。
+消费者必须重新读取并校验 immutable lookup receipt，然后要求
+`consumer_lookup_fields_must_equal` 中每个字段逐值相等。再对 context 的 `answer` 或
+addendum 的 `content` 取原始 UTF-8 bytes，要求 `len(bytes)==answer_bytes` 且
+`sha256(bytes)==answer_sha256`；任一不一致都丢弃 reference artifact、记录 knowledge-local
+integrity error，并继续原任务。只校验 `lookup_receipt_sha256` 而不校验正文绑定不合格。
 
-## 延迟、缓存和配额
+Shared/audit 层使用 exact `business_knowledge_safe_receipt_v1`，例如：
 
-- route decision 必须本地完成，不调用额外大模型。
-- business 查询与 issue/local context 预取并行，避免串行增加首响应时间。
-- 每个任务设置最大查询数、总 deadline、单次输出上限和有界重试；现有 Agent 工具
-  的总 deadline 为 120 秒。
-- 缓存必须按 `route + agent/policy version + auth principal fingerprint + knowledge
-  release fingerprint + normalized query hash` 隔离，使用短 TTL；不能跨用户共享
-  企业答案。
-- RCA 只允许同一 generation 内按 query hash 去重，不跨 generation 复用答案。缓存
-  命中仍需写 provenance；知识策略、Agent 发布版本或授权主体变化时全部失效。
-- `no_match` 只可短期缓存；permission/auth/protocol error 不缓存。transient error 最多
-  有界重试，不能因旧错误缓存跳过恢复后的真实检索。
-- 429/5xx/timeout 可按 deadline 有界重试；权限、身份和参数错误不重试、
-  不切 tenant、不改走 Web。
-- 先通过 shadow 指标确定 p50/p95、触发率、误触发率、无匹配率和配额，再决定 TTL
-  与并发；文档不预设未经测量的数值。
+```json
+{
+  "schema_version": "business_knowledge_safe_receipt_v1",
+  "submission_key": "...",
+  "generation": 1,
+  "phase": "preflight",
+  "mode": "active",
+  "status": "answer_only",
+  "influence": "reference_only",
+  "query_hmac_sha256": "...",
+  "provider_policy_fingerprint": "...",
+  "identity_policy_fingerprint": "...",
+  "lookup_receipt_sha256": "...",
+  "retrieved_at": "...",
+  "latency_ms": 0,
+  "answer_bytes": 33
+}
+```
 
-## 安全边界
+Safe receipt 顶层字段集合必须严格等于 `shared_receipt_common_fields_exact` 与对应
+`shared_receipt_status_fields_exact[status]` 的并集；未知 key 立即拒绝。该 allowlist 是
+主安全合同，`shared_receipt_forbidden_fields` 只是 defense-in-depth 检查。
 
-- 企业知识正文属于内部数据；owner-only task execution pack 可保存有界 context，
-  默认日志和共享/audit receipt 只保存状态、hash、长度和 provenance，不含摘要正文。
-- 检索内容按不可信外部文本处理：使用明确 delimiter 注入，不执行其中的命令、链接、
-  MCP 调用或“忽略之前指令”等内容。
-- 专用于 business route 的 Aily Agent 及其 MCP 必须是只读能力，关闭公开网络和所有
-  写工具。否则 Agent 可能在服务端直接产生副作用，客户端不执行返回文本仍不足以
-  建立安全边界。
-- 交互式 business route 必须使用当前飞书请求者对应的授权身份；无人值守
-  route 必须使用单独受审的 service principal。现候选仅允许固定员工交互会话；
-  多用户版上线前不能共享该 UAT。
-- 内部关键词未命中时不得降级 Web。若用户明确另问公开含义，应创建独立 web query，
-  并在答案中与公司含义分开。
-- 本地 knowledge/memory 是参考层，live runtime 和正式任务 receipt 决定当前状态。
+- `(submission_key, generation, phase, query_hmac_sha256,
+  provider_policy_fingerprint, identity_policy_fingerprint)` 是唯一 create-once key。
+  `phase` 只能是 `preflight`
+  或有界的 `gap:<round>`；首轮和二阶段不会因文本相同而错误共用 job。
+- create 已成功但 poll 结果不确定时不得自动创建第二个 chat。正式后台 provider 必须把
+  create 与 poll 拆成两个可恢复操作，或在收到 chat ID 后先调用 durable callback 封存
+  `chat_created` 再开始 poll；现有一次性 `run_agent_chat_user()` 不能原样承担该状态机。
+- RCA create body 必须省略 `session_id`，每个六元 job 获得全新 Aily session。返回的
+  session/chat ID 只可在该 owner-only job 内用于恢复 poll，绝不能用于另一个 job、task
+  或 generation；现有 transport 的可选 `session_id` 参数在后台 provider 路径必须固定为
+  `None`。
+- owner-only context 权限为 `0600`，有正文大小和保留期上限。
+- shared/audit receipt 只保留 exact allowlist 中的状态、长度、HMAC、策略版本、耗时和
+  时间，不保存查询、
+  答案、个人标识、chat/session ID 或凭据。
+- 低熵缩写在共享回执中使用 keyed HMAC，避免裸 SHA 被字典反推。
+- 不跨 generation 或授权主体复用答案；同 generation 仅用于幂等去重。
+- `identity_policy_fingerprint` 绑定稳定服务主体、auth mode 和已批准知识范围，不含 token、
+  open/union ID 明文；身份或 ACL 变化必须产生新 job，不能命中旧结果。
+- effective influence 只按机器契约的完整矩阵计算：active 下
+  `grounded_match/answer_only -> reference_only`，shadow 下这两种状态只能
+  `observe_only`；所有其他状态在两种模式下都是 `none`。context/addendum 的 mode、status
+  和 influence 必须与 lookup receipt 完全一致，shadow 结果不能生成面向任务消费者的
+  reference appendix。
 
-## 分阶段接入
+知识 job 使用单调状态：
 
-### A. 当前候选：显式工具
+```text
+reserved -> identity_check -> identity_unavailable
+                           -> creating -> chat_created -> polling
+         -> grounded_match | answer_only | no_match
+         | timeout | error | create_unknown
+```
 
-- 保留 `feishu_aily_agent_chat` 独立工具和单用户权限边界。
-- 用安全 smoke 验证 Agent/UAT，不对生产任务自动触发。
+上面是 provider 内部 `job_state`，不是对外 `status`。POST 前先持久化 `creating`。
+崩溃恢复时若没有已封存的 chat ID，则 job 转 `create_unknown`，对外映射为
+`status=error` 并结束本次增强，不能盲目再次 POST；已知 chat ID 时只允许继续 GET
+poll。该保守策略可能丢失一次增强，但不会重复执行服务端 Agent，也不影响原 RCA。
+`identity_unavailable` 是 create 前的独立 terminal job state，并映射同名对外 status；
+`not_required` 在路由层结束，不创建 job。
 
-### B. 统一路由 shadow
+`no_match` 只能来自绑定 query、provider policy 和本次调用的结构化 no-hit receipt。
+当前 Agent 文本自行声称“未检索到”不满足该条件，应保持 `answer_only`；不能把模型
+措辞提升为 provider no-hit 事实。
 
-- 新增版本化 keyword registry 和 route decision。
-- 只记录“本来会选择什么 route”，不实际改变回答或 RCA 结论。
-- 用真实飞书问题评估漏检、误触发和延迟预算。
+当前 Agent Chat 只有 `Completed`、文本、chat/session 和 artifact 标识，没有稳定来源
+契约。因此默认只能标为 `answer_only`。只有同时绑定 query、answer、source refs、
+Agent/知识策略版本和本次活动 receipt 时，才允许标 `grounded_match`。
 
-### C. 普通任务自动检索
+## 失败与隔离
 
-- 对 required business 规则实际调用 Aily并注入有界 context。
-- `no_match`/`error` 明示，禁止公网 fallback。
-- 通用问题和未命中规则的问题保持原有路径。
+- business lookup 使用独立限流、deadline、熔断和指标，不打开原 RCA dispatcher circuit。
+- lookup 不占用现有 dispatcher 长 lease；正式实现采用独立 durable enrichment stage。
+- provider 返回文本按不可信输入处理，用 delimiter 隔离，不能执行其中的命令、链接、
+  MCP 指令或“忽略之前规则”。
+- business 与 local/live 冲突时保留 `knowledge_conflict`，以原始证据为准。
+- Aily 超时、限流或停机不能改变原 execution request、canonical hash、VM submit、报告
+  和投递结果；除新增可观察 receipt 外，禁用增强应能恢复原行为。
 
-### D. RCA shadow context
+## 最小可逆原型
 
-- 在正式 RCA 分支加入 host preflight 和 `knowledge_context_v1`，先随 execution request
-  记录但不改变归因。
-- 同时实现并审查无人值守的只读 business provider；没有可用 service identity 时记录
-  `identity_unavailable`，不得借用交互式固定员工 UAT。
-- 对比有/无业务上下文的责任域、abstention 和人工复核结果。
+第一阶段不是直接修改 dispatcher，而是独立只读 shadow observer：
 
-### E. RCA enforced gate
+1. 读取已完成 RCA 的只读 execution request/goal 定位符；
+2. 运行同一确定性路由和 query builder；
+3. 使用专用只读 provider 或 mock；
+4. 写 owner-only context 和脱敏 receipt；
+5. 对比开启/关闭增强时的术语覆盖、分析聚焦度和误导率；
+6. 不修改 outbox、VM、报告、投递或 production circuit。
 
-- `task_type=rca` 强制 business route。
-- 只读后台身份、grounding receipt 和 `evidence_only`/abstention schema 都必须先完成；
-  任一缺失时 enforced gate 保持 blocked。
-- 只有证据充分的业务上下文才能支撑语义相关结论；无匹配/错误时保留数据分析，
-  对业务判断 abstain。
-- 经 governed release、真实 canary 和回滚演练后再启用。
+停止 observer 即完整回滚。Shadow 验收先证明身份、知识范围、grounding 能力、延迟和
+无副作用，再扩展为只读跟踪新物化 task 的 live reference observer。
+
+## 风险优先实施顺序
+
+1. **身份与 ACL**：建立专用服务用户、最小 RCA 知识范围和输出受众规则。
+2. **Agent 策略**：证明无公网、无写工具，并固化发布策略 fingerprint。
+3. **Provider receipt**：验证是否能获得来源/活动证据；不能则明确保持 `answer_only`。
+4. **Shadow observer**：create-once、限流、脱敏、故障隔离和对照评估。
+5. **普通飞书自动路由**：关键词命中自动预取，失败继续原任务。
+6. **RCA live reference lane**：只读跟踪新物化 task，不改 dispatcher、v2 request、
+   core result 或 required delivery。
+7. **二阶段补查**：先完成 gap/addendum artifact lineage，再打开一轮 feature flag；
+   主 task 不等待、不 resume。
+8. **受管发布**：正式 RCA 分支回归、materialize、gateway restart、readback 和 canary。
 
 ## 验收场景
 
-| 输入 | 预期 route |
+| 场景 | 预期 |
 | --- | --- |
-| `OOI是什么?` | business required；不调用 Web。 |
-| `分析这个AEB误触发RCA` | business + local required，即使正文没有更多内部关键词。 |
-| `查看当前gateway为什么没重启` | local required；不默认 business/Web。 |
-| `Python list append怎么用` | 不检索，直接使用通用能力。 |
-| `飞书最新公开API限流是多少` | web required；若涉及本租户内部策略，再并行 business。 |
-| 内部缩写未命中 | business=`no_match`；不降级 Web，不猜测。 |
-| Aily 返回文本但无检索 provenance | business=`answer_only`；RCA 不得据此形成确定性业务结论。 |
-| Kafka RCA 只有固定员工 UAT 可用 | business=`identity_unavailable`；不提交 VM，不借权。 |
-| business 与 live 证据冲突 | 标记 `knowledge_conflict`，保留原始证据并转人工裁决。 |
+| `OOI是什么?` | business auto；不调用 Web。 |
+| 正式 AEB RCA，标题无缩写 | business required attempt + local；原 RCA 始终继续。 |
+| Aily timeout / 403 / no-match | 记录状态；VM、报告和投递保持原行为。 |
+| 返回非空文本但无来源 | `answer_only/reference_only`，不能作为根因证据。 |
+| 通用 Python 问题 | 不触发 business。 |
+| 内部词和公开标准混合 | business 与 web 分开查询，不互相 fallback。 |
+| Kafka RCA 只有固定员工 UAT | `identity_unavailable`，不用该 UAT，原 RCA 继续。 |
+| VM 新发现业务术语 | 最多一轮 host gap、两条 lookup；主 task 不等待，addendum 绑定原 generation。 |
+| business 与 live 证据冲突 | 标记冲突，以 live/原始证据为准。 |
+
+后续正式分支的文件、测试和发布交接见
+[集成交接](feishu-aily-business-integration-handoff.md)。

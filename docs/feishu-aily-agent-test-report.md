@@ -56,7 +56,7 @@ uv run --frozen pytest -q \
   tests/tools/test_registry.py
 ```
 
-2026-08-21 在当前文档改动上重新执行，结果：`394 passed`。
+2026-08-21 在当前文档改动上重新执行，结果：`395 passed`。
 
 独立只读复核另外运行了 250 个相关测试，未发现 P0/P1/P2。以下静态检查也通过：
 
@@ -119,7 +119,8 @@ token：
    超时率和缓存收益的正式基线。
 8. **无人值守 RCA 身份未实现**：固定员工 UAT 只允许对应飞书会话使用。Kafka/outbox
    自动任务没有该会话身份，不能借用固定员工权限；必须另建受审的只读 service
-   principal/provider，或保持 RCA enforced gate 关闭。
+   principal/provider。该增强尚未实现不会阻断现有 RCA，查询失败后的正式策略也是
+   继续原链。
 9. **grounding 负例未完成**：尚未持久化 Aily 活动日志/来源，也没有“知识
    未命中且确认未走公网”、ACL 拒绝和 resident Feishu E2E receipt。当前真实
    答案只能归类为 `answer_only`。
@@ -138,11 +139,16 @@ SSE `finished`，因此必须记为失败，不属于上述 Agent UAT 成功证�
 1. 只移植 Aily 相关变更，证明没有删除或回退现有 RCA 文件与契约。
 2. 本报告的主回归在正式分支全部通过，并补充统一检索路由和 RCA 接入测试。
 3. 形成结构化 `business_knowledge_context`，明确 `grounded_match`、
-   `answer_only`、`no_match`、`identity_unavailable`、`error`、`not_required`。
+   `answer_only`、`no_match`、`identity_unavailable`、`timeout`、`error`、
+   `not_required`，并证明所有失败状态继续原 RCA。
 4. 完成 governed materialize、manifest/config/env 指纹、gateway 新 PID 和平台连接回读。
 5. 在固定员工真实飞书会话中验证：业务关键词自动触发 Aily；通用问题不触发；
-   RCA 无论是否显式包含关键词都执行企业知识检索。
+   RCA 无论是否显式包含关键词都尝试企业知识增强，失败后继续原链。
 6. 保存不含内部答案正文和个人标识的发布 receipt，并保留 Aily 知识工具策略/活动
    证据，证明没有公开网络兜底。
 7. 对 Kafka RCA 使用独立、只读、受审的后台身份；固定员工 UAT 不进入 resident、
    outbox worker 或 VM。
+8. 用基线 oracle 证明增强关闭或任何 provider 故障时，原 v2 request/hash、core result、
+   outbox、VM submit、报告和投递行为不变。
+9. 二阶段补查只允许 VM 发有界 gap artifact、host 查询并写 owner-only addendum；
+   主 task 不等待、不 resume，且不得进入人工 `need_input`、创建新 RCA 或阻断原投递。

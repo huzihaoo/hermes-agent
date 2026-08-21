@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import io
 import json
@@ -17,6 +18,16 @@ SCRIPT = Path(__file__).parents[2] / "scripts" / "feishu_aily_agent_user_smoke.p
 DOC = Path(__file__).parents[2] / "docs" / "feishu-aily-agent.md"
 TEST_REPORT_DOC = Path(__file__).parents[2] / "docs" / "feishu-aily-agent-test-report.md"
 ROUTING_DOC = Path(__file__).parents[2] / "docs" / "hermes-knowledge-retrieval-routing.md"
+WORKLOG_DOC = (
+    Path(__file__).parents[2]
+    / "docs"
+    / "feishu-aily-business-integration-worklog.md"
+)
+HANDOFF_DOC = (
+    Path(__file__).parents[2]
+    / "docs"
+    / "feishu-aily-business-integration-handoff.md"
+)
 SPEC = importlib.util.spec_from_file_location("feishu_aily_agent_user_smoke", SCRIPT)
 assert SPEC and SPEC.loader
 smoke = importlib.util.module_from_spec(SPEC)
@@ -49,6 +60,8 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
     main_documentation = DOC.read_text(encoding="utf-8")
     test_report = TEST_REPORT_DOC.read_text(encoding="utf-8")
     routing = ROUTING_DOC.read_text(encoding="utf-8")
+    worklog = WORKLOG_DOC.read_text(encoding="utf-8")
+    handoff = HANDOFF_DOC.read_text(encoding="utf-8")
 
     assert "feishu-aily-agent-test-report.md" in main_documentation
     assert "hermes-knowledge-retrieval-routing.md" in main_documentation
@@ -62,16 +75,18 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
     assert "a1e4565ec7 -> e25ba59684 -> 4a0adaba91" in test_report
     assert "HTTP 200 + 业务码 `2320008`" in test_report
     assert "session-derived attestation" in test_report
-    assert "Web、本地知识工程和飞书 Aily 企业知识的同级触发机制" in routing
-    assert "RCA 的强制规则" in routing
-    assert "内部关键词未命中时不得降级 Web" in routing
-    assert "knowledge_context_v1" in routing
-    assert '"business": "required"' in routing
+    assert "Web Search 和本地知识检索一样" in routing
+    assert "必须**尝试**" in routing
+    assert "内部词未命中 business 时不 fallback Web" in routing
+    assert "business_knowledge_context_v1" in routing
     assert "answer_only" in routing
     assert "identity_unavailable" in routing
-    assert "Kafka/outbox 自动 RCA" in routing
-    assert "不能把固定员工 UAT" in routing
-    assert "Aily Agent 及其 MCP 必须是只读能力" in routing
+    assert "专用 RCA 服务用户/UAT" in routing
+    assert "固定员工 UAT" in routing
+    assert "关闭公开网络" in routing
+    assert "继续原链" in routing
+    assert "host-mediated" in routing
+    assert "绑定同一 `submission_key`、generation" in routing
     for stage in (
         "盲区扫描",
         "先出原型",
@@ -80,47 +95,353 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
         "实施计划",
         "Log 笔记",
         "交接文档",
-        "出题验收",
+        "出题考你",
     ):
-        assert stage in routing
-    assert "关键题未满分不得提交" in routing
+        assert stage in worklog
+    assert "不是运行时流程" in worklog
+    assert "证据 Quiz" in handoff
+    assert "必须 9/9" in handoff
+    assert "八步方法不进入 runtime contract" in handoff
 
     contract_text = routing.split(
         "<!-- knowledge-routing-contract:begin -->", 1
     )[1].split("<!-- knowledge-routing-contract:end -->", 1)[0]
     contract = json.loads(contract_text.split("```json", 1)[1].split("```", 1)[0])
     assert contract["requirements"] == ["none", "auto", "required"]
+    assert contract["canonical_json_v1"] == {
+        "encoding": "utf-8",
+        "ensure_ascii": False,
+        "sort_keys": True,
+        "separators": [",", ":"],
+        "allow_nan": False,
+    }
     assert contract["statuses"] == [
         "grounded_match",
         "answer_only",
         "no_match",
         "identity_unavailable",
+        "timeout",
         "error",
         "not_required",
     ]
-    assert contract["rca_stage_order"] == [
-        "durable_admission",
-        "claim",
-        "official_issue_preread",
-        "identity_validation",
-        "business_lookup",
-        "seal",
-        "resource_reservation",
-        "vm_submit",
+    assert contract["enhancement_only"] is True
+    assert contract["gates_original_chain"] is False
+    assert contract["failure_policy"] == "continue_original_chain"
+    assert contract["business_knowledge_is_execution_evidence"] is False
+    assert contract["original_chain_mutations"] == {
+        "dispatcher": False,
+        "execution_request_v2": False,
+        "vm_goal": False,
+        "core_result": False,
+        "required_delivery": False,
+    }
+    assert contract["design_method_runtime"] is False
+    assert contract["effective_influence_by_mode"] == {
+        "shadow": {
+            "grounded_match": "observe_only",
+            "answer_only": "observe_only",
+            "no_match": "none",
+            "identity_unavailable": "none",
+            "timeout": "none",
+            "error": "none",
+            "not_required": "none",
+        },
+        "active": {
+            "grounded_match": "reference_only",
+            "answer_only": "reference_only",
+            "no_match": "none",
+            "identity_unavailable": "none",
+            "timeout": "none",
+            "error": "none",
+            "not_required": "none",
+        },
+    }
+    assert contract["lookup_unique_key"] == [
+        "submission_key",
+        "generation",
+        "phase",
+        "query_hmac_sha256",
+        "provider_policy_fingerprint",
+        "identity_policy_fingerprint",
     ]
+    assert contract["rca_enhancement_points"] == [
+        "post_vm_materialization_async_preflight",
+        "post_core_gap_async_lookup",
+        "owner_only_reference_appendix",
+    ]
+    assert contract["second_stage_fork"] == {
+        "after": "s6_report_seal_and_optional_gap_attempt",
+        "main_branch": [
+            "main_task_completion_without_host_wait",
+            "original_required_delivery",
+        ],
+        "reference_branch_requires": "valid_gap_atomic_seal",
+        "reference_branch": [
+            "host_gap_observer_claim",
+            "host_business_lookup_create_once",
+            "owner_only_addendum_seal",
+        ],
+    }
+    assert contract["second_stage_gap_outcomes"] == {
+        "valid_gap": ["main_branch", "reference_branch"],
+        "gap_absent": ["main_branch"],
+        "gap_build_or_seal_error": ["main_branch", "knowledge_local_metric_only"],
+    }
+    assert contract["second_stage_controls"] == {
+        "vm_direct_access": False,
+        "same_generation_binding": True,
+        "cross_generation_reuse": False,
+        "human_blocking_state": False,
+        "main_task_resume": False,
+        "required_delivery_effect": False,
+        "gap_artifact_failure_blocks_main": False,
+        "max_rounds": 1,
+        "max_queries": 2,
+    }
+    assert contract["rca_provider_session_policy"] == {
+        "create_request_session_id": None,
+        "fresh_session_per_job": True,
+        "cross_job_session_reuse": False,
+    }
     assert {
-        "query_sha256",
+        "schema_version",
+        "submission_key",
+        "generation",
+        "phase",
+        "mode",
+        "status",
+        "influence",
+        "rca_contract_sha256",
+        "query_hmac_sha256",
+        "provider_policy_fingerprint",
+        "identity_policy_fingerprint",
+        "retrieved_at",
+        "latency_ms",
+    } == set(contract["lookup_receipt_common_required"])
+    assert contract["lookup_receipt_status_fields_exact"] == {
+        "grounded_match": [
+            "answer_sha256",
+            "answer_bytes",
+            "source_refs_relpath",
+            "source_refs_sha256",
+            "retrieval_activity_receipt_relpath",
+            "retrieval_activity_receipt_sha256",
+        ],
+        "answer_only": ["answer_sha256", "answer_bytes"],
+        "no_match": [
+            "provider_no_hit_receipt_relpath",
+            "provider_no_hit_receipt_sha256",
+        ],
+        "identity_unavailable": ["error_code"],
+        "timeout": ["error_code"],
+        "error": ["error_code"],
+    }
+    assert contract["failure_statuses"] == [
+        "identity_unavailable",
+        "timeout",
+        "error",
+    ]
+    assert set(contract["consumer_receipt_binding_required"]) == {
+        "lookup_receipt_relpath",
+        "lookup_receipt_sha256",
+    }
+    consumer_equal_fields = {
+        "submission_key",
+        "generation",
+        "phase",
+        "mode",
+        "status",
+        "influence",
+        "rca_contract_sha256",
+        "query_hmac_sha256",
         "answer_sha256",
-        "knowledge_release_fingerprint",
-        "source_refs_sha256",
-        "retrieval_activity_receipt_sha256",
-    } <= set(contract["grounded_match_required"])
-    assert {
-        "query_sha256",
-        "knowledge_release_fingerprint",
-        "provider_no_hit_receipt_sha256",
-    } <= set(contract["no_match_required"])
+        "answer_bytes",
+        "provider_policy_fingerprint",
+        "identity_policy_fingerprint",
+    }
+    assert set(contract["consumer_lookup_fields_must_equal"]) == (
+        consumer_equal_fields
+    )
+    assert contract["consumer_content_binding"] == {
+        "business_knowledge_context_v1": "answer",
+        "business_knowledge_addendum_v1": "content",
+        "encoding": "utf-8",
+        "length_field": "answer_bytes",
+        "sha256_field": "answer_sha256",
+    }
+    shared_common = set(contract["shared_receipt_common_fields_exact"])
+    assert shared_common == {
+        "schema_version",
+        "submission_key",
+        "generation",
+        "phase",
+        "mode",
+        "status",
+        "influence",
+        "query_hmac_sha256",
+        "provider_policy_fingerprint",
+        "identity_policy_fingerprint",
+        "lookup_receipt_sha256",
+        "retrieved_at",
+        "latency_ms",
+    }
+    assert contract["shared_receipt_status_fields_exact"] == {
+        "grounded_match": ["answer_bytes"],
+        "answer_only": ["answer_bytes"],
+        "no_match": [],
+        "identity_unavailable": ["error_code"],
+        "timeout": ["error_code"],
+        "error": ["error_code"],
+    }
     assert "summary" in contract["shared_receipt_forbidden_fields"]
+    assert "query" in contract["shared_receipt_forbidden_fields"]
+    assert "agent_chat_id" in contract["shared_receipt_forbidden_fields"]
+    assert "lookup_receipt_relpath" in contract["shared_receipt_forbidden_fields"]
+    assert "source_refs_relpath" in contract["shared_receipt_forbidden_fields"]
+    assert "## 从检索到交付的八步闭环" not in routing
+    assert "### 闭环状态机" not in routing
+
+    gap_section = routing.split("`business_knowledge_gap_v1` 只允许：", 1)[1]
+    gap = json.loads(gap_section.split("```json", 1)[1].split("```", 1)[0])
+    assert gap["phase"] == "gap:1"
+    assert gap["submission_key"]
+    assert gap["gap_id"]
+    assert gap["run_id"]
+    assert gap["artifact_set_id"]
+    assert gap["request_sha256"]
+    assert gap["rca_contract_sha256"]
+    assert gap["s6_stage_receipt_sha256"]
+    assert "<artifact_root>/business_knowledge/gaps/gap-1.json" in routing
+    assert "<artifact_root>/stage_lineage/s6_report.json" in routing
+    assert "business_knowledge_canonical_json_v1" in routing
+    assert "`validate_stage_lineage_receipt` 不够" in routing
+    assert "六个字段全部等于当前 task/goal" in routing
+    assert "排除 `gap_id` 后的 normalized gap" in routing
+    assert "不能用新 helper 重算" in routing
+    assert "不得进入 `delivery_contract.json`" in routing
+
+    receipt_section = routing.split("`answer_only` receipt 示例：", 1)[1]
+    receipt = json.loads(
+        receipt_section.split("```json", 1)[1].split("```", 1)[0]
+    )
+    assert receipt["schema_version"] == "business_knowledge_lookup_receipt_v1"
+    assert receipt["mode"] == "active"
+    assert receipt["status"] == "answer_only"
+    assert receipt["influence"] == "reference_only"
+    for field in contract["lookup_receipt_common_required"]:
+        assert receipt[field] or receipt[field] == 0
+    for field in contract["lookup_receipt_status_fields_exact"]["answer_only"]:
+        assert receipt[field]
+    assert receipt["answer_bytes"] > 0
+    assert set(receipt) == set(contract["lookup_receipt_common_required"]) | set(
+        contract["lookup_receipt_status_fields_exact"]["answer_only"]
+    )
+
+    context_section = routing.split(
+        "成功返回正文的查询再生成 owner-only `business_knowledge_context_v1`：", 1
+    )[1]
+    context = json.loads(
+        context_section.split("```json", 1)[1].split("```", 1)[0]
+    )
+    assert context["mode"] == "active"
+    assert context["status"] == "answer_only"
+    assert context["influence"] == "reference_only"
+    assert context["submission_key"]
+    assert context["phase"] == "preflight"
+    assert context["rca_contract_sha256"]
+    for field in contract["consumer_receipt_binding_required"]:
+        assert context[field]
+    for field in contract["consumer_lookup_fields_must_equal"]:
+        assert context[field] == receipt[field]
+    context_bytes = context["answer"].encode("utf-8")
+    assert len(context_bytes) == context["answer_bytes"]
+    assert hashlib.sha256(context_bytes).hexdigest() == context["answer_sha256"]
+    tampered_context_bytes = (context["answer"] + "x").encode("utf-8")
+    assert not (
+        len(tampered_context_bytes) == context["answer_bytes"]
+        and hashlib.sha256(tampered_context_bytes).hexdigest()
+        == context["answer_sha256"]
+    )
+
+    addendum_section = routing.split("Owner-only addendum 使用 exact schema：", 1)[1]
+    addendum = json.loads(
+        addendum_section.split("```json", 1)[1].split("```", 1)[0]
+    )
+    assert addendum["schema_version"] == "business_knowledge_addendum_v1"
+    assert addendum["mode"] == "active"
+    assert addendum["status"] == "answer_only"
+    assert addendum["influence"] == "reference_only"
+    assert addendum["phase"] == "gap:1"
+    assert addendum["run_id"]
+    assert addendum["artifact_set_id"]
+    assert addendum["request_sha256"]
+    assert addendum["rca_contract_sha256"]
+    assert addendum["s6_stage_receipt_sha256"]
+    for field in contract["lookup_receipt_status_fields_exact"]["answer_only"]:
+        assert addendum[field]
+    for field in contract["consumer_receipt_binding_required"]:
+        assert addendum[field]
+    assert addendum["lookup_receipt_relpath"].startswith("gap-1/")
+    addendum_bytes = addendum["content"].encode("utf-8")
+    assert len(addendum_bytes) == addendum["answer_bytes"]
+    assert hashlib.sha256(addendum_bytes).hexdigest() == addendum["answer_sha256"]
+
+    safe_section = routing.split(
+        "Shared/audit 层使用 exact `business_knowledge_safe_receipt_v1`，例如：", 1
+    )[1]
+    safe_receipt = json.loads(
+        safe_section.split("```json", 1)[1].split("```", 1)[0]
+    )
+    safe_status_fields = set(
+        contract["shared_receipt_status_fields_exact"][safe_receipt["status"]]
+    )
+    assert set(safe_receipt) == shared_common | safe_status_fields
+    assert not (set(safe_receipt) & set(contract["shared_receipt_forbidden_fields"]))
+    assert set({**safe_receipt, "raw_provider_payload": {}}) != (
+        shared_common | safe_status_fields
+    )
+
+    exact_key = (
+        "(submission_key,generation,phase,query_hmac_sha256,\n"
+        "  provider_policy_fingerprint,identity_policy_fingerprint)"
+    )
+    assert exact_key in worklog
+    assert "同一 phase、同一授权主体/范围内去重" in worklog
+    assert "同一 `phase` 内相同 query digest 不重复调用" in routing
+    assert "main branch: complete original task and required delivery without host wait" in routing
+    assert "不得把 gap 变成 S6、task completion 或 delivery gate" in routing
+    assert "ENOSPC、permission、schema/hash、existing-target conflict" in routing
+    assert "现有一次性 `run_agent_chat_user()` 不能原样承担" in routing
+    assert "现有 transport 的可选 `session_id` 参数" in routing
+    assert "POST 前先 durable seal `creating` job state" in routing
+    assert "未知 key 立即拒绝" in routing
+    assert "只校验 `lookup_receipt_sha256` 而不校验正文绑定不合格" in routing
+    assert "reserved -> identity_check -> identity_unavailable" in routing
+    assert "这些状态以 lookup receipt 终止且不创建" in routing
+    assert "最多一轮 host gap、两条 lookup" in routing
+    assert "不创建 failure addendum" in handoff
+    assert "base_contract_sha256" not in routing
+    assert "core_result_sha256" not in routing
+
+
+def test_business_integration_handoff_quiz_is_complete_and_evidence_bounded():
+    handoff = HANDOFF_DOC.read_text(encoding="utf-8")
+    worklog = WORKLOG_DOC.read_text(encoding="utf-8")
+    quiz = handoff.split("## 证据 Quiz", 1)[1].split("## 回滚", 1)[0]
+
+    for number in range(1, 10):
+        assert f"{number}. **" in quiz
+    assert "继续原 RCA" in quiz
+    assert "只作 reference" in quiz
+    assert "专用最小权限服务身份" in quiz
+    assert "不能借员工 UAT" in quiz
+    assert "host 查询" in quiz
+    assert "主 task 不等待、不 resume" in quiz
+    assert "v2 request/hash" in quiz
+    assert "非空文本不够" in quiz
+    assert "不是运行时流程" in worklog
+    assert "设计合同自检：**9/9**" in worklog
+    assert "不代表 production release" in worklog
 
 
 def _env_file(tmp_path: Path, content: str) -> Path:

@@ -3,12 +3,15 @@
 相关文档：
 
 - [候选测试报告](feishu-aily-agent-test-report.md)
-- [Hermes 统一知识检索路由](hermes-knowledge-retrieval-routing.md)
+- [Hermes 业务知识检索接入设计](hermes-knowledge-retrieval-routing.md)
+- [业务接入设计工作记录](feishu-aily-business-integration-worklog.md)
+- [正式分支集成交接](feishu-aily-business-integration-handoff.md)
 
 当前 Aily 工具是独立、默认关闭的候选。用户身份 API canary 已打通，但生产 gateway
 尚未启用。目标体验不是让用户手工说“查企业知识库”，而是由统一路由根据关键词和
 任务上下文，在 Web、本地知识工程和 Aily 企业知识之间自动选择。RCA 属于企业知识
-强制检索任务；该自动路由仍待 RCA 正式生产分支实现。
+required-attempt 任务：必须尝试增强，但失败后继续原 RCA，绝不把知识回答当成证据。
+该自动路由仍待 RCA 正式生产分支实现。
 
 新版 Aily 智能体详情页地址中的 `agent_<...>` 是 Agent ID：
 
@@ -134,7 +137,12 @@ Web 搜索内部含义。
 
 当前候选允许主代理显式选择此工具。未来统一路由上线后，业务关键词和
 RCA 任务上下文将自动触发；具体契约见
-[Hermes 统一知识检索路由](hermes-knowledge-retrieval-routing.md)。
+[Hermes 业务知识检索接入设计](hermes-knowledge-retrieval-routing.md)。交互式固定员工
+UAT 不用于 Kafka/outbox；自动 RCA 将使用独立、最小权限、只读服务身份。
+
+RCA 中的 Aily 内容只用于解释术语、提示待验证假设和聚焦后续分析。查询超时、
+未命中、身份不可用或仅返回无来源文本时，原 VM、报告和投递链继续，不回退 Web，
+也不降低或提高现有证据结论。
 
 ## API 形状
 
