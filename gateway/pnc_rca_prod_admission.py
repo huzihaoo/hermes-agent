@@ -162,8 +162,8 @@ HISTORICAL_BUDGETS = {
 # Server-owned successor projection. Request payloads may repeat these pins,
 # but cannot select a different evaluator/source identity.
 HISTORICAL_SUCCESSOR_RELEASE: Mapping[str, Any] | None = {
-    "source_commit": "a4d021f8c3ef52229416967e6f2bc98bb531f0c7",
-    "source_tree": "ad399ad920eef2f78b654b079fae2aac360630f4",
+    "source_commit": "6a46de39cfd3e7a3e6665a6c7307fa4cf974aadd",
+    "source_tree": "67b8c6e90578df99b430fce7e08b974c7c25ab43",
     "requirements_contract_hash": "ca99f759c70b72b0836f956557ecc5e23c11538132b13f1d1bfe8a46ce7e6cb6",
     "evaluator_fingerprints": {
         "g1q3_rca/aeb_signal_parser.py": "fa227f22a684f2a4b0808fefe0d596a032c3a582e1571f67ede7937d5894e3d3",
@@ -175,11 +175,11 @@ HISTORICAL_SUCCESSOR_RELEASE: Mapping[str, Any] | None = {
         "g1q3_rca/signal_registry.py": "ffd0a796c027df1d81e30a1727eea1d37ccfcd0c5b88a806a201a0c8f3d54f17",
     },
     "evaluator_fingerprints_sha256": "e492eaa8afd9348990cb2de265575211ff248fdebacd0fff72b2f7bafe7f18c0",
-    "evaluator_version": "git-a4d021f8c3ef52229416967e6f2bc98bb531f0c7",
-    "suite_receipt_path": "/mnt/tmp/20260821-rca-cwd-fix/successor-evidence-a4d021f8/suite-receipt.json",
-    "suite_receipt_sha256": "c6bea0cd7b11dd821977c0c90fcd075e08fc93a016723f02a4cb43d2b217c69f",
-    "w17_receipt_path": "/mnt/tmp/20260821-rca-cwd-fix/successor-evidence-a4d021f8/w17-receipt.json",
-    "w17_receipt_sha256": "8de723173336823fbdb02b4170e446308ed61e320c32dfefd870ba89db438397",
+    "evaluator_version": "git-6a46de39cfd3e7a3e6665a6c7307fa4cf974aadd",
+    "suite_receipt_path": "/mnt/tmp/20260821-rca-s3a-seal-fix/evidence-run-6a46-v3/successor-evidence-6a46de39/suite-receipt.json",
+    "suite_receipt_sha256": "d5892772a50f0fb64c0853b5762e4cc115f2e1576d60e7e3d6fd8f3e09188e11",
+    "w17_receipt_path": "/mnt/tmp/20260821-rca-s3a-seal-fix/evidence-run-6a46-v3/successor-evidence-6a46de39/w17-receipt.json",
+    "w17_receipt_sha256": "c2d4dd5a9f19123aa762fb299cdd231112fd21a0b917c31c5d18556a6b7feb62",
 }
 
 RECEIPT_FIELDS = {
