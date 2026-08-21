@@ -1443,6 +1443,9 @@ def _historical_meta(plan: HistoricalFullRerunPlan) -> dict[str, Any]:
             _historical_receipt_binding_sha256(plan)
         ),
         "rca_prod_capacity_mode": "bootstrap",
+        "fixed_cli_entrypoint": "historical_full308",
+        "authority_mode": "development_only",
+        "production_effects": False,
         "coding_agent_fallback_enabled": False,
         "queue_if_blocked": False,
         "resource_gate_bypass": False,

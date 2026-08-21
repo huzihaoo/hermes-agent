@@ -1399,7 +1399,11 @@ def release_historical_lane_reservation(
     state_root: Path = HISTORICAL_STATE_ROOT,
     host_tmp_root: Path = HISTORICAL_HOST_TMP_ROOT,
 ) -> dict[str, Any]:
-    if reason not in {"create_failed_missing_reconfirmed", "verify_succeeded"}:
+    if reason not in {
+        "create_failed_missing_reconfirmed",
+        "pending_rejected_before_claim",
+        "verify_succeeded",
+    }:
         raise RcaProdAdmissionError(
             "rca_historical_lane_release_reason_invalid", retryable=False
         )

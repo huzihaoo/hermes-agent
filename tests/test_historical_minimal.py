@@ -4,8 +4,10 @@ from concurrent.futures import ThreadPoolExecutor
 import copy
 from datetime import datetime, timedelta, timezone
 import hashlib
+import importlib.util
 import inspect
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -21,6 +23,8 @@ from tools.registry import registry
 KEY = "hex:" + ("71" * 32)
 NOW = datetime(2026, 8, 18, 6, 0, tzinfo=timezone.utc)
 FIXED_SMOKE10_IDS_SHA256 = admission.HISTORICAL_ORDERED_WORK_ITEM_IDS_SHA256
+VM_ADMISSION_MODULE_ENV = "HERMES_RCA_HISTORICAL_VM_ADMISSION_MODULE"
+VM_ADMISSION_SHA256_ENV = "HERMES_RCA_HISTORICAL_VM_ADMISSION_SHA256"
 RUNTIME = WorkspaceRuntimeIdentity(
     root=Path("/fixed/runtime"), manifest_path=Path("/fixed/runtime/manifest.json"),
     creator_path=Path("/fixed/runtime/bin/create_task_v2.py"),
@@ -74,6 +78,25 @@ def call(operation: str, *, receipt=None) -> dict:
         expected_request_sha256=admission.sha256_value(value),
         bootstrap_receipt=receipt,
     )
+
+
+def load_pinned_vm_admission():
+    raw_path = os.environ.get(VM_ADMISSION_MODULE_ENV, "").strip()
+    raw_sha256 = os.environ.get(VM_ADMISSION_SHA256_ENV, "").strip().lower()
+    if not raw_path or not raw_sha256:
+        pytest.skip(
+            f"set {VM_ADMISSION_MODULE_ENV} and {VM_ADMISSION_SHA256_ENV} "
+            "to run the real VM worker admission compatibility test"
+        )
+    path = Path(raw_path).expanduser().absolute()
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == raw_sha256
+    spec = importlib.util.spec_from_file_location(
+        "pinned_historical_vm_rca_prod_admission", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def result_artifacts(
@@ -342,6 +365,67 @@ def test_bootstrap_is_owner_signed_plan_bound_and_fresh() -> None:
         )
 
 
+def test_historical_meta_passes_real_vm_worker_admission(tmp_path: Path) -> None:
+    vm_admission = load_pinned_vm_admission()
+    value = plan()
+    receipt = bootstrap(value)
+    goal_path = tmp_path / "goal.md"
+    goal_path.write_text(
+        vm_task_tool._historical_goal(value, receipt), encoding="utf-8"
+    )
+    task = {
+        **vm_task_tool._historical_meta(value),
+        **RUNTIME.task_meta(),
+        "task_id": value.task_id,
+        "owner": value.request["owner"],
+        "lane": "heavy",
+        "resource_class": "rca_prod",
+        "repo_scope": "unknown",
+        "workspace_scope": "none",
+        "risk_class": "high",
+        "executor_type": "direct_cli",
+        "agent_backend": "none",
+        "codex_backend_enabled": False,
+        "artifact_root": str(value.task_root) + "/",
+        "artifact_cifs_root": (
+            "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
+            + value.task_id
+            + "/"
+        ),
+        "rca_prod_admission_receipt": receipt,
+        "goal_path": str(goal_path),
+        "work_tmp_dir": str(value.task_root),
+    }
+    snapshot = {
+        "schema_version": vm_admission.SNAPSHOT_SCHEMA_VERSION,
+        "observed_at": NOW.isoformat(),
+        "root_available_bytes": 700 * 1024**3,
+        "delivery_available_bytes": 1200 * 1024**3,
+        "root_device": "2050",
+        "delivery_device": "93",
+        "delivery_filesystem": "cifs",
+        "delivery_mount_rw": True,
+        "delivery_writable": True,
+        "memory_available_bytes": 64 * 1024**3,
+        "swap_free_ratio": 0.9,
+        "load1": 1.0,
+        "cpu_count": 32,
+        "dnp_real": 0,
+        "dnp_like": 0,
+        "mcap_rss_bytes": 0,
+        "mcap_process_count": 0,
+    }
+    command = admission.build_historical_full_rerun_execute_argv(value)
+    verdict = vm_admission.validate_worker_admission(
+        task, command, snapshot, now=NOW, hmac_key=KEY
+    )
+
+    assert verdict["ok"] is True, verdict["reasons"]
+    assert verdict["identity"]["task_id"] == value.task_id
+    assert verdict["identity"]["plan_sha256"] == value.plan_sha256
+    assert verdict["historical"]["command"] == command
+
+
 def test_atomic_ledger_writes_exact_sidecar_and_verify_reads_history(tmp_path: Path) -> None:
     value, receipt = plan(), bootstrap(plan())
     state_root, host_root = tmp_path / "state", tmp_path / "hfs"
@@ -410,6 +494,39 @@ def test_release_is_exact_idempotent_and_frees_three_lanes(tmp_path: Path) -> No
     ledger = json.loads((state_root / "evaluation-lanes.json").read_text())
     assert list(ledger["active"]) == ["reservation-2"]
     assert first_receipt["receipt_id"] in ledger["consumed_receipts"]
+
+
+def test_release_accepts_pending_rejected_before_claim(tmp_path: Path) -> None:
+    value = plan("pending-rejected-before-claim")
+    receipt = bootstrap(value)
+    state_root, host_root = tmp_path / "state", tmp_path / "hfs"
+    reserved = admission.consume_historical_bootstrap_and_reserve_lanes(
+        receipt,
+        plan=value,
+        expected_owner="songying",
+        hmac_key=KEY,
+        now=NOW,
+        state_root=state_root,
+        host_tmp_root=host_root,
+    )
+
+    released = admission.release_historical_lane_reservation(
+        value,
+        receipt_id=receipt["receipt_id"],
+        reservation_id=receipt["reservation_id"],
+        raw_sha256=reserved["raw_sha256"],
+        semantic_sha256=reserved["semantic_sha256"],
+        reason="pending_rejected_before_claim",
+        state_root=state_root,
+        host_tmp_root=host_root,
+    )
+
+    assert released == {
+        "released": True,
+        "already_released": False,
+        "reservation_id": receipt["reservation_id"],
+        "reason": "pending_rejected_before_claim",
+    }
 
 
 def test_global_lane_cap_has_no_queue(tmp_path: Path) -> None:
