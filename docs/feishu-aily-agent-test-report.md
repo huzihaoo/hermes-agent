@@ -11,10 +11,12 @@ a1e4565ec7 -> e25ba59684 -> 4a0adaba91 -> dda09b7042
              -> 4b0623221d -> 70b15406e0 -> 368e3a2176
 ```
 
-候选与 2026-08-21 live gateway 的 merge-base 为 `93d26da4`。Owner 最新决定不再把
-该候选移植到正式 RCA 业务分支：首版能力只在本机 Hermes host 实现为独立 RCA
-observer，业务仓、VM、业务 schema/产物和 production gateway 均不是承载面。因此
-不得盲目重放或 cherry-pick 这条分叉历史到业务分支。
+候选与 2026-08-21 live gateway 的 merge-base 为 `93d26da4`。当日 owner 决定是不把
+这条分叉历史盲目重放到当时的 RCA 业务分支。2026-08-22 owner 已更新
+源码发布边界：可以把 exact range `9b701912..6948120a` 的功能内容重放到
+当前正式 Host 源码，但明确排除旧基线 `9b701912`。该更新只授权源码合入：
+Aily toolsets、provider、consumer seam 和凭据仍保持 default-off，不授权真实飞书调用、
+gateway 重启、运行时激活或 RCA 产物回写。
 
 ## 结论
 
@@ -40,10 +42,10 @@ observer，业务仓、VM、业务 schema/产物和 production gateway 均不是
 
 该候选**尚未部署到 production gateway**。2026-08-21 的只读预检发现候选与当时
 gateway commit `dcb535677` 已分叉，直接物化会回退大量 RCA 生产变更，因此操作被
-主动停止。最新方案不再等待正式 RCA 分支，也不向 production gateway 发布；后续只做
-本机 observer 的独立实现和验收。本轮候选 worktree 修改文档和 Python 合同断言/文档测试，
-没有修改候选 transport/tool/runtime 实现、配置、凭据或 resident；本机 shadow planner
-位于 Hermes owner-only 路径，另行验证。
+主动停止。2026-08-22 的合入必须从当前正式 Host 基线重放 exact feature patch，
+并重新生成 commit/tree-bound 证据。源码进入正式分支不表示 toolset/provider 已启用；
+本机 shadow planner 仍位于 Hermes owner-only 路径，其 consumer seam、凭据和生产效果
+仍需单独审批与验证。
 
 ## 自动化测试
 
@@ -85,8 +87,13 @@ Markdown 链接检查、owner 决策残留 `rg` 扫描和 scoped `git diff --che
 - 本机 shadow planner：`10 passed`，使用 `/usr/local/bin/pytest`，无网络。
 - 候选文档/合同测试：`37 passed`，使用候选 worktree 的 Python 3.11 环境，无网络。
 - Aily Agent/knowledge 离线相关测试集合：`149 passed`，无网络、无真实 API 请求。
+- 2026-08-22 统一 Host 候选的 25 个 changed-test 文件：`1430 passed, 1 skipped`，
+  无网络、无真实飞书请求。验证命令显式清除了调用环境中的
+  `HERMES_CONFIG_PATH`/`HERMES_ENV_PATH`，使测试继续使用每用例的隔离
+  `HERMES_HOME`；未清除时唯一失败是当前正式基线也存在的 test-fixture
+  环境绑定问题，不是本候选运行时回归。
 - 两组测试均使用 `-p no:cacheprovider` 和 `PYTHONDONTWRITEBYTECODE=1`。
-- `py_compile`、候选 `git diff --check` 通过。
+- `py_compile`、候选 `git diff --check` 和所有 changed Python 文件 Ruff 检查通过。
 - live `inspect --latest-completed`：`triggered=false`、`query_kind=not_triggered`、
   `requirement=not_required`；显式 stdin 的 OOI dry-run 仅返回 `status=planned`，未调用
   Aily、未写 observer 状态。
@@ -190,7 +197,7 @@ SSE `finished`，因此必须记为失败，不属于上述 Agent UAT 成功证�
 
 ## 本机 observer 验收边界
 
-这里没有正式 RCA 分支或 production 发布门。后续在本机显式启用 observer 前，至少
+这里不是正式 RCA 分支或 production 发布授权。后续在本机显式启用 observer 前，至少
 取得以下新证据；历史候选测试和 API canary 只能复用为参照：
 
 1. observer/broker/配置/状态全部位于 owner-only Hermes 本机范围；业务仓、VM、业务
@@ -215,6 +222,10 @@ SSE `finished`，因此必须记为失败，不属于上述 Agent UAT 成功证�
    consumer seam 放开且耐久 create/poll 完成后，才可通过 observer 执行端到端 canary。
    当前不能宣称 observer 已帮助 RCA，且候选通用 toolset 和 production gateway 仍未启用。
 
+以上技术证据不能代替绑定 exact Host commit/tree、配置、凭据作用域和允许 effects
+的独立启用授权。
+
 专用服务身份、ACL 正反 canary、审计触发者映射和 token 轮换自动化属于后续专项，不是
-首版本机启用门。通过以上验收只能声称“本机 observer 已验证/启用”，不能声称能力已
-进入业务仓、VM、production gateway 或正式 RCA 发布。
+首版本机启用门。通过以上验收只能声称“本机 observer 技术证据完成”；在
+独立授权和效果回读完成前，不能声称运行时能力已进入 VM、production gateway
+或正式 RCA 激活面。

@@ -4,7 +4,9 @@
 > [Aily Agent + MCP 接入](feishu-aily-agent.md)。本页只对应旧的
 > Data Knowledge API（`spring_...` app ID）。
 
-这份说明对应 Hermes 的可选 `feishu_aily` toolset。当前实现位于候选工作树，默认关闭；没有把它绑定到 active release、LaunchAgent 或现有 `.env`。
+这份说明对应 Hermes 的可选 `feishu_aily` toolset。default-off 源码可以进入正式
+Host 树，但当前没有把它绑定到 active release、LaunchAgent 或现有 `.env`，也没有
+开放 provider/consumer seam。源码存在不是启用证据。
 
 ## 两个 App ID
 
@@ -63,6 +65,10 @@ POST https://open.feishu.cn/open-apis/aily/v1/apps/:app_id/knowledges/ask
 /tools enable feishu_aily
 ```
 
+上述命令是能力界面示例，不是当前生产操作授权。未取得绑定 exact Host
+commit/tree、目标 profile、凭据作用域和允许 effects 的独立批准时，不得在 active
+gateway 执行。
+
 缺少 dedicated Aily 凭据时，Feishu comment 上下文可以使用显式注入的现有客户端；CLI/普通 gateway turn 应配置上表中的 dedicated 三项。工具只返回受限的最终文本、`has_answer`/`grounded`、`answer_available`、`finish_type` 和 FAQ 匹配问题，不把原始 `chunks`、SQL 或图表 DSL 回传给模型。
 
 Hermes tool 通过 `lark-oapi` 的 raw request 读取完整响应后再解析 SSE，只承诺最终答案，不提供 processing 事件的实时 UI。下面的 smoke 使用流式 HTTP 行迭代，但同样只在 `finished` 后判定成功。
@@ -78,7 +84,8 @@ Hermes tool 通过 `lark-oapi` 的 raw request 读取完整响应后再解析 SS
   scripts/feishu_aily_knowledge_smoke.py --pretty
 ```
 
-确认飞书侧前置条件后，显式执行一次问答：
+确认飞书侧前置条件，并取得对真实飞书调用的独立 effects 授权后，才能
+显式执行一次问答：
 
 ```bash
 /Users/songying/.hermes/runtime/venvs/hermes-v0.18.2-b85e919-sealed/bin/python \
@@ -107,7 +114,12 @@ Aily tool 只负责问答，不自动创建或更新飞书文档。用户明确�
 
 ## 发布顺序
 
-离线测试和 endpoint smoke 收到真实 `finished` 事件后，还要通过候选 handler 与目标 profile secret scope 的真实 canary；随后才可以按 Hermes release governance 将候选提交 materialize 到 release，更新 `LIVE_MANIFEST`，重启 `ai.hermes.gateway`，并做 Feishu route canary。当前 live release 未包含此 toolset，不能直接修改 active runtime。
+离线测试和 endpoint smoke 收到真实 `finished` 事件只能证明技术前置。后续还要通过
+候选 handler 与目标 profile secret scope 的真实 canary，并取得独立批准，精确绑定
+Host commit/tree、release manifest、目标 resident、凭据作用域和允许 effects。只有这些
+门都通过后，才可以按 Hermes release governance materialize、更新 `LIVE_MANIFEST`、重启
+`ai.hermes.gateway` 并做 Feishu route canary。当前 live release 未包含此 toolset，不能直接
+修改 active runtime。
 
 官方参考：
 

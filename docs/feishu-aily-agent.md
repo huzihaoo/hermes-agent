@@ -12,15 +12,21 @@
 一次安全调用。本机手动 shadow planner 原型文件已存在，但自动 RCA observer/consumer
 尚未实现或启用，production gateway 也未启用该工具。
 
-Owner 最新决定把首版范围收敛为**仅本机 Hermes host 的 RCA observer**：可复用胡子豪
+Owner 对运行时的最新决定仍是把首版范围收敛为**仅本机 Hermes host 的 RCA observer**：可复用胡子豪
 固定 UAT，能力优先；权限代理、审计归属、ACL 漂移和 token 生命周期风险登记为
-`accepted/deferred`，不作为首版门禁。运行时能力不得进入 PNC/RCA 业务仓、VM、业务
-schema/产物，也不得成为普通 Hermes/飞书对话或其他调用方可借用的通用工具。Aily 回答
+`accepted/deferred`，不作为首版门禁。运行时凭据/provider/consumer seam 不得进入
+PNC/RCA 业务链、VM、业务 schema/产物，也不得成为普通 Hermes/飞书对话或其他调用方
+可借用的通用工具。Aily 回答
 只作 owner-only reference，失败继续原 RCA，不能当成执行证据。
+
+2026-08-22 owner 另行允许 exact candidate 源码合入当前正式 Host。源码发布与
+运行时启用是两个门：合入后 Aily toolsets/provider/consumer seam 继续 default-off，
+不传递凭据、不做真实飞书调用、不回写 RCA，也不因合入自动重启 gateway。
 
 这项决定不等于自动 observer 已实现或已发布。本文件中现有 tool/smoke 和手动 shadow
 planner 只提供 API、身份、离线规划和隔离参照；当前 planner 未启用、未注册、非 daemon，
-没有 consumer seam，不能把结果回灌给正在执行的 RCA，不再等待正式 RCA 业务分支。
+没有 consumer seam，不能把结果回灌给正在执行的 RCA。候选源码是否已合入
+不改变这一运行时判定。
 
 新版 Aily 智能体详情页地址中的 `agent_<...>` 是 Agent ID：
 
@@ -245,8 +251,9 @@ UAT 和其他环境项。环境文件必须是当前用户持有的绝对路径�
 
 ## 本机 observer 生效边界
 
-本任务没有发布或生产生效动作。当前 production gateway toolset 保持关闭，不执行
-gateway restart、受管 materialize、业务分支合入、VM 下发或业务 schema migration。
+本文件记录的 observer 验收没有生产生效动作。即使 default-off 源码合入正式 Host，
+当前 production gateway toolset 仍保持关闭，不因源码合入执行 gateway restart、VM 下发、
+凭据配置或业务 schema migration。
 
 后续实现本机 observer 时，至少满足以下条件才能在本机显式启用：
 
@@ -263,6 +270,9 @@ gateway restart、受管 materialize、业务分支合入、VM 下发或业务 s
    存储失败都只终止 observer job，不改变原 RCA、报告或投递。
 6. owner-only 人工通过 stdin 重新执行内部 canary 以证明真实能力，默认 receipt 不记录问题、
    答案正文、身份或 token；缺少 provenance 时只标 `answer_only`。
+
+这些是技术必要条件，不是生产授权。实际启用还必须有独立、新鲜的批准，
+精确绑定 Host commit/tree、运行时配置、凭据作用域、影响的 resident 和允许 effects。
 
 专用服务身份、细粒度 ACL、审计触发者映射和 token 生命周期自动化已由 owner 延后，
 不属于上述首版门禁。若未来扩大到多用户、通用对话、远端服务、业务仓或 VM，必须重新

@@ -7,9 +7,12 @@
   RCA observer 自动消费尚未实现或启用。
 - Owner 已决定首版 observer 可复用胡子豪固定 UAT，能力优先。权限代理、审计归属、
   ACL 漂移和 token 生命周期风险登记为 `accepted/deferred`，不是当前上线门。
-- 首版运行时能力仅允许存在于本机 Hermes host。不得进入 PNC/RCA 业务仓、VM、业务
-  schema、报告或 artifact，也不得暴露为通用对话借权工具。
-- 不再等待正式 RCA 业务分支，不需要从候选向业务分支移植或合入。
+- 首版**运行时能力**仅允许存在于本机 Hermes host；凭据、provider、consumer
+  seam、业务 schema、报告和 artifact 不进入 VM 或 RCA 执行链，也不得暴露为
+  通用对话借权工具。
+- 2026-08-22 owner 已允许 exact range `9b701912..6948120a` 的源码内容合入
+  当前正式 Host 源码（排除旧基线 `9b701912`）。这是源码发布决定，不是
+  Aily toolset/provider 启用、凭据下发、gateway 重启或生产 canary 授权。
 - completed report 二阶段确定性提取和补查尚未实现；不再要求 VM gap 或业务侧
   addendum/schema，但未来只生成本机 host-private reference addendum。
 - `~/.hermes/scripts/pnc_rca_aily_shadow_observer.py` 与 `~/bin/pnc-rca-aily-shadow`
@@ -39,8 +42,9 @@
    失败都只结束本地增强，不改变原 RCA。
 6. Aily 内容是 reference knowledge，不是 issue/MCAP/log execution evidence；不自动写回
    原报告、事项或 required delivery。
-7. 运行时代码、配置和新增状态仅在本机 Hermes host；业务仓、dispatcher、outbox、VM、
-   execution request、业务 schema 和 artifact 均为零改动边界。
+7. 源码可以存在于正式 Host 树，但 Aily 运行时配置、凭据、provider 和新增状态
+   仅在本机 Hermes host；对单次 observer 任务而言，dispatcher、outbox、VM、execution
+   request、业务 schema 和 artifact 均为零改动边界。
 8. 第一阶段仅由确定性注册术语或 stdin 显式查询触发；无信号（包括仅 `task_type=rca`）
    为 `not_required`/原型 `not_triggered`，不调用 Aily 或 Web。第二阶段由本机 observer
    只读 completed report，仅在确定性提取出新注册术语后补查，
@@ -57,9 +61,10 @@ a1e4565ec7 -> e25ba59684 -> 4a0adaba91 -> dda09b7042
              -> 4b0623221d -> 70b15406e0 -> 368e3a2176
 ```
 
-这些 commit 只用于查找已验证的 Agent Chat、broker 隔离和身份核验做法。不要整条
-cherry-pick，也不要把任何 hunk 移植到 PNC/RCA 业务仓或 production gateway。首版本机
-实现只能复用必要逻辑到 owner-only Hermes host 能力中，并保持候选通用 toolset 关闭。
+这些 commit 用于查找已验证的 Agent Chat、broker 隔离和身份核验做法。源码合入时
+只能重放 owner 明确批准的 exact range `9b701912..6948120a`，不能把旧基线
+`9b701912` 或分叉上的其他历史带入正式 Host。合入后候选通用 toolset 仍关闭，
+首版本机 observer 只能通过 owner-only Hermes host 配置显式启用。
 
 建议的本机职责边界是：
 
@@ -88,7 +93,8 @@ observer 只读既有 locator/报告是允许的；新增文件、数据库、re
 - 记录启用前的业务仓工作树、RCA schema、VM goal、report/artifact manifest 和投递行为。
 - 确定 observer 可读 locator/completed report，以及独立 owner-only 本机状态根。
 - 加入写路径审计：测试期间任何新增写入只允许落在该本机状态根。
-- 明确不做业务分支合入、VM 任务、production materialize 或 gateway restart。
+- 源码合入与运行时启用分离；L0 不做 VM 任务、provider/consumer seam 启用、
+  production materialize 或 gateway restart。
 
 ### L1：固定 UAT broker
 
@@ -136,6 +142,8 @@ observer 只读既有 locator/报告是允许的；新增文件、数据库、re
 - 显式检查通用 Hermes/飞书对话、其他用户、CLI/API 和业务 worker 都没有借权入口。
 - 仅在上述能力与隔离证据通过后启用本机 observer；不得把“已有 API canary”误写成
   observer 已实现或已发布。当前 prototype 仍未启用、未注册、非 daemon。
+- 技术证据通过后仍必须取得独立启用授权，精确绑定 Host commit/tree、provider/
+  consumer seam 配置、凭据作用域、影响的 resident 和允许 effects。
 
 ### 后续专项（不阻断首版）
 
@@ -187,8 +195,9 @@ observer 只读既有 locator/报告是允许的；新增文件、数据库、re
      token 泄露、身份错配和越界暴露仍不得接受。
 3. **谁能调用这份 UAT？**
    - 只有本机 RCA observer；人工 smoke 仅验收/诊断，通用对话和其他执行面不能借权。
-4. **为什么不等待正式 RCA 分支？**
-   - 能力完全在本机 observer，业务仓和运行契约零修改，没有需要合入的业务 hunk。
+4. **源码合入是否等于 observer 已启用？**
+   - 不是。正式 Host 可以包含 default-off 的候选源码；运行时仍只有本机
+     observer，且必须另行验证 provider、consumer seam、凭据和效果授权。
 5. **Aily timeout 是否会阻断或重试原 RCA？**
    - 不会；它只终止本地 reference job。
 6. **Aily 回答能否直接成为根因或定责证据？**
@@ -207,9 +216,10 @@ observer 只读既有 locator/报告是允许的；新增文件、数据库、re
 ## 回滚
 
 - 停止并禁用本机 observer，保留原 RCA 原样运行。
-- 撤销本机 observer 配置只影响 owner-only 本机状态，不要求改业务 DB、业务分支、VM、
+- 撤销本机 observer 配置只影响 owner-only 本机状态，不要求改业务 DB、Host 源码、VM、
   report 或 delivery。
-- 候选通用 toolset 和 production gateway 始终保持未启用，因此本交接没有 production
-  rollback 步骤。
+- 候选通用 toolset 和 production gateway 默认保持未启用；源码存在本身不需要
+  observer rollback。如果后续另行启用了 resident/provider，必须使用当次激活合同的
+  独立 rollback 步骤。
 - 若停止 observer 后仍需要修改任何业务载体才能恢复，说明实现违反本机隔离边界，
   不得启用。

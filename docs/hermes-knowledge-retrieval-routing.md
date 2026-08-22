@@ -8,6 +8,10 @@
 [设计工作记录](feishu-aily-business-integration-worklog.md)；它们不是产品状态机，
 也不会成为每次 RCA 必须执行的步骤。
 
+2026-08-22 owner 已允许将 exact candidate 源码合入正式 Host；这不改变本文的
+运行时合同。Aily toolsets/provider/consumer seam 仍 default-off，凭据和状态仍只能位于
+owner-only 本机边界，源码存在不是启用证据。
+
 > 当前状态：本机已有手动、一次性的 shadow observer 原型
 > `~/.hermes/scripts/pnc_rca_aily_shadow_observer.py` 和入口
 > `~/bin/pnc-rca-aily-shadow`，但它未启用、未注册、不是 daemon，也没有自动 consumer。
@@ -26,7 +30,8 @@
 - 首版无人值守 RCA 以能力可用为先，在本机 Hermes host 复用预登记的胡子豪固定 UAT；
   专用 service identity 和身份借用风险专项明确后置，不作为首版门禁。
 - 该固定 UAT 只供独立 RCA host observer/provider 使用，不开放为任意会话可调用的通用
-  借权能力，也不进入业务仓库、VM 或业务 schema。
+  借权能力，也不进入 VM、业务 schema 或正式 Host 源码配置。default-off 代码可存在
+  于 Host 树，但不包含 UAT 或运行时授权。
 
 ## 三类检索来源
 

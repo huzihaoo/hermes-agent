@@ -53,8 +53,10 @@ def test_documented_rca_observer_is_explicitly_host_only_and_not_a_tool():
     assert "`accepted/deferred`" in documentation
     assert "不得成为普通 Hermes/飞书对话" in documentation
     assert "不注册到通用模型 tool schema" in documentation
-    assert "业务仓、VM、业务" in documentation
-    assert "schema/产物" in documentation
+    assert "运行时凭据/provider/consumer seam" in documentation
+    assert "PNC/RCA 业务链、VM、业务 schema/产物" in documentation
+    assert "源码发布与\n运行时启用是两个门" in documentation
+    assert "toolsets/provider/consumer seam 继续 default-off" in documentation
 
 
 def test_documentation_separates_verified_tool_from_future_automatic_routing():

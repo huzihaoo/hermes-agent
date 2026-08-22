@@ -76,7 +76,8 @@ provider job、不调用 Aily、不降级 Web。第二阶段不再等待 VM 产�
 
 代码复核一度考虑在 dispatcher 内 enqueue，也考虑让 VM 产出 gap artifact。最新本机
 边界同时否决这两条路径：即使网络失败处理完善，它们仍会把个人凭据能力或新增契约带进
-业务链。首版不需要等待正式 RCA 分支，也没有任何业务分支合入步骤。
+业务链。2026-08-22 owner 另行批准了 exact candidate 源码合入；该决定不改变上述
+运行时边界，也不授权 dispatcher/VM/provider 启用。
 
 ## 3. Owner 决定
 
@@ -87,7 +88,7 @@ provider job、不调用 Aily、不降级 Web。第二阶段不再等待 VM 产�
 | --- | --- | --- |
 | 无人值守 RCA 用什么身份？ | 首版复用胡子豪固定 UAT，能力优先。 | 仅本机 RCA observer 可用；每次调用精确核验 `open_id + union_id`，通过隔离 broker 获取 token。 |
 | 身份代理、审计和生命周期风险是否阻断？ | 接受并延后专项治理。 | 登记为 `accepted/deferred`，不再要求专用服务身份或完整 ACL 治理作为首版门禁。 |
-| 能力部署在哪里？ | 只在本机 Hermes host。 | 不进入 PNC/RCA 业务仓、VM、业务 schema、报告或 artifact，也不等待业务分支。 |
+| 能力部署在哪里？ | 运行时只在本机 Hermes host；default-off 源码可进入正式 Host。 | 凭据、provider、consumer seam、VM、业务 schema、报告或 artifact 均不因源码合入而启用。 |
 | 检索失败是否阻断 RCA？ | 不阻断。 | 所有失败状态只结束本地增强，原 RCA、报告和投递保持不变。 |
 | 什么触发第一阶段？ | 确定性注册术语或显式 stdin 查询。 | 无信号（包括仅 `task_type=rca`）为 `not_required`/`not_triggered`，不调用 Aily 或 Web。 |
 | 分析后出现的新术语如何处理？ | completed report 后本机确定性提取并补查。 | 不新增 VM gap；原 task 不等待、不 resume、不重投递。 |
@@ -137,7 +138,7 @@ task-owned 安全 receipt，但不要求把内部答案或身份写入共享产�
 以下方向已被 owner 决定明确取代：
 
 - 首版必须等待专用 RCA service identity；
-- 等待正式 RCA 业务分支后再实现或移植；
+- 把源码是否合入作为本机 observer 能力的启用前置；
 - 在 PNC/RCA 业务仓中新增 provider、router、schema 或 artifact；
 - 由 VM 写 `business_knowledge_gap_v1`，再由 host 写 addendum；
 - `business=required` 失败后阻断 VM 或暂缓投递；
@@ -158,11 +159,12 @@ task-owned 安全 receipt，但不要求把内部答案或身份写入共享产�
    本机 consumer seam。对新注册术语的补查最多一轮、两条 query，结果只落 owner-only
    本机 reference/receipt；任何失败不重试原 RCA、不修改报告、不触发投递。
 6. 运行 focused 单测、身份负例、本机路径/写入审计、故障矩阵；真实 OOI canary 只能
-   在 provider 明确启用且 observer 有 consumer seam 后执行，当前不得宣称已帮助 RCA。
+   在 provider 明确启用、observer 有 consumer seam，且独立授权精确绑定 Host 身份与
+   允许 effects 后执行；当前不得宣称已帮助 RCA。
 7. 专用服务身份、细粒度 ACL、审计映射和 token 轮换自动化进入后续专项，不阻断首版。
 
-该顺序没有正式业务分支、cherry-pick、VM 发布、业务 schema migration、gateway
-production materialize 或业务仓合入步骤。
+该顺序不依赖源码合入完成；2026-08-22 的源码发布是独立流程。本顺序仍没有
+VM 发布、业务 schema migration、provider/consumer seam 启用或 gateway restart 步骤。
 
 ## 7. 当前验证与缺口
 
@@ -196,9 +198,9 @@ production materialize 或业务仓合入步骤。
 
 这些缺口意味着自动 trigger、真实 provider、consumer seam 和 RCA 无感增强尚未实现、
 尚未启用，也未发布到 production gateway；仅手动 offline shadow planner 已存在。它们
-不再包含“等待正式 RCA 分支”或“先完成专用服务身份”。本轮候选 worktree 只更新设计、
-交接和 Python 合同断言，不修改候选 transport/tool/runtime 实现、配置、凭据、resident
-或生产；本机 shadow planner 单独位于 owner-only Hermes 路径。
+不再包含“等待正式 RCA 分支”或“先完成专用服务身份”。default-off 源码
+可以单独合入正式 Host，但不会因此改变配置、凭据、resident 或生产行为；
+本机 shadow planner 单独位于 owner-only Hermes 路径。
 
 下一恢复入口是
 [集成交接](feishu-aily-business-integration-handoff.md)，不是本聊天记录。
@@ -216,9 +218,9 @@ production materialize 或业务仓合入步骤。
 | 4. 谁能借用该 UAT？ | 仅本机 RCA observer。 | 无通用对话、其他用户、CLI/API、outbox 或 VM 调用面。 |
 | 5. 已接受哪些风险？ | 权限代理、审计归属、ACL 漂移和生命周期。 | 风险登记为 `accepted/deferred`，不伪装成已消除。 |
 | 6. 新术语如何补查？ | 本机只读 completed report 后确定性提取。 | 仅新注册术语触发，最多一轮两条 query；无 VM gap、schema、artifact 或 resume。 |
-| 7. 哪些位置不得改变？ | 业务仓、VM、业务 schema/产物及原报告/投递。 | 路径和 diff 审计为零写入。 |
+| 7. 哪些运行时位置不得改变？ | VM、业务 schema/产物及原报告/投递；Host 源码合入不启用这些效果。 | 运行时路径和效果审计为零写入。 |
 | 8. 无注册术语时做什么？ | `not_required`/原型 `not_triggered`。 | 不调用 Aily 或 Web，原 RCA 继续。 |
-| 9. 是否等待正式 RCA 分支？ | 否。 | 本机实现与业务分支、合入和发布解耦。 |
+| 9. 源码合入是否启用 observer？ | 否。 | 正式 Host 中的候选源码保持 default-off，本机实现与运行时启用解耦。 |
 | 10. 什么允许本机启用？ | broker/身份、隔离、故障、写入边界、consumer seam 和真实能力证据通过。 | `Completed + content` 或本文自检不能单独作为证据。 |
 
 当前只完成设计口径更新，不得把 Quiz 答案解释为 observer 已实现、已启用或已发布。
