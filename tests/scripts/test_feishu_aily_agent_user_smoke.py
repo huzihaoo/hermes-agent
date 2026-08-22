@@ -66,18 +66,26 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
 
     assert "feishu-aily-agent-test-report.md" in main_documentation
     assert "hermes-knowledge-retrieval-routing.md" in main_documentation
-    assert "本机后台 RCA observer 尚未实现或启用" in main_documentation
+    assert "本机手动 shadow planner 原型文件已存在" in main_documentation
+    assert "不能把结果回灌给正在执行的 RCA" in main_documentation
     assert "answer_available=true" in main_documentation
     assert "不等于企业知识已命中" in main_documentation
     assert "active gateway" in main_documentation
-    assert "结果：" in test_report and " passed" in test_report
+    assert "395 passed" in test_report and "250 个相关测试" in test_report
+    assert "149 passed" in test_report
     assert "尚未部署到 production gateway" in test_report
-    assert "本机自动路由未实现" in test_report
+    assert "确定性 trigger 尚未接入自动消费" in test_report
     assert "a1e4565ec7 -> e25ba59684 -> 4a0adaba91" in test_report
     assert "HTTP 200 + 业务码 `2320008`" in test_report
     assert "session-derived attestation" in test_report
     assert "Web Search 和本地知识检索一样" in routing
-    assert "必须**尝试**" in routing
+    assert "版本化注册表命中的业务术语" in routing
+    assert "stdin 提供的显式有界业务查询" in routing
+    assert "task_type=rca` 本身不触发" in routing
+    assert "无信号规范化为 `not_required`" in routing
+    assert "原型可显示别名 `not_triggered`" in routing
+    assert "不调用 Aily" in routing
+    assert "不为内部含义\n   降级到 Web" in routing or "不调用 Aily 或 Web" in routing
     assert "内部词未命中 business 时不 fallback Web" in routing
     assert "business_knowledge_context_v1" in routing
     assert "answer_only" in routing
@@ -159,6 +167,29 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
         "rca_local_host_observer_provider_only"
     )
     assert contract["ordinary_task_provider_enabled"] is False
+    assert contract["trigger_policy"] == {
+        "type": "deterministic_registered_term_or_explicit_query",
+        "signals": ["registered_business_term", "explicit_bounded_query"],
+        "rca_task_type_alone_triggers": False,
+        "no_signal_requirement": "none",
+        "no_signal_status": "not_required",
+        "prototype_status_alias": "not_triggered",
+        "provider_called_without_signal": False,
+        "web_fallback_without_signal": False,
+    }
+    assert contract["manual_shadow_prototype"] == {
+        "script": "~/.hermes/scripts/pnc_rca_aily_shadow_observer.py",
+        "wrapper": "~/bin/pnc-rca-aily-shadow",
+        "execution": "manual_one_shot",
+        "enabled": False,
+        "registered": False,
+        "daemon": False,
+        "inspect_network": False,
+        "dry_run_network": False,
+        "real_provider_enabled": False,
+        "durable_create_poll_recovery": False,
+        "consumer_seam_enabled": False,
+    }
     assert contract["original_chain_mutations"] == {
         "dispatcher": False,
         "execution_request_v2": False,
@@ -200,6 +231,21 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
         "post_completed_sealed_report_host_async_followup",
         "host_private_owner_only_reference",
     ]
+    assert contract["preflight_task_states"] == [
+        "pending",
+        "claimed",
+        "running",
+        "in_progress",
+        "completed",
+        "done",
+        "closed",
+    ]
+    assert contract["report_followup_task_states"] == [
+        "completed",
+        "done",
+        "closed",
+    ]
+    assert contract["report_followup_requires_sealed_delivery"] is True
     assert contract["rca_phases"] == ["preflight", "report_followup:1"]
     assert contract["second_stage_host_observer"] == {
         "trigger": "completed_sealed_report",
@@ -439,7 +485,13 @@ def test_documentation_separates_verified_tool_from_future_automatic_routing():
     assert "profile/open_id/union_id 任一不符" in routing
     assert "每个六元 job 获得全新 Aily session" in routing
     assert "## 普通飞书任务（首版不启用）" in routing
-    assert "普通任务的 `auto` 只是未来路由语义" in routing
+    assert "普通飞书任务在 scope gate 直接得到 `not_required`" in routing
+    assert "`not_triggered`（规范映射 `not_required`）" in routing
+    assert "未启用、未注册且非 daemon" in routing
+    assert "没有 consumer seam" in routing
+    assert "不回灌正在执行的 RCA" in routing
+    assert "问题不写入命令参数或 shell" in routing or "问题通过 stdin" in routing
+    assert "真实 provider 当前禁用且不可用" in routing
     assert "base_contract_sha256" not in routing
     assert "core_result_sha256" not in routing
 
@@ -449,7 +501,7 @@ def test_business_integration_handoff_quiz_is_complete_and_evidence_bounded():
     worklog = WORKLOG_DOC.read_text(encoding="utf-8")
     quiz = handoff.split("## 证据 Quiz", 1)[1].split("## 回滚", 1)[0]
 
-    for number in range(1, 10):
+    for number in range(1, 11):
         assert f"{number}. **" in quiz
     assert "胡子豪固定 UAT" in quiz
     assert "接受并延后" in quiz
@@ -458,6 +510,8 @@ def test_business_integration_handoff_quiz_is_complete_and_evidence_bounded():
     assert "owner-only reference" in quiz
     assert "业务 schema/artifact" in quiz
     assert "历史 `Completed + content` 本身不够" in quiz
+    assert "无注册术语或显式查询缺失时做什么" in quiz
+    assert "consumer seam" in quiz
     assert "不是运行时流程" in worklog
     assert "文档自检不代表实现验收" in worklog
     assert "不得把 Quiz 答案解释为 observer 已实现" in worklog

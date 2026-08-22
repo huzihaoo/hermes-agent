@@ -8,12 +8,16 @@
 [设计工作记录](feishu-aily-business-integration-worklog.md)；它们不是产品状态机，
 也不会成为每次 RCA 必须执行的步骤。
 
-> 当前状态：设计候选，尚未启用本机 Hermes RCA observer。现有 Aily Agent 工具只完成
-> 胡子豪固定 UAT 的交互式候选和 API canary。
+> 当前状态：本机已有手动、一次性的 shadow observer 原型
+> `~/.hermes/scripts/pnc_rca_aily_shadow_observer.py` 和入口
+> `~/bin/pnc-rca-aily-shadow`，但它未启用、未注册、不是 daemon，也没有自动 consumer。
+> `inspect` 和 `--provider dry-run` 不联网；真实 provider 当前禁用且不可用。固定 UAT 的
+> standalone canary 只证明 transport 能力，不证明 observer 已帮助任何 RCA。
 
 ## 目标与原则
 
-- 用户不需要显式说“查企业知识库”。内部术语、业务上下文或正式 RCA 会自动触发。
+- 只有版本化注册表命中的业务术语，或通过 stdin 提供的显式有界业务查询，才触发
+  business route；`task_type=rca` 本身不触发。
 - Web、本地知识和企业知识是并列来源，不互相冒充或静默降级。
 - 企业知识只帮助理解术语、预期行为、边界条件和聚焦分析方向。
 - 企业知识不是原始证据，不能替代 issue、MCAP、日志、代码或 live runtime。
@@ -32,13 +36,16 @@
 | `local` | 代码、live runtime、任务状态、本地知识工程、历史会话 | 文件/代码搜索、受管 context retrieval、`session_search` | live 证据优先，wiki/memory 仍是参考层。 |
 | `business` | 公司术语、产品行为、业务规则、内部流程、项目/RCA 语义 | Aily business knowledge provider | 内部参考知识，不是执行真相。 |
 
-一个任务可以同时选择多个 route。例如 RCA 默认需要 local/live 证据，也尝试获取
-business 上下文；只有问题确实涉及公开标准时才额外选择 Web。
+一个任务可以同时选择多个 route。RCA 默认需要 local/live 证据；只有确定性业务信号
+命中时才额外选择 business。无注册术语且无显式查询时不调用 Aily，也不为内部含义
+降级到 Web，原 RCA 继续。
 
 ## 机器契约
 
-`required` 表示必须**尝试** business lookup 并记录结果，不表示检索成功是任务继续的
-门禁。RCA 的失败策略固定为 `continue_original_chain`。
+`required` 只表示确定性触发信号已经命中后必须尝试 business lookup；它不由 RCA 类型
+无条件产生，也不表示检索成功是任务继续的门禁。无信号规范化为 `not_required`，手动
+原型可显示别名 `not_triggered`；两者都不创建 provider job。RCA 的失败策略固定为
+`continue_original_chain`。
 
 <!-- knowledge-routing-contract:begin -->
 ```json
@@ -57,6 +64,14 @@ business 上下文；只有问题确实涉及公开标准时才额外选择 Web�
   "canonical_json_v1": {
     "encoding": "utf-8",
     "ensure_ascii": false,
+    "sort_keys": true,
+    "separators": [",", ":"],
+    "allow_nan": false
+  },
+  "rca_contract_hash_json_v1": {
+    "purpose": "canonical hash of the sealed RCA admission/request projection",
+    "encoding": "utf-8",
+    "ensure_ascii": true,
     "sort_keys": true,
     "separators": [",", ":"],
     "allow_nan": false
@@ -110,6 +125,29 @@ business 上下文；只有问题确实涉及公开标准时才额外选择 Web�
   },
   "initial_runtime_scope": "rca_local_host_observer_provider_only",
   "ordinary_task_provider_enabled": false,
+  "trigger_policy": {
+    "type": "deterministic_registered_term_or_explicit_query",
+    "signals": ["registered_business_term", "explicit_bounded_query"],
+    "rca_task_type_alone_triggers": false,
+    "no_signal_requirement": "none",
+    "no_signal_status": "not_required",
+    "prototype_status_alias": "not_triggered",
+    "provider_called_without_signal": false,
+    "web_fallback_without_signal": false
+  },
+  "manual_shadow_prototype": {
+    "script": "~/.hermes/scripts/pnc_rca_aily_shadow_observer.py",
+    "wrapper": "~/bin/pnc-rca-aily-shadow",
+    "execution": "manual_one_shot",
+    "enabled": false,
+    "registered": false,
+    "daemon": false,
+    "inspect_network": false,
+    "dry_run_network": false,
+    "real_provider_enabled": false,
+    "durable_create_poll_recovery": false,
+    "consumer_seam_enabled": false
+  },
   "original_chain_mutations": {
     "dispatcher": false,
     "execution_request_v2": false,
@@ -131,6 +169,9 @@ business 上下文；只有问题确实涉及公开标准时才额外选择 Web�
     "post_completed_sealed_report_host_async_followup",
     "host_private_owner_only_reference"
   ],
+  "preflight_task_states": ["pending", "claimed", "running", "in_progress", "completed", "done", "closed"],
+  "report_followup_task_states": ["completed", "done", "closed"],
+  "report_followup_requires_sealed_delivery": true,
   "rca_phases": ["preflight", "report_followup:1"],
   "second_stage_host_observer": {
     "trigger": "completed_sealed_report",
@@ -268,7 +309,7 @@ business 上下文；只有问题确实涉及公开标准时才额外选择 Web�
 | `no_match` | 不注入企业事实，不 fallback Web。 | continue |
 | `identity_unavailable` | 预登记的胡子豪 profile/open_id/union_id 无法精确验证；不换用其他身份。 | continue |
 | `timeout` / `error` | 只进入增强自身指标和 safe receipt。 | continue |
-| `not_required` | 不执行 business provider。 | continue |
+| `not_required` | 无确定性信号，不执行 business provider；手动原型可显示 `not_triggered`。 | continue |
 
 ## 无感触发
 
@@ -276,16 +317,19 @@ business 上下文；只有问题确实涉及公开标准时才额外选择 Web�
 
 路由发生在主模型开始推理前，先使用本地、版本化规则，不额外调用大模型：
 
-1. `task_type=rca` 或正式 RCA intake：`business=required`。
-2. 命中内部缩写、功能名、车型/项目代号、内部字段、组织流程或内部域名：
-   `business=auto`。
-3. 当前代码、runtime、日志和配置问题：`local=required`；出现业务术语时并行 business。
-4. 公开时效问题：`web=required`；同时出现内部术语时拆成 business 与 web 两个查询。
-5. 纯通用编程、数学或语言转换：business=`none`。
+1. 命中版本化注册表中的内部缩写、功能名、车型/项目代号、内部字段或中文别名：
+   `business=required`。
+2. owner 通过 stdin 提供显式、有界的业务查询：`business=required`。
+3. 无注册术语且无显式查询，包括仅有 `task_type=rca`：`business=none`，规范状态为
+   `not_required`，手动原型可显示 `not_triggered`；不调用 Aily。
+4. 当前代码、runtime、日志和配置问题：`local=required`；只有同时命中上述确定性业务
+   信号时才并行 business。
+5. 公开时效问题：`web=required`；同时命中注册业务术语时拆成 business 与 web 两个
+   独立查询，二者不互相 fallback。
 
-RCA 是否尝试检索由任务类型决定，关键词只决定“查什么”。因此 issue 标题没有显式
-业务缩写也不会漏掉 business route。首版随后还执行 runtime scope gate：只有本机 RCA
-observer 可进入 provider；普通任务的 `auto` 只是未来路由语义，当前映射为 `not_required`。
+任务类型只确定这是一个可被本机 observer 检查的 RCA，不足以触发企业知识查询。首版
+随后还执行 runtime scope gate：只有本机 RCA observer 能进入 provider；普通任务的
+business 语义是未来设计，当前一律映射为 `not_required`。
 
 ### 关键词注册表
 
@@ -324,9 +368,12 @@ query_kinds: [term_definition, expected_behavior, abnormal_boundary]
 
 ### 插入位置
 
-首版不修改 host outbox dispatcher。独立 observer 完全运行在本机 Hermes host：VM task
-成功物化后只读 sealed goal 和最终 v2 request 执行首轮增强；原任务完成后再只读 sealed
-report 执行一次补查。业务仓库、VM 代码和既有业务 schema 均不改动。
+目标设计不修改 host outbox dispatcher。未来独立 observer 完全运行在本机 Hermes host：
+任务已经物化并封存 v2 request 后即可只读观察首轮输入；`preflight` 允许任务仍处于
+`pending`/`claimed`/`running` 等进行态，不等待 VM 或报告完成，只有命中确定性业务信号
+才执行首轮查询。`report_followup:1` 是独立阶段，只有原任务进入完成态且能通过封存
+delivery manifest/contract 校验时才读取 sealed report，并在提取新注册术语后补查。业务
+仓库、VM 代码和既有业务 schema 均不改动。
 
 ```text
 durable admission
@@ -336,9 +383,9 @@ durable admission
   -> original VM core / report / required delivery
 
 independent local Hermes host observer/provider
-  -> observe materialized VM task read-only
-  -> async preflight business lookup
-  -> observe completed sealed report read-only
+  -> observe materialized VM task read-only (preflight; task may still run)
+  -> async preflight business lookup (best effort)
+  -> observe completed sealed report read-only (follow-up only)
   -> deterministic business-term extraction
   -> async host supplemental lookup
   -> host-private owner-only reference + local audit receipt
@@ -349,10 +396,10 @@ goal 或原 delivery store 写入。Aily create/poll 不占用 outbox lease，�
 dispatcher circuit。不能把网络调用放入 Kafka consumer、SQLite transaction、飞书
 callback、VM、报告渲染或投递阶段。
 
-这意味着首版 RCA 增强是独立 host-private 参考 lane：它能给人工复核、后续追问或下一次
-受控分析提供术语和聚焦方向，但不会改变当前一次性 VM core。首版不为 Aily 增加任何
-VM 侧 hook/helper/artifact，也不扩展业务 schema；Aily 不参与当前 core 的
-hypothesis/evaluator 顺序。
+目标 RCA 增强是独立 host-private 参考 lane，不改变当前一次性 VM core。**当前手动
+shadow 原型没有 consumer seam，不能把计划或结果回灌给正在执行的 RCA，因此不能声称
+它已经帮助 RCA。**未来要做到无感消费，必须单独评审并放开一个本机、只读、owner-only
+consumer seam；首版仍不为 Aily 增加任何 VM hook/helper/artifact，也不扩展业务 schema。
 
 ### 查询范围
 
@@ -427,11 +474,14 @@ local Hermes host observer/provider
 - 第二阶段默认本机 feature flag 关闭；完成幂等、report binding 和故障注入测试后再开启。
 
 提取结果最多 `terms<=8`，只在 host 内存和 owner-only job state 中存在，不落入原报告或
-任何业务 schema。observer 必须先验证 task 已完成、report 为 regular file、无 symlink、
-大小有界，并核对 `submission_key`、generation、`rca_contract_sha256`、报告 SHA-256 与既有
-seal receipt；缺少现成 seal 或任一绑定不一致就跳过补查。所有 canonical JSON 与 hash 只由
-host provider 使用机器契约中的 UTF-8、`ensure_ascii=false`、sorted keys、compact separators、
-禁止 NaN 规则计算；不要求业务仓库或 VM 新增 helper。
+任何业务 schema。首轮 `preflight` 只需验证 materialized task root、sealed request、身份和
+文件绑定；不得把未完成任务当成报告输入。二阶段 observer 必须另外验证 task 已完成、report
+为 regular file、无 symlink、大小有界，并核对 `submission_key`、generation、
+`rca_contract_sha256`、报告 SHA-256 与既有 seal receipt；缺少现成 seal 或任一绑定不一致就
+跳过补查。普通 receipt/context canonical JSON 使用机器契约中的 UTF-8、`ensure_ascii=false`、
+sorted keys、compact separators、禁止 NaN；RCA execution-contract hash 使用上方单独声明的
+`rca_contract_hash_json_v1`（`ensure_ascii=true`）。两种算法都固定版本，不要求业务仓库或
+VM 新增 helper；不要求业务仓库或 VM 新增 helper。
 
 Owner-only addendum 使用 exact schema：
 
@@ -498,9 +548,9 @@ context 不消耗新额度。
 返回 `identity_unavailable`，RCA 继续原链；不能回退 tenant identity、Web、另一个员工
 UAT 或另一个 Agent。
 
-## 结果与持久化
+## 结果与持久化（真实 provider 目标合同）
 
-每次 RCA provider job 都使用 active governed Hermes home 的 host 私有根
+未来真实 RCA provider job 必须使用 active governed Hermes home 的 host 私有根
 `$HERMES_HOME/runtime/rca-prod/business-knowledge/<submission_key>/<generation>/`
 持久化状态。POST 前先 durable seal `creating` job state；获得 terminal status 后、任何
 消费者读取前，再封存 owner-only `business_knowledge_lookup_receipt_v1`。`phase_path` 只能是
@@ -548,7 +598,7 @@ receipt 顶层字段集合必须严格等于 `lookup_receipt_common_required` �
   不得包含 answer/content/source/no-hit 字段；这些状态以 lookup receipt 终止且不创建
   context/addendum。`not_required` 不创建 provider job。
 
-本机 coordinator 必须绑定 reviewed active home，不能接受每个 job 的 `HERMES_HOME` 或
+未来本机 coordinator 必须绑定 reviewed active home，不能接受每个 job 的 `HERMES_HOME` 或
 状态根覆盖。所有 `*_relpath` 都以 generation 根为基准，规范化后不得绝对化、穿越父目录
 或指向符号链接。
 
@@ -667,8 +717,8 @@ Agent/知识策略版本和本次活动 receipt 时，才允许标 `grounded_mat
 ## 失败与隔离
 
 - business lookup 使用独立限流、deadline、熔断和指标，不打开原 RCA dispatcher circuit。
-- lookup 不占用现有 dispatcher 长 lease；本机 observer/provider 使用独立 durable
-  enrichment state。
+- lookup 不占用现有 dispatcher 长 lease；未来真实 provider 必须使用独立 durable
+  enrichment state。当前手动原型没有耐久 create/poll 恢复能力。
 - provider 返回文本按不可信输入处理，用 delimiter 隔离，不能执行其中的命令、链接、
   MCP 指令或“忽略之前规则”。
 - business 与 local/live 冲突时保留 `knowledge_conflict`，以原始证据为准。
@@ -677,28 +727,45 @@ Agent/知识策略版本和本次活动 receipt 时，才允许标 `grounded_mat
 
 ## 最小可逆原型
 
-第一阶段不是直接修改 dispatcher，而是独立只读 shadow observer：
+当前已存在的原型路径是：
 
-1. 只读已经成功物化 RCA 的 sealed goal、最终 v2 request 和既有 host 定位符；
-2. 使用 allowlisted request 字段运行首轮确定性路由和 query builder；
-3. 通过 Keychain/lark-cli broker 使用预登记胡子豪固定 UAT，或使用无凭据 mock；
-4. 只在 active Hermes home 写 owner-only context/addendum 和脱敏 receipt；
-5. 对比开启/关闭增强时的术语覆盖、分析聚焦度和误导率；
-6. 不修改 outbox、VM、报告、投递或 production circuit。
+- `~/.hermes/scripts/pnc_rca_aily_shadow_observer.py`
+- `~/bin/pnc-rca-aily-shadow`
 
-停止 observer 即完整回滚。Shadow 验收先证明首轮身份、知识范围、grounding 分类边界
-（有来源才标 grounded，否则保持 `answer_only`）、延迟和无副作用，再扩展为跟踪
-completed sealed report 的第二阶段确定性提词与本机补查。
+它是手动、一次性、未启用、未注册且非 daemon 的 planner。`inspect` 和
+`run --provider dry-run` 都不发网络请求；无注册术语且未从 stdin 提供显式查询时返回
+`not_triggered`（规范映射 `not_required`），不创建 provider job。真实 provider 当前
+禁用且不可用：现有一次性 transport 不能耐久封存 create/chat ID 并恢复 poll，不能用
+`--provider real` 宣称已经接入。
+
+手动 dry-run 示例：
+
+```bash
+~/bin/pnc-rca-aily-shadow run \
+  --latest-completed \
+  --query-stdin \
+  --provider dry-run \
+  --pretty
+```
+
+命令启动后在终端输入业务问题，再按 `Ctrl-D` 结束 stdin。问题不写入命令参数或 shell
+history。该命令只生成脱敏计划，不联网、不调用固定 UAT，也不回灌正在执行的 RCA。
+
+未来无感能力需要单独启用本机 consumer seam，并在此之前实现可恢复的 create/poll、
+真实 provider admission、owner-only 状态和故障测试。八步法只用于设计形成和评审，不是
+原型或每个 RCA 的运行时状态机。
 
 ## 风险优先实施顺序
 
-1. **固定身份可用性**：预登记胡子豪 profile/open_id/union_id，并验证 Keychain/lark-cli
-   broker 能稳定 refresh 与调用；能力验证优先。
-2. **Agent 策略**：证明无公网、无写工具，并固化 provider/identity policy fingerprint。
-3. **Provider receipt**：验证是否能获得来源/活动证据；不能则明确保持 `answer_only`。
-4. **本机 shadow observer**：create-once、fresh session、限流、脱敏、故障隔离和对照评估。
-5. **本机 active reference**：只读已完成 sealed report，确定性提词并写 host-private
-   owner-only addendum；不改业务仓库、VM、既有 schema 或 required delivery。
+1. **手动 shadow 基线**：保持现有 `inspect`/`dry-run` 无网络，验证 deterministic trigger、
+   `not_triggered`、stdin 和零业务副作用。
+2. **可恢复 provider**：拆分 create/poll，耐久封存 chat ID；在此之前真实 provider 保持禁用。
+3. **固定身份可用性**：预登记胡子豪 profile/open_id/union_id，并验证 Keychain/lark-cli
+   broker；这不等于开启自动消费。
+4. **Agent 策略与 receipt**：证明无公网、无写工具和来源边界；不能证明来源则保持
+   `answer_only`。
+5. **本机 consumer seam**：单独评审并显式放开后，才允许自动观察并将 owner-only
+   reference 提供给后续 Hermes 消费；不得回写正在执行 RCA。
 6. **身份风险专项后置**：另行评审专用 service identity、最小权限与审计迁移；不得反向
    阻塞已批准的首版固定 UAT 能力路径。
 
@@ -706,15 +773,17 @@ completed sealed report 的第二阶段确定性提词与本机补查。
 
 | 场景 | 预期 |
 | --- | --- |
-| 本机 RCA observer 查询 `OOI是什么?` | business required；不调用 Web。 |
-| 正式 AEB RCA，标题无缩写 | business required attempt + local；原 RCA 始终继续。 |
+| RCA 命中注册业务术语 | business required；不调用 Web fallback。 |
+| RCA 无注册术语且无 stdin 显式查询 | `not_required` / 原型 `not_triggered`；不调用 Aily 或 Web，原 RCA 继续。 |
+| 手动 `inspect` 或 `--provider dry-run` | 只输出脱敏计划；无网络、无 UAT、无 RCA 回灌。 |
+| 手动原型请求真实 provider | 当前禁用/不可用；不能宣称上线。 |
 | Aily timeout / 403 / no-match | 记录状态；VM、报告和投递保持原行为。 |
 | 返回非空文本但无来源 | `answer_only/reference_only`，不能作为根因证据。 |
 | 通用 Python 问题 | 不触发 business。 |
 | 内部词和公开标准混合 | business 与 web 分开查询，不互相 fallback。 |
 | 无人值守 RCA 使用胡子豪固定 UAT | 精确校验预登记 profile/open_id/union_id 后由 host provider 调用。 |
 | 普通会话尝试借胡子豪 UAT | 不暴露 provider/broker；不能通用借权。 |
-| 报告中新出现业务术语 | report seal 后由 host 确定性提词，最多一轮、两条 lookup；原任务不等待。 |
+| 报告中新出现注册业务术语 | 未来 consumer seam 放开后，report seal 后确定性提词并最多一轮、两条 lookup；原任务不等待。 |
 | business 与 live 证据冲突 | 标记冲突，以 live/原始证据为准。 |
 
 相关设计材料与验收题目见[集成交接](feishu-aily-business-integration-handoff.md)；所有实现

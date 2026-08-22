@@ -6,8 +6,9 @@
 ## 目标
 
 让本机 Hermes observer 在不修改原 RCA 的前提下，用飞书 Aily 企业知识解释术语和
-补充业务背景。知识只帮助人工理解和聚焦后续分析，不能替代 issue、MCAP、日志、代码
-或 live runtime 证据；任何检索失败都不改变已经完成或正在运行的原 RCA。
+补充业务背景。只有确定性注册术语命中或 stdin 显式查询才触发 business；无信号时
+不调用 Aily 或 Web，原 RCA 继续。知识只帮助人工理解和聚焦后续分析，不能替代 issue、
+MCAP、日志、代码或 live runtime 证据；任何检索失败都不改变已经完成或正在运行的原 RCA。
 
 本轮按 owner 提供的方法完成设计，但这些步骤不进入运行时：
 
@@ -44,7 +45,11 @@ owner 接受并延后专项治理，不是当前能力上线门。身份必须�
 
 ## 2. 最小原型
 
-首版原型是本机、只读、可独立停用的 observer：
+首版目标是本机、只读、可独立停用的 observer。当前已经有手动 shadow 原型文件
+`~/.hermes/scripts/pnc_rca_aily_shadow_observer.py` 和入口 `~/bin/pnc-rca-aily-shadow`，
+但它未启用、未注册、不是 daemon，也没有 consumer seam；它不能把结果回灌给正在执行的
+RCA。`inspect` 和 `--provider dry-run` 不联网，真实 provider 当前禁用/不可用，且没有
+耐久 create/poll 恢复，因此不能把原型写成已上线能力：
 
 ```text
 local RCA locator / completed report (read-only)
@@ -57,13 +62,17 @@ local RCA locator / completed report (read-only)
 ```
 
 observer 不修改 dispatcher、outbox、execution request、VM goal、RCA schema、报告、
-delivery manifest 或业务 artifact。它可以读取已经存在的本机 locator 和 completed report，
+delivery manifest 或业务 artifact。首轮可读取已物化但仍在进行态的 sealed request；它可以
+读取 completed report 仅用于第二阶段，
 但所有新增状态都写入 owner-only 的 Hermes 本机状态区。停掉 observer 即完整回滚。
 
-每个 eligible RCA job 的第一阶段都必须尝试一次；关键词只决定查什么，不决定是否尝试。
-第二阶段不再等待 VM 产出 gap；observer 只在原报告已经完成后，按版本化规则从允许
-字段中提取、排序、去重和截断**新注册术语**，命中时至多执行一轮、两条补查 query。
-报告文本始终按数据处理，不能作为 prompt 指令原样执行。
+第一阶段只有确定性注册术语或显式 stdin 查询才触发；仅有 `task_type=rca` 不触发。
+无信号规范状态为 `not_required`，手动原型显示别名 `not_triggered`，两者都不创建
+provider job、不调用 Aily、不降级 Web。第二阶段不再等待 VM 产出 gap；未来 observer
+只有在 sealed delivery manifest/contract 存在且身份/hash 校验通过后，才在原报告已经
+完成时按版本化规则从允许字段提取、排序、去重和截断**新注册术语**，命中时至多执行
+一轮、两条补查 query。缺失或不匹配时 fail closed，只记本机状态。报告文本始终按数据
+处理，不能作为 prompt 指令原样执行。
 
 代码复核一度考虑在 dispatcher 内 enqueue，也考虑让 VM 产出 gap artifact。最新本机
 边界同时否决这两条路径：即使网络失败处理完善，它们仍会把个人凭据能力或新增契约带进
@@ -80,6 +89,7 @@ delivery manifest 或业务 artifact。它可以读取已经存在的本机 loca
 | 身份代理、审计和生命周期风险是否阻断？ | 接受并延后专项治理。 | 登记为 `accepted/deferred`，不再要求专用服务身份或完整 ACL 治理作为首版门禁。 |
 | 能力部署在哪里？ | 只在本机 Hermes host。 | 不进入 PNC/RCA 业务仓、VM、业务 schema、报告或 artifact，也不等待业务分支。 |
 | 检索失败是否阻断 RCA？ | 不阻断。 | 所有失败状态只结束本地增强，原 RCA、报告和投递保持不变。 |
+| 什么触发第一阶段？ | 确定性注册术语或显式 stdin 查询。 | 无信号（包括仅 `task_type=rca`）为 `not_required`/`not_triggered`，不调用 Aily 或 Web。 |
 | 分析后出现的新术语如何处理？ | completed report 后本机确定性提取并补查。 | 不新增 VM gap；原 task 不等待、不 resume、不重投递。 |
 
 风险接受的范围是“先获得本机能力”，不是把胡子豪 UAT 变成通用委托身份。其他飞书
@@ -111,8 +121,8 @@ task-owned 安全 receipt，但不要求把内部答案或身份写入共享产�
   worker、outbox 或 VM；owner-only 人工 smoke 仅用于验收和诊断。
 - 输入：只读本机 locator、允许字段和 completed report；query builder 严格排除完整
   issue/report、ID、URL、PDCL、帧、日志、用户/评论、附件和既有根因。
-- 第一阶段：每个 eligible RCA job 都做一次 required attempt；关键词只用于从允许字段
-  构造至多一条有界业务 query。
+- 第一阶段：命中确定性注册术语或 stdin 显式查询才做 required attempt；仅 `task_type=rca`
+  或无注册术语为 `not_required`/原型 `not_triggered`，不调用 Aily 或 Web。
 - 第二阶段：报告完成后由本机确定性 extractor 产生有界的新注册术语集合；命中时至多
   补查一轮、两条 query，不依赖 VM gap、业务 schema 或新 artifact。
 - Agent：目标策略是企业知识检索、无公网、无写工具和副作用 MCP；缺少逐回答来源时
@@ -139,14 +149,16 @@ task-owned 安全 receipt，但不要求把内部答案或身份写入共享产�
    改动，并确定 owner-only 本地状态目录。
 2. 从现有候选中复用最小 transport 逻辑，形成 observer 专用隔离 broker；每次请求先
    精确核验胡子豪 `open_id + union_id`，错误身份在 create 前失败。
-3. 实现本机只读 RCA observer；每个 eligible RCA job 无条件做一次第一阶段 attempt，
-   关键词只决定有界 query 内容。不得注册为通用模型工具，也不获得业务 outbox lease。
-4. 实现 completed report 的确定性术语 extractor：版本化允许字段、排序、去重、上限和
+3. 保持手动 shadow 原型的 `inspect`/`dry-run` 无网络、未注册、非 daemon 行为；在
+   确定性触发信号命中时再实现本机只读 observer。不得注册为通用模型工具，也不获得
+   业务 outbox lease。
+4. 实现 completed report 的确定性新注册术语 extractor：版本化允许字段、排序、去重、上限和
    query allowlist；所有报告内容按不可信数据处理。
-5. 对新注册术语接入至多一轮、两条第二阶段 query，结果只落 owner-only 本机
-   reference/receipt；任何失败不重试原 RCA、不修改报告、不触发投递。
-6. 运行 focused 单测、身份负例、本机路径/写入审计、故障矩阵和真实 OOI canary，随后
-   才能在本机显式启用 observer。
+5. 在真实 provider 仍禁用期间只验证 dry-run；先拆分并耐久封存 create/poll，再评审
+   本机 consumer seam。对新注册术语的补查最多一轮、两条 query，结果只落 owner-only
+   本机 reference/receipt；任何失败不重试原 RCA、不修改报告、不触发投递。
+6. 运行 focused 单测、身份负例、本机路径/写入审计、故障矩阵；真实 OOI canary 只能
+   在 provider 明确启用且 observer 有 consumer seam 后执行，当前不得宣称已帮助 RCA。
 7. 专用服务身份、细粒度 ACL、审计映射和 token 轮换自动化进入后续专项，不阻断首版。
 
 该顺序没有正式业务分支、cherry-pick、VM 发布、业务 schema migration、gateway
@@ -158,7 +170,10 @@ production materialize 或业务仓合入步骤。
 
 - 候选 Aily user transport、tool、smoke、session identity 和 CLI 配置测试曾通过；详情见
   测试报告。
-- 固定员工 UAT 的真实 API canary 曾对 `OOI是什么?` 返回内部业务内容。
+- 固定员工 UAT 的真实 API canary 曾对内部 OOI 问题返回业务内容；这只是 standalone
+  transport 能力，不是 observer consumer 或 RCA 回灌证据。
+- 手动 shadow 原型文件和 wrapper 已存在，但当前仅可作为离线 planner 参照：未启用、未
+  注册、非 daemon；`inspect`/`dry-run` 无网络，真实 provider 禁用/不可用且无耐久恢复。
 - 2026-08-21 本机独立进程在没有飞书 session context 时通过 user smoke 完成固定 UAT
   调用：`ok=true`、`status=Completed`、`user_identity_verified=true`、`poll_count=17`、
   `answer_available=true`、`answer_length=2300`、`text_item_count=3`、
@@ -171,17 +186,19 @@ production materialize 或业务仓合入步骤。
 
 仍未实现或未验证：
 
-- 本机后台 RCA observer 及其只对 observer 开放的 broker 调用路径；standalone smoke
-  已证明 transport 能核验身份，但未证明运行时调用面隔离。
+- 本机后台 RCA observer、确定性 trigger 和只对 observer 开放的 broker 调用路径；standalone
+  smoke 已证明 transport 能核验身份，但未证明运行时调用面隔离。
+- consumer seam 未放开；当前任何 shadow 结果都不能回灌正在执行的 RCA。
 - completed report 的确定性术语 extractor 和第二阶段补查；
 - owner-only 本地 context/receipt、create-unknown 恢复和故障矩阵；
 - 本机 observer 的真实 OOI canary、无通用对话暴露检查和写入路径审计；
 - Aily Agent 无公网/无写工具的可审 fingerprint 或明确的 `answer_only` 降级证据。
 
-这些缺口意味着能力尚未实现、尚未在本机 RCA observer 启用，也未发布到 production
-gateway。它们不再包含“等待正式 RCA 分支”或“先完成专用服务身份”。本轮只更新设计、
-交接和 Python 合同断言，不修改 transport/tool/runtime 实现、配置、凭据、resident 或
-生产。
+这些缺口意味着自动 trigger、真实 provider、consumer seam 和 RCA 无感增强尚未实现、
+尚未启用，也未发布到 production gateway；仅手动 offline shadow planner 已存在。它们
+不再包含“等待正式 RCA 分支”或“先完成专用服务身份”。本轮候选 worktree 只更新设计、
+交接和 Python 合同断言，不修改候选 transport/tool/runtime 实现、配置、凭据、resident
+或生产；本机 shadow planner 单独位于 owner-only Hermes 路径。
 
 下一恢复入口是
 [集成交接](feishu-aily-business-integration-handoff.md)，不是本聊天记录。
@@ -200,7 +217,8 @@ gateway。它们不再包含“等待正式 RCA 分支”或“先完成专用�
 | 5. 已接受哪些风险？ | 权限代理、审计归属、ACL 漂移和生命周期。 | 风险登记为 `accepted/deferred`，不伪装成已消除。 |
 | 6. 新术语如何补查？ | 本机只读 completed report 后确定性提取。 | 仅新注册术语触发，最多一轮两条 query；无 VM gap、schema、artifact 或 resume。 |
 | 7. 哪些位置不得改变？ | 业务仓、VM、业务 schema/产物及原报告/投递。 | 路径和 diff 审计为零写入。 |
-| 8. 是否等待正式 RCA 分支？ | 否。 | 本机实现与业务分支、合入和发布解耦。 |
-| 9. 什么允许本机启用？ | broker/身份、隔离、故障、写入边界和真实能力证据通过。 | `Completed + content` 或本文自检不能单独作为证据。 |
+| 8. 无注册术语时做什么？ | `not_required`/原型 `not_triggered`。 | 不调用 Aily 或 Web，原 RCA 继续。 |
+| 9. 是否等待正式 RCA 分支？ | 否。 | 本机实现与业务分支、合入和发布解耦。 |
+| 10. 什么允许本机启用？ | broker/身份、隔离、故障、写入边界、consumer seam 和真实能力证据通过。 | `Completed + content` 或本文自检不能单独作为证据。 |
 
 当前只完成设计口径更新，不得把 Quiz 答案解释为 observer 已实现、已启用或已发布。

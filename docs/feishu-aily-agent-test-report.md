@@ -33,15 +33,17 @@ observer，业务仓、VM、业务 schema/产物和 production gateway 均不是
    UAT 调用，返回 `user_identity_verified=true`。这证明 standalone 后台 transport
    能力，不证明 RCA observer 已接入或其唯一调用面已经实现。
 
-该证据**不证明本机后台 RCA observer 已实现**。后台 observer 没有飞书会话身份，仍需
-接入 observer 专用隔离 broker，在每次 create 前重复精确核验 token 对应的胡子豪
-`open_id + union_id`，同时禁止通用对话、其他用户、CLI/API、业务 worker 和 VM 借权。
+该证据**不证明自动本机 RCA observer 已实现**。手动 shadow planner 原型虽已存在，但
+尚未启用、未注册、不是 daemon，也没有 consumer seam；后台自动调用仍需接入 observer
+专用隔离 broker，在每次 create 前重复精确核验 token 对应的胡子豪 `open_id + union_id`，
+同时禁止通用对话、其他用户、CLI/API、业务 worker 和 VM 借权。
 
 该候选**尚未部署到 production gateway**。2026-08-21 的只读预检发现候选与当时
 gateway commit `dcb535677` 已分叉，直接物化会回退大量 RCA 生产变更，因此操作被
 主动停止。最新方案不再等待正式 RCA 分支，也不向 production gateway 发布；后续只做
-本机 observer 的独立实现和验收。本轮只修改文档和 Python 合同断言，没有修改
-transport/tool/runtime 实现、配置、凭据或 resident。
+本机 observer 的独立实现和验收。本轮候选 worktree 修改文档和 Python 合同断言/文档测试，
+没有修改候选 transport/tool/runtime 实现、配置、凭据或 resident；本机 shadow planner
+位于 Hermes owner-only 路径，另行验证。
 
 ## 自动化测试
 
@@ -65,18 +67,32 @@ uv run --frozen pytest -q \
   tests/tools/test_registry.py
 ```
 
-2026-08-21 在本轮 owner 决策与本机边界合同更新后重新执行，结果：`395 passed`。
+候选基线的历史回归结果记录为 `395 passed`；这不是本轮最终测试数字，也不代表 shadow
+planner 或自动 observer 已验收。
 
-独立只读复核另外运行了 250 个相关测试，未发现 P0/P1/P2。以下静态检查也通过：
+候选阶段的独立只读复核另外运行了 250 个相关测试，未发现 P0/P1/P2；这同样是历史记录，
+不是本轮最终测试数字。以下静态检查也通过：
 
 - Ruff
 - `py_compile`
 - `plugin.yaml` 解析
 - `git diff --check`
 
-本轮修改设计、交接和合同断言，没有修改 transport/tool/runtime 实现。除上述 12 模块
-回归外，还单独执行了合同聚焦测试（`37 passed`）、Markdown 链接检查、owner 决策残留
-`rg` 扫描和 scoped `git diff --check`。
+本轮修改设计、交接和合同断言，没有修改候选 transport/tool/runtime 实现。相关合同测试、
+Markdown 链接检查、owner 决策残留 `rg` 扫描和 scoped `git diff --check` 的实际结果应
+以本轮命令输出为准。当前可复核结果如下：
+
+- 本机 shadow planner：`10 passed`，使用 `/usr/local/bin/pytest`，无网络。
+- 候选文档/合同测试：`37 passed`，使用候选 worktree 的 Python 3.11 环境，无网络。
+- Aily Agent/knowledge 离线相关测试集合：`149 passed`，无网络、无真实 API 请求。
+- 两组测试均使用 `-p no:cacheprovider` 和 `PYTHONDONTWRITEBYTECODE=1`。
+- `py_compile`、候选 `git diff --check` 通过。
+- live `inspect --latest-completed`：`triggered=false`、`query_kind=not_triggered`、
+  `requirement=not_required`；显式 stdin 的 OOI dry-run 仅返回 `status=planned`，未调用
+  Aily、未写 observer 状态。
+- `report_followup:1` 当前对 live shared-state 结果 fail closed（缺少可验证的 sealed
+  delivery manifest/contract）；这不是成功的二阶段能力证明，后续需 DB sealed join 或
+  明确 sealed fixture。
 
 ### 关键覆盖
 
@@ -134,21 +150,24 @@ observer 已接入、grounding/source provenance 或 no-public-web。
 
 ## 尚未验证或尚未实现
 
-1. **本机后台 observer 未实现**：现有候选依赖飞书会话身份，没有 read-only completed
-   report observer、后台调度或本机 reference store。
-2. **observer 专用 broker admission 未实现**：standalone smoke 已证明无会话 transport
-   会核验固定用户身份；尚未证明运行时 broker 只对本机 RCA observer 可达，也尚未形成
-   observer job 到固定 profile/`open_id + union_id` 的完整接线证据。
-3. **本机自动路由未实现**：第一阶段允许字段、bounded query 和幂等状态仍是设计；
-   候选通用模型工具保持关闭，不能作为后台替代。
-4. **completed report 二阶段未实现**：尚无只读完成态判定、确定性新注册术语提取、
+1. **自动本机 observer 未实现/未启用**：手动 shadow planner 文件和 wrapper 已存在，
+   但未注册、非 daemon、没有 consumer seam，不能回灌正在执行的 RCA。
+2. **确定性 trigger 尚未接入自动消费**：只有注册业务术语或 stdin 显式查询才应触发；
+   无信号（包括仅 `task_type=rca`）必须为 `not_required`/原型 `not_triggered`，不调用
+   Aily 或 Web。
+3. **真实 provider 当前禁用/不可用**：`inspect` 和 `--provider dry-run` 不联网；现有
+   一次性 transport 没有耐久 create/poll 恢复，不能宣称真实增强已上线。
+4. **completed report 二阶段未实现**：必须先有 sealed delivery manifest 与 delivery
+   contract；缺失、无效或身份/hash 不匹配时 fail closed。当前尚无只读完成态判定、
+   确定性新注册术语提取、
    排序去重、query allowlist 或至多一轮两条补查 query。最新方案不要求 VM gap 或业务
-   侧 schema/addendum，但仍需要本机 host-private reference addendum。
+   侧 schema/addendum，但未来只允许本机 host-private reference addendum。
 5. **结构化 grounded 证据不足**：当前 Agent Chat 返回文本、状态和产物标识，没有
    统一的检索来源/命中片段契约。任务流程不能把 `answer_available=true` 当作
    `grounded=true`。
-6. **本机 observer 真实 canary 未执行**：已有固定 UAT API canary，但尚未证明本机
-   observer 能只读 RCA、自动构造问题、调用 broker 并只写 owner-only 状态。
+6. **本机 observer 真实 canary 未执行**：已有固定 UAT API canary 和 standalone smoke，
+   但尚未证明自动 observer 能只读 RCA、按确定性信号构造问题、调用 broker 并只写
+   owner-only 状态。
 7. **多用户/通用对话不在首版范围**：固定 UAT 只允许本机 RCA observer 使用；扩大前
    必须重新设计逐用户凭据、稳定身份映射和并发隔离，不能沿用本次风险接受。
 8. **性能基线不完整**：回执记录 poll 次数，尚未形成 p50/p95 总耗时、无匹配率、
@@ -180,17 +199,21 @@ SSE `finished`，因此必须记为失败，不属于上述 Agent UAT 成功证�
    问题前失败，不回退 TAT，UAT/App Secret 不出现在 observer 环境、argv、日志或 receipt。
 3. 只有本机 RCA observer 能调用 broker。通用 Hermes/飞书对话、其他用户、CLI/API、
    Kafka/outbox、dispatcher 和 VM 的负例都在网络请求前拒绝。
-4. 第一阶段 query 只使用允许字段并有界；完整 issue/report、ID、URL、PDCL、帧、日志、
-   用户/评论、附件和现有 root cause 不进入 Aily。
-5. completed report 只读完成态、确定性新注册术语 extractor、固定排序/去重/上限和
+4. 第一阶段只有确定性注册术语或 stdin 显式查询才触发；无信号返回
+   `not_required`/`not_triggered`，不调用 Aily 或 Web。触发后的 query 只使用允许字段并
+   有界；完整 issue/report、ID、URL、PDCL、帧、日志、用户/评论、附件和现有 root cause
+   不进入 Aily。
+5. completed report 只有在 sealed manifest/contract 绑定通过时才只读完成态、确定性新
+   注册术语 extractor、固定排序/去重/上限和
    prompt-like 文本负例通过；第二阶段最多一轮两条 query，不产生 VM gap、业务 schema
    或 artifact。
 6. timeout、403、429、5xx、no-match、bad JSON、oversize、crash、create-unknown 和本地
    存储失败都只终止 observer job，不改变原 RCA 或触发 retry/delivery。
 7. 形成 owner-only safe receipt；不含 query、answer、user、chat、session、token，低熵
    digest 使用 keyed HMAC 或不持久化。无来源答案只标 `answer_only`。
-8. 以已成功的 standalone user smoke 为 transport 基线，再通过接入后的 observer 执行
-   `OOI是什么?` 端到端 canary；同时证明候选通用 toolset 和 production gateway 未启用。
+8. 以已成功的 standalone user smoke 为 transport 基线；只有在真实 provider 明确启用、
+   consumer seam 放开且耐久 create/poll 完成后，才可通过 observer 执行端到端 canary。
+   当前不能宣称 observer 已帮助 RCA，且候选通用 toolset 和 production gateway 仍未启用。
 
 专用服务身份、ACL 正反 canary、审计触发者映射和 token 轮换自动化属于后续专项，不是
 首版本机启用门。通过以上验收只能声称“本机 observer 已验证/启用”，不能声称能力已

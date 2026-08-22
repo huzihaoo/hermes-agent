@@ -9,8 +9,8 @@
 
 当前 Aily transport/tool 是独立、默认关闭的候选。固定员工用户身份 API canary 已
 打通；2026-08-21 还在无飞书 session context 的本机独立进程中通过 user smoke 完成了
-一次安全调用。但本机后台 RCA observer 尚未实现或启用，production gateway 也未启用
-该工具。
+一次安全调用。本机手动 shadow planner 原型文件已存在，但自动 RCA observer/consumer
+尚未实现或启用，production gateway 也未启用该工具。
 
 Owner 最新决定把首版范围收敛为**仅本机 Hermes host 的 RCA observer**：可复用胡子豪
 固定 UAT，能力优先；权限代理、审计归属、ACL 漂移和 token 生命周期风险登记为
@@ -18,8 +18,9 @@ Owner 最新决定把首版范围收敛为**仅本机 Hermes host 的 RCA observ
 schema/产物，也不得成为普通 Hermes/飞书对话或其他调用方可借用的通用工具。Aily 回答
 只作 owner-only reference，失败继续原 RCA，不能当成执行证据。
 
-这项决定不等于 observer 已实现或已发布。本文件中现有 tool/smoke 只提供 API、身份和
-隔离参照；首版本机 observer 仍需单独完成实现和验收，不再等待正式 RCA 业务分支。
+这项决定不等于自动 observer 已实现或已发布。本文件中现有 tool/smoke 和手动 shadow
+planner 只提供 API、身份、离线规划和隔离参照；当前 planner 未启用、未注册、非 daemon，
+没有 consumer seam，不能把结果回灌给正在执行的 RCA，不再等待正式 RCA 业务分支。
 
 新版 Aily 智能体详情页地址中的 `agent_<...>` 是 Agent ID：
 
@@ -66,8 +67,9 @@ observer；普通对话、其他用户、CLI/API、resident 业务 worker、Kafk
    开启企业知识，并选择“全部”或明确的目标知识空间。
 4. Agent 开启知识空间检索并挂载目标知识。直连知识仍按对话用户权限过滤，
    不需要给调用应用额外增加 `wiki`/`docx` scope。
-5. 该 Agent 必须关闭公开网络兜底，或使用只执行知识检索的知识问答策略。
-   未命中企业知识时应返回“未检索到”，不能改用互联网搜索或通用知识猜测。
+5. 上线前门禁必须确认该 Agent 已关闭公开网络兜底，或使用只执行知识检索的知识
+   问答策略；当前本机没有后台配置/活动日志证明这一点。未命中企业知识时应返回
+   “未检索到”，不能改用互联网搜索或通用知识猜测。
 
 MCP 是 Agent 后台配置的服务端能力，请求体不传 MCP URL、工具名或 secret。
 是否执行 MCP 取决于 Agent 的对话模式和已发布技能。下游 MCP 使用什么身份、
@@ -150,12 +152,14 @@ observer 构造的业务问题不包含 Agent ID 或身份字段；以下只展�
 `grounded=true`。每个 observer job 使用全新 session，不跨 task/generation 共享对话
 历史。`no_match`、身份或协议错误不能自动降级到 Web 搜索内部含义。
 
-首版有两个本机、异步且不影响原链的机会点：
+首版目标有两个本机、异步且不影响原链的机会点；当前仅离线 shadow planner 可检查计划：
 
-1. 每个 eligible RCA job 都执行一次第一阶段 required attempt，从既有只读 RCA
-   locator/允许字段构造至多一条 query；关键词只决定查什么，不决定是否尝试；
-2. 原报告完成后，observer 用版本化确定性规则从允许字段提取、排序、去重和截断术语，
-   仅在出现新注册术语时执行至多一轮、两条补查 query。
+1. 命中确定性注册术语或 stdin 显式查询时，从既有只读 RCA locator/允许字段构造至多
+   一条 required query；仅 `task_type=rca` 或无信号时为 `not_required`（手动 planner
+   显示 `not_triggered`），不调用 Aily 或 Web；
+2. 原报告完成后，未来 observer 只有在 sealed delivery manifest/contract 存在且身份/hash
+   校验通过时，才用版本化确定性规则从允许字段提取、排序、去重和截断新注册术语；
+   缺失或不匹配时 fail closed，仅记本机状态。命中时执行至多一轮、两条补查 query。
 
 第二阶段不要求 VM 生成 gap，不增加业务 schema 或 artifact，也不恢复、重跑或重新投递
 主任务。报告内容按不可信数据处理；完整 issue/report、ID、URL、PDCL、帧、日志、用户、
@@ -198,6 +202,25 @@ GET /open-apis/aily/v1/agents/:agent_id/chats/:agent_chat_id
 Aily 功能手册的新资源表曾展示 `/agent_chats`，但当前接口详情和官方 SDK 仍
 使用 `/chats`。本实现锁定当前具体接口详情，不做可能重复创建会话的自动 fallback。
 
+## 本机 shadow planner 示例
+
+手动原型通过 stdin 接收问题，命令行不包含业务问题；`dry-run` 只输出脱敏计划，不联网、
+不调用 UAT，也不回灌正在执行的 RCA：
+
+```bash
+~/bin/pnc-rca-aily-shadow run \
+  --latest-completed \
+  --query-stdin \
+  --provider dry-run \
+  --pretty
+```
+
+启动后在终端输入问题，再按 `Ctrl-D` 结束 stdin。无注册术语且没有显式输入时，计划返回
+`not_triggered`（规范状态 `not_required`）。report-followup 没有 sealed manifest/contract
+或绑定校验失败时也 fail closed，不补查。真实 provider 当前禁用/不可用，没有耐久
+create/poll 恢复；该原型未启用、未注册、非 daemon。`--latest-completed` 目前只定位一个
+已物化任务，不是 completed sealed report locator；报告二阶段尚未接入数据库封存联结。
+
 ## 用户身份 smoke
 
 问题必须从 stdin 输入，避免进入 shell history 和进程列表。默认 receipt 只包含
@@ -233,11 +256,12 @@ gateway restart、受管 materialize、业务分支合入、VM 下发或业务 s
    或 App Secret 暴露给 observer 进程、日志和 receipt。
 3. 通用 Hermes/飞书对话、其他用户、CLI/API、Kafka/outbox、dispatcher 和 VM 都没有
    broker 调用入口；候选 toolset 保持关闭。
-4. 第一阶段 required attempt 与 completed-report 确定性 extractor 通过 allowlist、
-   幂等、注册术语、固定排序/上限和 prompt-like 文本负例测试；二阶段最多一轮两条 query。
+4. 第一阶段的 deterministic trigger 与 completed-report 确定性 extractor 通过
+   allowlist、命中后 required attempt、无信号 `not_triggered`、幂等、注册术语、固定排序/
+   上限和 prompt-like 文本负例测试；二阶段最多一轮两条 query。
 5. timeout、403、429、5xx、no-match、bad JSON、oversize、crash、create-unknown 和本地
    存储失败都只终止 observer job，不改变原 RCA、报告或投递。
-6. owner-only 人工 `OOI是什么?` canary 重新证明真实能力，默认 receipt 不记录问题、
+6. owner-only 人工通过 stdin 重新执行内部 canary 以证明真实能力，默认 receipt 不记录问题、
    答案正文、身份或 token；缺少 provenance 时只标 `answer_only`。
 
 专用服务身份、细粒度 ACL、审计触发者映射和 token 生命周期自动化已由 owner 延后，
@@ -260,7 +284,7 @@ gateway restart、受管 materialize、业务分支合入、VM 下发或业务 s
 | `10007` | 检查身份类型、用户/应用可用范围、同租户和附件归属。 |
 | `10008` | 租户尚未开通 Aily OpenAPI。 |
 | `10009`～`10011` | 兼容性提示；检查身份开关和用户/应用范围，以实际 `code/msg/log_id` 为准。 |
-| `50001` | Aily 内部错误；有界重试一次，持续出现时携带脱敏 log id 排查。 |
+| `50001` | 当前 observer 不调用真实 provider；未来只有在请求尚未发出或已有 durable idempotency 的 broker 中，才可按独立策略有界重试，并携带脱敏 log id 排查。 |
 
 ## 官方参考
 

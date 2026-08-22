@@ -3,16 +3,21 @@
 ## 当前状态
 
 - 候选 transport/tool、固定员工 UAT API canary，以及无飞书 session context 的本机
-  standalone user smoke 已有测试证据；本机后台 RCA observer 尚未实现或启用。
+  standalone user smoke 已有测试证据；本机手动 shadow planner 原型文件已存在，但
+  RCA observer 自动消费尚未实现或启用。
 - Owner 已决定首版 observer 可复用胡子豪固定 UAT，能力优先。权限代理、审计归属、
   ACL 漂移和 token 生命周期风险登记为 `accepted/deferred`，不是当前上线门。
 - 首版运行时能力仅允许存在于本机 Hermes host。不得进入 PNC/RCA 业务仓、VM、业务
   schema、报告或 artifact，也不得暴露为通用对话借权工具。
 - 不再等待正式 RCA 业务分支，不需要从候选向业务分支移植或合入。
 - completed report 二阶段确定性提取和补查尚未实现；不再要求 VM gap 或业务侧
-  addendum/schema，但仍生成本机 host-private reference addendum。
-- 本轮只更新文档和 Python 合同断言，没有修改 transport/tool/runtime 实现、配置、
-  凭据、resident 或生产。
+  addendum/schema，但未来只生成本机 host-private reference addendum。
+- `~/.hermes/scripts/pnc_rca_aily_shadow_observer.py` 与 `~/bin/pnc-rca-aily-shadow`
+  当前未启用、未注册、非 daemon；`inspect`/`--provider dry-run` 不联网，真实 provider
+  禁用/不可用且无耐久 create/poll 恢复。当前没有 consumer seam，不能回灌正在执行的 RCA。
+- 候选 worktree 本轮只更新文档、Python 合同断言和文档测试，没有修改候选
+  transport/tool/runtime、配置、凭据、resident 或生产；本机 shadow planner 是独立的
+  owner-only Hermes 文件，不属于业务仓候选改动。
 
 形成过程见 [设计工作记录](feishu-aily-business-integration-worklog.md)，已有候选测试证据见
 [Aily Agent 测试报告](feishu-aily-agent-test-report.md)。
@@ -36,7 +41,9 @@
    原报告、事项或 required delivery。
 7. 运行时代码、配置和新增状态仅在本机 Hermes host；业务仓、dispatcher、outbox、VM、
    execution request、业务 schema 和 artifact 均为零改动边界。
-8. 第二阶段由本机 observer 只读 completed report，仅在确定性提取出新注册术语后补查，
+8. 第一阶段仅由确定性注册术语或 stdin 显式查询触发；无信号（包括仅 `task_type=rca`）
+   为 `not_required`/原型 `not_triggered`，不调用 Aily 或 Web。第二阶段由本机 observer
+   只读 completed report，仅在确定性提取出新注册术语后补查，
    最多一轮、两条 query；不新增 VM gap、业务侧 addendum/schema、main-task wait/resume
    或重新投递，只写本机 host-private reference addendum。
 9. 内部术语未命中不能 fallback Web。
@@ -94,16 +101,21 @@ observer 只读既有 locator/报告是允许的；新增文件、数据库、re
 
 ### L2：第一阶段本机 observer
 
-- 只读本机已有 RCA locator/允许字段，不持 outbox lease，不调用 VM submit。
-- 每个 eligible RCA job 无条件执行一次 required attempt；关键词只决定查询内容，不决定
-  是否尝试。按版本化规则构造至多一条有界问题。
+- 在 task 已物化并封存 v2 request 后，只读本机 RCA locator/允许字段；`pending`、
+  `claimed`、`running` 等进行态可以做首轮观察，不持 outbox lease、不等待任务完成、
+  不调用 VM submit。进行态不是 report 输入，不能触发第二阶段。
+- 只有命中版本化注册术语，或 owner 通过 stdin 提供显式有界查询，才执行 required
+  attempt；仅 `task_type=rca`、无注册术语且无显式查询为 `not_required`/原型
+  `not_triggered`，不调用 Aily 或 Web。命中后按版本化规则构造至多一条有界问题。
 - Query 不得含 ID、URL、PDCL、帧、日志、用户/评论、附件、完整 issue/report 或现有
   root cause。
 - 结果只写 owner-only local reference/receipt；provider 故障不影响业务链。
 
 ### L3：completed report 二阶段
 
-- 只在原报告已完成且稳定可读后执行；报告文件和业务 artifact 全程只读。
+- 只在原报告已完成且稳定可读后执行；必须同时存在并校验 sealed delivery manifest 与
+  delivery contract，缺失、无效或身份/hash 不匹配时 fail closed，只记本机状态，不补查。
+  报告文件和业务 artifact 全程只读。
 - 用确定性、版本化 extractor 从允许字段提取新注册术语，固定 normalization、排序、
   去重和上限；不得调用模型决定提取结果，也不得执行报告中的 prompt-like 文本。
 - 只有提取出新注册术语才补查，最多一轮、两条 query；与第一阶段做本机幂等去重，
@@ -114,6 +126,8 @@ observer 只读既有 locator/报告是允许的；新增文件、数据库、re
 ### L4：本机验收与启用
 
 - 运行 focused 单测、身份负例、query allowlist、create/poll fault matrix 和路径写入审计。
+- 验证 `inspect` 与 `run --provider dry-run` 为手动离线计划：无网络、无 UAT、无状态
+  consumer；无信号返回 `not_triggered`/`not_required`。
 - 复用已成功的 standalone user smoke 作为 transport 基线，并在 observer 接好后重新做
   owner-only `OOI是什么?` 端到端 canary；默认 receipt 不保存问题、答案正文、个人标识
   或 token。
@@ -121,7 +135,7 @@ observer 只读既有 locator/报告是允许的；新增文件、数据库、re
   schema、artifacts、原报告和投递均无变化。
 - 显式检查通用 Hermes/飞书对话、其他用户、CLI/API 和业务 worker 都没有借权入口。
 - 仅在上述能力与隔离证据通过后启用本机 observer；不得把“已有 API canary”误写成
-  observer 已实现或已发布。
+  observer 已实现或已发布。当前 prototype 仍未启用、未注册、非 daemon。
 
 ### 后续专项（不阻断首版）
 
@@ -184,9 +198,11 @@ observer 只读既有 locator/报告是允许的；新增文件、数据库、re
      不依赖 VM gap。
 8. **哪些载体必须保持零改动？**
    - PNC/RCA 业务仓、VM、业务 schema/artifact、原报告和 required delivery。
-9. **什么证据允许本机启用？**
+9. **无注册术语或显式查询缺失时做什么？**
+   - 返回 `not_required`（手动原型显示 `not_triggered`），不调用 Aily 或 Web，原 RCA 继续。
+10. **什么证据允许本机启用？**
    - broker 身份与密钥隔离、唯一调用面、query 边界、故障矩阵、写路径 oracle、确定性
-     二阶段和真实 OOI 能力证据；历史 `Completed + content` 本身不够。
+     二阶段、consumer seam 和真实能力证据；历史 `Completed + content` 本身不够。
 
 ## 回滚
 
