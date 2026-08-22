@@ -831,10 +831,7 @@ def create_consumer(
         raise RuntimeError(
             "kafka-python is not installed in this runtime; install a pinned dependency first"
         ) from exc
-    control_store = store or RcaControlStore(
-        config.control_db_path,
-        require_current=True,
-    )
+    control_store = store or _open_control_store(config.control_db_path)
     _require_activation_ingress_open(control_store, config)
     consumer = KafkaConsumer(**config.kafka_kwargs())
     listener_type = type(
@@ -848,6 +845,20 @@ def create_consumer(
     # retains it through subscription state, but that is not a public contract.
     consumer._hermes_rca_initial_offset_listener = listener
     return consumer
+
+
+def _open_control_store(path: Path) -> RcaControlStore:
+    """Open either the current schema or the already-promoted successor."""
+    try:
+        return RcaControlStore(path, require_current=True)
+    except RuntimeError as exc:
+        if str(exc) != "incompatible_control_store_schema:version":
+            raise
+        return RcaControlStore(
+            path,
+            require_current=True,
+            allow_successor_write=True,
+        )
 
 
 def _require_activation_ingress_open(
@@ -1259,7 +1270,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True))
             return 0 if status.get("ok") is True else 2
 
-        store = RcaControlStore(config.control_db_path, require_current=True)
+        store = _open_control_store(config.control_db_path)
         _require_activation_ingress_open(store, config)
         health = HealthReporter(config, store)
         stats = PollStats()
