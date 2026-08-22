@@ -2307,6 +2307,7 @@ def test_all_failure_lanes_use_first_failure_observation_for_fallback_deadline(
     [
         "remote_evidence_domain_unsupported",
         "viz_evidence_unavailable",
+        "evidence_not_ready",
     ],
 )
 def test_known_production_terminal_is_not_held_for_fallback_window(
@@ -2326,6 +2327,11 @@ def test_known_production_terminal_is_not_held_for_fallback_window(
         if blocker_kind == "viz_evidence_unavailable"
         else blocker_kind
     )
+    [route] = instance.store.list_rows("rca_failure_routes")
+    if blocker_kind == "evidence_not_ready":
+        assert route["lane"] == "needs_human_input"
+        assert route["route_kind"] == "internal_backlog"
+        assert route["owner"] == "rca-triage"
     assert instance.store.list_rows("rca_delivery_jobs") == []
 
 

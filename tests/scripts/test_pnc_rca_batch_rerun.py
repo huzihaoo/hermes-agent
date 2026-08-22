@@ -549,14 +549,15 @@ def test_terminal_failure_surfaces_silent_watch_without_delivery_job(error_code)
     }
 
 
-def test_terminal_failure_does_not_expand_to_other_silent_watch_codes():
+@pytest.mark.parametrize("error_code", ["vm_status_missing", "evidence_not_ready"])
+def test_terminal_failure_does_not_expand_to_other_silent_watch_codes(error_code):
     snapshot = {
         **_snapshot(job_status=""),
         "delivery_id": None,
         "effects": [],
         "watch_state": "terminal_failed",
         "watch_delivery_id": None,
-        "watch_error_code": "vm_status_missing",
+        "watch_error_code": error_code,
     }
 
     assert _terminal_failure(snapshot) is None

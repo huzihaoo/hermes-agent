@@ -593,6 +593,45 @@ def test_operator_silent_terminal_rerun_rejects_tampered_authority_without_mutat
     assert {table: store.list_rows(table) for table in before} == before
 
 
+def test_evidence_quality_terminal_is_not_a_silent_technical_rerun(
+    tmp_path,
+):
+    store, terminal_at = _silent_deadline_terminal_store(tmp_path)
+    _rewrite_silent_terminal_error_code(store, "evidence_not_ready")
+    request = _silent_batch_request(batch_id="batch-evidence-quality")
+    authority = _silent_batch_authority(
+        store,
+        request,
+        batch_id="batch-evidence-quality",
+    )
+    before = {
+        table: store.list_rows(table)
+        for table in (
+            "business_triggers",
+            "rca_outbox",
+            "rca_trigger_sources",
+            "rca_shadow_promotion_audit",
+        )
+    }
+
+    with pytest.raises(
+        ManualRcaAdmissionError,
+        match="silent_terminal_rerun_terminal_generation_required",
+    ):
+        store.admit_manual_trigger(
+            request,
+            allowed_chat_ids=set(),
+            submit_enabled=True,
+            operator_authorized=True,
+            silent_terminal_rerun_authority=authority,
+            outbox_high_watermark=10_000,
+            activation_required=True,
+            now=terminal_at + timedelta(seconds=1),
+        )
+
+    assert {table: store.list_rows(table) for table in before} == before
+
+
 def test_operator_silent_terminal_rerun_requires_callsite_activation_gate(
     tmp_path,
 ):

@@ -27,6 +27,7 @@ from scripts import pnc_fault_taxonomy as tax
         ("service_provenance_unavailable", tax.HARD_DEFECT, tax.INTERNAL_ALERT),
         ("delivery_lineage_unavailable", tax.HARD_DEFECT, tax.INTERNAL_ALERT),
         ("viz_mcap_build_failed", tax.HARD_DEFECT, tax.INTERNAL_ALERT),
+        ("evidence_not_ready", tax.NEEDS_HUMAN_INPUT, tax.INTERNAL_BACKLOG),
     ],
 )
 def test_named_production_blockers_have_exactly_one_lane(kind, lane, route):

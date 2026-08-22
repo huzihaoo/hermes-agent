@@ -200,6 +200,7 @@ _IMMEDIATE_TERMINAL_ERROR_CODES = frozenset({
     "taxonomy_gap:remote_evidence_domain_unsupported",
     "viz_evidence_unavailable",
     "taxonomy_gap:viz_evidence_unavailable",
+    "evidence_not_ready",
 })
 
 

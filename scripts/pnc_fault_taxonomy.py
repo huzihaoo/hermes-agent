@@ -84,6 +84,7 @@ NEEDS_HUMAN_INPUT_KINDS = frozenset({
     "need_key_frame",
     "required_input",
     "missing_required_input",
+    "evidence_not_ready",
 })
 
 # Code, provenance, lineage, and publication-contract defects.  These are
