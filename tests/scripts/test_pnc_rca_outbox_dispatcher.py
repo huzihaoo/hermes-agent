@@ -41,7 +41,8 @@ def _v15_control_store(path: Path) -> RcaControlStore:
 def test_storage_admission_uses_isolated_production_runtime():
     assert dispatcher.REMOTE_STORAGE_ADMISSION_MODULE == (
         "/home/mini/.hermes/rca-prod-runtime/releases/"
-        "rca-platform-20260724/api/g1q3_rca/storage_admission.py"
+        "rca-platform-20260822.installed-c2821d2-r15bm/"
+        "api/g1q3_rca/storage_admission.py"
     )
 
 
