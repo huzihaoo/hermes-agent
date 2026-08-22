@@ -1,7 +1,7 @@
 # 飞书 Aily Agent 企业知识接入测试报告
 
-> 观测日期：2026-08-20 至 2026-08-21  
-> 候选分支：`codex/feishu-aily-knowledge-qa-current-20260813`  
+> 观测日期：2026-08-20 至 2026-08-21
+> 候选分支：`codex/feishu-aily-knowledge-qa-current-20260813`
 > 实现基线（本报告整理前）：`368e3a2176`
 
 候选是累积实现；以下历史链只用于定位已测试的 transport/tool/identity 代码：
