@@ -44,7 +44,9 @@ def test_script_path_help_is_executable_from_repository_root():
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert "{preflight,prepare,plan,apply,verify}" in completed.stdout
+    assert "preflight" in completed.stdout
+    assert "prepare-preflight" in completed.stdout
+    assert "activate" in completed.stdout
 
 
 def _write(path: Path, raw: bytes, mode: int = 0o600) -> Path:
@@ -874,6 +876,28 @@ def test_preflight_real_store_preserves_db_wal_shm_and_cleans_snapshots(
     assert not prepared["note_path"].exists()
     assert not prepared["env_output"].exists()
     assert not prepared["manifest_output"].exists()
+
+
+def test_prepare_preflight_defers_canary_and_raw_control_snapshot(release_files):
+    prepared = _prepare_fixture(release_files)
+    runner = FakeRunner(release_files)
+    result = release.prepare_preflight_release(**prepared["args"], runner=runner)
+
+    assert result["mode"] == "prepare-preflight"
+    assert result["preflight_ok"] is True
+    assert result["deferred"] >= 7
+    deferred = {
+        row["gate"]: row
+        for row in result["checks"]
+        if row["status"] == "deferred"
+    }
+    assert deferred["prepare_control_snapshot_invalid"]["precheckable"] is False
+    assert deferred["rca_control_store_snapshot_source_changed"]["precheckable"] is False
+    assert deferred["canary_state_unavailable"]["precheckable"] is False
+    assert not prepared["store_calls"]
+    assert not prepared["note_path"].exists()
+    assert not prepared["manifest_output"].exists()
+    assert not prepared["env_output"].exists()
 
 
 def test_prepare_failure_retains_full_preflight_report(release_files):
@@ -3300,6 +3324,277 @@ def test_apply_rejects_nonpositive_or_nonfinite_restart_timeout(release_files, t
             store_factory=_factory(FakeStore(), []),
         )
     assert not runner.calls
+
+
+def test_bounded_quiesced_phase_restores_exact_resident_shape(release_files):
+    runner = FakeRunner(release_files)
+    for label, *_rest in release.REQUIRED_RESIDENTS:
+        runner.disabled[label] = False
+    for label in release.DISABLED_RESIDENTS:
+        runner.disabled[label] = True
+    original_loaded = set(runner.loaded)
+    original_disabled = dict(runner.disabled)
+    receipt = release_files["note_path"].with_name("bounded-window.json")
+
+    def phase(token, lock, quiesce):
+        assert not runner.loaded
+        assert lock[0] == release_files["home"] / "runtime" / release.RELEASE_LOCK_NAME
+        assert token["token_sha256"] == release._sha(
+            release._canonical({key: value for key, value in token.items() if key != "token_sha256"})
+        )
+        assert quiesce["token"] == token
+        return {"applied": False, "stage": "prepare-plan"}
+
+    result = release._run_bounded_quiesced_phase(
+        release_id="rca-bounded-window-20260822",
+        home=release_files["home"],
+        receipt=receipt,
+        phase=phase,
+        runner=runner,
+    )
+
+    assert result["transaction_state"] == "completed"
+    assert result["restoration"]["attempted"] is True
+    assert runner.loaded == original_loaded
+    assert runner.disabled == original_disabled
+    assert stat.S_IMODE(receipt.stat().st_mode) == 0o600
+    assert json.loads(receipt.read_bytes())["token"]["token_sha256"]
+    assert not (release_files["home"] / "runtime" / release.RELEASE_LOCK_NAME).exists()
+
+
+def test_bounded_quiesced_phase_restores_prepare_failure(release_files):
+    runner = FakeRunner(release_files)
+    for label, *_rest in release.REQUIRED_RESIDENTS:
+        runner.disabled[label] = False
+    for label in release.DISABLED_RESIDENTS:
+        runner.disabled[label] = True
+    original_loaded = set(runner.loaded)
+    original_disabled = dict(runner.disabled)
+    receipt = release_files["note_path"].with_name("bounded-window-failed.json")
+
+    def fail(*_args):
+        assert not runner.loaded
+        raise release.ReleaseError("prepare_control_snapshot_invalid")
+
+    with pytest.raises(release.ReleaseError, match="prepare_control_snapshot_invalid"):
+        release._run_bounded_quiesced_phase(
+            release_id="rca-bounded-window-failed-20260822",
+            home=release_files["home"],
+            receipt=receipt,
+            phase=fail,
+            runner=runner,
+            hold_for_apply=True,
+        )
+
+    failed = json.loads(receipt.read_bytes())
+    assert failed["transaction_state"] == "failed"
+    assert failed["restoration"]["attempted"] is True
+    assert failed["token"]["token_sha256"]
+    assert runner.loaded == original_loaded
+    assert runner.disabled == original_disabled
+    assert not (release_files["home"] / "runtime" / release.RELEASE_LOCK_NAME).exists()
+
+
+def test_bounded_quiesced_phase_restores_loaded_but_persistently_disabled(
+    release_files,
+):
+    runner = FakeRunner(release_files)
+    first = release.REQUIRED_RESIDENTS[0][0]
+    for label in release._all_resident_labels():
+        runner.disabled[label] = label in release.DISABLED_RESIDENTS or label == first
+    original_loaded = set(runner.loaded)
+    original_disabled = dict(runner.disabled)
+    receipt = release_files["note_path"].with_name("bounded-disabled-loaded.json")
+
+    result = release._run_bounded_quiesced_phase(
+        release_id="rca-bounded-disabled-loaded-20260822",
+        home=release_files["home"],
+        receipt=receipt,
+        phase=lambda *_args: {"applied": False},
+        runner=runner,
+    )
+
+    assert result["transaction_state"] == "completed"
+    assert runner.loaded == original_loaded
+    assert runner.disabled == original_disabled
+
+
+def test_activate_runs_prepare_plan_apply_in_one_quiesced_window(
+    release_files, monkeypatch
+):
+    prepared = _prepare_fixture(release_files)
+    runner = FakeRunner(release_files)
+    sequence = []
+    apply_receipt = prepared["note_path"].with_name("activate-apply.json")
+    window_receipt = prepared["note_path"].with_name("activate-window.json")
+
+    def prepare(**kwargs):
+        sequence.append("prepare")
+        assert not runner.loaded
+        assert kwargs["release_id"] == prepared["args"]["release_id"]
+        return {
+            "outputs": {
+                "manifest": {"path": str(prepared["manifest_output"])},
+                "env": {"path": str(prepared["env_output"])},
+            },
+            "templates": {
+                "manifest": {"sha256": "a" * 64},
+                "env": {"sha256": "b" * 64},
+            },
+        }
+
+    def plan(**kwargs):
+        sequence.append("plan")
+        assert not runner.loaded
+        assert kwargs["expected_manifest_sha256"] == "a" * 64
+        assert kwargs["expected_env_sha256"] == "b" * 64
+        return {"ok": True, "mode": "plan"}
+
+    def apply(**kwargs):
+        sequence.append("apply")
+        assert not runner.loaded
+        assert kwargs["_release_lock"][0] == (
+            release_files["home"] / "runtime" / release.RELEASE_LOCK_NAME
+        )
+        assert kwargs["_prequiesce"]["token"]["token_sha256"]
+        for label, *_rest in release.REQUIRED_RESIDENTS:
+            runner(("/bin/launchctl", "enable", f"gui/{os.getuid()}/{label}"))
+            runner((
+                "/bin/launchctl",
+                "bootstrap",
+                f"gui/{os.getuid()}",
+                str(release_files["home"].parent / "Library/LaunchAgents" / f"{label}.plist"),
+            ))
+        for label in release.DISABLED_RESIDENTS:
+            runner(("/bin/launchctl", "disable", f"gui/{os.getuid()}/{label}"))
+        return {"applied": True, "mode": "apply"}
+
+    monkeypatch.setattr(release, "prepare_release", prepare)
+    monkeypatch.setattr(release, "build_plan", plan)
+    monkeypatch.setattr(release, "apply_release", apply)
+
+    result = release.activate_release(
+        prepare_inputs=prepared["args"],
+        confirm_release_id=prepared["args"]["release_id"],
+        receipt=apply_receipt,
+        quiesce_receipt=window_receipt,
+        runner=runner,
+    )
+
+    assert sequence == ["prepare", "plan", "apply"]
+    assert result["mode"] == "activate"
+    assert result["applied"] is True
+    window = json.loads(window_receipt.read_bytes())
+    assert window["transaction_state"] == "completed"
+    assert window["restoration"] == {
+        "attempted": False,
+        "reason": "apply_completed",
+    }
+    assert runner.loaded == {row[0] for row in release.REQUIRED_RESIDENTS}
+    assert not (release_files["home"] / "runtime" / release.RELEASE_LOCK_NAME).exists()
+
+
+def test_activate_executes_real_prepare_plan_apply_with_fake_boundaries(
+    release_files, monkeypatch
+):
+    prepared = _prepare_fixture(release_files)
+    runner = FakeRunner(release_files)
+    store = prepared["store"]
+    residents = _synthetic_resident_profile(release_files)
+
+    def restart(*_args, **_kwargs):
+        for label, *_rest in release.REQUIRED_RESIDENTS:
+            runner((
+                "/bin/launchctl",
+                "bootstrap",
+                f"gui/{os.getuid()}",
+                str(release_files["home"].parent / "Library/LaunchAgents" / f"{label}.plist"),
+            ))
+        return residents
+
+    monkeypatch.setattr(release, "_restart", restart)
+    monkeypatch.setattr(
+        release, "_resident_profile_readback", lambda *_args, **_kwargs: residents
+    )
+    apply_receipt = prepared["note_path"].with_name("real-activate-apply.json")
+    window_receipt = prepared["note_path"].with_name("real-activate-window.json")
+    real_build_plan = release.build_plan
+    plan_calls = []
+
+    def counted_build_plan(**kwargs):
+        plan_calls.append(1)
+        return real_build_plan(**kwargs)
+
+    monkeypatch.setattr(release, "build_plan", counted_build_plan)
+
+    result = release.activate_release(
+        prepare_inputs=prepared["args"],
+        confirm_release_id=prepared["args"]["release_id"],
+        receipt=apply_receipt,
+        quiesce_receipt=window_receipt,
+        runner=runner,
+        migration_apply=store.migrate_v14_to_v15_and_activate,
+        outcome_probe=store.probe_activation_outcome,
+    )
+
+    assert result["applied"] is True
+    assert plan_calls == [1]
+    assert json.loads(apply_receipt.read_bytes())["transaction_state"] == "completed"
+    assert json.loads(window_receipt.read_bytes())["transaction_state"] == "completed"
+    assert store.migration_calls
+    assert runner.loaded == {row[0] for row in release.REQUIRED_RESIDENTS}
+    assert not (release_files["home"] / "runtime" / release.RELEASE_LOCK_NAME).exists()
+
+
+def test_activate_apply_failure_keeps_apply_fail_closed_resident_stop(
+    release_files, monkeypatch
+):
+    prepared = _prepare_fixture(release_files)
+    runner = FakeRunner(release_files)
+    apply_receipt = prepared["note_path"].with_name("failed-activate-apply.json")
+    window_receipt = prepared["note_path"].with_name("failed-activate-window.json")
+
+    monkeypatch.setattr(
+        release,
+        "prepare_release",
+        lambda **_kwargs: {
+            "outputs": {
+                "manifest": {"path": str(prepared["manifest_output"])},
+                "env": {"path": str(prepared["env_output"])},
+            },
+            "templates": {
+                "manifest": {"sha256": "a" * 64},
+                "env": {"sha256": "b" * 64},
+            },
+        },
+    )
+    monkeypatch.setattr(release, "build_plan", lambda **_kwargs: {"ok": True})
+
+    def fail_apply(**_kwargs):
+        assert not runner.loaded
+        raise release.ReleaseError("activation_migration_outcome_unknown")
+
+    monkeypatch.setattr(release, "apply_release", fail_apply)
+
+    with pytest.raises(
+        release.ReleaseError, match="activation_migration_outcome_unknown"
+    ):
+        release.activate_release(
+            prepare_inputs=prepared["args"],
+            confirm_release_id=prepared["args"]["release_id"],
+            receipt=apply_receipt,
+            quiesce_receipt=window_receipt,
+            runner=runner,
+        )
+
+    failed = json.loads(window_receipt.read_bytes())
+    assert failed["transaction_state"] == "failed"
+    assert failed["restoration"] == {
+        "attempted": False,
+        "reason": "apply_fail_closed",
+    }
+    assert not runner.loaded
+    assert not (release_files["home"] / "runtime" / release.RELEASE_LOCK_NAME).exists()
 
 
 def test_quiesce_persists_profile_and_recovers_loaded_service_without_pid(

@@ -85,6 +85,8 @@ cd "$REPO_ROOT"
 
 `prepare` 不接收 commit/tree/tag object、report SHA、partition offset 或 candidate hash。它从 GitLab exact branch/tag 派生三面 commit/tree/tag object，通过固定的 `~/.local/bin/ssh-mini-agent` 只读稳定 VM report manifest 并绑定原始 SHA，从只读 ControlStore snapshot 派生数据库 identity、v14 predecessor、partition fence 和 v14-to-v15 epoch contract，再从当前 live env/manifest 模板生成候选投影。`operator_issue_only_v1` 默认不启用 Kafka，因此 fence 可以为空；只有明确启用 Kafka 的后续 profile 才传 `--partition-topic TOPIC=PARTITION`。发布前会再次读回 GitLab、Host runtime 和 report manifest；任一漂移时不创建输出。当前 driver 只生成 exact v14-to-v15 cutover note；已有 v15 只允许同一 successor 的幂等读回，不能用它创建另一个 v15 epoch。
 
+当常驻 writer 使 raw DB/WAL/SHM snapshot 在普通 prepare 前发生漂移时，先运行同一组参数的只读 `prepare-preflight`。它不会打开 ControlStore，也不会要求未来 canary；这一步只用来提前排除静态输入问题。随后在明确的维护窗口使用 `activate`，由 driver 在一个 release lock 内 quiesce 六个 resident，重新执行完整 `prepare`、`plan`、`apply`，并写入独立的 `--quiesce-receipt` 与 apply `--receipt`。prepare/plan 失败会按 receipt 中的原始 loaded/disabled profile 自动恢复；apply 一旦进入事务，沿用现有 receipt 的 `not_committed`、`committed` 或 `unknown` 语义，禁止自动猜测恢复。普通 `preflight`、`prepare`、`plan`、`apply` 命令的默认行为不变。
+
 三个输出使用 `0600`、`O_EXCL` 和 fsync；任一输出已存在时拒绝覆盖。`prepare` 的 `templates` 给出 plan 所需的 live expected SHA，`outputs` 给出 candidate SHA：
 
 ```bash
@@ -93,6 +95,30 @@ CANDIDATE_ENV_SHA='<prepare.outputs.env.sha256>'
 LIVE_MANIFEST_SHA='<prepare.templates.manifest.sha256>'
 LIVE_ENV_SHA='<prepare.templates.env.sha256>'
 ```
+
+在确认 owner 已批准维护窗口后，可将三步合并为一个有边界的事务入口：
+
+```bash
+"$PY" scripts/pnc_rca_minimal_release.py activate \
+  --release-note "$RELEASE_NOTE" \
+  --release-id "$RELEASE_ID" --epoch-id "$EPOCH_ID" \
+  --operator "$OPERATOR" --reason "$REASON" \
+  --canary-batch-id "$CANARY_BATCH_ID" --canary-issue-id "$CANARY_ISSUE_ID" \
+  --canary-state-path "$CANARY_STATE" \
+  --host-branch "$HOST_BRANCH" --host-tag "$HOST_TAG" \
+  --host-runtime-root "$HOST_RUNTIME_ROOT" \
+  --worker-remote "$WORKER_GITLAB_REMOTE" --worker-branch "$WORKER_BRANCH" \
+  --worker-tag "$WORKER_TAG" --worker-runtime-root "$WORKER_RUNTIME_ROOT" \
+  --pipeline-remote "$PIPELINE_GITLAB_REMOTE" --pipeline-branch "$PIPELINE_BRANCH" \
+  --pipeline-tag "$PIPELINE_TAG" --pipeline-runtime-root "$PIPELINE_RUNTIME_ROOT" \
+  --report-manifest-path /home/mini/.config/g1q3-rca/report-runtime-manifest.json \
+  --control-db "$CONTROL_DB" \
+  --manifest-output "$MANIFEST_SOURCE" --env-output "$ENV_SOURCE" \
+  --confirm-release-id "$RELEASE_ID" \
+  --receipt "$APPLY_RECEIPT" --quiesce-receipt "$QUIESCE_RECEIPT"
+```
+
+`activate` 不接受预先拼好的 candidate hash；它从同一份 `prepare` 输出推导 plan 输入。`prepare-preflight` 仍可单独运行，但它本身不会停 resident，也不能替代 `activate` 的 bounded window。
 
 ## 4. Plan
 

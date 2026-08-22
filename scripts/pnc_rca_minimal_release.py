@@ -50,6 +50,7 @@ SCHEMA = "pnc_rca_minimal_release_driver_v1"
 PREFLIGHT_SCHEMA = "pnc_rca_minimal_release_preflight_v1"
 NOTE_SCHEMA = MINIMAL_RELEASE_NOTE_SCHEMA_VERSION
 RECEIPT_SCHEMA = "pnc_rca_minimal_release_apply_receipt_v3"
+QUIESCE_PHASE_SCHEMA = "pnc_rca_minimal_release_quiesce_phase_v1"
 TERMINAL_FAILURE_SCHEMA = "pnc_rca_minimal_release_terminal_failure_v1"
 EXECUTION_READBACK_SCHEMA = "pnc_rca_execution_identity_readback_v1"
 PRODUCTION_DEFINITION = MINIMAL_RELEASE_PRODUCTION_DEFINITION
@@ -163,6 +164,11 @@ StoreFactory = Callable[[Path, bool], Any]
 DeliveryStoreFactory = Callable[[Path], Any]
 WorkspaceRuntimeResolver = Callable[[Path, Runner], Mapping[str, str]]
 DependencyProbe = Callable[[Path, Mapping[str, Any]], Mapping[str, Any]]
+QuiescedPhase = Callable[
+    [Mapping[str, Any], tuple[Path, int, tuple[int, int]], Mapping[str, Any]],
+    Mapping[str, Any],
+]
+RestoreDecision = Callable[[BaseException], bool]
 
 
 class ReleaseError(RuntimeError):
@@ -2158,6 +2164,33 @@ def _release_release_lock(lock: tuple[Path, int, tuple[int, int]]) -> None:
             pass
 
 
+def _validate_existing_release_lock(
+    lock: tuple[Path, int, tuple[int, int]],
+    home: Path,
+) -> tuple[Path, int, tuple[int, int]]:
+    try:
+        path, descriptor, identity = lock
+        opened = os.fstat(descriptor)
+        observed = path.lstat()
+    except (OSError, TypeError, ValueError) as exc:
+        raise ReleaseError("release_apply_locked") from exc
+    if (
+        path != home / "runtime" / RELEASE_LOCK_NAME
+        or identity != (opened.st_dev, opened.st_ino)
+        or identity != (observed.st_dev, observed.st_ino)
+        or not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(observed.st_mode)
+        or stat.S_IMODE(opened.st_mode) != 0o600
+        or stat.S_IMODE(observed.st_mode) != 0o600
+        or opened.st_uid != os.geteuid()
+        or observed.st_uid != os.geteuid()
+        or opened.st_nlink != 1
+        or observed.st_nlink != 1
+    ):
+        raise ReleaseError("release_apply_locked")
+    return lock
+
+
 def _write_reserved_receipt(
     receipt: tuple[Path, int, tuple[int, int]], value: Mapping[str, Any]
 ) -> None:
@@ -2251,6 +2284,179 @@ def _close_apply_receipt(receipt: tuple[Path, int, tuple[int, int]] | None) -> N
             os.close(receipt[1])
         except OSError:
             pass
+
+
+def _run_bounded_quiesced_phase(
+    *,
+    release_id: str,
+    home: Path,
+    receipt: Path,
+    phase: QuiescedPhase,
+    runner: Runner = _run,
+    hold_for_apply: bool = False,
+    timeout: float = 60,
+    restore_decision: RestoreDecision | None = None,
+) -> dict[str, Any]:
+    """Run one callback while DB writers are stopped under the release lock."""
+
+    home = _absolute(home, "hermes_home_invalid")
+    receipt = _absolute(receipt, "receipt_path_invalid")
+    if not IDENTIFIER.fullmatch(str(release_id or "")):
+        raise ReleaseError("apply_confirmation_mismatch")
+    if not isinstance(hold_for_apply, bool) or isinstance(timeout, bool):
+        raise ReleaseError("restart_timeout_invalid")
+    try:
+        timeout = float(timeout)
+    except (TypeError, ValueError) as exc:
+        raise ReleaseError("restart_timeout_invalid") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ReleaseError("restart_timeout_invalid")
+    lock = _acquire_release_lock(home, release_id)
+    receipt_handle: tuple[Path, int, tuple[int, int]] | None = None
+    resident_state: dict[str, Any] | None = None
+    quiesce: dict[str, Any] | None = None
+    phase_result: Mapping[str, Any] | None = None
+    apply_completed = False
+    signal_handlers: dict[int, Any] = {}
+    started_at = datetime.now(timezone.utc).isoformat()
+    started = {
+        "schema_version": QUIESCE_PHASE_SCHEMA,
+        "transaction_state": "started",
+        "ok": False,
+        "mode": "bounded-quiesced-phase",
+        "phase_pid": os.getpid(),
+        "started_at": started_at,
+        "release_id": release_id,
+        "receipt_path": str(receipt),
+        "hold_for_apply": hold_for_apply,
+    }
+    try:
+        receipt_handle = _reserve_apply_receipt(receipt, started)
+        signal_handlers = _install_apply_signal_handlers()
+        resident_state = _bounded_resident_state(runner)
+        quiesce = _quiesce_preserving_profile(
+            runner,
+            resident_state,
+            timeout=timeout,
+        )
+        token_body = {
+            "schema_version": QUIESCE_PHASE_SCHEMA,
+            "release_id": release_id,
+            "receipt_path": str(receipt),
+            "phase_pid": os.getpid(),
+            "started_at": started_at,
+            "hold_for_apply": hold_for_apply,
+            "resident_state_sha256": _sha(_canonical(resident_state)),
+        }
+        token = {**token_body, "token_sha256": _sha(_canonical(token_body))}
+        quiesce["token"] = token
+        _write_reserved_receipt(
+            receipt_handle,
+            {
+                **started,
+                "transaction_state": "quiesced",
+                "token": token,
+                "resident_state": resident_state,
+                "quiesce": quiesce,
+            },
+        )
+        phase_result = phase(token, lock, quiesce)
+        if not isinstance(phase_result, Mapping):
+            raise ReleaseError("apply_confirmation_mismatch")
+        if hold_for_apply:
+            if phase_result.get("applied") is not True:
+                raise ReleaseError("apply_confirmation_mismatch")
+            apply_completed = True
+            restoration: dict[str, Any] = {
+                "attempted": False,
+                "reason": "apply_completed",
+            }
+        else:
+            restoration = {
+                "attempted": True,
+                "result": _restore_bounded_resident_state(
+                    runner,
+                    resident_state,
+                    home,
+                    timeout=timeout,
+                ),
+            }
+        completed_at = datetime.now(timezone.utc).isoformat()
+        completed = {
+            **started,
+            "transaction_state": "completed",
+            "ok": True,
+            "completed_at": completed_at,
+            "token": token,
+            "phase_result": dict(phase_result),
+            "restoration": restoration,
+        }
+        _write_reserved_receipt(receipt_handle, completed)
+        return completed
+    except BaseException as exc:
+        _ignore_apply_signals(signal_handlers)
+        effect_started = bool(
+            isinstance(quiesce, Mapping) and quiesce.get("_effect_started")
+        )
+        should_restore = not apply_completed and not effect_started
+        if should_restore and restore_decision is not None:
+            try:
+                should_restore = bool(restore_decision(exc))
+            except BaseException:
+                should_restore = False
+        restoration = {
+            "attempted": False,
+            "reason": "apply_fail_closed" if not should_restore else "not_quiesced",
+        }
+        restore_error: ReleaseError | None = None
+        if should_restore and resident_state is not None:
+            try:
+                restoration = {
+                    "attempted": True,
+                    "result": _restore_bounded_resident_state(
+                        runner,
+                        resident_state,
+                        home,
+                        timeout=timeout,
+                    ),
+                }
+            except ReleaseError as recovery_exc:
+                restore_error = recovery_exc
+                restoration = {
+                    "attempted": True,
+                    "error_code": recovery_exc.code,
+                }
+        if receipt_handle is not None:
+            failed = {
+                **started,
+                "transaction_state": "failed",
+                "failed_at": datetime.now(timezone.utc).isoformat(),
+                "error_code": (
+                    exc.code
+                    if isinstance(exc, ReleaseError)
+                    else "apply_internal_error"
+                ),
+                "quiesced": quiesce is not None,
+                "token": (
+                    dict(quiesce.get("token"))
+                    if isinstance(quiesce, Mapping)
+                    and isinstance(quiesce.get("token"), Mapping)
+                    else None
+                ),
+                "resident_state": resident_state,
+                "restoration": restoration,
+            }
+            _write_reserved_receipt(receipt_handle, failed)
+        if restore_error is not None:
+            raise restore_error from exc
+        raise
+    finally:
+        try:
+            _restore_apply_signal_handlers(signal_handlers)
+        except BaseException:
+            pass
+        _close_apply_receipt(receipt_handle)
+        _release_release_lock(lock)
 
 
 def _read_apply_receipt(path: Path) -> tuple[bytes, dict]:
@@ -2630,6 +2836,138 @@ def _quiesce_residents(runner: Runner) -> dict:
         "previous": previous,
         "stopped": stopped,
         "persistent": persistent,
+    }
+
+
+def _bounded_resident_state(runner: Runner) -> dict[str, Any]:
+    disabled = _persistent_disabled_readback(runner)
+    return {
+        "previous": {
+            label: _launch(label, runner) for label in _all_resident_labels()
+        },
+        "persistent_disabled": {
+            label: bool(disabled.get(label, False))
+            for label in _all_resident_labels()
+        },
+    }
+
+
+def _quiesce_preserving_profile(
+    runner: Runner,
+    state: Mapping[str, Any],
+    *,
+    timeout: float,
+) -> dict[str, Any]:
+    previous = state.get("previous")
+    persistent = state.get("persistent_disabled")
+    if not isinstance(previous, Mapping) or not isinstance(persistent, Mapping):
+        raise ReleaseError("resident_transition_invalid")
+    for label in _all_resident_labels():
+        observed = previous.get(label)
+        if not isinstance(observed, Mapping):
+            raise ReleaseError("resident_transition_invalid")
+        if observed.get("loaded") is True:
+            _call(
+                runner,
+                ("/bin/launchctl", "bootout", f"gui/{os.getuid()}/{label}"),
+                "resident_quiesce",
+            )
+    stopped = _wait_for_all_residents_stopped(runner, timeout=timeout)
+    readback = _persistent_disabled_readback(runner)
+    if any(
+        bool(readback.get(label, False)) is not bool(persistent.get(label))
+        for label in _all_resident_labels()
+    ):
+        raise ReleaseError("resident_persistent_profile_mismatch")
+    return {
+        "previous": dict(previous),
+        "stopped": stopped,
+        "persistent_disabled": dict(persistent),
+    }
+
+
+def _restore_bounded_resident_state(
+    runner: Runner,
+    state: Mapping[str, Any],
+    home: Path,
+    *,
+    timeout: float,
+) -> dict[str, Any]:
+    previous = state.get("previous")
+    persistent = state.get("persistent_disabled")
+    if not isinstance(previous, Mapping) or not isinstance(persistent, Mapping):
+        raise ReleaseError("resident_transition_invalid")
+    stopped = _stop_all_residents(runner)
+    if stopped["all_stopped"] is not True:
+        raise ReleaseError("resident_quiesce_readback_failed")
+    for label in _all_resident_labels():
+        observed = previous.get(label)
+        if not isinstance(observed, Mapping):
+            raise ReleaseError("resident_transition_invalid")
+        command = (
+            "enable"
+            if observed.get("loaded") is True
+            else "disable"
+            if bool(persistent.get(label))
+            else "enable"
+        )
+        _call(
+            runner,
+            ("/bin/launchctl", command, f"gui/{os.getuid()}/{label}"),
+            "resident_persistent_restore",
+        )
+    launch_dir = home.parent / "Library/LaunchAgents"
+    for label in _all_resident_labels():
+        observed = previous.get(label)
+        if not isinstance(observed, Mapping):
+            raise ReleaseError("resident_transition_invalid")
+        if observed.get("loaded") is True:
+            _call(
+                runner,
+                (
+                    "/bin/launchctl",
+                    "bootstrap",
+                    f"gui/{os.getuid()}",
+                    str(launch_dir / f"{label}.plist"),
+                ),
+                "resident_bootstrap",
+            )
+    for label in _all_resident_labels():
+        command = "disable" if bool(persistent.get(label)) else "enable"
+        _call(
+            runner,
+            ("/bin/launchctl", command, f"gui/{os.getuid()}/{label}"),
+            "resident_persistent_restore",
+        )
+    deadline = time.monotonic() + timeout
+    while True:
+        restored = {
+            label: _launch(label, runner) for label in _all_resident_labels()
+        }
+        if all(
+            restored[label]["loaded"]
+            is bool(
+                isinstance(previous.get(label), Mapping)
+                and previous[label].get("loaded") is True
+            )
+            for label in _all_resident_labels()
+        ):
+            break
+        if time.monotonic() >= deadline:
+            raise ReleaseError("restart_readback_timeout")
+        time.sleep(0.25)
+    persistent_readback = _persistent_disabled_readback(runner)
+    if any(
+        bool(persistent_readback.get(label, False)) is not bool(persistent.get(label))
+        for label in _all_resident_labels()
+    ):
+        raise ReleaseError("resident_persistent_profile_mismatch")
+    return {
+        "loaded": list(restored.values()),
+        "persistent_disabled": {
+            label: bool(persistent_readback.get(label, False))
+            for label in _all_resident_labels()
+        },
     }
 
 
@@ -3472,6 +3810,7 @@ def preflight_release(
     workspace_runtime_resolver: WorkspaceRuntimeResolver = _workspace_runtime_projection,
     dependency_probe: DependencyProbe | None = None,
     require_canary_state: bool | None = None,
+    require_control_snapshot: bool = True,
 ) -> dict[str, Any]:
     """Read all statically knowable release gates without preparing any output."""
     collector = _PreflightCollector()
@@ -3816,6 +4155,12 @@ def preflight_release(
         partition_topic_readback,
     )
 
+    def deferred_control_gate() -> dict[str, str]:
+        return {
+            "status": "deferred",
+            "reason": "bounded_quiesced_activation_window_required",
+        }
+
     def store_schema():
         def inspect(store):
             capability = store.schema_runtime_capability()
@@ -3835,7 +4180,8 @@ def preflight_release(
         "prepare",
         f"{CONTROL_SCHEMA_V14} or {CONTROL_SCHEMA_V15} read-only",
         "Use a current control-store schema with read-only capability enabled.",
-        store_schema,
+        store_schema if require_control_snapshot else deferred_control_gate,
+        precheckable=require_control_snapshot,
     )
 
     def store_snapshot():
@@ -3860,7 +4206,8 @@ def preflight_release(
         "prepare",
         "stable read-only control DB source snapshot",
         "Stop and obtain a fresh governed DB snapshot; do not mutate the source DB.",
-        store_snapshot,
+        store_snapshot if require_control_snapshot else deferred_control_gate,
+        precheckable=require_control_snapshot,
     )
 
     def store_snapshot_stable():
@@ -3879,7 +4226,8 @@ def preflight_release(
         "prepare",
         "two identical read-only source snapshot identities",
         "Hold the source DB stable and retry; preflight never writes or repairs it.",
-        store_snapshot_stable,
+        store_snapshot_stable if require_control_snapshot else deferred_control_gate,
+        precheckable=require_control_snapshot,
     )
 
     def historical_schema_gate():
@@ -3899,7 +4247,8 @@ def preflight_release(
         "prepare",
         "v15 is accepted as a successor read-only schema",
         "Treat an already-v15 store as a valid successor; do not attempt legacy migration.",
-        historical_schema_gate,
+        historical_schema_gate if require_control_snapshot else deferred_control_gate,
+        precheckable=require_control_snapshot,
     )
 
     def store_predecessor():
@@ -3921,7 +4270,8 @@ def preflight_release(
         "prepare",
         "direct steady predecessor with binding fingerprint",
         "Use the current direct predecessor; do not invent or bypass activation state.",
-        store_predecessor,
+        store_predecessor if require_control_snapshot else deferred_control_gate,
+        precheckable=require_control_snapshot,
     )
     for topic, partitions in normalized_topics.items():
         collector.check(
@@ -3929,10 +4279,15 @@ def preflight_release(
             "prepare",
             {topic: list(partitions)},
             "Refresh the read-only partition progress snapshot before preparing.",
-            lambda topic=topic, partitions=partitions: _preflight_partition_progress(
-                control_db_path, store_factory, topic, partitions
+            (
+                lambda topic=topic, partitions=partitions: _preflight_partition_progress(
+                    control_db_path, store_factory, topic, partitions
+                )
+                if require_control_snapshot
+                else deferred_control_gate()
             ),
             subject=topic,
+            precheckable=require_control_snapshot,
         )
 
     if dependency_probe is None:
@@ -3998,6 +4353,20 @@ def preflight_release(
         precheckable=False,
     )
     return collector.finish()
+
+
+def prepare_preflight_release(**inputs: Any) -> dict[str, Any]:
+    """Check every gate available before entering the activation window."""
+
+    inputs = dict(inputs)
+    inputs.pop("require_canary_state", None)
+    inputs.pop("require_control_snapshot", None)
+    result = preflight_release(
+        **inputs,
+        require_canary_state=False,
+        require_control_snapshot=False,
+    )
+    return {**result, "mode": "prepare-preflight"}
 
 
 def _preflight_partition_progress(
@@ -4751,6 +5120,9 @@ def apply_release(
     migration_apply: Callable[..., Mapping[str, Any]] | None = None,
     outcome_probe: Callable[..., str] | None = None,
     restart_timeout: float = 60,
+    _release_lock: tuple[Path, int, tuple[int, int]] | None = None,
+    _prequiesce: Mapping[str, Any] | None = None,
+    _plan: Mapping[str, Any] | None = None,
 ) -> dict:
     release_note = _absolute(release_note, "release_note_path_invalid")
     home = _absolute(home, "hermes_home_invalid")
@@ -4774,11 +5146,20 @@ def apply_release(
     if receipt.parent != release_note.parent:
         raise ReleaseError("receipt_path_invalid")
     note_sha = _sha(note_raw)
-    lock = _acquire_release_lock(home, note["release_id"])
+    if _prequiesce is not None and not isinstance(_prequiesce, Mapping):
+        raise ReleaseError("resident_transition_invalid")
+    quiesce: dict[str, Any] | None = (
+        dict(_prequiesce) if isinstance(_prequiesce, Mapping) else None
+    )
+    lock_owned = _release_lock is None
+    lock = (
+        _acquire_release_lock(home, note["release_id"])
+        if _release_lock is None
+        else _validate_existing_release_lock(_release_lock, home)
+    )
     receipt_handle: tuple[Path, int, tuple[int, int]] | None = None
     staged: list[dict[str, Any]] = []
     installs: list[dict[str, Any]] = []
-    quiesce: dict[str, Any] | None = None
     artifacts_installed = False
     activation_attempted = False
     activation_committed = False
@@ -4814,16 +5195,22 @@ def apply_release(
         }
         receipt_handle = _reserve_apply_receipt(receipt, started)
         signal_handlers = _install_apply_signal_handlers()
-        plan = build_plan(
-            release_note=release_note,
-            manifest_source=manifest_source,
-            env_source=env_source,
-            expected_manifest_sha256=expected_manifest_sha256,
-            expected_env_sha256=expected_env_sha256,
-            home=home,
-            runner=runner,
-            store_factory=store_factory,
-            outcome_probe=outcome_probe,
+        if _plan is not None and not isinstance(_plan, Mapping):
+            raise ReleaseError("apply_plan_invalid")
+        plan = (
+            dict(_plan)
+            if isinstance(_plan, Mapping)
+            else build_plan(
+                release_note=release_note,
+                manifest_source=manifest_source,
+                env_source=env_source,
+                expected_manifest_sha256=expected_manifest_sha256,
+                expected_env_sha256=expected_env_sha256,
+                home=home,
+                runner=runner,
+                store_factory=store_factory,
+                outcome_probe=outcome_probe,
+            )
         )
         if plan["release_note"]["sha256"] != note_sha:
             raise ReleaseError("release_note_changed")
@@ -4843,7 +5230,25 @@ def apply_release(
         }
         _write_reserved_receipt(receipt_handle, started)
         effect_started = True
-        quiesce = _quiesce_residents(runner)
+        if quiesce is None:
+            quiesce = _quiesce_residents(runner)
+        else:
+            _assert_all_residents_stopped(runner)
+            for label, *_rest in REQUIRED_RESIDENTS:
+                _call(
+                    runner,
+                    ("/bin/launchctl", "enable", f"gui/{os.getuid()}/{label}"),
+                    "resident_persistent_enable",
+                )
+            for label in DISABLED_RESIDENTS:
+                _call(
+                    runner,
+                    ("/bin/launchctl", "disable", f"gui/{os.getuid()}/{label}"),
+                    "resident_persistent_disable",
+                )
+            quiesce["persistent"] = _persistent_profile_readback(runner)
+            _assert_all_residents_stopped(runner)
+        quiesce["_effect_started"] = True
         _require_release_note_sha(release_note, note_sha)
         installs = _install_staged(staged)
         artifacts_installed = True
@@ -5075,10 +5480,121 @@ def apply_release(
             _close_apply_receipt(receipt_handle)
         except BaseException:
             pass
-        try:
-            _release_release_lock(lock)
-        except BaseException:
-            pass
+        if lock_owned:
+            try:
+                _release_release_lock(lock)
+            except BaseException:
+                pass
+
+
+def activate_release(
+    *,
+    prepare_inputs: Mapping[str, Any],
+    confirm_release_id: str,
+    receipt: Path,
+    quiesce_receipt: Path,
+    runner: Runner = _run,
+    process_factory: ProcessFactory = psutil.Process,
+    migration_apply: Callable[..., Mapping[str, Any]] | None = None,
+    outcome_probe: Callable[..., str] | None = None,
+    restart_timeout: float = 60,
+) -> dict[str, Any]:
+    """Prepare, plan, and apply in one explicit bounded quiesce window."""
+
+    inputs = dict(prepare_inputs)
+    release_id = str(inputs.get("release_id") or "")
+    if confirm_release_id != release_id:
+        raise ReleaseError("apply_confirmation_mismatch")
+    home = _absolute(Path(inputs["home"]), "hermes_home_invalid")
+    if not isinstance(receipt, Path):
+        receipt = Path(receipt)
+    if not isinstance(quiesce_receipt, Path):
+        quiesce_receipt = Path(quiesce_receipt)
+    if receipt.expanduser().absolute() == quiesce_receipt.expanduser().absolute():
+        raise ReleaseError("receipt_path_invalid")
+    release_note_path = _absolute(
+        Path(inputs["release_note"]), "release_note_path_invalid"
+    )
+    if (
+        receipt.expanduser().absolute().parent != release_note_path.parent
+        or quiesce_receipt.expanduser().absolute().parent != release_note_path.parent
+    ):
+        raise ReleaseError("receipt_path_invalid")
+    store_factory = inputs.get("store_factory", _open_store)
+    phase_state = {"apply_entered": False}
+
+    def phase(
+        token: Mapping[str, Any],
+        lock: tuple[Path, int, tuple[int, int]],
+        quiesce: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        # The exact source snapshot is intentionally acquired by prepare while
+        # all resident writers are stopped.  Plan and apply reuse that same
+        # stopped window; no WAL/SHM identity check is bypassed.
+        prepared = prepare_release(**inputs, runner=runner)
+        manifest_source = Path(prepared["outputs"]["manifest"]["path"])
+        env_source = Path(prepared["outputs"]["env"]["path"])
+        plan = build_plan(
+            release_note=release_note_path,
+            manifest_source=manifest_source,
+            env_source=env_source,
+            expected_manifest_sha256=prepared["templates"]["manifest"]["sha256"],
+            expected_env_sha256=prepared["templates"]["env"]["sha256"],
+            home=home,
+            runner=runner,
+            store_factory=store_factory,
+            outcome_probe=outcome_probe,
+        )
+        phase_state["apply_entered"] = True
+        applied = apply_release(
+            release_note=release_note_path,
+            manifest_source=manifest_source,
+            env_source=env_source,
+            expected_manifest_sha256=prepared["templates"]["manifest"]["sha256"],
+            expected_env_sha256=prepared["templates"]["env"]["sha256"],
+            home=home,
+            confirm_release_id=confirm_release_id,
+            receipt=receipt,
+            runner=runner,
+            process_factory=process_factory,
+            store_factory=store_factory,
+            migration_apply=migration_apply,
+            outcome_probe=outcome_probe,
+            restart_timeout=restart_timeout,
+            _release_lock=lock,
+            _prequiesce=dict(quiesce),
+            _plan=plan,
+        )
+        # apply owns the resident restart/readback once activation starts.
+        return {
+            "applied": applied.get("applied") is True,
+            "prepare": prepared,
+            "plan": plan,
+            "apply": applied,
+            "quiesce_token": dict(token),
+        }
+
+    def preserve_apply_failure(_exc: BaseException) -> bool:
+        # Once apply has entered its transaction, retain its existing
+        # not_committed/committed/unknown resident-stop semantics.  Only
+        # prepare/plan failures are eligible for automatic restoration.
+        return not phase_state["apply_entered"]
+
+    result = _run_bounded_quiesced_phase(
+        release_id=release_id,
+        home=home,
+        receipt=quiesce_receipt,
+        phase=phase,
+        runner=runner,
+        hold_for_apply=True,
+        timeout=restart_timeout,
+        restore_decision=preserve_apply_failure,
+    )
+    return {
+        **result,
+        "mode": "activate",
+        "applied": True,
+    }
 
 
 def verify_release(
@@ -5258,9 +5774,16 @@ def _parser() -> argparse.ArgumentParser:
         target.add_argument("--manifest-output", type=Path, required=True)
         target.add_argument("--env-output", type=Path, required=True)
 
-    for name in ("preflight", "prepare"):
+    for name in ("preflight", "prepare", "prepare-preflight"):
         target = commands.add_parser(name)
         prepare_arguments(target)
+
+    activate = commands.add_parser("activate")
+    prepare_arguments(activate)
+    activate.add_argument("--confirm-release-id", required=True)
+    activate.add_argument("--receipt", type=Path, required=True)
+    activate.add_argument("--quiesce-receipt", type=Path, required=True)
+    activate.add_argument("--restart-timeout", type=float, default=60)
 
     for name in ("plan", "apply"):
         target = commands.add_parser(name)
@@ -5285,7 +5808,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = _parser().parse_args(argv)
         command = args.command
         common = {"release_note": args.release_note, "home": args.hermes_home}
-        if command in {"preflight", "prepare"}:
+        if command in {"preflight", "prepare", "prepare-preflight", "activate"}:
             try:
                 partition_topics: object = _partition_topic_arguments(
                     args.partition_topic
@@ -5320,11 +5843,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "manifest_output": args.manifest_output,
                 "env_output": args.env_output,
             }
-            result = (
-                preflight_release(**prepare_inputs)
-                if command == "preflight"
-                else prepare_release(**prepare_inputs)
-            )
+            if command == "preflight":
+                result = preflight_release(**prepare_inputs)
+            elif command == "prepare-preflight":
+                result = prepare_preflight_release(**prepare_inputs)
+            elif command == "prepare":
+                result = prepare_release(**prepare_inputs)
+            else:
+                result = activate_release(
+                    prepare_inputs=prepare_inputs,
+                    confirm_release_id=args.confirm_release_id,
+                    receipt=args.receipt,
+                    quiesce_receipt=args.quiesce_receipt,
+                    restart_timeout=args.restart_timeout,
+                )
         elif command == "verify":
             result = verify_release(**common, apply_receipt=args.apply_receipt)
         else:
@@ -5360,7 +5892,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
         return 2
     print(json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
-    if command == "preflight" and result.get("preflight_ok") is not True:
+    if command in {"preflight", "prepare-preflight"} and result.get("preflight_ok") is not True:
         return 2
     return 0
 

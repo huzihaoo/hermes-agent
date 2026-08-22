@@ -13,6 +13,7 @@ activation_schema_transition_invalid,plan/apply/verify,false,downstream plan/app
 activation_successor_outcome_unknown,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1613
 activation_transition_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1685
 apply_confirmation_mismatch,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4712
+apply_plan_invalid,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:5199
 apply_receipt_binding_mismatch,apply/verify,false,downstream apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4634
 apply_receipt_changed_during_verify,apply/verify,false,downstream apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:5121
 apply_receipt_identity_invalid,apply/verify,false,downstream apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2214

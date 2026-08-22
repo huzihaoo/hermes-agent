@@ -129,6 +129,23 @@ because prepare must not create a future activation artifact.
 blocked, `PreflightError.result` and the CLI response retain the complete
 aggregate failure list.
 
+### Activation-window preflight
+
+`prepare-preflight` is an explicit, read-only early phase.  It keeps the
+ordinary identity, dependency, path, and output checks, but marks the canary
+and every raw ControlStore/WAL/SHM snapshot gate as deferred.  It never opens
+the production DB and never changes resident state.  Those gates are rerun by
+`activate` after the bounded quiesce phase begins.
+
+`activate` is the only command that opts into this bounded window.  It acquires
+the normal release lock, records an owner-only window receipt, stops the six
+resident labels while preserving their exact loaded and persistent-disabled
+profile, then runs `prepare`, `plan`, and `apply` in the same process.  The
+existing raw snapshot identity checks remain unchanged.  A prepare/plan error
+restores the recorded resident profile; once `apply` starts, its existing
+`not_committed`/`committed`/`unknown` rollback ceiling controls and the wrapper
+does not guess or restart services.
+
 The v4 goal prose also names a `status` subcommand, but the observed baseline
 parser exposed only `prepare`, `plan`, `apply`, and `verify`.  A2 follows the
 live parser and adds only `preflight`; it does not introduce an unrelated
