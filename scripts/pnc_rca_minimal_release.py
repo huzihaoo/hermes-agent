@@ -875,19 +875,38 @@ def _preflight_vm_dependency_probe(
     except ReleaseError as exc:
         raise _PreflightProbeFailure(exc.code, {"path": str(pipeline_root)}) from exc
     expected_commit = pipeline_identity.get("commit")
-    if not isinstance(expected_commit, str) or not HEX40.fullmatch(expected_commit):
+    expected_tree = pipeline_identity.get("tree")
+    if (
+        not isinstance(expected_commit, str)
+        or not HEX40.fullmatch(expected_commit)
+        or (
+            expected_tree is not None
+            and (
+                not isinstance(expected_tree, str)
+                or not HEX40.fullmatch(expected_tree)
+            )
+        )
+    ):
         raise _PreflightProbeFailure(
             "remote_reader_dependency_unavailable",
             {
                 "ok": False,
                 "source": {
                     "ok": False,
-                    "expected": {"commit": expected_commit},
+                    "expected": {
+                        "commit": expected_commit,
+                        "tree": expected_tree,
+                    },
                     "actual": None,
-                    "error": "pipeline_identity_commit_invalid",
+                    "error": "pipeline_identity_commit_or_tree_invalid",
                 },
             },
-            {"source": {"commit": "resolved 40-hex pipeline commit"}},
+            {
+                "source": {
+                    "commit": "resolved 40-hex pipeline commit",
+                    "tree": "resolved 40-hex pipeline tree",
+                }
+            },
         )
 
     # Keep all values inserted into the VM program as JSON literals. The
@@ -902,6 +921,7 @@ def _preflight_vm_dependency_probe(
         "from pathlib import Path\n"
         f"root = {json.dumps(str(root))}\n"
         f"expected_commit = {json.dumps(expected_commit)}\n"
+        f"expected_tree = {json.dumps(expected_tree)}\n"
         f"bundle_schema = {json.dumps(REMOTE_READER_RUNTIME_BUNDLE_SCHEMA)}\n"
         f"contract_schema = {json.dumps(REMOTE_READER_RUNTIME_CONTRACT_SCHEMA)}\n"
         f"required_dependencies = {json.dumps(REMOTE_READER_SYSTEM_DEPENDENCIES)}\n"
@@ -993,6 +1013,164 @@ def hash_file(path):
             digest.update(chunk)
     return digest.hexdigest()
 
+def canonical_json(value):
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+def semantic_sha256(value):
+    body = dict(value)
+    body.pop("self_seal", None)
+    return hashlib.sha256(canonical_json(body)).hexdigest()
+
+def read_stable_file(path, maximum_bytes=32 * 1024 * 1024):
+    before = os.lstat(str(path))
+    if (not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode)
+            or before.st_nlink != 1 or before.st_size > maximum_bytes):
+        raise RuntimeError("frozen_file_identity_invalid")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(str(path), flags)
+    try:
+        opened = os.fstat(descriptor)
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    after = os.lstat(str(path))
+    identities = [
+        (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+         value.st_gid, value.st_nlink, value.st_size)
+        for value in (before, opened, after)
+    ]
+    if identities[0] != identities[1] or identities[1] != identities[2]:
+        raise RuntimeError("frozen_file_changed")
+    return b"".join(chunks), before
+
+def frozen_entry_snapshot(root_path):
+    root_info = os.lstat(str(root_path))
+    if (not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode)
+            or root_info.st_uid != os.geteuid()
+            or stat.S_IMODE(root_info.st_mode) & 0o022):
+        raise RuntimeError("frozen_root_identity_invalid")
+    entries = []
+
+    def visit(directory):
+        children = sorted(os.scandir(str(directory)), key=lambda item: item.name)
+        try:
+            for child in children:
+                path = Path(child.path)
+                observed = os.lstat(str(path))
+                relative = path.relative_to(root_path).as_posix()
+                mode = "%04o" % stat.S_IMODE(observed.st_mode)
+                if stat.S_ISLNK(observed.st_mode):
+                    target = os.readlink(str(path))
+                    resolved = (path.parent / target).resolve(strict=False)
+                    root_resolved = root_path.resolve(strict=True)
+                    if root_resolved not in resolved.parents and resolved != root_resolved:
+                        raise RuntimeError("frozen_external_symlink")
+                    entries.append({
+                        "path": relative, "type": "symlink", "mode": mode,
+                        "size_bytes": 0, "sha256": None, "target": target,
+                    })
+                elif stat.S_ISDIR(observed.st_mode):
+                    if stat.S_IMODE(observed.st_mode) & 0o022:
+                        raise RuntimeError("frozen_writable_directory")
+                    entries.append({
+                        "path": relative, "type": "directory", "mode": mode,
+                        "size_bytes": 0, "sha256": None,
+                    })
+                    visit(path)
+                elif stat.S_ISREG(observed.st_mode):
+                    if observed.st_nlink != 1 or stat.S_IMODE(observed.st_mode) & 0o022:
+                        raise RuntimeError("frozen_writable_or_hardlinked_file")
+                    raw, stable = read_stable_file(path)
+                    entries.append({
+                        "path": relative, "type": "file",
+                        "mode": "%04o" % stat.S_IMODE(stable.st_mode),
+                        "size_bytes": len(raw),
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                    })
+                else:
+                    raise RuntimeError("frozen_special_entry")
+        finally:
+            # DirEntry objects do not own a closable descriptor once the
+            # scandir iterator has been materialized into a list.
+            del children
+
+    visit(root_path)
+    return {
+        "path": str(root_path),
+        "type": "directory",
+        "mode": "%04o" % stat.S_IMODE(root_info.st_mode),
+        "uid": root_info.st_uid,
+        "gid": root_info.st_gid,
+        "dev": root_info.st_dev,
+        "ino": root_info.st_ino,
+        "entries": sorted(entries, key=lambda item: item["path"]),
+    }
+
+def load_frozen_materialization(root_path):
+    runtime_parent = root_path.parent
+    runtime_container = runtime_parent.parent
+    if runtime_parent.name != "releases" or runtime_container.name != "rca-prod-runtime":
+        raise RuntimeError("frozen_receipt_root_invalid")
+    receipts_root = runtime_container / "receipts"
+    candidates = []
+    try:
+        receipt_dirs = sorted(os.scandir(str(receipts_root)), key=lambda item: item.name)
+    except OSError as exc:
+        raise RuntimeError("frozen_receipt_root_unavailable") from exc
+    try:
+        for item in receipt_dirs:
+            if not item.is_dir(follow_symlinks=False):
+                continue
+            receipt_path = Path(item.path) / "source-materialization.json"
+            if not receipt_path.exists() or receipt_path.is_symlink():
+                continue
+            raw, _ = read_stable_file(receipt_path)
+            receipt = json.loads(raw.decode("utf-8"))
+            if raw != canonical_json(receipt) + b"\n":
+                continue
+            if (
+                receipt.get("schema_version") != "g1q3_rca_vm_source_materialization_v1"
+                or receipt.get("pipeline_commit") != expected_commit
+                or not isinstance(expected_tree, str)
+                or receipt.get("pipeline_tree") != expected_tree
+                or receipt.get("runtime_root") != str(root_path)
+                or semantic_sha256(receipt) != receipt.get("self_seal")
+            ):
+                continue
+            candidates.append((receipt_path, raw, receipt))
+    finally:
+        # receipt_dirs is a materialized list of DirEntry values; no iterator
+        # remains open here.
+        del receipt_dirs
+    if len(candidates) != 1:
+        raise RuntimeError("frozen_materialization_receipt_ambiguous")
+    return candidates[0]
+
+def frozen_runtime_snapshot(root_path):
+    receipt_path, receipt_raw, receipt = load_frozen_materialization(root_path)
+    snapshot = frozen_entry_snapshot(root_path)
+    expected_root = receipt.get("root_identity")
+    if not isinstance(expected_root, dict) or any(
+        snapshot.get(key) != expected_root.get(key)
+        for key in ("mode", "uid", "gid", "dev", "ino")
+    ):
+        raise RuntimeError("frozen_root_identity_mismatch")
+    expected_entries = receipt.get("entries")
+    if not isinstance(expected_entries, list) or sorted(
+        expected_entries, key=lambda item: item.get("path", "")
+    ) != snapshot["entries"]:
+        raise RuntimeError("frozen_runtime_snapshot_mismatch")
+    return snapshot, receipt_path, receipt_raw, receipt
+
 def fingerprint(distribution_name, module_name):
     distribution = importlib.metadata.distribution(distribution_name)
     distribution_root = Path(distribution.locate_file("")).resolve(strict=True)
@@ -1034,15 +1212,23 @@ def fingerprint(distribution_name, module_name):
         "critical_file_count": len(files),
     }
 
-source_expected = {"runtime_root": root, "commit": expected_commit, "clean": True}
+source_expected = {
+    "runtime_root": root, "commit": expected_commit, "tree": expected_tree,
+    "clean": True,
+}
 source_actual = None
 source_error = None
 source_ok = False
 bundle = {}
+bundle_raw = None
+frozen_receipt_path = None
+frozen_receipt_raw = None
+frozen_receipt = None
 contract = {}
 vendor_manifest = {}
 contract_error = None
 committed_bytes = None
+committed_bundle_sha256 = None
 worktree_bytes = None
 try:
     root_info = os.lstat(root)
@@ -1050,23 +1236,52 @@ try:
         raise RuntimeError("pipeline_root_not_real_directory")
     if str(root_path.resolve(strict=True)) != root:
         raise RuntimeError("pipeline_root_not_canonical")
-    first = source_snapshot()
-    committed_bytes = git_read(
-        ["cat-file", "blob", expected_commit + ":" + bundle_relative],
-        binary=True,
-    )
-    worktree_bytes = stable_regular_file(bundle_path)
-    second = source_snapshot()
-    source_actual = dict(second)
-    source_actual["stable"] = first == second
-    source_ok = bool(
-        first == second
-        and second["commit"] == expected_commit
-        and second["top_level"] == root
-        and second["clean"]
-        and len(second["tree"]) == 40
-    )
-    bundle = json.loads(committed_bytes.decode("utf-8"))
+    if (root_path / ".git").exists():
+        first = source_snapshot()
+        committed_bytes = git_read(
+            ["cat-file", "blob", expected_commit + ":" + bundle_relative],
+            binary=True,
+        )
+        worktree_bytes = stable_regular_file(bundle_path)
+        second = source_snapshot()
+        source_actual = dict(second)
+        source_actual["stable"] = first == second
+        source_ok = bool(
+            first == second
+            and second["commit"] == expected_commit
+            and (expected_tree is None or second["tree"] == expected_tree)
+            and second["top_level"] == root
+            and second["clean"]
+            and len(second["tree"]) == 40
+        )
+        bundle_raw = committed_bytes
+    else:
+        snapshot, frozen_receipt_path, frozen_receipt_raw, frozen_receipt = (
+            frozen_runtime_snapshot(root_path)
+        )
+        source_actual = {
+            "runtime_root": root,
+            "commit": expected_commit,
+            "tree": expected_tree,
+            "top_level": root,
+            "clean": True,
+            "stable": True,
+            "frozen_runtime": True,
+            "receipt_path": str(frozen_receipt_path),
+            "receipt_sha256": hashlib.sha256(frozen_receipt_raw).hexdigest(),
+        }
+        source_ok = True
+        bundle_entry = next(
+            (item for item in snapshot["entries"]
+             if item.get("path") == bundle_relative and item.get("type") == "file"),
+            None,
+        )
+        if not isinstance(bundle_entry, dict) or len(str(bundle_entry.get("sha256") or "")) != 64:
+            raise RuntimeError("frozen_bundle_receipt_entry_missing")
+        committed_bundle_sha256 = bundle_entry["sha256"]
+        bundle_raw, _ = read_stable_file(bundle_path)
+        worktree_bytes = bundle_raw
+    bundle = json.loads(bundle_raw.decode("utf-8"))
     if isinstance(bundle, dict):
         contract = bundle.get("runtime_contract")
         vendor_manifest = bundle.get("vendor_manifest")
@@ -1118,9 +1333,14 @@ for name in required_dependencies:
         and expected.get("critical_file_count", 0) > 0
     )
 bytes_match = bool(
-    committed_bytes is not None
-    and worktree_bytes is not None
-    and committed_bytes == worktree_bytes
+    worktree_bytes is not None
+    and (
+        (committed_bytes is not None and committed_bytes == worktree_bytes)
+        or (
+            committed_bundle_sha256 is not None
+            and hashlib.sha256(worktree_bytes).hexdigest() == committed_bundle_sha256
+        )
+    )
 )
 bundle_ok = bool(source_ok and bytes_match and bundle_shape_ok)
 contract_ok = bool(bundle_ok and contract_shape_ok)
@@ -1190,7 +1410,7 @@ response = {
         "schema_version": bundle.get("schema_version") if isinstance(bundle, dict) else None,
         "expected_schema_version": bundle_schema,
         "committed_sha256": (hashlib.sha256(committed_bytes).hexdigest()
-                             if committed_bytes is not None else None),
+                             if committed_bytes is not None else committed_bundle_sha256),
         "worktree_sha256": (hashlib.sha256(worktree_bytes).hexdigest()
                             if worktree_bytes is not None else None),
         "runtime_contract_sha256": (
@@ -4296,7 +4516,15 @@ def preflight_release(
         )
 
     def dependency_readback():
-        value = dependency_probe(pipeline_root, pipeline_identity)
+        probe_identity = dict(pipeline_identity)
+        # Ref-only preflight cannot obtain an object-bearing tree. The report
+        # manifest is already bound to the exact frozen runtime and supplies a
+        # provisional tree for the read-only dependency probe; prepare/activate
+        # repeats the probe after the object-bearing Git readback.
+        if not probe_identity.get("tree") and report_value.get("pipeline_tree"):
+            probe_identity["tree"] = report_value["pipeline_tree"]
+            probe_identity["tree_source"] = "report_manifest_provisional"
+        value = dependency_probe(pipeline_root, probe_identity)
         if not isinstance(value, Mapping) or value.get("ok") is not True:
             raise _PreflightProbeFailure(
                 "remote_reader_dependency_unavailable",

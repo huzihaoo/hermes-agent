@@ -1005,6 +1005,10 @@ def test_default_dependency_probe_reports_vm_fingerprint_without_install(release
         assert "--porcelain=v1" in input_text
         assert "cat-file" in input_text
         assert release_files["identity"]["pipeline"]["commit"] in input_text
+        assert release_files["identity"]["pipeline"]["tree"] in input_text
+        assert "source-materialization.json" in input_text
+        assert "frozen_runtime" in input_text
+        assert "frozen_materialization_receipt_ambiguous" in input_text
         assert "bootstrap_remote_reader_runtime.py" not in input_text
         assert "--install-offline" not in input_text
         assert release.REMOTE_READER_RUNTIME_BUNDLE_SCHEMA in input_text
