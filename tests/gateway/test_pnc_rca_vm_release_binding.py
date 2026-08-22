@@ -15,6 +15,9 @@ def test_current_rca_vm_release_binding_is_shared_by_all_active_host_paths():
         f"{binding.RCA_PROD_VM_RELEASE_ROOT}/"
         "api/g1q3_rca/derived_capacity_reservation.py"
     )
+    assert binding.RCA_PROD_VM_STORAGE_ADMISSION_MODULE == (
+        f"{binding.RCA_PROD_VM_RELEASE_ROOT}/api/g1q3_rca/storage_admission.py"
+    )
     assert vm_task_tool._RCA_VM_REPO_ROOT == binding.RCA_PROD_VM_RELEASE_ROOT
     assert vm_task_tool._RCA_FIXED_CLI_RELATIVE_PATH == (
         "./api/g1q3_rca/scripts/run_rca_service_request.py"

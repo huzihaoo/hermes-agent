@@ -12,6 +12,9 @@ import pytest
 from gateway.pnc_rca_control_store import RcaControlStore
 from gateway.pnc_rca_runtime_identity import RCA_RUNTIME_RELATIVE_FILES
 from gateway.pnc_rca_runtime_identity import canonical_json_sha256
+from gateway.pnc_rca_vm_release_binding import (
+    RCA_PROD_VM_STORAGE_ADMISSION_MODULE,
+)
 from scripts import pnc_rca_outbox_dispatcher as dispatcher
 from tests.gateway.test_pnc_rca_control_store import (
     _migrate_v14_fixture_to_v15,
@@ -39,10 +42,9 @@ def _v15_control_store(path: Path) -> RcaControlStore:
 
 
 def test_storage_admission_uses_isolated_production_runtime():
-    assert dispatcher.REMOTE_STORAGE_ADMISSION_MODULE == (
-        "/home/mini/.hermes/rca-prod-runtime/releases/"
-        "rca-platform-20260822.installed-c2821d2-r15bm/"
-        "api/g1q3_rca/storage_admission.py"
+    assert (
+        dispatcher.REMOTE_STORAGE_ADMISSION_MODULE
+        == RCA_PROD_VM_STORAGE_ADMISSION_MODULE
     )
 
 

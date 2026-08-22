@@ -82,6 +82,9 @@ from gateway.pnc_rca_runtime_identity import (
     canonical_json_sha256,
     runtime_identity_is_valid,
 )
+from gateway.pnc_rca_vm_release_binding import (
+    RCA_PROD_VM_STORAGE_ADMISSION_MODULE,
+)
 from gateway.pnc_rca_schema import (
     RCA_VM_MAX_EXECUTION_REQUEST_JSON_BYTES,
     RcaExecutionRequest,
@@ -132,11 +135,7 @@ DERIVED_CAPACITY_SCOPE = "derived_artifact_and_cache"
 DERIVED_CAPACITY_REQUEST_SCOPE = "this_capacity_admission_only"
 REMOTE_DATA_ACCESS_MODE = "remote_read"
 DEFAULT_SSH_MINI_AGENT = str(Path.home() / ".local" / "bin" / "ssh-mini-agent")
-REMOTE_STORAGE_ADMISSION_MODULE = (
-    "/home/mini/.hermes/rca-prod-runtime/releases/"
-    "rca-platform-20260822.installed-c2821d2-r15bm/"
-    "api/g1q3_rca/storage_admission.py"
-)
+REMOTE_STORAGE_ADMISSION_MODULE = RCA_PROD_VM_STORAGE_ADMISSION_MODULE
 VM_ARTIFACT_PREFIX = "/mnt/tmp/"
 CIFS_ARTIFACT_PREFIX = (
     "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"

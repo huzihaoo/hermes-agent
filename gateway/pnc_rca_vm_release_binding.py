@@ -11,3 +11,6 @@ RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH = "api/g1q3_rca/scripts/run_rca_service_requ
 RCA_PROD_VM_DERIVED_RESERVATION_MODULE = (
     f"{RCA_PROD_VM_RELEASE_ROOT}/api/g1q3_rca/derived_capacity_reservation.py"
 )
+RCA_PROD_VM_STORAGE_ADMISSION_MODULE = (
+    f"{RCA_PROD_VM_RELEASE_ROOT}/api/g1q3_rca/storage_admission.py"
+)
