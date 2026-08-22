@@ -162,8 +162,8 @@ HISTORICAL_BUDGETS = {
 # Server-owned successor projection. Request payloads may repeat these pins,
 # but cannot select a different evaluator/source identity.
 HISTORICAL_SUCCESSOR_RELEASE: Mapping[str, Any] | None = {
-    "source_commit": "1364e0d0cf59bcdb4a04ace506903fd07899f7b9",
-    "source_tree": "70dea7edddc052fe8f8e246bcaf206952a3fa049",
+    "source_commit": "c2821d2cdca398f2fc3f5240a8d9a37ad5d15f66",
+    "source_tree": "97e0c1400449588065afba3d4e815821a0287a98",
     "requirements_contract_hash": "319b1000f0317345c834f6b9387646f822fb78c372e88529e8d14ce233c4ed87",
     "evaluator_fingerprints": {
         "g1q3_rca/aeb_signal_parser.py": "cfebee699fb211a7b7457fb0cdda736b886294a30ba484416a210ed0a12739a6",
@@ -176,11 +176,11 @@ HISTORICAL_SUCCESSOR_RELEASE: Mapping[str, Any] | None = {
         "g1q3_rca/signal_registry.py": "ffd0a796c027df1d81e30a1727eea1d37ccfcd0c5b88a806a201a0c8f3d54f17",
     },
     "evaluator_fingerprints_sha256": "352e8d07611e4006c12ef3a847080c3d520ba2e6c7d759142beb574c137160ad",
-    "evaluator_version": "git-1364e0d0cf59bcdb4a04ace506903fd07899f7b9",
-    "suite_receipt_path": "/mnt/tmp/20260822-rca-integrated-1364e0d/evidence-run-1364e0d/successor-evidence-1364e0d/suite-receipt.json",
-    "suite_receipt_sha256": "2f274635757946c577abadb0cf1526a67f6b07b9360f2a2e4fab813c665188e6",
-    "w17_receipt_path": "/mnt/tmp/20260822-rca-integrated-1364e0d/evidence-run-1364e0d/successor-evidence-1364e0d/w17-receipt.json",
-    "w17_receipt_sha256": "9cc8042bd85503508fa07a66d6f21a3a7dcc471f20f084809c14a33b053dadeb",
+    "evaluator_version": "git-c2821d2cdca398f2fc3f5240a8d9a37ad5d15f66",
+    "suite_receipt_path": "/mnt/tmp/20260822-rca-integrated-c2821d2c/evidence-run-c2821d2c/successor-evidence-c2821d2/suite-receipt.json",
+    "suite_receipt_sha256": "fcb8b6e47a12936a0072698516399ed53adbba611a4e9805468176918cf57c52",
+    "w17_receipt_path": "/mnt/tmp/20260822-rca-integrated-c2821d2c/evidence-run-c2821d2c/successor-evidence-c2821d2/w17-receipt.json",
+    "w17_receipt_sha256": "cd039f6c2652ca8022e8cd279a5bfcb685fb7407e19f4ae1bbbdad44902bd5a5",
 }
 
 RECEIPT_FIELDS = {

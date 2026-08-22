@@ -25,30 +25,30 @@ def test_blocked_receipt_successor_projection_is_exact() -> None:
             "w17_receipt_sha256",
         )
     } == {
-        "source_commit": "1364e0d0cf59bcdb4a04ace506903fd07899f7b9",
-        "source_tree": "70dea7edddc052fe8f8e246bcaf206952a3fa049",
+        "source_commit": "c2821d2cdca398f2fc3f5240a8d9a37ad5d15f66",
+        "source_tree": "97e0c1400449588065afba3d4e815821a0287a98",
         "requirements_contract_hash": (
             "319b1000f0317345c834f6b9387646f822fb78c372e88529e8d14ce233c4ed87"
         ),
         "evaluator_fingerprints_sha256": (
             "352e8d07611e4006c12ef3a847080c3d520ba2e6c7d759142beb574c137160ad"
         ),
-        "evaluator_version": "git-1364e0d0cf59bcdb4a04ace506903fd07899f7b9",
+        "evaluator_version": "git-c2821d2cdca398f2fc3f5240a8d9a37ad5d15f66",
         "suite_receipt_path": (
-            "/mnt/tmp/20260822-rca-integrated-1364e0d/evidence-run-1364e0d/"
-            "successor-evidence-1364e0d/"
+            "/mnt/tmp/20260822-rca-integrated-c2821d2c/evidence-run-c2821d2c/"
+            "successor-evidence-c2821d2/"
             "suite-receipt.json"
         ),
         "suite_receipt_sha256": (
-            "2f274635757946c577abadb0cf1526a67f6b07b9360f2a2e4fab813c665188e6"
+            "fcb8b6e47a12936a0072698516399ed53adbba611a4e9805468176918cf57c52"
         ),
         "w17_receipt_path": (
-            "/mnt/tmp/20260822-rca-integrated-1364e0d/evidence-run-1364e0d/"
-            "successor-evidence-1364e0d/"
+            "/mnt/tmp/20260822-rca-integrated-c2821d2c/evidence-run-c2821d2c/"
+            "successor-evidence-c2821d2/"
             "w17-receipt.json"
         ),
         "w17_receipt_sha256": (
-            "9cc8042bd85503508fa07a66d6f21a3a7dcc471f20f084809c14a33b053dadeb"
+            "cd039f6c2652ca8022e8cd279a5bfcb685fb7407e19f4ae1bbbdad44902bd5a5"
         ),
     }
     assert set(release["evaluator_fingerprints"]) == {
@@ -94,6 +94,13 @@ def test_scoped_receipts_keep_full_suite_claim_explicit() -> None:
         assert receipt["source_commit"] == release["source_commit"]
         assert receipt["source_tree"] == release["source_tree"]
         assert receipt["scope"]["full_suite_not_claimed"] is True
+        if path_key == "suite_receipt_path":
+            regression = (
+                "api/g1q3_rca/tests/test_historical_full_chain_minimal.py::"
+                "test_evaluator_fingerprint_is_bound_to_frozen_source_entry"
+            )
+            assert regression in receipt["argv"]
+            assert regression in receipt["scope"]["tests"]
         assert receipt["contract_debt"] == {
             "full_suite_status": "NOT_RUN",
             "reason": receipt["contract_debt"]["reason"],
