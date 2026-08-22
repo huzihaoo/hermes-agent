@@ -208,6 +208,11 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_BACKGROUND_NOTIFICATIONS",
     "HERMES_EXEC_ASK",
     "HERMES_HOME_MODE",
+    # Config/env path pins must not escape the per-test HERMES_HOME. Without
+    # these, a developer shell can make tests read the real user's config even
+    # after the fixture has installed an isolated home.
+    "HERMES_CONFIG_PATH",
+    "HERMES_ENV_PATH",
     "HERMES_AGENT_USE_LEGACY_SESSION_KEYS",
     # Kanban path/board pins must never leak from a developer shell or
     # dispatched worker into tests; otherwise tests can write fake tasks to
