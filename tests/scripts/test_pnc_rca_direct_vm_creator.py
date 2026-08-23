@@ -168,6 +168,51 @@ def test_creator_rejects_missing_submit_contract_before_write(
     assert not root.exists()
 
 
+def test_creator_rejects_group_or_world_writable_module(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "shared-state"
+    module_path = _write_old_abi_module(tmp_path / "shared_state_v2.py")
+    module_path.chmod(0o666)
+    submit_path = Path("gateway/pnc_rca_direct_vm_submit.py").resolve()
+    monkeypatch.setattr(creator, "_safe_root", lambda _value: root)
+
+    with pytest.raises(creator.DirectVmCreatorError) as raised:
+        creator.create_direct_vm_task(
+            str(root),
+            _load_request(),
+            shared_state_module_path=str(module_path),
+            submit_module_path=str(submit_path),
+        )
+
+    assert raised.value.code == "direct_vm_shared_state_creator_unavailable"
+    assert not root.exists()
+
+
+def test_creator_rejects_module_parent_symlink(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "shared-state"
+    real_dir = tmp_path / "real-modules"
+    real_dir.mkdir()
+    module_path = _write_old_abi_module(real_dir / "shared_state_v2.py")
+    linked_dir = tmp_path / "linked-modules"
+    linked_dir.symlink_to(real_dir, target_is_directory=True)
+    submit_path = Path("gateway/pnc_rca_direct_vm_submit.py").resolve()
+    monkeypatch.setattr(creator, "_safe_root", lambda _value: root)
+
+    with pytest.raises(creator.DirectVmCreatorError) as raised:
+        creator.create_direct_vm_task(
+            str(root),
+            _load_request(),
+            shared_state_module_path=str(linked_dir / module_path.name),
+            submit_module_path=str(submit_path),
+        )
+
+    assert raised.value.code == "direct_vm_shared_state_creator_unavailable"
+    assert not root.exists()
+
+
 def test_creator_rejects_shared_state_abi_without_create_task(
     monkeypatch, tmp_path: Path
 ) -> None:

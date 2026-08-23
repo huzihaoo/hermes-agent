@@ -194,6 +194,9 @@ def test_status_uses_one_bounded_agent_verb_and_keeps_paths_out_of_argv() -> Non
     assert DEFAULT_REMOTE_CREATOR_PATH in script
     assert "/home/mini/.hermes/shared-state" in script
     assert TASK_ID in script
+    assert "direct_vm_module_parent_invalid" in script
+    assert "direct_vm_module_permissions_invalid" in script
+    assert "info.st_nlink != 1" in script
 
 
 def test_remote_helper_failure_is_unknown_not_missing() -> None:

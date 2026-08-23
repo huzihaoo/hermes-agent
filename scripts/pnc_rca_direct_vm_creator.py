@@ -682,6 +682,8 @@ def _load_module(path_value: str, name: str) -> Any:
         or observed.st_nlink != 1
     ):
         raise DirectVmCreatorError("direct_vm_module_not_regular")
+    if int(observed.st_uid) != os.geteuid() or stat.S_IMODE(observed.st_mode) & 0o022:
+        raise DirectVmCreatorError("direct_vm_module_permissions_invalid")
     spec = importlib.util.spec_from_file_location(name, str(path))
     if spec is None or spec.loader is None:
         raise DirectVmCreatorError("direct_vm_module_unloadable")
