@@ -614,6 +614,16 @@ def test_direct_config_rejects_shadow_default_group(tmp_path: Path):
         direct.DirectKafkaConfig.from_env(env, hermes_home=tmp_path)
 
 
+def test_direct_config_rejects_legacy_production_group(tmp_path: Path):
+    env = _direct_env(
+        tmp_path,
+        **{f"{direct.DIRECT_ENV_PREFIX}GROUP_ID": "rca_root_cause_analysis_agent"},
+    )
+
+    with pytest.raises(ValueError, match="legacy Kafka group"):
+        direct.DirectKafkaConfig.from_env(env, hermes_home=tmp_path)
+
+
 @pytest.mark.parametrize("suffix", ["GROUP_ID", "COMMIT_ENABLED"])
 def test_direct_cli_config_requires_explicit_group_and_commit_mode(
     tmp_path: Path, suffix: str

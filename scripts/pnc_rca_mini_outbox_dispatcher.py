@@ -861,6 +861,7 @@ class MiniOutboxDispatcherConfig:
     lease_seconds: int = 300
     poll_interval_seconds: int = 5
     max_batch_size: int = 1
+    request_builder: str = "prebuilt"
     auth_principal: str = DIRECT_DISPATCHER_AUTH_PRINCIPAL
     auth_capability: str = DIRECT_DISPATCHER_AUTH_CAPABILITY
 
@@ -918,6 +919,13 @@ class MiniOutboxDispatcherConfig:
             raise MiniDispatcherConfigError(
                 "production_direct_group_must_be_rca_direct_path"
             )
+        request_builder = _text_setting(
+            source,
+            (f"{MINI_DISPATCHER_ENV_PREFIX}REQUEST_BUILDER",),
+            default="prebuilt",
+        ).lower()
+        if request_builder not in {"prebuilt", "host_preread"}:
+            raise MiniDispatcherConfigError("request_builder_invalid")
 
         db_path = _absolute_path(
             _text_setting(
@@ -1017,6 +1025,7 @@ class MiniOutboxDispatcherConfig:
                 minimum=1,
                 maximum=1_000,
             ),
+            request_builder=request_builder,
             auth_principal=auth_principal,
             auth_capability=auth_capability,
         )
@@ -1035,6 +1044,7 @@ class MiniOutboxDispatcherConfig:
             "lease_seconds": self.lease_seconds,
             "poll_interval_seconds": self.poll_interval_seconds,
             "max_batch_size": self.max_batch_size,
+            "request_builder": self.request_builder,
             "auth_principal": self.auth_principal,
             "auth_capability": self.auth_capability,
         }
@@ -1378,12 +1388,14 @@ class DirectVmDispatcherBoundary:
         config: MiniOutboxDispatcherConfig,
         *,
         transport: Any | None = None,
+        request_builder: BuildRequest | None = None,
     ) -> None:
         if not config.enabled or not config.submit_enabled:
             raise MiniDispatcherConfigError(
                 "direct_vm_boundary_requires_submit_enabled"
             )
         self.config = config
+        self.request_builder = request_builder
         if transport is None:
             from gateway.pnc_rca_direct_vm_transport import build_direct_vm_transport
 
@@ -1413,9 +1425,11 @@ class DirectVmDispatcherBoundary:
                         "prebuilt_execution_request_invalid"
                     )
             else:
-                execution_request = _prebuilt_execution_request(
-                    self._payload(claim), claim
-                )
+                payload = self._payload(claim)
+                if self.request_builder is not None:
+                    execution_request = self.request_builder(payload, claim)
+                else:
+                    execution_request = _prebuilt_execution_request(payload, claim)
         return build_strict_direct_vm_request(
             execution_request,
             claim,
@@ -1496,15 +1510,54 @@ def _validate_direct_outbox_payload(
         raise PermanentDispatchError("direct outbox action is invalid")
 
 
+def build_host_preread_execution_request(
+    payload: Mapping[str, Any],
+    claim: MiniOutboxClaim,
+    *,
+    reader: Callable[[str, str], Any] | None = None,
+) -> Mapping[str, Any]:
+    """Explicit opt-in builder using the bounded host read-only preread.
+
+    The import is lazy so the default prebuilt/safe-off path does not load
+    Feishu tooling or perform any read.  Missing evidence raises a retryable
+    direct-builder error which the dispatcher records without crossing create.
+    """
+
+    from gateway.pnc_rca_direct_execution_builder import (
+        DirectExecutionBuildError,
+        build_direct_execution_request,
+    )
+
+    try:
+        if reader is None:
+            return build_direct_execution_request(payload, claim)
+        return build_direct_execution_request(payload, claim, reader=reader)
+    except DirectExecutionBuildError as exc:
+        if exc.retryable:
+            retry = UnknownDispatchError(exc.detail)
+            # Preserve the stable builder code in the MiniStore receipt while
+            # retaining UnknownDispatchError's retryable state.
+            retry.code = exc.code
+            raise retry from exc
+        permanent = PermanentDispatchError(exc.detail)
+        # Preserve the typed builder code in the durable quarantine receipt;
+        # the base dispatcher exception uses a class-level default otherwise.
+        permanent.code = exc.code
+        raise permanent from exc
+
+
 def build_mini_outbox_dispatcher(
     config: MiniOutboxDispatcherConfig,
     *,
     transport: Any | None = None,
+    request_reader: Callable[[str, str], Any] | None = None,
 ) -> MiniOutboxDispatcher:
     """Build the live dispatcher only after both effect flags are enabled."""
 
     if not config.enabled or not config.submit_enabled:
         raise MiniDispatcherConfigError("dispatcher_submit_not_enabled")
+    if config.request_builder not in {"prebuilt", "host_preread"}:
+        raise MiniDispatcherConfigError("request_builder_invalid")
     root = _ensure_runtime_root(config.db_path.parent, create=False)
     db_path = _validate_bound_path(
         config.db_path,
@@ -1514,7 +1567,23 @@ def build_mini_outbox_dispatcher(
     )
     if not db_path.exists():
         raise MiniDispatcherConfigError("db_file_missing")
-    boundary = DirectVmDispatcherBoundary(config, transport=transport)
+    request_builder: BuildRequest | None = None
+    if config.request_builder == "host_preread":
+        if request_reader is None:
+            request_builder = build_host_preread_execution_request
+        else:
+            request_builder = lambda payload, claim: (
+                build_host_preread_execution_request(
+                    payload,
+                    claim,
+                    reader=request_reader,
+                )
+            )
+    boundary = DirectVmDispatcherBoundary(
+        config,
+        transport=transport,
+        request_builder=request_builder,
+    )
     store = MiniStore(db_path)
 
     def check_request(request: Mapping[str, Any], claim: MiniOutboxClaim) -> None:
@@ -1530,7 +1599,7 @@ def build_mini_outbox_dispatcher(
         lease_owner=config.lease_owner,
         status=boundary.status,
         create=boundary.create,
-        build_request=build_prebuilt_execution_request,
+        build_request=request_builder or build_prebuilt_execution_request,
         admission_check=_validate_direct_outbox_payload,
         request_check=check_request,
         lease_seconds=config.lease_seconds,
@@ -1752,6 +1821,7 @@ __all__ = [
     "StatusUnknownError",
     "UnknownDispatchError",
     "build_arg_parser",
+    "build_host_preread_execution_request",
     "build_mini_outbox_dispatcher",
     "build_prebuilt_execution_request",
     "build_strict_direct_vm_request",

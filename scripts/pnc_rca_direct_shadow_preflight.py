@@ -575,7 +575,14 @@ def build_preflight_plan(
         try:
             config = direct.DirectKafkaConfig.from_env(source, hermes_home=hermes_home)
         except Exception as exc:
-            errors.append(_redact_text(str(exc), source))
+            detail = _redact_text(str(exc), source)
+            if "legacy Kafka group" in detail:
+                # Preserve the preflight's stable public error vocabulary even
+                # though the lower-level direct config now rejects the legacy
+                # group earlier for every commit mode.
+                errors.append("shadow_group_must_not_match_production_group")
+            else:
+                errors.append(detail)
 
     checks: dict[str, Any] = {}
     public_config: dict[str, Any] | None = None

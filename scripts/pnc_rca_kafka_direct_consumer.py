@@ -25,6 +25,7 @@ from typing import Any, Final, Protocol, TypeAlias
 from dotenv import dotenv_values
 
 from gateway.pnc_rca_kafka_contract import (
+    FIXED_KAFKA_GROUP_ID,
     WorkflowEventPolicy,
     WorkflowTransition,
 )
@@ -481,6 +482,8 @@ class DirectKafkaConfig:
         group_id = str(group_value).strip()
         if not group_id:
             raise ValueError("direct group id must not be empty")
+        if group_id.casefold() == FIXED_KAFKA_GROUP_ID.casefold():
+            raise ValueError("direct group id must not reuse the legacy Kafka group")
 
         protocol = (
             str(

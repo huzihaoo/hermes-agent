@@ -128,9 +128,46 @@ def test_config_requires_explicit_two_level_safe_off_and_fixed_paths(tmp_path: P
     assert config.enabled is False
     assert config.submit_enabled is False
     assert config.group_id == "rca_direct_path"
+    assert config.request_builder == "prebuilt"
     assert config.db_path == loaded_path.parent / "mini.sqlite3"
     assert config.health_path == loaded_path.parent / "outbox_dispatcher_health.json"
     assert values["HERMES_RCA_DIRECT_OUTBOX_SUBMIT_ENABLED"] == "false"
+
+
+def test_host_preread_builder_is_explicitly_selectable(tmp_path: Path):
+    env_path, _ = _env_file(
+        tmp_path,
+        HERMES_RCA_DIRECT_OUTBOX_REQUEST_BUILDER="host_preread",
+    )
+    source, loaded_path = dispatcher.load_mini_outbox_environment(
+        env_path,
+        environ={},
+        hermes_home=tmp_path / ".hermes",
+    )
+    config = dispatcher.MiniOutboxDispatcherConfig.from_env(
+        source,
+        hermes_home=tmp_path / ".hermes",
+        env_file=loaded_path,
+    )
+    assert config.request_builder == "host_preread"
+
+
+def test_unknown_request_builder_fails_closed(tmp_path: Path):
+    env_path, _ = _env_file(
+        tmp_path,
+        HERMES_RCA_DIRECT_OUTBOX_REQUEST_BUILDER="legacy",
+    )
+    source, loaded_path = dispatcher.load_mini_outbox_environment(
+        env_path,
+        environ={},
+        hermes_home=tmp_path / ".hermes",
+    )
+    with pytest.raises(dispatcher.MiniDispatcherConfigError, match="request_builder"):
+        dispatcher.MiniOutboxDispatcherConfig.from_env(
+            source,
+            hermes_home=tmp_path / ".hermes",
+            env_file=loaded_path,
+        )
 
 
 @pytest.mark.parametrize(
@@ -361,6 +398,7 @@ def test_env_example_has_explicit_safe_off_and_no_secrets():
         direct_consumer.DirectKafkaConfig.from_env(commit_probe)
     assert "HERMES_RCA_DIRECT_OUTBOX_ENABLED=false" in text
     assert "HERMES_RCA_DIRECT_OUTBOX_SUBMIT_ENABLED=false" in text
+    assert "HERMES_RCA_DIRECT_OUTBOX_REQUEST_BUILDER=prebuilt" in text
     assert "HERMES_RCA_DIRECT_KAFKA_GROUP_ID=rca_direct_path" in text
     assert "HERMES_RCA_DIRECT_OUTBOX_DB_PATH=" in text
     assert "HERMES_RCA_DIRECT_OUTBOX_HEALTH_PATH=" in text
