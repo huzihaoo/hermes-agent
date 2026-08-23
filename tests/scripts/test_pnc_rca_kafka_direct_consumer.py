@@ -455,6 +455,18 @@ def test_offset_resolution_rejects_broker_ahead_of_durable_progress(
         direct.DirectOffsetCoordinator(store, topic=TOPIC, provider=provider).resolve(0)
 
 
+def test_offset_resolution_rejects_committed_before_explicit_t0(store: MiniStore):
+    provider = direct.MappingOffsetProvider(committed={0: 9})
+
+    with pytest.raises(direct.OffsetCoherenceError, match="incoherent:0"):
+        direct.DirectOffsetCoordinator(
+            store,
+            topic=TOPIC,
+            provider=provider,
+            initial_offsets={0: 10},
+        ).resolve(0)
+
+
 def test_offset_provider_is_injected_and_assignment_is_sought_once(
     tmp_path: Path, store: MiniStore
 ):
@@ -495,8 +507,8 @@ def test_partition_offsets_must_not_decrease_within_batch(
     with pytest.raises(direct.PollOrderError, match="offset_decreased"):
         direct.run_poll_loop(consumer, store, _config(tmp_path), max_polls=1)
 
-    assert len(consumer.commits) == 1
-    assert consumer.commits[0]["offsets"] == {(TOPIC, 0): 12}
+    assert consumer.commits == []
+    assert store.list_rows("kafka_inbox") == []
 
 
 def test_idle_poll_is_bounded_and_observed(tmp_path: Path, store: MiniStore):

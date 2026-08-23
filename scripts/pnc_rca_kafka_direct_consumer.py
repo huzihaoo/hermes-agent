@@ -335,8 +335,8 @@ class DirectOffsetCoordinator:
         if committed is not None:
             # A failed broker commit legitimately leaves the broker behind
             # local durable progress.  The inverse would skip unpersisted data.
-            if durable is not None and (
-                committed > durable or (t0 is not None and committed < t0)
+            if (t0 is not None and committed < t0) or (
+                durable is not None and committed > durable
             ):
                 raise OffsetCoherenceError(
                     f"broker_local_offset_incoherent:{partition}"
@@ -711,9 +711,9 @@ def run_poll_loop(
 
         try:
             for partition, messages in _batch_items(batch):
+                records = tuple(record_from_message(message) for message in messages)
                 previous_offset: int | None = None
-                for message in messages:
-                    record = record_from_message(message)
+                for record in records:
                     if partition is not None:
                         expected_partition = _partition_id(partition)
                         if record.partition != expected_partition:
@@ -723,6 +723,8 @@ def run_poll_loop(
                             f"partition_offset_decreased:{record.partition}"
                         )
                     previous_offset = record.offset
+
+                for record in records:
                     stats.records_seen += 1
                     health.event()
                     try:
