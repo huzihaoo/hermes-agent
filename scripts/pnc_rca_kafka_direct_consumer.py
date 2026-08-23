@@ -1422,6 +1422,12 @@ def run_poll_loop(
     stats = stats or DirectPollStats()
     stop_requested = stop_requested or (lambda: False)
     health = health or DirectHealthReporter(config.health_path, config=config)
+    if not config.enabled:
+        # Keep the API-level kill switch equivalent to the CLI safe-off path.
+        # An embedding caller must not be able to poll, recover, ingest, or
+        # commit merely by bypassing ``main``.
+        health.write(state="disabled", stats=stats)
+        return stats
     assignment: tuple[Any, ...] = ()
     cohered_assignment: tuple[tuple[str, int], ...] | None = None
     health.write(state="starting", stats=stats, assignment=assignment)

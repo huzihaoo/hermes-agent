@@ -896,6 +896,36 @@ def test_shadow_runner_never_calls_commit(tmp_path: Path, store: MiniStore):
     assert stats.commits_skipped == 1
 
 
+def test_api_safe_off_skips_recovery_poll_ingest_and_commit(tmp_path: Path):
+    class ExplodingStore:
+        def __getattr__(self, name):
+            raise AssertionError(f"safe-off touched store: {name}")
+
+    class ExplodingConsumer:
+        def __getattr__(self, name):
+            raise AssertionError(f"safe-off touched consumer: {name}")
+
+    config = _config(
+        tmp_path,
+        enabled=False,
+        commit_enabled=True,
+        group_id="rca-direct-safe-off",
+    )
+    stats = direct.run_poll_loop(
+        ExplodingConsumer(),
+        ExplodingStore(),
+        config,
+        max_polls=1,
+    )
+
+    assert stats == direct.DirectPollStats()
+    body = json.loads((tmp_path / "health.json").read_text(encoding="utf-8"))
+    assert body["state"] == "disabled"
+    assert body["healthy"] is True
+    assert body["ok"] is False
+    assert body["config"]["enabled"] is False
+
+
 def test_check_config_is_read_only_and_does_not_construct_store_or_kafka(
     monkeypatch, tmp_path: Path, capsys
 ):

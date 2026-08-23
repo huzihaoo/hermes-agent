@@ -114,6 +114,14 @@ _FORBIDDEN_DOWNLOAD_KEYS = frozenset({
     "mdi_download_cmd",
     "pdcl_download_cmd",
 })
+_SENSITIVE_KEYS = frozenset({
+    "raw",
+    "raw_payload",
+    "raw_feishu_payload",
+    "full_payload",
+    "secret",
+    "token",
+})
 _EXECUTION_REQUEST_FIELDS = _EXECUTION_REQUEST_REQUIRED_FIELDS
 
 
@@ -212,6 +220,8 @@ def _scan_forbidden_contract(value: Any) -> None:
         if isinstance(item, Mapping):
             for key, child in item.items():
                 normalized = _normalized_key(key)
+                if normalized in _SENSITIVE_KEYS:
+                    raise _fail("direct_vm_sensitive_field_forbidden")
                 if normalized in _FORBIDDEN_EXACT_KEYS or normalized.startswith(
                     _FORBIDDEN_KEY_PREFIXES
                 ):
