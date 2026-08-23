@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 import pytest
 
 from gateway.pnc_rca_kafka_contract import WorkflowEventPolicy, WorkflowTransition
-from gateway.pnc_rca_mini_store import MiniKafkaRecord, MiniStore
+from gateway.pnc_rca_mini_store import MiniKafkaRecord, MiniStore, _stable_source_id
 from scripts.pnc_rca_mini_outbox_dispatcher import MiniOutboxDispatcher
 
 
@@ -125,3 +126,24 @@ def test_frozen_request_is_byte_stable(tmp_path: Path):
     )
     assert first == second
     assert digest == same_digest
+
+
+def test_retrigger_source_identity_includes_generation():
+    event_uid = "feishu-project-workflow-event:0:10"
+    assert _stable_source_id(event_uid, 2, "kafka_retrigger") != _stable_source_id(
+        event_uid, 1, "issue_created"
+    )
+
+
+def test_expired_lease_cannot_complete(tmp_path: Path):
+    store = MiniStore(tmp_path / "mini.sqlite3")
+    store.ingest_record(_record(), policy=_policy())
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    claim = store.claim_outbox(lease_owner="owner-a", lease_seconds=1, now=start)[0]
+    with pytest.raises(Exception):
+        store.complete_outbox(
+            claim.outbox_id,
+            lease_owner="owner-a",
+            result={"ok": True},
+            now=start + timedelta(seconds=2),
+        )

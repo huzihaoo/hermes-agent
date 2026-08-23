@@ -149,6 +149,7 @@ class MiniOutboxClaim:
     action: str
     business_key: str
     generation: int
+    trigger_kind: str
     source_event_id: str
     origin_source_id: str
     payload_json: str
@@ -863,11 +864,21 @@ class MiniStore:
                 if request and digest != _json_sha256(request):
                     raise MiniStoreError("outbox request hash mismatch")
                 attempt = int(row["attempt_count"]) + 1
-                conn.execute(
+                updated = conn.execute(
                     "UPDATE rca_outbox SET status='claimed',lease_owner=?,lease_expires_at=?,"
                     "attempt_count=?,updated_at=? WHERE outbox_id=?",
                     (owner, expires, attempt, current_iso, int(row["outbox_id"])),
-                )
+                ).rowcount
+                if updated != 1:
+                    raise MiniOutboxLeaseError("outbox claim lost its row")
+                try:
+                    payload = json.loads(str(row["payload_json"]))
+                    trigger_kind = str(
+                        (payload.get("admission") or {}).get("trigger_kind")
+                        or "issue_created"
+                    )
+                except (TypeError, ValueError, AttributeError):
+                    raise MiniStoreError("outbox payload admission is invalid")
                 claimed.append(
                     MiniOutboxClaim(
                         outbox_id=int(row["outbox_id"]),
@@ -875,8 +886,13 @@ class MiniStore:
                         action=str(row["action"]),
                         business_key=str(row["business_key"]),
                         generation=int(row["generation"]),
+                        trigger_kind=trigger_kind,
                         source_event_id=str(row["source_event_id"]),
-                        origin_source_id=_stable_source_id(str(row["source_event_id"])),
+                        origin_source_id=_stable_source_id(
+                            str(row["source_event_id"]),
+                            int(row["generation"]),
+                            trigger_kind,
+                        ),
                         payload_json=str(row["payload_json"]),
                         request_json=request,
                         request_sha256=digest,
@@ -901,12 +917,16 @@ class MiniStore:
         current_iso = _as_iso(now)
         with self._transaction() as conn:
             row = conn.execute(
-                "SELECT status,lease_owner,request_json,request_sha256 FROM rca_outbox WHERE outbox_id=?",
+                "SELECT status,lease_owner,lease_expires_at,request_json,request_sha256 FROM rca_outbox WHERE outbox_id=?",
                 (int(outbox_id),),
             ).fetchone()
             if row is None:
                 raise MiniRecordNotFoundError(str(outbox_id))
-            if row["status"] != "claimed" or row["lease_owner"] != lease_owner:
+            if (
+                row["status"] != "claimed"
+                or row["lease_owner"] != lease_owner
+                or not str(row["lease_expires_at"] or "") > current_iso
+            ):
                 raise MiniOutboxLeaseError("outbox lease is not owned")
             existing = str(row["request_json"] or "")
             if existing:
@@ -916,11 +936,15 @@ class MiniStore:
                 ):
                     raise MiniStoreError("execution request is already frozen")
                 return existing, request_sha
-            conn.execute(
+            updated = conn.execute(
                 "UPDATE rca_outbox SET request_json=?,request_sha256=?,updated_at=? "
                 "WHERE outbox_id=? AND status='claimed' AND lease_owner=? AND request_json=''",
                 (request_json, request_sha, current_iso, int(outbox_id), lease_owner),
-            )
+            ).rowcount
+            if updated != 1:
+                raise MiniOutboxLeaseError(
+                    "outbox lease changed while freezing request"
+                )
             return request_json, request_sha
 
     def renew_outbox(
@@ -931,6 +955,8 @@ class MiniStore:
         lease_seconds: int = 300,
         now: datetime | None = None,
     ) -> str:
+        if isinstance(lease_seconds, bool) or not 1 <= int(lease_seconds) <= 86_400:
+            raise ValueError("lease_seconds out of bounds")
         current = now or datetime.now(timezone.utc)
         expires = _as_iso(current + timedelta(seconds=int(lease_seconds)))
         with self._transaction() as conn:
@@ -955,23 +981,30 @@ class MiniStore:
         current_iso = _as_iso(now)
         with self._transaction() as conn:
             row = conn.execute(
-                "SELECT lease_owner,status,business_key,generation FROM rca_outbox WHERE outbox_id=?",
+                "SELECT lease_owner,status,lease_expires_at,business_key,generation FROM rca_outbox WHERE outbox_id=?",
                 (int(outbox_id),),
             ).fetchone()
             if row is None:
                 raise MiniRecordNotFoundError(str(outbox_id))
-            if row["status"] != "claimed" or row["lease_owner"] != lease_owner:
+            if (
+                row["status"] != "claimed"
+                or row["lease_owner"] != lease_owner
+                or not str(row["lease_expires_at"] or "") > current_iso
+            ):
                 raise MiniOutboxLeaseError("outbox lease is not owned")
             conn.execute(
                 "UPDATE rca_outbox SET status='completed',result_json=?,result_sha256=?,"
-                "lease_owner='',lease_expires_at='',updated_at=? WHERE outbox_id=?",
+                "lease_owner='',lease_expires_at='',next_attempt_at='',last_error_code='',"
+                "last_error_detail='',updated_at=? WHERE outbox_id=?",
                 (result_json, _json_sha256(result_json), current_iso, int(outbox_id)),
             )
-            conn.execute(
+            trigger_updated = conn.execute(
                 "UPDATE business_triggers SET state='completed',updated_at=? "
                 "WHERE business_key=? AND generation=?",
                 (current_iso, str(row["business_key"]), int(row["generation"])),
-            )
+            ).rowcount
+            if trigger_updated != 1:
+                raise MiniStoreError("business trigger completion is missing")
 
     def fail_outbox(
         self,
@@ -989,12 +1022,16 @@ class MiniStore:
         status = "quarantined" if quarantine else "pending"
         with self._transaction() as conn:
             row = conn.execute(
-                "SELECT lease_owner,status,business_key,generation FROM rca_outbox WHERE outbox_id=?",
+                "SELECT lease_owner,status,lease_expires_at,business_key,generation FROM rca_outbox WHERE outbox_id=?",
                 (int(outbox_id),),
             ).fetchone()
             if row is None:
                 raise MiniRecordNotFoundError(str(outbox_id))
-            if row["status"] != "claimed" or row["lease_owner"] != lease_owner:
+            if (
+                row["status"] != "claimed"
+                or row["lease_owner"] != lease_owner
+                or not str(row["lease_expires_at"] or "") > current_iso
+            ):
                 raise MiniOutboxLeaseError("outbox lease is not owned")
             conn.execute(
                 "UPDATE rca_outbox SET status=?,lease_owner='',lease_expires_at='',"
@@ -1008,7 +1045,7 @@ class MiniStore:
                     int(outbox_id),
                 ),
             )
-            conn.execute(
+            trigger_updated = conn.execute(
                 "UPDATE business_triggers SET state=?,updated_at=? WHERE business_key=? AND generation=?",
                 (
                     "quarantined" if quarantine else "pending",
@@ -1016,7 +1053,9 @@ class MiniStore:
                     str(row["business_key"]),
                     int(row["generation"]),
                 ),
-            )
+            ).rowcount
+            if trigger_updated != 1:
+                raise MiniStoreError("business trigger failure state is missing")
 
     def get_inbox(self, event_uid: str) -> dict[str, Any] | None:
         conn = self._connect()
