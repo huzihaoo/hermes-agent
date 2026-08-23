@@ -418,6 +418,90 @@ def _convert_silent_terminal_to_immediate_viz_gap(
         conn.close()
 
 
+def _convert_silent_terminal_to_legacy_gate_a_gap(
+    store: RcaControlStore,
+) -> None:
+    """Build the exact pre-r15bx Gate-A terminal route shape."""
+    delivery = RcaDeliveryStore(
+        store.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    [watch] = delivery.list_rows("rca_execution_watch")
+    [route] = delivery.list_rows("rca_failure_routes")
+    status = json.loads(watch["last_status_json"])
+    taxonomy = status["failure_taxonomy"]
+    error_code = "taxonomy_gap:gate_a_projection_invalid"
+    taxonomy.update(
+        {
+            "known": False,
+            "retryable": False,
+            "raw_code": "gate_a_projection_invalid",
+            "terminal_error_code": error_code,
+            "source": "delivery_contract_verifier",
+            "observed_state": "completed",
+            "source_conflict": False,
+            "external_comment_policy": "honest_non_attribution_only",
+            "contract_errors": ["unknown_blocker_kind"],
+        }
+    )
+    # The legacy producer omitted the receipt field entirely; an explicit
+    # empty receipt is accepted only for compatibility with older snapshots.
+    taxonomy.pop("receipt", None)
+    route_payload = json.loads(route["route_payload_json"])
+    route_payload["decision"].update(
+        {
+            "raw_code": "gate_a_projection_invalid",
+            "terminal_error_code": error_code,
+            "known": False,
+            "retryable": False,
+            "internal_route": "internal_alert",
+            "lane": "hard_defect",
+            "contract_errors": ["unknown_blocker_kind"],
+        }
+    )
+    route_payload["blocker"].update(
+        {
+            "kind": "gate_a_projection_invalid",
+            "message": "gate_a_projection_invalid: unmaterialized_failure_class_invalid",
+        }
+    )
+    route_audit = json.loads(route["audit_json"])
+    route_audit.update(
+        {
+            "source": "delivery_contract_verifier",
+            "receipt": {},
+            "contract_errors": ["unknown_blocker_kind"],
+            "taxonomy_audit": {},
+        }
+    )
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE rca_execution_watch SET last_error_code=?, last_status_json=? "
+            "WHERE submission_key=?",
+            (
+                error_code,
+                control_store_module._canonical_json(status),
+                watch["submission_key"],
+            ),
+        )
+        conn.execute(
+            "UPDATE rca_failure_routes SET terminal_error_code=?, audit_json=?, "
+            "route_payload_json=? WHERE route_key=?",
+            (
+                error_code,
+                control_store_module._canonical_json(route_audit),
+                control_store_module._canonical_json(route_payload),
+                route["route_key"],
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _silent_batch_request(batch_id: str = "batch-684") -> ManualRcaTriggerRequest:
     request = _operator_request(
         f"{batch_id}-7041712812-try-1",
@@ -713,6 +797,59 @@ def test_immediate_viz_gap_terminal_rejects_tampered_receipt(tmp_path):
     [watch] = delivery.list_rows("rca_execution_watch")
     status = json.loads(watch["last_status_json"])
     status["failure_taxonomy"]["receipt"]["status"] = "success"
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE rca_execution_watch SET last_status_json=? "
+            "WHERE submission_key=?",
+            (
+                control_store_module._canonical_json(status),
+                watch["submission_key"],
+            ),
+        )
+        conn.commit()
+        [epoch] = conn.execute(
+            "SELECT epoch_id FROM rca_activation_epochs WHERE is_current=1"
+        ).fetchall()
+        inflight = store._direct_steady_current_inflight_tx(
+            conn, epoch_id=str(epoch["epoch_id"])
+        )
+    finally:
+        conn.close()
+
+    assert inflight["execution_delivery"] == 1
+
+
+def test_legacy_gate_a_terminal_drains_activation_with_exact_route(tmp_path):
+    store, _terminal_at = _silent_deadline_terminal_store(tmp_path)
+    _convert_silent_terminal_to_issue_only_operator(store)
+    _convert_silent_terminal_to_legacy_gate_a_gap(store)
+    conn = store._connect()
+    try:
+        [epoch] = conn.execute(
+            "SELECT epoch_id FROM rca_activation_epochs WHERE is_current=1"
+        ).fetchall()
+        inflight = store._direct_steady_current_inflight_tx(
+            conn, epoch_id=str(epoch["epoch_id"])
+        )
+    finally:
+        conn.close()
+
+    assert inflight["execution_delivery"] == 0
+
+
+def test_legacy_gate_a_terminal_rejects_route_source_tamper(tmp_path):
+    store, _terminal_at = _silent_deadline_terminal_store(tmp_path)
+    _convert_silent_terminal_to_issue_only_operator(store)
+    _convert_silent_terminal_to_legacy_gate_a_gap(store)
+    [watch] = RcaDeliveryStore(
+        store.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    ).list_rows("rca_execution_watch")
+    status = json.loads(watch["last_status_json"])
+    status["failure_taxonomy"]["source"] = "untrusted_source"
     conn = store._connect()
     try:
         conn.execute("BEGIN IMMEDIATE")

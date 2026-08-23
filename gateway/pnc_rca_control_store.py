@@ -8096,11 +8096,35 @@ class RcaControlStore:
             and receipt.get("status") == "pipeline_not_successful"
             and str(receipt.get("task_id") or "") == task_id
         )
+        # Older collector releases classified a completed, zero-effect Gate-A
+        # verification failure as a taxonomy gap after the terminal diagnostic
+        # fallback window.  It is safe to drain only this exact legacy shape:
+        # the route is an internal hard-defect alert, the verifier explicitly
+        # rejected an unknown blocker, and no terminal receipt/effect exists.
+        legacy_gate_a_terminal = (
+            taxonomy_gap_code == "gate_a_projection_invalid"
+            and taxonomy.get("known") is False
+            and taxonomy.get("retryable") is False
+            and str(taxonomy.get("raw_code") or "")
+            == "gate_a_projection_invalid"
+            and taxonomy.get("source") == "delivery_contract_verifier"
+            and taxonomy.get("observed_state") == "completed"
+            and taxonomy.get("source_conflict") is False
+            and taxonomy.get("external_comment_policy")
+            == "honest_non_attribution_only"
+            and taxonomy.get("contract_errors") == ["unknown_blocker_kind"]
+            and (
+                receipt is None
+                or (isinstance(receipt, dict) and not receipt)
+            )
+            and (route_kind, lane) == ("internal_alert", "hard_defect")
+        )
         if (
             not (
                 known_terminal
                 or taxonomy_gap_terminal
                 or immediate_taxonomy_gap_terminal
+                or legacy_gate_a_terminal
             )
             or str(taxonomy.get("terminal_error_code") or "") != error_code
             or (route_kind, lane)
@@ -8146,6 +8170,23 @@ class RcaControlStore:
             or not isinstance(fallback.get("elapsed_seconds"), int)
             or isinstance(fallback.get("elapsed_seconds"), bool)
             or int(fallback.get("elapsed_seconds")) < 0
+        ):
+            return False
+        if legacy_gate_a_terminal and (
+            fallback.get("schema_version")
+            != "pnc_rca_bounded_terminal_fallback_v1"
+            or fallback.get("terminal_class") != "honest_non_attribution"
+            or fallback.get("confidence_tier") != "low"
+            or str(durable_route.get("owner") or "") != "rca-engineering"
+            or str(durable_route.get("status") or "") != "alert_pending"
+            or not isinstance(fallback.get("elapsed_seconds"), int)
+            or isinstance(fallback.get("elapsed_seconds"), bool)
+            or int(fallback.get("elapsed_seconds")) < 0
+            or not str(fallback.get("work_started_at") or "")
+            or not str(fallback.get("deadline_at") or "")
+            or taxonomy.get("terminal_fallback_seconds") != 1800
+            or durable_route.get("created") is not False
+            or durable_route.get("remediation_attempt_count") != 0
         ):
             return False
         route = conn.execute(
@@ -8201,6 +8242,29 @@ class RcaControlStore:
                 or blocker.get("blocks_attribution") is not True
                 or audit.get("source") != "rca_service_result"
                 or audit.get("receipt") != receipt
+            ):
+                return False
+        if legacy_gate_a_terminal:
+            decision = payload.get("decision")
+            blocker = payload.get("blocker")
+            if (
+                not isinstance(decision, dict)
+                or not isinstance(blocker, dict)
+                or decision.get("raw_code") != "gate_a_projection_invalid"
+                or decision.get("terminal_error_code") != error_code
+                or decision.get("known") is not False
+                or decision.get("retryable") is not False
+                or decision.get("internal_route") != "internal_alert"
+                or decision.get("lane") != "hard_defect"
+                or decision.get("contract_errors") != ["unknown_blocker_kind"]
+                or blocker.get("kind") != "gate_a_projection_invalid"
+                or not str(blocker.get("message") or "").startswith(
+                    "gate_a_projection_invalid:"
+                )
+                or audit.get("source") != "delivery_contract_verifier"
+                or audit.get("receipt") not in ({}, None)
+                or audit.get("contract_errors") != ["unknown_blocker_kind"]
+                or not isinstance(audit.get("taxonomy_audit"), dict)
             ):
                 return False
         subscriptions = conn.execute(
