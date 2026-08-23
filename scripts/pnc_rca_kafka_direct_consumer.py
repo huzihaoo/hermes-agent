@@ -935,6 +935,35 @@ class DirectOffsetCoordinator:
                 seek(item, resolution.seek_offset)
         return resolutions
 
+    def prime_assignment(
+        self, consumer: Any, partitions: Iterable[Any]
+    ) -> tuple[tuple[str, int, int], ...]:
+        """Set explicit T0 without broker or store reads inside a callback.
+
+        kafka-python invokes synchronous rebalance listeners from its network
+        event loop. Calling ``committed()`` or ``position()`` there re-enters
+        that loop and fails. A local ``seek`` is sufficient to prevent
+        ``auto_offset_reset=none`` from rejecting a fresh group. The main poll
+        loop subsequently performs the full committed/durable/T0 coherence
+        check and discards any batch prefetched before that final seek.
+        """
+
+        seek = getattr(consumer, "seek", None)
+        if not callable(seek):
+            raise OffsetCoherenceError("consumer_seek_unavailable")
+        primed: list[tuple[str, int, int]] = []
+        for item in tuple(partitions):
+            topic = _partition_topic(item, self.topic)
+            if topic != self.topic:
+                raise OffsetCoherenceError("assigned_unexpected_topic")
+            partition = _partition_id(item)
+            offset = self.initial_offsets.get(partition)
+            if offset is None:
+                continue
+            seek(item, offset)
+            primed.append((topic, partition, offset))
+        return tuple(primed)
+
     cohere_assignment = resolve_assignment
 
 
@@ -1018,7 +1047,7 @@ class KafkaPythonConsumerAdapter:
 
             def on_partitions_assigned(self, partitions: Iterable[Any]) -> None:
                 if adapter._coordinator is not None and partitions:
-                    adapter._coordinator.apply_assignment(adapter, partitions)
+                    adapter._coordinator.prime_assignment(adapter, partitions)
 
         return Listener()
 

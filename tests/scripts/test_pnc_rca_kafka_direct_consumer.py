@@ -782,10 +782,10 @@ def test_assignment_listener_seeks_explicit_t0_before_first_fetch(tmp_path: Path
             self.seeks = []
 
         def committed(self, _partition, **_kwargs):
-            return None
+            raise AssertionError("rebalance callback must not query committed offset")
 
         def position(self, _partition):
-            raise RuntimeError("position unavailable before initial seek")
+            raise AssertionError("rebalance callback must not query position")
 
         def seek(self, partition, offset):
             self.seeks.append((partition, offset))
@@ -812,6 +812,39 @@ def test_assignment_listener_seeks_explicit_t0_before_first_fetch(tmp_path: Path
     assert [(item.topic, item.partition, offset) for item, offset in raw.seeks] == [
         (TOPIC, 0, 10)
     ]
+
+
+def test_assignment_listener_without_t0_defers_to_main_poll_loop(tmp_path: Path):
+    class TopicPartition:
+        def __init__(self, topic, partition):
+            self.topic = topic
+            self.partition = partition
+
+    class Raw:
+        def committed(self, _partition, **_kwargs):
+            raise AssertionError("rebalance callback must not query committed offset")
+
+        def position(self, _partition):
+            raise AssertionError("rebalance callback must not query position")
+
+        def seek(self, _partition, _offset):
+            raise AssertionError("no explicit T0 means the callback must not seek")
+
+    adapter = direct.KafkaPythonConsumerAdapter(
+        Raw(),
+        SimpleNamespace(
+            TopicPartition=TopicPartition,
+            ConsumerRebalanceListener=type("ConsumerRebalanceListener", (), {}),
+        ),
+    )
+    coordinator = direct.DirectOffsetCoordinator(
+        MiniStore(tmp_path / "mini.sqlite3"),
+        topic=TOPIC,
+        provider=adapter,
+    )
+    adapter.set_coordinator(coordinator)
+
+    adapter.rebalance_listener().on_partitions_assigned((TopicPartition(TOPIC, 0),))
 
 
 def test_shadow_runner_never_calls_commit(tmp_path: Path, store: MiniStore):
