@@ -1105,6 +1105,25 @@ def test_host_gate_a_projection_replaces_candidate_bearing_contract():
     assert "candidate_owner_domain" not in bundle["delivery_contract"]["report"]
 
 
+def test_host_gate_a_projection_accepts_known_viz_build_abstention():
+    bundle = collector._apply_gate_a_bundle_projection({
+        "delivery_contract": {
+            "summary": {"short_conclusion": "stale"},
+            "report": {},
+        },
+        "gate_a_source": {
+            "input_materialized": False,
+            "materialization_attested": True,
+            "failure_class": "viz_mcap_build_failed",
+            "rca_evaluators": [],
+        },
+    })
+
+    projection = bundle["delivery_contract"]["gate_a_projection"]
+    assert projection["level"] == "L0_abstain"
+    assert projection["abstention"]["failure_class"] == "viz_mcap_build_failed"
+
+
 def test_host_keeps_only_a_trusted_v19_primary_conclusion():
     contract = _trusted_v19_contract()
 

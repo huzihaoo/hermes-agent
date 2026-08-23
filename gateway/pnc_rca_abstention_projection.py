@@ -33,6 +33,9 @@ UNMATERIALIZED_FAILURE_MESSAGES = {
     "remote_read_completeness_not_proven": (
         "当前无法证明远程读取完整；本次未取得可用于归因的分析数据。"
     ),
+    "viz_mcap_build_failed": (
+        "可视化证据构建未完成；本次未取得可用于归因的完整分析证据。"
+    ),
 }
 _MATERIALIZED_ENTRY_FIELDS = ("key", "domain", "pattern", "status")
 MAX_PUBLIC_GATE_A_OBSERVATIONS = 8

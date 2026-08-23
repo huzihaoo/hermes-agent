@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, is_dataclass, replace as dataclass_replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
+import math
 import re
 from typing import Any, Literal
 
@@ -29,6 +30,84 @@ RCA_VM_MAX_JSON_NODES = 50_000
 
 SourceQuality = Literal["full", "partial", "fallback_raw_text", "unavailable"]
 RequestKind = Literal["issue_intake", "status_check"]
+
+
+# Keep this parser deliberately narrow.  It only promotes a timestamp when
+# the issue's explicit occurrence field contains a self-consistent marker and
+# range; otherwise the pipeline must continue to fail closed on missing time.
+_OCCURRENCE_LINE_RE = re.compile(
+    r"(?:【)?发生时间(?:】)?\s*[：:]\s*([^\r\n]+)"
+)
+_OCCURRENCE_PATTERNS = (
+    re.compile(r"(?<!\d)(20\d{12})(?!\d)"),
+    re.compile(
+        r"(?<!\d)(20\d{2})(\d{2})(\d{2})\s*[,，_ ]+"
+        r"(\d{2}):(\d{2}):(\d{2})(?!\d)"
+    ),
+    re.compile(
+        r"(?<!\d)(20\d{2})-(\d{2})-(\d{2})[ T_,]+"
+        r"(\d{2})[:-](\d{2})[:-](\d{2})(?!\d)"
+    ),
+)
+_ASIA_SHANGHAI = timezone(timedelta(hours=8))
+
+
+def _reported_occurrence_context(description: Any) -> dict[str, Any]:
+    """Extract an exact issue marker without guessing from clip metadata."""
+    match = _OCCURRENCE_LINE_RE.search(str(description or ""))
+    if match is None:
+        return {}
+    text = match.group(1)
+    compact = _OCCURRENCE_PATTERNS[0].search(text)
+    explicit = list(_OCCURRENCE_PATTERNS[2].finditer(text))
+    if compact is not None and len(explicit) >= 2:
+        try:
+            marker = datetime.strptime(compact.group(1), "%Y%m%d%H%M%S")
+            local_range = [
+                datetime(*(int(value) for value in found.groups()))
+                .replace(tzinfo=_ASIA_SHANGHAI)
+                .timestamp()
+                for found in explicit
+            ]
+        except (TypeError, ValueError, OverflowError):
+            local_range = []
+        if local_range:
+            lower = min(local_range)
+            upper = max(local_range)
+            marker_as_local = marker.replace(tzinfo=_ASIA_SHANGHAI).timestamp()
+            marker_as_utc = marker.replace(tzinfo=timezone.utc).timestamp()
+            for value, source in (
+                (marker_as_local, "description_occurrence_time_asia_shanghai"),
+                (
+                    marker_as_utc,
+                    "description_occurrence_time_utc_marker_aligned_to_local_range",
+                ),
+            ):
+                if lower - 120.0 <= value <= upper + 120.0 and math.isfinite(value):
+                    return {"issue_time_s": value, "issue_time_source": source}
+        return {}
+
+    for index, pattern in enumerate(_OCCURRENCE_PATTERNS):
+        found = pattern.search(text)
+        if found is None:
+            continue
+        try:
+            if index == 0:
+                parsed = datetime.strptime(found.group(1), "%Y%m%d%H%M%S")
+            else:
+                parsed = datetime(*(int(value) for value in found.groups()))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        # The common midnight value is a date-only placeholder in issue forms.
+        if parsed.hour == parsed.minute == parsed.second == 0:
+            return {}
+        issue_time_s = parsed.replace(tzinfo=_ASIA_SHANGHAI).timestamp()
+        if math.isfinite(issue_time_s):
+            return {
+                "issue_time_s": issue_time_s,
+                "issue_time_source": "description_occurrence_time_asia_shanghai",
+            }
+    return {}
 
 
 @dataclass(frozen=True)
@@ -472,6 +551,7 @@ def build_execution_request(
         "function_domain": issue_context.function_domain,
         "project_label": issue_context.project_label,
     }
+    case.update(_reported_occurrence_context(issue_context.description_markdown))
     execution_policy = {
         "mode": (
             "remote_read"

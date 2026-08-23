@@ -216,6 +216,47 @@ def test_issue_context_carries_canonical_frame_lookup_into_execution_request():
     assert to_dict(request)["case"]["frame_lookup"] == frame_lookup
 
 
+def test_build_execution_request_promotes_compound_occurrence_time():
+    context = RcaIssueContext(
+        work_item_id="7068819154",
+        pdcl_download_cmd="mdi download event -u demo -s ./",
+        description_markdown=(
+            "【发生时间】：20260728112713_2026-07-28_11-26-43_"
+            "2026-07-28_11-28-33"
+        ),
+        source_quality="partial",
+    )
+
+    payload = to_dict(build_execution_request(
+        request_kind="issue_intake",
+        task_id="g1q3_rca_issue_intake_7068819154",
+        issue_context=context,
+    ))
+
+    assert payload["case"]["issue_time_s"] == 1785209233.0
+    assert payload["case"]["issue_time_source"] == (
+        "description_occurrence_time_asia_shanghai"
+    )
+
+
+def test_build_execution_request_rejects_midnight_occurrence_placeholder():
+    context = RcaIssueContext(
+        work_item_id="7068819154",
+        pdcl_download_cmd="mdi download event -u demo -s ./",
+        description_markdown="【发生时间】：2026-07-28 00:00:00",
+        source_quality="partial",
+    )
+
+    payload = to_dict(build_execution_request(
+        request_kind="issue_intake",
+        task_id="g1q3_rca_issue_intake_7068819154_midnight",
+        issue_context=context,
+    ))
+
+    assert "issue_time_s" not in payload["case"]
+    assert "issue_time_source" not in payload["case"]
+
+
 def test_unavailable_issue_context_gets_structured_blocker():
     ctx = issue_context_from_compact_text(project_key="t03o4q", work_item_id="7008267126", compact_text="")
 
