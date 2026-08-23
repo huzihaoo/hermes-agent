@@ -8119,12 +8119,28 @@ class RcaControlStore:
             )
             and (route_kind, lane) == ("internal_alert", "hard_defect")
         )
+        legacy_execution_identity_terminal = (
+            taxonomy_gap_code == "execution_identity_readback_unavailable"
+            and taxonomy.get("known") is False
+            and taxonomy.get("retryable") is False
+            and str(taxonomy.get("raw_code") or "")
+            == "execution_identity_readback_unavailable"
+            and taxonomy.get("source") == "delivery_contract_verifier"
+            and taxonomy.get("observed_state") == "completed"
+            and taxonomy.get("source_conflict") is False
+            and taxonomy.get("external_comment_policy")
+            == "honest_non_attribution_only"
+            and taxonomy.get("contract_errors") == ["unknown_blocker_kind"]
+            and receipt == {}
+            and (route_kind, lane) == ("internal_alert", "hard_defect")
+        )
         if (
             not (
                 known_terminal
                 or taxonomy_gap_terminal
                 or immediate_taxonomy_gap_terminal
                 or legacy_gate_a_terminal
+                or legacy_execution_identity_terminal
             )
             or str(taxonomy.get("terminal_error_code") or "") != error_code
             or (route_kind, lane)
@@ -8173,6 +8189,23 @@ class RcaControlStore:
         ):
             return False
         if legacy_gate_a_terminal and (
+            fallback.get("schema_version")
+            != "pnc_rca_bounded_terminal_fallback_v1"
+            or fallback.get("terminal_class") != "honest_non_attribution"
+            or fallback.get("confidence_tier") != "low"
+            or str(durable_route.get("owner") or "") != "rca-engineering"
+            or str(durable_route.get("status") or "") != "alert_pending"
+            or not isinstance(fallback.get("elapsed_seconds"), int)
+            or isinstance(fallback.get("elapsed_seconds"), bool)
+            or int(fallback.get("elapsed_seconds")) < 0
+            or not str(fallback.get("work_started_at") or "")
+            or not str(fallback.get("deadline_at") or "")
+            or taxonomy.get("terminal_fallback_seconds") != 1800
+            or durable_route.get("created") is not False
+            or durable_route.get("remediation_attempt_count") != 0
+        ):
+            return False
+        if legacy_execution_identity_terminal and (
             fallback.get("schema_version")
             != "pnc_rca_bounded_terminal_fallback_v1"
             or fallback.get("terminal_class") != "honest_non_attribution"
@@ -8263,6 +8296,31 @@ class RcaControlStore:
                 )
                 or audit.get("source") != "delivery_contract_verifier"
                 or audit.get("receipt") not in ({}, None)
+                or audit.get("contract_errors") != ["unknown_blocker_kind"]
+                or not isinstance(audit.get("taxonomy_audit"), dict)
+            ):
+                return False
+        if legacy_execution_identity_terminal:
+            decision = payload.get("decision")
+            blocker = payload.get("blocker")
+            if (
+                not isinstance(decision, dict)
+                or not isinstance(blocker, dict)
+                or decision.get("raw_code")
+                != "execution_identity_readback_unavailable"
+                or decision.get("terminal_error_code") != error_code
+                or decision.get("known") is not False
+                or decision.get("retryable") is not False
+                or decision.get("internal_route") != "internal_alert"
+                or decision.get("lane") != "hard_defect"
+                or decision.get("contract_errors") != ["unknown_blocker_kind"]
+                or blocker.get("kind")
+                != "execution_identity_readback_unavailable"
+                or not str(blocker.get("message") or "").startswith(
+                    "execution_identity_readback_unavailable:"
+                )
+                or audit.get("source") != "delivery_contract_verifier"
+                or audit.get("receipt") != {}
                 or audit.get("contract_errors") != ["unknown_blocker_kind"]
                 or not isinstance(audit.get("taxonomy_audit"), dict)
             ):

@@ -502,6 +502,89 @@ def _convert_silent_terminal_to_legacy_gate_a_gap(
         conn.close()
 
 
+def _convert_silent_terminal_to_legacy_execution_identity_gap(
+    store: RcaControlStore,
+) -> None:
+    """Build the exact legacy execution-identity verifier terminal shape."""
+    delivery = RcaDeliveryStore(
+        store.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    [watch] = delivery.list_rows("rca_execution_watch")
+    [route] = delivery.list_rows("rca_failure_routes")
+    status = json.loads(watch["last_status_json"])
+    taxonomy = status["failure_taxonomy"]
+    error_code = "taxonomy_gap:execution_identity_readback_unavailable"
+    taxonomy.update(
+        {
+            "known": False,
+            "retryable": False,
+            "raw_code": "execution_identity_readback_unavailable",
+            "terminal_error_code": error_code,
+            "source": "delivery_contract_verifier",
+            "observed_state": "completed",
+            "source_conflict": False,
+            "external_comment_policy": "honest_non_attribution_only",
+            "contract_errors": ["unknown_blocker_kind"],
+            "receipt": {},
+        }
+    )
+    route_payload = json.loads(route["route_payload_json"])
+    route_payload["decision"].update(
+        {
+            "raw_code": "execution_identity_readback_unavailable",
+            "terminal_error_code": error_code,
+            "known": False,
+            "retryable": False,
+            "internal_route": "internal_alert",
+            "lane": "hard_defect",
+            "contract_errors": ["unknown_blocker_kind"],
+        }
+    )
+    route_payload["blocker"].update(
+        {
+            "kind": "execution_identity_readback_unavailable",
+            "message": "execution_identity_readback_unavailable: legacy verifier receipt absent",
+            "blocks_attribution": True,
+        }
+    )
+    route_audit = json.loads(route["audit_json"])
+    route_audit.update(
+        {
+            "source": "delivery_contract_verifier",
+            "receipt": {},
+            "contract_errors": ["unknown_blocker_kind"],
+            "taxonomy_audit": {},
+        }
+    )
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE rca_execution_watch SET last_error_code=?, last_status_json=? "
+            "WHERE submission_key=?",
+            (
+                error_code,
+                control_store_module._canonical_json(status),
+                watch["submission_key"],
+            ),
+        )
+        conn.execute(
+            "UPDATE rca_failure_routes SET terminal_error_code=?, audit_json=?, "
+            "route_payload_json=? WHERE route_key=?",
+            (
+                error_code,
+                control_store_module._canonical_json(route_audit),
+                control_store_module._canonical_json(route_payload),
+                route["route_key"],
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _silent_batch_request(batch_id: str = "batch-684") -> ManualRcaTriggerRequest:
     request = _operator_request(
         f"{batch_id}-7041712812-try-1",
@@ -862,6 +945,87 @@ def test_legacy_gate_a_terminal_rejects_route_source_tamper(tmp_path):
             ),
         )
         conn.commit()
+        [epoch] = conn.execute(
+            "SELECT epoch_id FROM rca_activation_epochs WHERE is_current=1"
+        ).fetchall()
+        inflight = store._direct_steady_current_inflight_tx(
+            conn, epoch_id=str(epoch["epoch_id"])
+        )
+    finally:
+        conn.close()
+
+    assert inflight["execution_delivery"] == 1
+
+
+def test_legacy_execution_identity_terminal_drains_activation_with_exact_route(
+    tmp_path,
+):
+    store, _terminal_at = _silent_deadline_terminal_store(tmp_path)
+    _convert_silent_terminal_to_issue_only_operator(store)
+    _convert_silent_terminal_to_legacy_execution_identity_gap(store)
+    conn = store._connect()
+    try:
+        [epoch] = conn.execute(
+            "SELECT epoch_id FROM rca_activation_epochs WHERE is_current=1"
+        ).fetchall()
+        inflight = store._direct_steady_current_inflight_tx(
+            conn, epoch_id=str(epoch["epoch_id"])
+        )
+    finally:
+        conn.close()
+
+    assert inflight["execution_delivery"] == 0
+
+
+def _tamper_legacy_execution_identity_taxonomy(
+    store: RcaControlStore,
+    field: str,
+    value,
+) -> None:
+    delivery = RcaDeliveryStore(
+        store.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    [watch] = delivery.list_rows("rca_execution_watch")
+    status = json.loads(watch["last_status_json"])
+    status["failure_taxonomy"][field] = value
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE rca_execution_watch SET last_status_json=? "
+            "WHERE submission_key=?",
+            (
+                control_store_module._canonical_json(status),
+                watch["submission_key"],
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("raw_code", "unknown_execution_identity_code"),
+        ("source", "untrusted_source"),
+        ("internal_route", "internal_backlog"),
+        ("lane", "needs_human_input"),
+        ("receipt", {"status": "success"}),
+        ("contract_errors", []),
+    ],
+)
+def test_legacy_execution_identity_terminal_rejects_tampered_envelope(
+    tmp_path, field, value
+):
+    store, _terminal_at = _silent_deadline_terminal_store(tmp_path)
+    _convert_silent_terminal_to_issue_only_operator(store)
+    _convert_silent_terminal_to_legacy_execution_identity_gap(store)
+    _tamper_legacy_execution_identity_taxonomy(store, field, value)
+    conn = store._connect()
+    try:
         [epoch] = conn.execute(
             "SELECT epoch_id FROM rca_activation_epochs WHERE is_current=1"
         ).fetchall()
