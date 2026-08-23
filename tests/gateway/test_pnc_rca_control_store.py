@@ -338,6 +338,86 @@ def _convert_silent_terminal_to_issue_only_operator(
         conn.close()
 
 
+def _convert_silent_terminal_to_immediate_viz_gap(
+    store: RcaControlStore,
+) -> None:
+    """Build the exact immediate service-result gap contract for the predicate."""
+    delivery = RcaDeliveryStore(
+        store.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    [watch] = delivery.list_rows("rca_execution_watch")
+    [route] = delivery.list_rows("rca_failure_routes")
+    status = json.loads(watch["last_status_json"])
+    taxonomy = status["failure_taxonomy"]
+    error_code = "taxonomy_gap:viz_evidence_unavailable"
+    receipt = {
+        "schema_version": "g1q3_rca_service_result_v2",
+        "pipeline_stage": "s6_report",
+        "pipeline_status": "blocked",
+        "status": "pipeline_not_successful",
+        "task_id": watch["task_id"],
+    }
+    taxonomy.update(
+        {
+            "known": False,
+            "retryable": False,
+            "raw_code": "viz_evidence_unavailable",
+            "terminal_error_code": error_code,
+            "source": "rca_service_result",
+            "observed_state": "failed",
+            "source_conflict": False,
+            "external_comment_policy": "honest_non_attribution_only",
+            "receipt": receipt,
+        }
+    )
+    route_payload = json.loads(route["route_payload_json"])
+    route_payload["decision"].update(
+        {
+            "raw_code": "viz_evidence_unavailable",
+            "terminal_error_code": error_code,
+            "known": False,
+            "retryable": False,
+            "internal_route": "internal_alert",
+            "lane": "hard_defect",
+        }
+    )
+    route_payload["blocker"].update(
+        {
+            "kind": "viz_evidence_unavailable",
+            "blocks_attribution": True,
+        }
+    )
+    route_audit = json.loads(route["audit_json"])
+    route_audit.update({"source": "rca_service_result", "receipt": receipt})
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE rca_execution_watch SET last_error_code=?, last_status_json=? "
+            "WHERE submission_key=?",
+            (
+                error_code,
+                control_store_module._canonical_json(status),
+                watch["submission_key"],
+            ),
+        )
+        conn.execute(
+            "UPDATE rca_failure_routes SET terminal_error_code=?, audit_json=?, "
+            "route_payload_json=? WHERE route_key=?",
+            (
+                error_code,
+                control_store_module._canonical_json(route_audit),
+                control_store_module._canonical_json(route_payload),
+                route["route_key"],
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _silent_batch_request(batch_id: str = "batch-684") -> ManualRcaTriggerRequest:
     request = _operator_request(
         f"{batch_id}-7041712812-try-1",
@@ -556,6 +636,105 @@ def test_issue_only_operator_silent_terminal_drains_activation(tmp_path):
         conn.close()
 
     assert inflight["execution_delivery"] == 0
+
+
+def test_issue_only_kafka_silent_terminal_drains_activation(tmp_path):
+    store, _terminal_at = _silent_deadline_terminal_store(tmp_path)
+    [source] = store.list_rows("rca_trigger_sources")
+    [subscription] = store.list_rows("rca_delivery_subscriptions")
+    assert source["source_kind"] == "kafka_workflow_event"
+    assert subscription["effect_kind"] == "feishu_issue_comment"
+
+    conn = store._connect()
+    try:
+        [epoch] = conn.execute(
+            "SELECT epoch_id FROM rca_activation_epochs WHERE is_current=1"
+        ).fetchall()
+        inflight = store._direct_steady_current_inflight_tx(
+            conn, epoch_id=str(epoch["epoch_id"])
+        )
+    finally:
+        conn.close()
+
+    assert inflight["execution_delivery"] == 0
+
+
+def test_kafka_issue_only_shape_rejects_non_kafka_source(tmp_path):
+    store, _terminal_at = _silent_deadline_terminal_store(tmp_path)
+    [source] = store.list_rows("rca_trigger_sources")
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE rca_trigger_sources SET source_kind='feishu_group_manual' "
+            "WHERE source_id=?",
+            (source["source_id"],),
+        )
+        conn.commit()
+        [epoch] = conn.execute(
+            "SELECT epoch_id FROM rca_activation_epochs WHERE is_current=1"
+        ).fetchall()
+        inflight = store._direct_steady_current_inflight_tx(
+            conn, epoch_id=str(epoch["epoch_id"])
+        )
+    finally:
+        conn.close()
+
+    assert inflight["execution_delivery"] == 1
+
+
+def test_immediate_viz_gap_terminal_drains_activation_with_exact_receipt(tmp_path):
+    store, _terminal_at = _silent_deadline_terminal_store(tmp_path)
+    _convert_silent_terminal_to_issue_only_operator(store)
+    _convert_silent_terminal_to_immediate_viz_gap(store)
+    conn = store._connect()
+    try:
+        [epoch] = conn.execute(
+            "SELECT epoch_id FROM rca_activation_epochs WHERE is_current=1"
+        ).fetchall()
+        inflight = store._direct_steady_current_inflight_tx(
+            conn, epoch_id=str(epoch["epoch_id"])
+        )
+    finally:
+        conn.close()
+
+    assert inflight["execution_delivery"] == 0
+
+
+def test_immediate_viz_gap_terminal_rejects_tampered_receipt(tmp_path):
+    store, _terminal_at = _silent_deadline_terminal_store(tmp_path)
+    _convert_silent_terminal_to_issue_only_operator(store)
+    _convert_silent_terminal_to_immediate_viz_gap(store)
+    delivery = RcaDeliveryStore(
+        store.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    [watch] = delivery.list_rows("rca_execution_watch")
+    status = json.loads(watch["last_status_json"])
+    status["failure_taxonomy"]["receipt"]["status"] = "success"
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "UPDATE rca_execution_watch SET last_status_json=? "
+            "WHERE submission_key=?",
+            (
+                control_store_module._canonical_json(status),
+                watch["submission_key"],
+            ),
+        )
+        conn.commit()
+        [epoch] = conn.execute(
+            "SELECT epoch_id FROM rca_activation_epochs WHERE is_current=1"
+        ).fetchall()
+        inflight = store._direct_steady_current_inflight_tx(
+            conn, epoch_id=str(epoch["epoch_id"])
+        )
+    finally:
+        conn.close()
+
+    assert inflight["execution_delivery"] == 1
 
 
 def test_operator_silent_terminal_rerun_rejects_tampered_authority_without_mutation(

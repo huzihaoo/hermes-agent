@@ -430,6 +430,14 @@ _SILENT_TERMINAL_ROUTE_LANES = frozenset(
         ("internal_backlog", "needs_human_input"),
     }
 )
+_ACTIVATION_IMMEDIATE_TAXONOMY_GAP_CODES = frozenset(
+    {
+        # The collector deliberately terminalizes this evidence failure
+        # immediately.  Keep its activation exception narrower than the
+        # deadline-based taxonomy-gap contract below.
+        "viz_evidence_unavailable",
+    }
+)
 _ACTIVATION_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ACTIVATION_EPOCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _CONTROL_STORE_INSTALLATION_MARKERS = (
@@ -8046,6 +8054,7 @@ class RcaControlStore:
         lane = str(taxonomy.get("lane") or "")
         durable_route = taxonomy.get("durable_route")
         fallback = taxonomy.get("terminal_fallback")
+        receipt = taxonomy.get("receipt")
         taxonomy_gap_prefix = "taxonomy_gap:"
         taxonomy_gap_code = (
             error_code[len(taxonomy_gap_prefix) :]
@@ -8069,8 +8078,30 @@ class RcaControlStore:
             == "honest_non_attribution_only"
             and (route_kind, lane) == ("internal_alert", "hard_defect")
         )
+        immediate_taxonomy_gap_terminal = (
+            taxonomy_gap_code in _ACTIVATION_IMMEDIATE_TAXONOMY_GAP_CODES
+            and taxonomy.get("known") is False
+            and taxonomy.get("retryable") is False
+            and str(taxonomy.get("raw_code") or "") == taxonomy_gap_code
+            and taxonomy.get("source") == "rca_service_result"
+            and taxonomy.get("observed_state") == "failed"
+            and taxonomy.get("source_conflict") is False
+            and taxonomy.get("external_comment_policy")
+            == "honest_non_attribution_only"
+            and (route_kind, lane) == ("internal_alert", "hard_defect")
+            and isinstance(receipt, dict)
+            and receipt.get("schema_version") == "g1q3_rca_service_result_v2"
+            and receipt.get("pipeline_stage") == "s6_report"
+            and receipt.get("pipeline_status") == "blocked"
+            and receipt.get("status") == "pipeline_not_successful"
+            and str(receipt.get("task_id") or "") == task_id
+        )
         if (
-            not (known_terminal or taxonomy_gap_terminal)
+            not (
+                known_terminal
+                or taxonomy_gap_terminal
+                or immediate_taxonomy_gap_terminal
+            )
             or str(taxonomy.get("terminal_error_code") or "") != error_code
             or (route_kind, lane)
             not in _SILENT_TERMINAL_ROUTE_LANES
@@ -8103,6 +8134,18 @@ class RcaControlStore:
             or fallback.get("confidence_tier") != "low"
             or str(durable_route.get("owner") or "") != "rca-engineering"
             or str(durable_route.get("status") or "") != "alert_pending"
+        ):
+            return False
+        if immediate_taxonomy_gap_terminal and (
+            fallback.get("schema_version")
+            != "pnc_rca_bounded_terminal_fallback_v1"
+            or fallback.get("terminal_class") != "honest_non_attribution"
+            or fallback.get("confidence_tier") != "low"
+            or str(durable_route.get("owner") or "") != "rca-engineering"
+            or str(durable_route.get("status") or "") != "alert_pending"
+            or not isinstance(fallback.get("elapsed_seconds"), int)
+            or isinstance(fallback.get("elapsed_seconds"), bool)
+            or int(fallback.get("elapsed_seconds")) < 0
         ):
             return False
         route = conn.execute(
@@ -8142,6 +8185,24 @@ class RcaControlStore:
             != "pnc_rca_failure_route_payload_v1"
         ):
             return False
+        if immediate_taxonomy_gap_terminal:
+            decision = payload.get("decision")
+            blocker = payload.get("blocker")
+            if (
+                not isinstance(decision, dict)
+                or not isinstance(blocker, dict)
+                or decision.get("raw_code") != taxonomy_gap_code
+                or decision.get("terminal_error_code") != error_code
+                or decision.get("known") is not False
+                or decision.get("retryable") is not False
+                or decision.get("internal_route") != "internal_alert"
+                or decision.get("lane") != "hard_defect"
+                or blocker.get("kind") != taxonomy_gap_code
+                or blocker.get("blocks_attribution") is not True
+                or audit.get("source") != "rca_service_result"
+                or audit.get("receipt") != receipt
+            ):
+                return False
         subscriptions = conn.execute(
             """
             SELECT effect_kind, required, status, delivery_id, effect_key,
@@ -8157,7 +8218,9 @@ class RcaControlStore:
         }
         trigger_source = conn.execute(
             """
-            SELECT source.platform, source.chat_id, source.thread_id
+            SELECT source.source_kind, source.platform, source.chat_id,
+                   source.thread_id, source.requester_id, source.mode,
+                   source.outcome
               FROM business_triggers AS trigger
               JOIN rca_trigger_sources AS source
                 ON source.source_id = trigger.origin_source_id
@@ -8174,6 +8237,17 @@ class RcaControlStore:
             and not str(trigger_source["chat_id"] or "")
             and not str(trigger_source["thread_id"] or "")
         )
+        issue_only_kafka = bool(
+            trigger_source is not None
+            and str(trigger_source["source_kind"] or "")
+            == "kafka_workflow_event"
+            and not str(trigger_source["platform"] or "")
+            and not str(trigger_source["chat_id"] or "")
+            and not str(trigger_source["thread_id"] or "")
+            and not str(trigger_source["requester_id"] or "")
+            and str(trigger_source["mode"] or "") == "issue_created"
+            and not str(trigger_source["outcome"] or "")
+        )
         if taxonomy_gap_terminal:
             valid_subscription_shape = (
                 len(subscriptions) in {1, 2}
@@ -8183,7 +8257,7 @@ class RcaControlStore:
                     {"feishu_issue_comment", "feishu_thread_reply"}
                 )
             )
-        elif issue_only_operator:
+        elif issue_only_operator or issue_only_kafka:
             valid_subscription_shape = (
                 len(subscriptions) == 1
                 and subscription_kinds == {"feishu_issue_comment"}
