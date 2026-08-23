@@ -28,8 +28,8 @@
     "local.pnc.safe-worktree-remove": {
       "target_kind": "governance_tool",
       "relative_path": "hermes_safe_worktree_remove.py",
-      "sha256": "d4a49ac02f072cb85b974203437614a7548ddc09252b5b37728db7445f38a051",
-      "size": 9427
+      "sha256": "3865ac20b104664fe6e8e6aa20c5509f44edabe95f896770ed66ade993104483",
+      "size": 14702
     },
     "local.pnc.task-dashboard.viewer": {
       "target_kind": "runtime_file",
