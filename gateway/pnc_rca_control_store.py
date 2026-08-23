@@ -8131,7 +8131,7 @@ class RcaControlStore:
             and taxonomy.get("external_comment_policy")
             == "honest_non_attribution_only"
             and taxonomy.get("contract_errors") == ["unknown_blocker_kind"]
-            and receipt == {}
+            and (receipt is None or receipt == {})
             and (route_kind, lane) == ("internal_alert", "hard_defect")
         )
         if (

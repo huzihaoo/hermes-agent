@@ -504,6 +504,8 @@ def _convert_silent_terminal_to_legacy_gate_a_gap(
 
 def _convert_silent_terminal_to_legacy_execution_identity_gap(
     store: RcaControlStore,
+    *,
+    receipt_value=None,
 ) -> None:
     """Build the exact legacy execution-identity verifier terminal shape."""
     delivery = RcaDeliveryStore(
@@ -527,7 +529,7 @@ def _convert_silent_terminal_to_legacy_execution_identity_gap(
             "source_conflict": False,
             "external_comment_policy": "honest_non_attribution_only",
             "contract_errors": ["unknown_blocker_kind"],
-            "receipt": {},
+            "receipt": receipt_value,
         }
     )
     route_payload = json.loads(route["route_payload_json"])
@@ -957,12 +959,15 @@ def test_legacy_gate_a_terminal_rejects_route_source_tamper(tmp_path):
     assert inflight["execution_delivery"] == 1
 
 
+@pytest.mark.parametrize("receipt_value", [None, {}], ids=["missing", "empty"])
 def test_legacy_execution_identity_terminal_drains_activation_with_exact_route(
-    tmp_path,
+    tmp_path, receipt_value
 ):
     store, _terminal_at = _silent_deadline_terminal_store(tmp_path)
     _convert_silent_terminal_to_issue_only_operator(store)
-    _convert_silent_terminal_to_legacy_execution_identity_gap(store)
+    _convert_silent_terminal_to_legacy_execution_identity_gap(
+        store, receipt_value=receipt_value
+    )
     conn = store._connect()
     try:
         [epoch] = conn.execute(
