@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 import plistlib
 
+from dotenv import dotenv_values
 import pytest
 
 from gateway.pnc_rca_mini_store import MiniOutboxClaim
+from scripts import pnc_rca_kafka_direct_consumer as direct_consumer
 from scripts import pnc_rca_mini_outbox_dispatcher as dispatcher
 
 
@@ -323,9 +324,46 @@ def test_plists_are_direct_secret_free_and_shadow_is_not_packaged():
 def test_env_example_has_explicit_safe_off_and_no_secrets():
     path = REPO_ROOT / "assets/pnc_rca_direct.env.example"
     text = path.read_text(encoding="utf-8")
+    values = dotenv_values(path)
+    required_consumer = {
+        "HERMES_RCA_DIRECT_KAFKA_BOOTSTRAP_SERVERS",
+        "HERMES_RCA_DIRECT_KAFKA_TOPIC",
+        "HERMES_RCA_DIRECT_KAFKA_GROUP_ID",
+        "HERMES_RCA_DIRECT_KAFKA_SECURITY_PROTOCOL",
+        "HERMES_RCA_DIRECT_KAFKA_SASL_MECHANISM",
+        "HERMES_RCA_DIRECT_KAFKA_SASL_USERNAME",
+        "HERMES_RCA_DIRECT_KAFKA_SASL_PASSWORD",
+        "HERMES_RCA_DIRECT_KAFKA_POLICY_JSON",
+        "HERMES_RCA_DIRECT_KAFKA_COMMIT_ENABLED",
+        "HERMES_RCA_DIRECT_KAFKA_DB_PATH",
+        "HERMES_RCA_DIRECT_KAFKA_HEALTH_PATH",
+    }
+    assert required_consumer <= values.keys()
+    assert values["HERMES_RCA_DIRECT_KAFKA_DB_PATH"].endswith(
+        "/feishu_issue_kafka_rca_direct/mini.sqlite3"
+    )
+    assert values["HERMES_RCA_DIRECT_KAFKA_HEALTH_PATH"].endswith(
+        "/feishu_issue_kafka_rca_direct/consumer_health.json"
+    )
+    assert values["HERMES_RCA_DIRECT_KAFKA_SASL_USERNAME"] in {None, ""}
+    assert values["HERMES_RCA_DIRECT_KAFKA_SASL_PASSWORD"] in {None, ""}
+    assert values["HERMES_RCA_DIRECT_KAFKA_COMMIT_ENABLED"] == "false"
+    with pytest.raises(ValueError, match="SASL credentials"):
+        credential_probe = dict(values)
+        credential_probe["HERMES_RCA_DIRECT_KAFKA_COMMIT_ENABLED"] = "true"
+        direct_consumer.DirectKafkaConfig.from_env(credential_probe)
+    with pytest.raises(ValueError, match="SASL credentials"):
+        direct_consumer.DirectKafkaConfig.from_env(values)
+    commit_probe = dict(values)
+    commit_probe["HERMES_RCA_DIRECT_KAFKA_SASL_USERNAME"] = "example-user"
+    commit_probe["HERMES_RCA_DIRECT_KAFKA_SASL_PASSWORD"] = "example-password"
+    with pytest.raises(ValueError, match="shadow mode"):
+        direct_consumer.DirectKafkaConfig.from_env(commit_probe)
     assert "HERMES_RCA_DIRECT_OUTBOX_ENABLED=false" in text
     assert "HERMES_RCA_DIRECT_OUTBOX_SUBMIT_ENABLED=false" in text
     assert "HERMES_RCA_DIRECT_KAFKA_GROUP_ID=rca_direct_path" in text
-    assert "PASSWORD=" not in text.upper()
-    assert "SECRET=" not in text.upper()
-    assert "TOKEN=" not in text.upper()
+    assert "HERMES_RCA_DIRECT_OUTBOX_DB_PATH=" in text
+    assert "HERMES_RCA_DIRECT_OUTBOX_HEALTH_PATH=" in text
+    for key, value in values.items():
+        if any(marker in key.upper() for marker in ("PASSWORD", "SECRET", "TOKEN")):
+            assert value in {None, ""}, key
