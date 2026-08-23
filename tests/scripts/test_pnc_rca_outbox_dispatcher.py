@@ -242,6 +242,36 @@ def test_config_does_not_require_or_project_legacy_release_identity(tmp_path):
     assert "storage_reservation_enabled" not in public
 
 
+def test_target_submission_key_is_exposed_only_as_an_explicit_config_binding(
+    tmp_path,
+):
+    key = "g1q3-rca-s1-" + "a" * 64
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path), hermes_home=tmp_path
+    )
+    targeted = replace(config, only_submission_key=key)
+
+    assert targeted.public_dict()["only_submission_key"] == key
+    assert config.public_dict()["only_submission_key"] is None
+
+
+def test_target_submission_key_requires_once(monkeypatch, tmp_path, capsys):
+    key = "g1q3-rca-s1-" + "b" * 64
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path), hermes_home=tmp_path
+    )
+    monkeypatch.setattr(dispatcher, "load_dispatcher_environment", lambda _path: None)
+    monkeypatch.setattr(
+        dispatcher.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+
+    assert dispatcher.main(["--only-submission-key", key]) == 2
+    error = json.loads(capsys.readouterr().err)
+    assert error["message"] == "outbox_target_requires_once_and_valid_key"
+
+
 def test_config_exposes_strict_activation_required(tmp_path):
     env = _config_env(tmp_path)
     env["HERMES_RCA_OUTBOX_ACTIVATION_REQUIRED"] = "true"

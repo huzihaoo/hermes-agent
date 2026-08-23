@@ -16194,6 +16194,7 @@ class RcaControlStore:
         lease_owner: str,
         lease_seconds: int = 180,
         max_age_seconds: int = 86_400,
+        submission_key: str | None = None,
         now: datetime | None = None,
     ) -> OutboxClaim | None:
         """Atomically claim one due pending row or recover one expired lease.
@@ -16209,6 +16210,15 @@ class RcaControlStore:
             raise ValueError("lease_seconds must be positive")
         if max_age_seconds < 1:
             raise ValueError("max_age_seconds must be positive")
+        target_submission_key = None
+        if submission_key is not None:
+            target_submission_key = str(submission_key).strip()
+            if (
+                not target_submission_key
+                or len(target_submission_key) > 256
+                or any(ord(char) < 0x21 for char in target_submission_key)
+            ):
+                raise ValueError("submission_key filter is invalid")
         current = _utc_datetime(now)
         now_iso = _iso(current)
         expires_at = _iso(current + timedelta(seconds=lease_seconds))
@@ -16221,11 +16231,18 @@ class RcaControlStore:
             activation_predicate, activation_parameters = (
                 self._activation_claim_predicate_tx(conn)
             )
+            target_clause = (
+                " AND o.submission_key = ?" if target_submission_key else ""
+            )
+            target_parameters = (
+                (target_submission_key,) if target_submission_key else ()
+            )
             expired_rows = conn.execute(
                 f"""
                 SELECT o.outbox_id, o.business_key, o.generation
                   FROM rca_outbox AS o
                  WHERE ({activation_predicate})
+                   {target_clause}
                    AND COALESCE(o.retry_window_started_at, o.created_at) <= ?
                    AND (
                         o.status = 'pending'
@@ -16236,7 +16253,7 @@ class RcaControlStore:
                         )
                    )
                 """,
-                (*activation_parameters, cutoff, now_iso),
+                (*activation_parameters, *target_parameters, cutoff, now_iso),
             ).fetchall()
             if expired_rows:
                 expired_ids = [int(row["outbox_id"]) for row in expired_rows]
@@ -16289,6 +16306,7 @@ class RcaControlStore:
                 SELECT o.*
                   FROM rca_outbox AS o
                  WHERE ({activation_predicate})
+                   {target_clause}
                    AND ((
                         o.status = 'pending'
                         AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?)
@@ -16305,7 +16323,7 @@ class RcaControlStore:
                           ), outbox_id
                  LIMIT 1
                 """,
-                (*activation_parameters, now_iso, now_iso),
+                (*activation_parameters, *target_parameters, now_iso, now_iso),
             ).fetchone()
             if row is None:
                 conn.commit()
@@ -16318,6 +16336,7 @@ class RcaControlStore:
                        fence = fence + 1, lease_token = ?, lease_owner = ?,
                        lease_expires_at = ?, claimed_at = ?, updated_at = ?
                  WHERE outbox_id = ?
+                   AND (? IS NULL OR submission_key = ?)
                    AND (
                         (status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
                         OR (
@@ -16334,6 +16353,8 @@ class RcaControlStore:
                     now_iso,
                     now_iso,
                     row["outbox_id"],
+                    target_submission_key,
+                    target_submission_key,
                     now_iso,
                     now_iso,
                 ),
@@ -16770,11 +16791,21 @@ class RcaControlStore:
         self,
         *,
         limit: int = 20,
+        submission_key: str | None = None,
         now: datetime | None = None,
     ) -> list[dict[str, Any]]:
         """Read due rows without claiming or mutating them (used by dry-run)."""
         if limit < 1:
             return []
+        target_submission_key = None
+        if submission_key is not None:
+            target_submission_key = str(submission_key).strip()
+            if (
+                not target_submission_key
+                or len(target_submission_key) > 256
+                or any(ord(char) < 0x21 for char in target_submission_key)
+            ):
+                raise ValueError("submission_key filter is invalid")
         current = _iso(now)
         conn = self._connect()
         try:
@@ -16787,8 +16818,9 @@ class RcaControlStore:
                 SELECT o.outbox_id, o.action, o.submission_key, o.source_event_id,
                        o.source_topic, o.source_partition, o.source_offset, o.attempt,
                        o.status, o.next_attempt_at, o.lease_expires_at, o.created_at
-                  FROM rca_outbox AS o
+                 FROM rca_outbox AS o
                  WHERE ({activation_predicate})
+                   AND (? IS NULL OR o.submission_key = ?)
                    AND ((
                         o.status = 'pending'
                         AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?)
@@ -16801,7 +16833,14 @@ class RcaControlStore:
                  ORDER BY COALESCE(o.next_attempt_at, o.created_at), o.outbox_id
                  LIMIT ?
                 """,
-                (*activation_parameters, current, current, limit),
+                (
+                    *activation_parameters,
+                    target_submission_key,
+                    target_submission_key,
+                    current,
+                    current,
+                    limit,
+                ),
             ).fetchall()
             value = [dict(row) for row in rows]
             conn.commit()

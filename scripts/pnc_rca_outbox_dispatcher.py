@@ -793,6 +793,7 @@ class DispatcherConfig:
     derived_capacity_reservation_timeout_seconds: int
     w3_snapshot_read_mode: str
     w3_snapshot_authority: W3SnapshotAuthority | None
+    only_submission_key: str | None = None
 
     @classmethod
     def from_env(
@@ -1075,6 +1076,7 @@ class DispatcherConfig:
                 if self.w3_snapshot_authority is not None
                 else {"enabled": False, "mode": self.w3_snapshot_read_mode}
             ),
+            "only_submission_key": self.only_submission_key,
         }
 
     def runtime_public_dict(self) -> dict[str, Any]:
@@ -2646,6 +2648,7 @@ class OutboxDispatcher:
             lease_owner=self.lease_owner,
             lease_seconds=self.config.lease_seconds,
             max_age_seconds=self.config.max_age_seconds,
+            submission_key=self.config.only_submission_key,
             now=current,
         )
         if claim is None:
@@ -3954,6 +3957,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--health-max-age-seconds", type=int, default=60)
     parser.add_argument("--once", action="store_true")
     parser.add_argument(
+        "--only-submission-key",
+        help="claim exactly one submission key; requires --once",
+    )
+    parser.add_argument(
         "--clear-circuit",
         action="store_true",
         help="plan or apply an audited reset of the persisted submission circuit",
@@ -4015,6 +4022,16 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("dispatcher_circuit_reset_receipt_required")
         load_dispatcher_environment(args.env_file)
         config = DispatcherConfig.from_env()
+        if args.only_submission_key is not None:
+            target = str(args.only_submission_key).strip()
+            if (
+                not args.once
+                or not target
+                or len(target) > 256
+                or any(ord(char) < 0x21 for char in target)
+            ):
+                raise ValueError("outbox_target_requires_once_and_valid_key")
+            config = replace(config, only_submission_key=target)
         if args.check_config:
             if config.dispatch_enabled and config.control_db_path.is_file():
                 check_store = RcaControlStore(
@@ -4184,6 +4201,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             rows = store.preview_dispatchable(
                 limit=config.batch_size,
+                submission_key=config.only_submission_key,
             )
             print(
                 json.dumps(

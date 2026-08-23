@@ -3786,6 +3786,35 @@ def test_activation_required_without_epoch_blocks_before_persist_or_commit(tmp_p
     assert store.claim_outbox(lease_owner="required-dispatcher") is None
 
 
+def test_outbox_claim_and_preview_can_be_bound_to_one_submission_key(tmp_path):
+    store = _steady_control_store(tmp_path / "control.sqlite3")
+    first = store.ingest_record(
+        _record(20, value=_value(work_item_id=7041712820)),
+        policy=_policy(),
+        submit_enabled=True,
+    )
+    second = store.ingest_record(
+        _record(21, value=_value(work_item_id=7041712821)),
+        policy=_policy(),
+        submit_enabled=True,
+    )
+    assert first.decision == "accepted"
+    assert second.decision == "accepted"
+
+    preview = store.preview_dispatchable(submission_key=second.submission_key)
+    assert [row["submission_key"] for row in preview] == [second.submission_key]
+
+    claim = store.claim_outbox(
+        lease_owner="targeted-canary",
+        submission_key=second.submission_key,
+    )
+    assert claim is not None
+    assert claim.submission_key == second.submission_key
+    rows = {row["submission_key"]: row for row in store.list_rows("rca_outbox")}
+    assert rows[first.submission_key]["status"] == "pending"
+    assert rows[second.submission_key]["status"] == "claimed"
+
+
 def _register_policy_without_classifying(store: RcaControlStore) -> None:
     store.persist_raw(_record(), policy=_policy(), submit_enabled=True)
 
