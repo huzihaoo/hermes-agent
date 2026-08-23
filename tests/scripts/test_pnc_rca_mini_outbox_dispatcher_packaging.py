@@ -386,6 +386,18 @@ def test_env_example_has_explicit_safe_off_and_no_secrets():
     assert values["HERMES_RCA_DIRECT_KAFKA_SASL_PASSWORD"] in {None, ""}
     assert values["HERMES_RCA_DIRECT_KAFKA_ENABLED"] == "false"
     assert values["HERMES_RCA_DIRECT_KAFKA_COMMIT_ENABLED"] == "false"
+    policy = json.loads(values["HERMES_RCA_DIRECT_KAFKA_POLICY_JSON"])
+    assert policy == {
+        "policy_version": "feishu-state-open-issue-v1",
+        "project_keys": ["68ef617fb371dc80a10641f7"],
+        "project_simple_names": ["t03o4q"],
+        "snapshot_patterns": ["State"],
+        "snapshot_sub_stages": ["OPEN"],
+        "status_change_types": [],
+        "topic": "feishu-project-workflow-event",
+        "transitions": [],
+        "work_item_type_keys": ["issue"],
+    }
     disabled = direct_consumer.DirectKafkaConfig.from_env(values)
     assert disabled.enabled is False
     with pytest.raises(ValueError, match="SASL credentials"):
