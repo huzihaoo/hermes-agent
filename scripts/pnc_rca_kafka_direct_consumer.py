@@ -185,6 +185,7 @@ class DirectConsumerConfig:
     initial_offsets: Mapping[int, int] = field(default_factory=dict)
     health_path: Path | None = None
     commit_enabled: bool = True
+    enabled: bool = True
 
     def __post_init__(self) -> None:
         topic = str(self.topic or "").strip()
@@ -212,6 +213,8 @@ class DirectConsumerConfig:
         object.__setattr__(self, "initial_offsets", offsets)
         if not isinstance(self.commit_enabled, bool):
             raise ValueError("commit_enabled must be a boolean")
+        if not isinstance(self.enabled, bool):
+            raise ValueError("enabled must be a boolean")
         if self.health_path is not None:
             object.__setattr__(self, "health_path", Path(self.health_path).expanduser())
 
@@ -226,6 +229,7 @@ class DirectConsumerConfig:
             "max_poll_records": self.max_poll_records,
             "recovery_batch_size": self.recovery_batch_size,
             "commit_enabled": self.commit_enabled,
+            "enabled": self.enabled,
             "initial_offsets": {
                 str(partition): offset
                 for partition, offset in sorted(self.initial_offsets.items())
@@ -254,6 +258,7 @@ class DirectConsumerConfig:
             initial_offsets=offsets or {},
             health_path=value.get("health_path"),
             commit_enabled=value.get("commit_enabled", True),
+            enabled=value.get("enabled", True),
         )
 
 
@@ -453,6 +458,7 @@ class DirectKafkaConfig:
     client_id: str
     policy: WorkflowEventPolicy
     commit_enabled: bool
+    enabled: bool
     ssl_cafile: str | None = None
     ssl_certfile: str | None = None
     ssl_keyfile: str | None = None
@@ -465,6 +471,13 @@ class DirectKafkaConfig:
         hermes_home: str | Path | None = None,
     ) -> "DirectKafkaConfig":
         source = os.environ if env is None else env
+        enabled_value = _direct_pick(source, ("ENABLED",), default="false")
+        enabled_raw = str(enabled_value).strip().lower()
+        if enabled_raw not in {"true", "false"}:
+            raise ValueError(
+                f"{DIRECT_ENV_PREFIX}ENABLED must be exactly true or false"
+            )
+        enabled = enabled_raw == "true"
         bootstrap = _direct_required(source, "BOOTSTRAP_SERVERS")
         bootstrap_servers = tuple(
             item.strip() for item in bootstrap.split(",") if item.strip()
@@ -512,10 +525,12 @@ class DirectKafkaConfig:
             _direct_pick(source, ("SASL_USERNAME", "USERNAME", "USER"), default="")
         ).strip()
         password = str(_direct_pick(source, ("SASL_PASSWORD", "PASSWORD"), default=""))
-        if protocol.startswith("SASL_") and (not username or not password):
+        if enabled and protocol.startswith("SASL_") and (not username or not password):
             raise ValueError("direct SASL credentials are required")
-        if protocol in {"SSL", "SASL_SSL"} and not _direct_pick(
-            source, ("SSL_CAFILE",), default=None
+        if (
+            enabled
+            and protocol in {"SSL", "SASL_SSL"}
+            and not _direct_pick(source, ("SSL_CAFILE",), default=None)
         ):
             raise ValueError("direct SSL requires SSL_CAFILE")
         isolation = str(
@@ -649,6 +664,7 @@ class DirectKafkaConfig:
             or "hermes-rca-direct",
             policy=policy,
             commit_enabled=commit_enabled,
+            enabled=enabled,
             ssl_cafile=(
                 str(_direct_pick(source, ("SSL_CAFILE",), default="")).strip() or None
             ),
@@ -660,7 +676,7 @@ class DirectKafkaConfig:
             ),
         )
 
-    def runner_config(self) -> DirectConsumerConfig:
+    def runner_config(self, *, enabled: bool | None = None) -> DirectConsumerConfig:
         return DirectConsumerConfig(
             topic=self.topic,
             policy=self.policy,
@@ -671,6 +687,7 @@ class DirectKafkaConfig:
             initial_offsets=self.initial_offsets,
             health_path=self.health_path,
             commit_enabled=self.commit_enabled,
+            enabled=self.enabled if enabled is None else enabled,
         )
 
     def kafka_kwargs(self) -> dict[str, Any]:
@@ -729,6 +746,7 @@ class DirectKafkaConfig:
             },
             "client_id": self.client_id,
             "commit_enabled": self.commit_enabled,
+            "enabled": self.enabled,
             "policy": self.policy.to_dict(),
         }
 
@@ -1334,11 +1352,13 @@ class DirectHealthReporter:
         )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                os.fchmod(handle.fileno(), 0o600)
                 json.dump(body, handle, ensure_ascii=False, sort_keys=True)
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, self.path)
+            os.chmod(self.path, 0o600)
         finally:
             try:
                 os.unlink(temporary)
@@ -1578,6 +1598,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="validate direct startup prerequisites without side effects",
     )
+    mode.add_argument(
+        "--safe-off",
+        action="store_true",
+        help="force disabled mode without opening MiniStore or Kafka",
+    )
     parser.add_argument(
         "--max-polls",
         type=int,
@@ -1606,6 +1631,11 @@ def main(argv: list[str] | None = None) -> int:
     consumer: KafkaPythonConsumerAdapter | None = None
     try:
         source, env_path = load_direct_environment(args.env_file)
+        if args.safe_off:
+            # The CLI flag is an explicit operator override.  Apply it to a
+            # private copy so dotenv/process environments are never mutated.
+            source = dict(source)
+            source[f"{DIRECT_ENV_PREFIX}ENABLED"] = "false"
         config = build_direct_config(source)
         if args.check_config or args.dry_run:
             payload: dict[str, Any] = {
@@ -1619,10 +1649,15 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(payload)
             return 0
 
-        runner_config = config.runner_config()
-        store = MiniStore(config.db_path)
+        effective_enabled = config.enabled and not args.safe_off
+        runner_config = config.runner_config(enabled=effective_enabled)
         stats = DirectPollStats()
         health = DirectHealthReporter(config.health_path, config=runner_config)
+        if not effective_enabled:
+            health.write(state="disabled", stats=stats)
+            return 0
+
+        store = MiniStore(config.db_path)
         health.write(state="starting", stats=stats)
         recover_pending(
             store,

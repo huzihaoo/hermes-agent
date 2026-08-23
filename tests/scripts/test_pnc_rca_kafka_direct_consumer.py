@@ -581,6 +581,7 @@ def _direct_env(tmp_path: Path, **updates: str) -> dict[str, str]:
         f"{direct.DIRECT_ENV_PREFIX}HEALTH_PATH": str(tmp_path / "direct-health.json"),
         f"{direct.DIRECT_ENV_PREFIX}POLICY_JSON": json.dumps(_policy().to_dict()),
         f"{direct.DIRECT_ENV_PREFIX}COMMIT_ENABLED": "true",
+        f"{direct.DIRECT_ENV_PREFIX}ENABLED": "true",
     }
     values.update(updates)
     return values
@@ -597,6 +598,7 @@ def test_direct_config_isolated_env_and_redacted_public_contract(tmp_path: Path)
     assert config.db_path.name == "direct-mini.sqlite3"
     assert config.health_path.name == "direct-health.json"
     assert config.public_dict()["commit_enabled"] is True
+    assert config.public_dict()["enabled"] is True
     public = json.dumps(config.public_dict(), sort_keys=True)
     assert "direct-password" not in public
     assert "CONTROL_DB_PATH" not in public
@@ -611,6 +613,27 @@ def test_direct_config_rejects_shadow_default_group(tmp_path: Path):
     )
 
     with pytest.raises(ValueError, match="isolated group"):
+        direct.DirectKafkaConfig.from_env(env, hermes_home=tmp_path)
+
+
+def test_direct_config_defaults_to_safe_off_when_enabled_is_absent(tmp_path: Path):
+    env = _direct_env(tmp_path)
+    env.pop(f"{direct.DIRECT_ENV_PREFIX}ENABLED")
+    env[f"{direct.DIRECT_ENV_PREFIX}SASL_USERNAME"] = ""
+    env[f"{direct.DIRECT_ENV_PREFIX}SASL_PASSWORD"] = ""
+
+    config = direct.DirectKafkaConfig.from_env(env, hermes_home=tmp_path)
+
+    assert config.enabled is False
+
+
+def test_direct_config_requires_exact_enabled_boolean(tmp_path: Path):
+    env = _direct_env(
+        tmp_path,
+        **{f"{direct.DIRECT_ENV_PREFIX}ENABLED": "1"},
+    )
+
+    with pytest.raises(ValueError, match="ENABLED must be exactly true or false"):
         direct.DirectKafkaConfig.from_env(env, hermes_home=tmp_path)
 
 
@@ -918,6 +941,48 @@ def test_dry_run_is_read_only(monkeypatch, tmp_path: Path, capsys):
     assert payload["ok"] is True
     assert payload["mode"] == "dry-run"
     assert payload["validation_scope"] == "config_only_no_db_or_kafka"
+
+
+@pytest.mark.parametrize(
+    ("enabled", "argv"),
+    [
+        ("false", []),
+        ("true", ["--safe-off"]),
+    ],
+)
+def test_safe_off_writes_private_health_without_opening_store_or_kafka(
+    monkeypatch, tmp_path: Path, enabled: str, argv: list[str]
+):
+    env = _direct_env(
+        tmp_path,
+        **{f"{direct.DIRECT_ENV_PREFIX}ENABLED": enabled},
+    )
+    # --safe-off must override an otherwise enabled config before the
+    # credential gate is evaluated; disabled env mode also permits blank creds.
+    env[f"{direct.DIRECT_ENV_PREFIX}SASL_USERNAME"] = ""
+    env[f"{direct.DIRECT_ENV_PREFIX}SASL_PASSWORD"] = ""
+    monkeypatch.setattr(direct.os, "environ", env)
+    monkeypatch.setattr(
+        direct,
+        "MiniStore",
+        lambda *_args, **_kwargs: pytest.fail("safe-off opened MiniStore"),
+    )
+    monkeypatch.setattr(
+        direct,
+        "create_kafka_consumer",
+        lambda *_args, **_kwargs: pytest.fail("safe-off created Kafka"),
+    )
+
+    assert direct.main(argv) == 0
+
+    db_path = Path(env[f"{direct.DIRECT_ENV_PREFIX}DB_PATH"])
+    health_path = Path(env[f"{direct.DIRECT_ENV_PREFIX}HEALTH_PATH"])
+    assert not db_path.exists()
+    assert (health_path.stat().st_mode & 0o777) == 0o600
+    body = json.loads(health_path.read_text(encoding="utf-8"))
+    assert body["state"] == "disabled"
+    assert body["config"]["enabled"] is False
+    assert body["stats"] == direct.DirectPollStats().to_dict()
 
 
 def test_kafka_factory_fails_closed_when_listener_contract_is_missing(
