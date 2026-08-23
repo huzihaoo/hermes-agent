@@ -187,3 +187,54 @@ def test_creator_rejects_shared_state_abi_without_create_task(
         )
 
     assert raised.value.code == "direct_vm_shared_state_creator_abi_invalid"
+
+
+def test_creator_rejects_auth_impersonation_before_any_root_write(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "shared-state"
+    request = _load_request()
+    request["auth"] = {
+        "principal": "other-principal",
+        "capability": "g1q3_rca_direct_vm_submit",
+    }
+    # Rebuild the identity hash so the rejection specifically exercises the
+    # creator's fixed auth contract rather than a malformed envelope hash.
+    request = build_direct_vm_request(
+        task_id=str(request["task_id"]),
+        submission_key=str(request["submission_key"]),
+        auth=request["auth"],
+        source_refs=request["source_refs"],
+        execution_request=request["execution_request"],
+        artifact_root=str(request["artifact_root"]),
+        artifact_cifs_root=str(request["artifact_cifs_root"]),
+    ).to_dict()
+    with pytest.raises(creator.DirectVmCreatorError) as raised:
+        creator.create_direct_vm_task(
+            str(root),
+            request,
+            shared_state_module_path=str(tmp_path / "missing_shared_state.py"),
+            submit_module_path=str(tmp_path / "missing_submit.py"),
+        )
+    assert raised.value.code == "direct_vm_envelope_auth_mismatch"
+    assert not root.exists()
+
+
+def test_creator_rejects_overdeep_envelope_before_module_load(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "shared-state"
+    request = _load_request()
+    nested: object = "leaf"
+    for _ in range(creator.MAX_JSON_DEPTH + 1):
+        nested = [nested]
+    request["execution_request"] = nested
+    with pytest.raises(creator.DirectVmCreatorError) as raised:
+        creator.create_direct_vm_task(
+            str(root),
+            request,
+            shared_state_module_path=str(tmp_path / "missing_shared_state.py"),
+            submit_module_path=str(tmp_path / "missing_submit.py"),
+        )
+    assert raised.value.code == "direct_vm_json_shape_exceeded"
+    assert not root.exists()

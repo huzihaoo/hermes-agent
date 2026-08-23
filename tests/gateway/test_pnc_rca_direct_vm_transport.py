@@ -12,6 +12,8 @@ from gateway.pnc_rca_direct_vm_transport import (
     DirectVmTransport,
     DirectVmTransportConfig,
     DirectVmTransportError,
+    REVIEWED_SSH_MINI_AGENT,
+    build_direct_vm_transport,
 )
 from tests.gateway.test_pnc_rca_direct_vm_submit import _missing, _request
 
@@ -67,6 +69,23 @@ def test_defaults_pin_worker_state_paths_and_creation_is_opt_in() -> None:
         == DEFAULT_REMOTE_SHARED_STATE_MODULE_PATH
     )
     assert "release" not in json.dumps(config.public_dict(), sort_keys=True).lower()
+
+
+def test_production_builder_requires_reviewed_agent_path() -> None:
+    assert (
+        build_direct_vm_transport({"create_enabled": False}).config.ssh_mini_agent
+        == REVIEWED_SSH_MINI_AGENT
+    )
+    with pytest.raises(ValueError, match="reviewed_path"):
+        build_direct_vm_transport({
+            "ssh_mini_agent": "/tmp/fake-agent",
+            "create_enabled": False,
+        })
+    test_transport = build_direct_vm_transport(
+        {"ssh_mini_agent": "/tmp/fake-agent", "create_enabled": False},
+        test_only=True,
+    )
+    assert test_transport.config.ssh_mini_agent == "/tmp/fake-agent"
 
 
 @pytest.mark.parametrize(

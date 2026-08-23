@@ -25,6 +25,10 @@ DIRECT_VM_TRANSPORT_PROTOCOL_VERSION = "g1q3_rca_direct_vm_transport_v1"
 DIRECT_VM_SUBMIT_SCHEMA_VERSION = "g1q3_rca_direct_vm_submit_envelope_v1"
 MAX_ENVELOPE_BYTES = 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
+MAX_JSON_DEPTH = 32
+MAX_JSON_NODES = 50_000
+DIRECT_VM_AUTH_PRINCIPAL = "pnc-rca-direct-outbox"
+DIRECT_VM_AUTH_CAPABILITY = "g1q3_rca_direct_vm_submit"
 _TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _STATE_FIELDS = frozenset({"state", "task_id", "submission_key", "identity_sha256"})
@@ -537,6 +541,22 @@ def _canonical_json(value: Any) -> str:
         raise DirectVmCreatorError("direct_vm_envelope_json_invalid") from exc
 
 
+def _validate_json_shape(value: Any) -> None:
+    """Bound standalone helper input before recursive contract inspection."""
+
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_JSON_NODES or depth > MAX_JSON_DEPTH:
+            raise DirectVmCreatorError("direct_vm_json_shape_exceeded")
+        if isinstance(item, Mapping):
+            stack.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
+
+
 def _normalized_key(value: str) -> str:
     camel = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value)
     return re.sub(r"[^a-z0-9]+", "_", camel.lower()).strip("_")
@@ -575,7 +595,11 @@ def _scan_contract(value: Any) -> None:
 def _validate_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(envelope, Mapping):
         raise DirectVmCreatorError("direct_vm_envelope_invalid")
-    payload = json.loads(_canonical_json(dict(envelope)))
+    encoded = _canonical_json(dict(envelope)).encode("utf-8")
+    if len(encoded) > MAX_ENVELOPE_BYTES:
+        raise DirectVmCreatorError("direct_vm_envelope_too_large")
+    payload = json.loads(encoded)
+    _validate_json_shape(payload)
     _scan_contract(payload)
     required = {
         "schema_version",
@@ -628,6 +652,11 @@ def _validate_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
         or not _text(auth.get("capability"))
     ):
         raise DirectVmCreatorError("direct_vm_envelope_auth_invalid")
+    if (
+        auth.get("principal") != DIRECT_VM_AUTH_PRINCIPAL
+        or auth.get("capability") != DIRECT_VM_AUTH_CAPABILITY
+    ):
+        raise DirectVmCreatorError("direct_vm_envelope_auth_mismatch")
     if not isinstance(payload.get("source_refs"), Mapping) or not isinstance(
         payload.get("execution_request"), Mapping
     ):

@@ -16,7 +16,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 import re
 import subprocess
 from typing import Any
@@ -31,6 +31,7 @@ from gateway.pnc_rca_direct_vm_submit import (
 
 
 DIRECT_VM_TRANSPORT_PROTOCOL_VERSION = "g1q3_rca_direct_vm_transport_v1"
+REVIEWED_SSH_MINI_AGENT = "/Users/songying/.local/bin/ssh-mini-agent"
 DEFAULT_VM_SHARED_STATE_ROOT = "/home/mini/.hermes/shared-state"
 DEFAULT_REMOTE_CREATOR_PATH = (
     "/home/mini/.hermes/worker-state/pnc_rca_direct_vm_creator.py"
@@ -136,9 +137,7 @@ class DirectVmTransportConfig:
     max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
 
     def normalized(self) -> "DirectVmTransportConfig":
-        agent = _text(self.ssh_mini_agent) or str(
-            Path.home() / ".local" / "bin" / "ssh-mini-agent"
-        )
+        agent = _text(self.ssh_mini_agent) or REVIEWED_SSH_MINI_AGENT
         agent = _safe_remote_path(agent, "ssh_mini_agent")
         root = _safe_shared_state_root(self.shared_state_root)
         creator = _safe_worker_module_path(
@@ -452,10 +451,18 @@ def build_direct_vm_transport(
     config: DirectVmTransportConfig | Mapping[str, Any] | None = None,
     *,
     command_runner: CommandRunner | None = None,
+    test_only: bool = False,
 ) -> DirectVmTransport:
-    """Build a concrete transport; invalid config fails closed before I/O."""
+    """Build a concrete transport; production uses the reviewed agent path.
 
-    return DirectVmTransport(config, command_runner=command_runner)
+    ``test_only`` is intentionally explicit so unit tests can inject a fake
+    command runner and executable without weakening the resident dispatcher.
+    """
+
+    transport = DirectVmTransport(config, command_runner=command_runner)
+    if not test_only and transport.config.ssh_mini_agent != REVIEWED_SSH_MINI_AGENT:
+        raise ValueError("ssh_mini_agent_must_use_reviewed_path")
+    return transport
 
 
 __all__ = [
@@ -464,6 +471,7 @@ __all__ = [
     "DEFAULT_REMOTE_SUBMIT_MODULE_PATH",
     "DEFAULT_VM_SHARED_STATE_ROOT",
     "DIRECT_VM_TRANSPORT_PROTOCOL_VERSION",
+    "REVIEWED_SSH_MINI_AGENT",
     "DirectVmTransport",
     "DirectVmTransportConfig",
     "DirectVmTransportError",
