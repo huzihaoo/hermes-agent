@@ -555,7 +555,11 @@ class MiniStore:
             if row is None:
                 raise MiniRecordNotFoundError(event_uid)
             if str(row["decision"]) != "pending":
-                return self._result_from_row(row, True, True)
+                return self._result_from_row(
+                    row,
+                    True,
+                    self._row_ack_safe_tx(conn, row),
+                )
             policy = WorkflowEventPolicy.from_mapping(
                 json.loads(str(row["policy_json"]))
             )
@@ -617,7 +621,13 @@ class MiniStore:
                 business_key=business_key,
                 submission_key=submission_key,
                 generation=generation,
-                ack_safe=True,
+                ack_safe=self._row_ack_safe_tx(
+                    conn,
+                    conn.execute(
+                        "SELECT * FROM kafka_inbox WHERE event_uid=?",
+                        (event_uid,),
+                    ).fetchone(),
+                ),
             )
 
     @staticmethod
@@ -629,7 +639,6 @@ class MiniStore:
         event_uid: str,
         updated_at: str,
     ) -> None:
-        next_offset = offset + 1
         current = conn.execute(
             "SELECT durable_next_offset FROM kafka_partition_progress WHERE topic=? AND partition_id=?",
             (topic, partition),
@@ -637,13 +646,51 @@ class MiniStore:
         if current is None:
             conn.execute(
                 "INSERT INTO kafka_partition_progress(topic,partition_id,first_offset,durable_next_offset,last_event_uid,updated_at) VALUES(?,?,?,?,?,?)",
-                (topic, partition, offset, next_offset, event_uid, updated_at),
+                (topic, partition, offset, offset + 1, event_uid, updated_at),
             )
-        elif next_offset > int(current["durable_next_offset"]):
+            return
+
+        durable_next = int(current["durable_next_offset"])
+        if offset != durable_next:
+            return
+
+        last_event_uid = event_uid
+        rows = conn.execute(
+            """
+            SELECT event_uid, offset_id, decision
+              FROM kafka_inbox
+             WHERE topic=? AND partition_id=? AND offset_id>=?
+             ORDER BY offset_id
+            """,
+            (topic, partition, durable_next),
+        ).fetchall()
+        for row in rows:
+            row_offset = int(row["offset_id"])
+            if row_offset != durable_next or str(row["decision"]) == "pending":
+                break
+            durable_next += 1
+            last_event_uid = str(row["event_uid"])
+        if durable_next > int(current["durable_next_offset"]):
             conn.execute(
                 "UPDATE kafka_partition_progress SET durable_next_offset=?,last_event_uid=?,updated_at=? WHERE topic=? AND partition_id=?",
-                (next_offset, event_uid, updated_at, topic, partition),
+                (durable_next, last_event_uid, updated_at, topic, partition),
             )
+
+    @staticmethod
+    def _row_ack_safe_tx(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
+        progress = conn.execute(
+            """
+            SELECT durable_next_offset
+              FROM kafka_partition_progress
+             WHERE topic=? AND partition_id=?
+            """,
+            (str(row["topic"]), int(row["partition_id"])),
+        ).fetchone()
+        return bool(
+            str(row["decision"]) != "pending"
+            and progress is not None
+            and int(progress["durable_next_offset"]) >= int(row["offset_id"]) + 1
+        )
 
     def partition_progress(
         self, *, topic: str, partitions: Iterable[int]

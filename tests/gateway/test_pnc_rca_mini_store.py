@@ -130,6 +130,26 @@ def test_existing_unrelated_database_is_rejected_before_ddl(tmp_path: Path):
         )
 
 
+def test_existing_partial_mini_schema_is_not_implicitly_completed(tmp_path: Path):
+    path = tmp_path / "partial.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE mini_store_meta(key TEXT PRIMARY KEY, value TEXT)")
+        conn.commit()
+
+    with pytest.raises(MiniStoreSchemaError, match="additive mini store"):
+        MiniStore(path)
+
+    with sqlite3.connect(path) as conn:
+        tables = tuple(
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        )
+    assert tables == ("mini_store_meta",)
+
+
 def test_schema_marker_mismatch_is_fail_closed(tmp_path: Path):
     path = tmp_path / "mini.sqlite3"
     first = MiniStore(path)
@@ -321,17 +341,39 @@ def test_atomic_failure_rolls_back_trigger_outbox_and_progress(
     assert recovered[0].ack_safe is True
 
 
-def test_progress_is_monotonic_when_records_arrive_out_of_order(store: MiniStore):
+def test_progress_does_not_cross_an_unprocessed_offset_gap(store: MiniStore):
     first = store.ingest_record(_record(10, work_item_id=1), policy=_policy())
     assert first.ack_safe is True
     later = store.ingest_record(_record(14, work_item_id=2), policy=_policy())
     earlier = store.ingest_record(_record(12, work_item_id=3), policy=_policy())
 
-    assert later.ack_safe and earlier.ack_safe
-    assert store.partition_progress(topic=TOPIC, partitions=[0]) == {0: 15}
+    assert later.ack_safe is False
+    assert earlier.ack_safe is False
+    assert store.partition_progress(topic=TOPIC, partitions=[0]) == {0: 11}
     progress = store.list_rows("kafka_partition_progress")[0]
     assert progress["first_offset"] == 10
-    assert progress["durable_next_offset"] == 15
+    assert progress["durable_next_offset"] == 11
+
+    missing_11 = store.ingest_record(_record(11, work_item_id=4), policy=_policy())
+    assert missing_11.ack_safe is True
+    assert store.partition_progress(topic=TOPIC, partitions=[0]) == {0: 13}
+    assert store.ack_safe(earlier.event_uid) is True
+    assert store.ack_safe(later.event_uid) is False
+
+    missing_13 = store.ingest_record(_record(13, work_item_id=5), policy=_policy())
+    assert missing_13.ack_safe is True
+    assert store.partition_progress(topic=TOPIC, partitions=[0]) == {0: 15}
+    assert store.ack_safe(later.event_uid) is True
+
+
+def test_terminal_duplicate_rechecks_durable_progress(store: MiniStore):
+    store.ingest_record(_record(10, work_item_id=1), policy=_policy())
+    first = store.ingest_record(_record(12, work_item_id=2), policy=_policy())
+    duplicate = store.ingest_record(_record(12, work_item_id=2), policy=_policy())
+
+    assert first.ack_safe is False
+    assert duplicate.transport_duplicate is True
+    assert duplicate.ack_safe is False
 
 
 def test_partition_progress_rejects_negative_partition(store: MiniStore):
