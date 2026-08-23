@@ -205,6 +205,9 @@ def test_status_uses_one_bounded_agent_verb_and_keeps_paths_out_of_argv() -> Non
     assert TASK_ID in script
     assert "direct_vm_module_parent_invalid" in script
     assert "direct_vm_module_permissions_invalid" in script
+    assert "info.st_uid not in {0, os.geteuid()}" in script
+    assert "info.st_uid == 0 and stat.S_IMODE(info.st_mode) & 0o022" in script
+    assert "info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) & 0o002" in script
     assert "info.st_nlink != 1" in script
     assert "SUBMIT_MODULE" not in script
     assert "direct_vm_module_hash_mismatch" in script
