@@ -11,6 +11,7 @@ from gateway.pnc_rca_business_profiles import resolve_business_profile
 
 
 NORMALIZED_EVENT_SCHEMA_VERSION = "pnc_rca_workflow_event_v1"
+FIXED_KAFKA_GROUP_ID = "rca_root_cause_analysis_agent"
 MAX_WORKFLOW_EVENT_BYTES = 2 * 1024 * 1024
 MAX_WORKFLOW_NODES = 100
 MAX_TITLE_LENGTH = 2_000

@@ -27,6 +27,7 @@ from gateway.pnc_rca_control_store import (
     RecordProcessingBlockedError,
 )
 from gateway.pnc_rca_kafka_contract import (
+    FIXED_KAFKA_GROUP_ID,
     MAX_WORKFLOW_EVENT_BYTES,
     WorkflowEventPolicy,
 )
@@ -55,7 +56,6 @@ SERVICE_LABEL = "local.pnc.rca-kafka-consumer"
 MAX_CONFIG_JSON_NESTING = 32
 FIXED_SERVICE_ID = "root_cause_analysis_agent"
 FIXED_KAFKA_PRINCIPAL = "rca"
-FIXED_KAFKA_GROUP_ID = "rca_root_cause_analysis_agent"
 FIXED_API_VERSION = (3, 9, 0)
 FIXED_REQUEST_TIMEOUT_MS = 120_000
 MIN_SESSION_TIMEOUT_MS = 10_000
