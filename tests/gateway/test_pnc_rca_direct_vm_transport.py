@@ -89,6 +89,23 @@ def test_production_builder_requires_reviewed_agent_path() -> None:
 
 
 @pytest.mark.parametrize(
+    "field",
+    [
+        "shared_state_root",
+        "remote_creator_path",
+        "remote_shared_state_module_path",
+        "remote_submit_module_path",
+    ],
+)
+def test_production_builder_requires_reviewed_vm_paths(field: str) -> None:
+    updates = {field: "/home/mini/.hermes/worker-state/other.py"}
+    if field == "shared_state_root":
+        updates[field] = "/mnt/tmp/test-direct-root"
+    with pytest.raises(ValueError, match=f"{field}_must_use_reviewed_path"):
+        build_direct_vm_transport({**updates, "create_enabled": False})
+
+
+@pytest.mark.parametrize(
     "updates",
     [
         {"shared_state_root": "relative/root"},

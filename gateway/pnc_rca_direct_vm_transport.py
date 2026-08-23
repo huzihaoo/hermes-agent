@@ -460,8 +460,17 @@ def build_direct_vm_transport(
     """
 
     transport = DirectVmTransport(config, command_runner=command_runner)
-    if not test_only and transport.config.ssh_mini_agent != REVIEWED_SSH_MINI_AGENT:
-        raise ValueError("ssh_mini_agent_must_use_reviewed_path")
+    if not test_only:
+        reviewed_fields = {
+            "ssh_mini_agent": REVIEWED_SSH_MINI_AGENT,
+            "shared_state_root": DEFAULT_VM_SHARED_STATE_ROOT,
+            "remote_creator_path": DEFAULT_REMOTE_CREATOR_PATH,
+            "remote_shared_state_module_path": DEFAULT_REMOTE_SHARED_STATE_MODULE_PATH,
+            "remote_submit_module_path": DEFAULT_REMOTE_SUBMIT_MODULE_PATH,
+        }
+        for field, expected in reviewed_fields.items():
+            if getattr(transport.config, field) != expected:
+                raise ValueError(f"{field}_must_use_reviewed_path")
     return transport
 
 
