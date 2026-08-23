@@ -132,6 +132,29 @@ def test_typed_unavailable_context_is_retryable(tmp_path: Path):
     assert exc_info.value.retryable is True
 
 
+def test_unready_business_profile_never_synthesizes_request(tmp_path: Path):
+    _store_obj, claim, payload = _store(tmp_path)
+    context = RcaIssueContext(
+        project_key="project-key",
+        work_item_type="problem-type",
+        work_item_id="7041712812",
+        url="https://project.feishu.cn/g1q3/issue/detail/7041712812",
+        title="ACC braking issue",
+        source_quality="partial",
+        business_profile={
+            "status": "matched",
+            "profile_id": "mdrive4",
+            "execution_readiness": "input_adapter_pending",
+        },
+        pdcl_download_cmd="mdi download event -u demo -s ./",
+    )
+
+    with pytest.raises(DirectExecutionBuildError) as exc_info:
+        build_direct_execution_request(payload, claim, reader=lambda *_: context)
+    assert exc_info.value.code == "business_profile_adapter_not_ready"
+    assert exc_info.value.retryable is False
+
+
 def test_reader_identity_mismatch_is_permanent(tmp_path: Path):
     _store_obj, claim, payload = _store(tmp_path)
 
