@@ -380,7 +380,6 @@ def build_plan(
         raise StableTargetRepairError(
             "stable_target_evidence_exists", str(transaction_dir)
         )
-    _directory(transaction_dir, create=True)
 
     _helper_raw, helper_stat = _stable_read(paths["helper_source"])
     helper = _observe_file(
@@ -397,6 +396,16 @@ def build_plan(
     manifest_raw, _manifest, manifest_observation = _read_json(
         paths["live_manifest"], allowed_modes=(0o600,)
     )
+    installed_observation = _observe_file(
+        paths["installed_helper"], required=True, allowed_modes=(0o755,)
+    )
+    runtime_registry_raw, _runtime_registry, runtime_registry_observation = _read_json(
+        paths["runtime_registry"], allowed_modes=(0o644,)
+    )
+    # A target preimage must be structurally valid before it can be used as
+    # evidence.  Otherwise a future staged writer could lack a trustworthy
+    # rollback baseline even though the path/hash itself is stable.
+    _validate_registry_shape(runtime_registry_raw)
     candidate_registry_raw = _candidate_registry(
         registry_raw,
         helper_sha256=str(helper["sha256"]),
@@ -405,21 +414,18 @@ def build_plan(
     candidate_registry_path = (
         transaction_dir / "pnc_stable_target_registry_v1.candidate.json"
     )
-    candidate_registry_observation = _write_evidence_new(
-        candidate_registry_path, candidate_registry_raw, mode=0o644
-    )
     candidate_raw = _candidate_manifest(
         manifest_raw, helper_sha256=str(helper["sha256"])
+    )
+    # Do not materialize a transaction directory until every source and target
+    # preimage has passed validation and both candidate payloads are ready.
+    _directory(transaction_dir, create=True)
+    candidate_registry_observation = _write_evidence_new(
+        candidate_registry_path, candidate_registry_raw, mode=0o644
     )
     candidate_manifest_path = transaction_dir / "LIVE_MANIFEST.candidate.json"
     candidate_manifest_observation = _write_evidence_new(
         candidate_manifest_path, candidate_raw, mode=0o600
-    )
-    installed_observation = _observe_file(
-        paths["installed_helper"], required=True, allowed_modes=(0o755,)
-    )
-    runtime_registry_observation = _observe_file(
-        paths["runtime_registry"], required=True, allowed_modes=(0o644,)
     )
     entries = [
         _entry("helper_source", paths["helper_source"], helper, role="source"),

@@ -191,6 +191,18 @@ def test_old_registry_hash_is_replaced_in_bound_candidate(
     assert repair.verify_plan(plan, plan_path=plan_path)["verification"] == "pass"
 
 
+def test_invalid_runtime_registry_is_rejected_before_candidate_write(
+    repair_case: dict[str, Any],
+) -> None:
+    repair_case["runtime_registry"].write_text("not-json\n")
+    repair_case["runtime_registry"].chmod(0o644)
+    with pytest.raises(
+        repair.StableTargetRepairError, match="stable_target_json_invalid"
+    ):
+        _build(repair_case, "invalid-runtime-registry")
+    assert not (repair_case["evidence"] / "invalid-runtime-registry").exists()
+
+
 def test_plan_binding_and_evidence_cas_are_fail_closed(
     repair_case: dict[str, Any],
 ) -> None:
