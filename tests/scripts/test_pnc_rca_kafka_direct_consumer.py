@@ -981,6 +981,8 @@ def test_safe_off_writes_private_health_without_opening_store_or_kafka(
     assert (health_path.stat().st_mode & 0o777) == 0o600
     body = json.loads(health_path.read_text(encoding="utf-8"))
     assert body["state"] == "disabled"
+    assert body["healthy"] is True
+    assert body["ok"] is False
     assert body["config"]["enabled"] is False
     assert body["stats"] == direct.DirectPollStats().to_dict()
 

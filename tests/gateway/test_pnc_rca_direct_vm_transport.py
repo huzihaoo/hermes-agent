@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
+from pathlib import Path
 import subprocess
 
 import pytest
@@ -9,6 +11,9 @@ import pytest
 from gateway.pnc_rca_direct_vm_transport import (
     DEFAULT_REMOTE_CREATOR_PATH,
     DEFAULT_REMOTE_SHARED_STATE_MODULE_PATH,
+    DEFAULT_REMOTE_VALIDATOR_MODULE_PATH,
+    DEFAULT_REMOTE_CREATOR_SHA256,
+    DEFAULT_REMOTE_VALIDATOR_SHA256,
     DirectVmTransport,
     DirectVmTransportConfig,
     DirectVmTransportError,
@@ -68,6 +73,9 @@ def test_defaults_pin_worker_state_paths_and_creation_is_opt_in() -> None:
         config.remote_shared_state_module_path
         == DEFAULT_REMOTE_SHARED_STATE_MODULE_PATH
     )
+    assert config.remote_validator_module_path == DEFAULT_REMOTE_VALIDATOR_MODULE_PATH
+    assert config.remote_creator_sha256 != "__CREATOR_SHA256__"
+    assert config.remote_validator_sha256 != "__VALIDATOR_SHA256__"
     assert "release" not in json.dumps(config.public_dict(), sort_keys=True).lower()
 
 
@@ -94,7 +102,7 @@ def test_production_builder_requires_reviewed_agent_path() -> None:
         "shared_state_root",
         "remote_creator_path",
         "remote_shared_state_module_path",
-        "remote_submit_module_path",
+        "remote_validator_module_path",
     ],
 )
 def test_production_builder_requires_reviewed_vm_paths(field: str) -> None:
@@ -192,11 +200,31 @@ def test_status_uses_one_bounded_agent_verb_and_keeps_paths_out_of_argv() -> Non
     assert kwargs.get("shell", False) is False
     script = str(kwargs["input"])
     assert DEFAULT_REMOTE_CREATOR_PATH in script
+    assert DEFAULT_REMOTE_VALIDATOR_MODULE_PATH in script
     assert "/home/mini/.hermes/shared-state" in script
     assert TASK_ID in script
     assert "direct_vm_module_parent_invalid" in script
     assert "direct_vm_module_permissions_invalid" in script
     assert "info.st_nlink != 1" in script
+    assert "SUBMIT_MODULE" not in script
+    assert "direct_vm_module_hash_mismatch" in script
+
+
+def test_config_rejects_unbound_module_hashes() -> None:
+    with pytest.raises(ValueError, match="remote_validator_sha256_invalid"):
+        DirectVmTransportConfig(remote_validator_sha256="not-a-sha").normalized()
+
+
+def test_reviewed_source_hashes_bind_to_formal_files() -> None:
+    repo = Path(__file__).parents[2]
+    creator = hashlib.sha256(
+        (repo / "scripts/pnc_rca_direct_vm_creator.py").read_bytes()
+    ).hexdigest()
+    validator = hashlib.sha256(
+        (repo / "scripts/pnc_rca_direct_vm_validator.py").read_bytes()
+    ).hexdigest()
+    assert creator == DEFAULT_REMOTE_CREATOR_SHA256
+    assert validator == DEFAULT_REMOTE_VALIDATOR_SHA256
 
 
 def test_remote_helper_failure_is_unknown_not_missing() -> None:

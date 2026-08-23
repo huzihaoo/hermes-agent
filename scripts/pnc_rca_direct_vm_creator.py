@@ -23,6 +23,7 @@ from typing import Any
 DIRECT_VM_CREATOR_SCHEMA_VERSION = "g1q3_rca_direct_vm_creator_v1"
 DIRECT_VM_TRANSPORT_PROTOCOL_VERSION = "g1q3_rca_direct_vm_transport_v1"
 DIRECT_VM_SUBMIT_SCHEMA_VERSION = "g1q3_rca_direct_vm_submit_envelope_v1"
+DIRECT_VM_VALIDATOR_SCHEMA_VERSION = "g1q3_rca_direct_vm_validator_v1"
 MAX_ENVELOPE_BYTES = 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
 MAX_JSON_DEPTH = 32
@@ -407,7 +408,7 @@ def _state_from_task(root: Path, task_id: str, meta: Mapping[str, Any]) -> str:
 def read_direct_vm_status(
     root_value: str,
     task_id_value: str,
-    _submit_module_path: str = "",
+    _validator_module_path: str = "",
 ) -> dict[str, str]:
     """Return a four-field status, distinguishing absence from read failure."""
 
@@ -664,7 +665,12 @@ def _validate_envelope(envelope: Mapping[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def _load_module(path_value: str, name: str) -> Any:
+def _load_module(
+    path_value: str,
+    name: str,
+    *,
+    expected_sha256: str = "",
+) -> Any:
     path = Path(path_value)
     if not path.is_absolute() or ".." in PurePosixPath(path).parts:
         raise DirectVmCreatorError("direct_vm_module_path_invalid")
@@ -673,17 +679,58 @@ def _load_module(path_value: str, name: str) -> Any:
     except DirectVmCreatorError as exc:
         raise DirectVmCreatorError("direct_vm_module_path_invalid") from exc
     try:
-        observed = path.lstat()
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
     except OSError as exc:
         raise DirectVmCreatorError("direct_vm_module_missing") from exc
-    if (
-        stat.S_ISLNK(observed.st_mode)
-        or not stat.S_ISREG(observed.st_mode)
-        or observed.st_nlink != 1
-    ):
-        raise DirectVmCreatorError("direct_vm_module_not_regular")
-    if int(observed.st_uid) != os.geteuid() or stat.S_IMODE(observed.st_mode) & 0o022:
-        raise DirectVmCreatorError("direct_vm_module_permissions_invalid")
+    try:
+        observed = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or int(observed.st_uid) != os.geteuid()
+            or stat.S_IMODE(observed.st_mode) & 0o022
+            or observed.st_size > MAX_METADATA_BYTES * 16
+        ):
+            raise DirectVmCreatorError("direct_vm_module_permissions_invalid")
+        chunks: list[bytes] = []
+        remaining = observed.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise DirectVmCreatorError("direct_vm_module_unstable")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise DirectVmCreatorError("direct_vm_module_unstable")
+        after = os.fstat(descriptor)
+        lexical = path.lstat()
+        if (
+            stat.S_ISLNK(lexical.st_mode)
+            or observed != after
+            or (
+                lexical.st_dev,
+                lexical.st_ino,
+                lexical.st_size,
+                lexical.st_mtime_ns,
+                lexical.st_ctime_ns,
+            )
+            != (
+                observed.st_dev,
+                observed.st_ino,
+                observed.st_size,
+                observed.st_mtime_ns,
+                observed.st_ctime_ns,
+            )
+        ):
+            raise DirectVmCreatorError("direct_vm_module_unstable")
+        raw = b"".join(chunks)
+        if expected_sha256 and hashlib.sha256(raw).hexdigest() != expected_sha256:
+            raise DirectVmCreatorError("direct_vm_module_hash_mismatch")
+    except OSError as exc:
+        raise DirectVmCreatorError("direct_vm_module_unstable") from exc
+    finally:
+        os.close(descriptor)
     spec = importlib.util.spec_from_file_location(name, str(path))
     if spec is None or spec.loader is None:
         raise DirectVmCreatorError("direct_vm_module_unloadable")
@@ -701,7 +748,8 @@ def _load_module(path_value: str, name: str) -> Any:
         if module_dir not in sys.path:
             sys.path.insert(0, module_dir)
     try:
-        spec.loader.exec_module(module)
+        module.__file__ = str(path)
+        exec(compile(raw, str(path), "exec"), module.__dict__)
     except Exception as exc:
         if previous is None:
             sys.modules.pop(name, None)
@@ -872,7 +920,12 @@ def create_direct_vm_task(
     envelope: Mapping[str, Any],
     *,
     shared_state_module_path: str,
-    submit_module_path: str,
+    validator_module_path: str = "",
+    shared_state_sha256: str = "",
+    validator_sha256: str = "",
+    # Backwards-compatible keyword for older Host callers.  It is treated as
+    # the validator path; no legacy gateway submit module is loaded remotely.
+    submit_module_path: str = "",
 ) -> dict[str, Any]:
     """Create one pending shared-state task through the canonical VM ABI."""
 
@@ -883,26 +936,40 @@ def create_direct_vm_task(
     _validate_create_root(root)
     try:
         creator = _load_module(
-            shared_state_module_path, "pnc_rca_shared_state_v2_direct"
+            shared_state_module_path,
+            "pnc_rca_shared_state_v2_direct",
+            expected_sha256=shared_state_sha256,
         )
     except DirectVmCreatorError as exc:
         raise DirectVmCreatorError(
             "direct_vm_shared_state_creator_unavailable"
         ) from exc
-    # Loading the submit contract is an explicit protocol/version check.  The
-    # validator is a pure envelope contract; no worker/admission module is
-    # imported or called here.
+    validator_path = validator_module_path or submit_module_path
+    if not validator_path:
+        raise DirectVmCreatorError("direct_vm_submit_contract_unavailable")
+    # Loading the self-contained validator is an explicit protocol/version
+    # check.  No Host ``gateway`` package, worker/admission module, or release
+    # machinery is imported or called on the VM.
     try:
-        submit_module = _load_module(
-            submit_module_path, "pnc_rca_direct_vm_submit_remote"
+        validator_module = _load_module(
+            validator_path,
+            "pnc_rca_direct_vm_validator_remote",
+            expected_sha256=validator_sha256,
         )
     except DirectVmCreatorError as exc:
         raise DirectVmCreatorError("direct_vm_submit_contract_unavailable") from exc
-    if not hasattr(submit_module, "validate_direct_vm_request"):
+    if getattr(validator_module, "DIRECT_VM_VALIDATOR_SCHEMA_VERSION", "") != (
+        DIRECT_VM_VALIDATOR_SCHEMA_VERSION
+    ):
+        raise DirectVmCreatorError("direct_vm_submit_contract_unavailable")
+    validate_request = getattr(validator_module, "validate_direct_vm_request", None)
+    if not callable(validate_request):
         raise DirectVmCreatorError("direct_vm_submit_contract_unavailable")
     try:
-        validated = submit_module.validate_direct_vm_request(payload)
-        payload = validated.to_dict()
+        validated = validate_request(payload)
+        if not isinstance(validated, Mapping):
+            raise TypeError("validator must return a mapping")
+        payload = dict(validated)
     except Exception as exc:
         raise DirectVmCreatorError("direct_vm_submit_contract_invalid") from exc
 
@@ -960,6 +1027,7 @@ def create_direct_vm_task(
 
 __all__ = [
     "DIRECT_VM_CREATOR_SCHEMA_VERSION",
+    "DIRECT_VM_VALIDATOR_SCHEMA_VERSION",
     "DirectVmCreatorError",
     "create_direct_vm_task",
     "read_direct_vm_status",

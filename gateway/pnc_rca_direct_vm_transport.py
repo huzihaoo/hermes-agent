@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+import hashlib
 import json
 import os
 from pathlib import PurePosixPath
@@ -39,8 +40,24 @@ DEFAULT_REMOTE_CREATOR_PATH = (
 DEFAULT_REMOTE_SHARED_STATE_MODULE_PATH = (
     "/home/mini/.hermes/worker-state/shared_state_v2.py"
 )
-DEFAULT_REMOTE_SUBMIT_MODULE_PATH = (
-    "/home/mini/.hermes/worker-state/pnc_rca_direct_vm_submit.py"
+DEFAULT_REMOTE_VALIDATOR_MODULE_PATH = (
+    "/home/mini/.hermes/worker-state/pnc_rca_direct_vm_validator.py"
+)
+# Compatibility alias for pre-validator configuration names.  The path now
+# points at the self-contained validator; no gateway submit module is loaded on
+# the VM.
+DEFAULT_REMOTE_SUBMIT_MODULE_PATH = DEFAULT_REMOTE_VALIDATOR_MODULE_PATH
+# These hashes are the reviewed Host creator/validator bytes and the current
+# live VM shared-state ABI.  A mismatch is an unknown/retryable transport
+# result, never a proven absence.
+DEFAULT_REMOTE_CREATOR_SHA256 = (
+    "eff4ce684b7fbc66e13c02c369855624db083dc9695d809e5a85d1c0f93624e0"
+)
+DEFAULT_REMOTE_VALIDATOR_SHA256 = (
+    "d85f42bb8028181fa35c2c12a862a40c9ca11579a90e0866f3ff4b23ff1d12ac"
+)
+DEFAULT_REMOTE_SHARED_STATE_SHA256 = (
+    "a6a893d3773ef4f54e44f3f0a2224f32e86de9851214a92df59baf3f18d7ec22"
 )
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 20.0
 DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024
@@ -131,7 +148,12 @@ class DirectVmTransportConfig:
     shared_state_root: str = DEFAULT_VM_SHARED_STATE_ROOT
     remote_creator_path: str = DEFAULT_REMOTE_CREATOR_PATH
     remote_shared_state_module_path: str = DEFAULT_REMOTE_SHARED_STATE_MODULE_PATH
-    remote_submit_module_path: str = DEFAULT_REMOTE_SUBMIT_MODULE_PATH
+    remote_validator_module_path: str = DEFAULT_REMOTE_VALIDATOR_MODULE_PATH
+    # Deprecated input alias retained for old callers/config files.
+    remote_submit_module_path: str = ""
+    remote_creator_sha256: str = DEFAULT_REMOTE_CREATOR_SHA256
+    remote_validator_sha256: str = DEFAULT_REMOTE_VALIDATOR_SHA256
+    remote_shared_state_sha256: str = DEFAULT_REMOTE_SHARED_STATE_SHA256
     create_enabled: bool = False
     timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS
     max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES
@@ -147,10 +169,26 @@ class DirectVmTransportConfig:
             self.remote_shared_state_module_path,
             "remote_shared_state_module_path",
         )
-        submit = _safe_worker_module_path(
-            self.remote_submit_module_path,
-            "remote_submit_module_path",
+        validator_value = self.remote_validator_module_path
+        if self.remote_submit_module_path:
+            if (
+                validator_value != DEFAULT_REMOTE_VALIDATOR_MODULE_PATH
+                and validator_value != self.remote_submit_module_path
+            ):
+                raise ValueError("remote_validator_module_path_alias_conflict")
+            validator_value = self.remote_submit_module_path
+        validator = _safe_worker_module_path(
+            validator_value,
+            "remote_validator_module_path",
         )
+        hashes = {
+            "remote_creator_sha256": self.remote_creator_sha256,
+            "remote_validator_sha256": self.remote_validator_sha256,
+            "remote_shared_state_sha256": self.remote_shared_state_sha256,
+        }
+        for field, value in hashes.items():
+            if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+                raise ValueError(f"{field}_invalid")
         if isinstance(self.create_enabled, bool) is False:
             raise ValueError("create_enabled_must_be_boolean")
         try:
@@ -171,7 +209,8 @@ class DirectVmTransportConfig:
             shared_state_root=root,
             remote_creator_path=creator,
             remote_shared_state_module_path=shared,
-            remote_submit_module_path=submit,
+            remote_validator_module_path=validator,
+            remote_submit_module_path="",
             timeout_seconds=timeout,
         )
 
@@ -183,7 +222,8 @@ class DirectVmTransportConfig:
             "vm_shared_state_root": "shared_state_root",
             "creator_path": "remote_creator_path",
             "shared_state_module_path": "remote_shared_state_module_path",
-            "submit_module_path": "remote_submit_module_path",
+            "submit_module_path": "remote_validator_module_path",
+            "remote_submit_module_path": "remote_validator_module_path",
             "enabled": "create_enabled",
         }
         fields = {
@@ -191,7 +231,11 @@ class DirectVmTransportConfig:
             "shared_state_root",
             "remote_creator_path",
             "remote_shared_state_module_path",
+            "remote_validator_module_path",
             "remote_submit_module_path",
+            "remote_creator_sha256",
+            "remote_validator_sha256",
+            "remote_shared_state_sha256",
             "create_enabled",
             "timeout_seconds",
             "max_response_bytes",
@@ -211,7 +255,11 @@ class DirectVmTransportConfig:
             "shared_state_root": normalized.shared_state_root,
             "remote_creator_path": normalized.remote_creator_path,
             "remote_shared_state_module_path": normalized.remote_shared_state_module_path,
-            "remote_submit_module_path": normalized.remote_submit_module_path,
+            "remote_validator_module_path": normalized.remote_validator_module_path,
+            "remote_submit_module_path": normalized.remote_validator_module_path,
+            "remote_creator_sha256": normalized.remote_creator_sha256,
+            "remote_validator_sha256": normalized.remote_validator_sha256,
+            "remote_shared_state_sha256": normalized.remote_shared_state_sha256,
             "create_enabled": normalized.create_enabled,
             "timeout_seconds": normalized.timeout_seconds,
             "max_response_bytes": normalized.max_response_bytes,
@@ -265,7 +313,10 @@ def _remote_script(
     helper_path: str,
     shared_state_root: str,
     shared_state_module_path: str,
-    submit_module_path: str,
+    validator_module_path: str,
+    creator_sha256: str,
+    validator_sha256: str,
+    shared_state_sha256: str,
     operation: str,
     task_id: str = "",
     envelope: Mapping[str, Any] | None = None,
@@ -279,11 +330,14 @@ def _remote_script(
     # Values are literals in the generated script; no shell interpolation or
     # user-controlled argv is used by ssh-mini-agent.
     return (
-        "import importlib.util, json, os, stat\n"
+        "import hashlib, importlib.util, json, os, stat\n"
         f"HELPER_PATH = {helper_path!r}\n"
         f"ROOT = {shared_state_root!r}\n"
         f"SHARED_STATE_MODULE = {shared_state_module_path!r}\n"
-        f"SUBMIT_MODULE = {submit_module_path!r}\n"
+        f"VALIDATOR_MODULE = {validator_module_path!r}\n"
+        f"CREATOR_SHA256 = {creator_sha256!r}\n"
+        f"VALIDATOR_SHA256 = {validator_sha256!r}\n"
+        f"SHARED_STATE_SHA256 = {shared_state_sha256!r}\n"
         f"OPERATION = {operation!r}\n"
         f"TASK_ID = {task_id!r}\n"
         f"ENVELOPE = json.loads({request_json!r})\n"
@@ -296,16 +350,27 @@ def _remote_script(
         "        if index < len(parts) - 1:\n"
         "            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):\n"
         "                raise RuntimeError('direct_vm_module_parent_invalid')\n"
-        "            if stat.S_IMODE(info.st_mode) & 0o022:\n"
+        "            if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o002:\n"
         "                raise RuntimeError('direct_vm_module_parent_permissions_invalid')\n"
         "    info = os.lstat(path)\n"
         "    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:\n"
         "        raise RuntimeError('direct_vm_module_not_regular')\n"
         "    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:\n"
         "        raise RuntimeError('direct_vm_module_permissions_invalid')\n"
+        "def _check_hash(path, expected):\n"
+        "    before = os.lstat(path)\n"
+        "    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:\n"
+        "        raise RuntimeError('direct_vm_module_not_regular')\n"
+        "    digest = hashlib.sha256(open(path, 'rb').read()).hexdigest()\n"
+        "    after = os.lstat(path)\n"
+        "    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) or digest != expected:\n"
+        "        raise RuntimeError('direct_vm_module_hash_mismatch')\n"
         "_check_pinned_module(HELPER_PATH)\n"
         "_check_pinned_module(SHARED_STATE_MODULE)\n"
-        "_check_pinned_module(SUBMIT_MODULE)\n"
+        "_check_pinned_module(VALIDATOR_MODULE)\n"
+        "_check_hash(HELPER_PATH, CREATOR_SHA256)\n"
+        "_check_hash(SHARED_STATE_MODULE, SHARED_STATE_SHA256)\n"
+        "_check_hash(VALIDATOR_MODULE, VALIDATOR_SHA256)\n"
         "spec = importlib.util.spec_from_file_location('pnc_rca_direct_vm_creator_remote', HELPER_PATH)\n"
         "if spec is None or spec.loader is None:\n"
         "    raise RuntimeError('direct_vm_creator_helper_unloadable')\n"
@@ -314,9 +379,9 @@ def _remote_script(
         "if getattr(module, 'DIRECT_VM_CREATOR_SCHEMA_VERSION', '') != 'g1q3_rca_direct_vm_creator_v1':\n"
         "    raise RuntimeError('direct_vm_creator_protocol_mismatch')\n"
         "if OPERATION == 'status':\n"
-        "    result = module.read_direct_vm_status(ROOT, TASK_ID, SUBMIT_MODULE)\n"
+        "    result = module.read_direct_vm_status(ROOT, TASK_ID, VALIDATOR_MODULE)\n"
         "else:\n"
-        "    result = module.create_direct_vm_task(ROOT, ENVELOPE, shared_state_module_path=SHARED_STATE_MODULE, submit_module_path=SUBMIT_MODULE)\n"
+        "    result = module.create_direct_vm_task(ROOT, ENVELOPE, shared_state_module_path=SHARED_STATE_MODULE, validator_module_path=VALIDATOR_MODULE, shared_state_sha256=SHARED_STATE_SHA256, validator_sha256=VALIDATOR_SHA256)\n"
         "print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(',', ':')))\n"
     )
 
@@ -358,7 +423,10 @@ class DirectVmTransport:
             helper_path=self.config.remote_creator_path,
             shared_state_root=self.config.shared_state_root,
             shared_state_module_path=self.config.remote_shared_state_module_path,
-            submit_module_path=self.config.remote_submit_module_path,
+            validator_module_path=self.config.remote_validator_module_path,
+            creator_sha256=self.config.remote_creator_sha256,
+            validator_sha256=self.config.remote_validator_sha256,
+            shared_state_sha256=self.config.remote_shared_state_sha256,
             operation=operation,
             task_id=task_id,
             envelope=envelope,
@@ -482,7 +550,10 @@ def build_direct_vm_transport(
             "shared_state_root": DEFAULT_VM_SHARED_STATE_ROOT,
             "remote_creator_path": DEFAULT_REMOTE_CREATOR_PATH,
             "remote_shared_state_module_path": DEFAULT_REMOTE_SHARED_STATE_MODULE_PATH,
-            "remote_submit_module_path": DEFAULT_REMOTE_SUBMIT_MODULE_PATH,
+            "remote_validator_module_path": DEFAULT_REMOTE_VALIDATOR_MODULE_PATH,
+            "remote_creator_sha256": DEFAULT_REMOTE_CREATOR_SHA256,
+            "remote_validator_sha256": DEFAULT_REMOTE_VALIDATOR_SHA256,
+            "remote_shared_state_sha256": DEFAULT_REMOTE_SHARED_STATE_SHA256,
         }
         for field, expected in reviewed_fields.items():
             if getattr(transport.config, field) != expected:
@@ -494,6 +565,10 @@ __all__ = [
     "DEFAULT_REMOTE_CREATOR_PATH",
     "DEFAULT_REMOTE_SHARED_STATE_MODULE_PATH",
     "DEFAULT_REMOTE_SUBMIT_MODULE_PATH",
+    "DEFAULT_REMOTE_VALIDATOR_MODULE_PATH",
+    "DEFAULT_REMOTE_CREATOR_SHA256",
+    "DEFAULT_REMOTE_VALIDATOR_SHA256",
+    "DEFAULT_REMOTE_SHARED_STATE_SHA256",
     "DEFAULT_VM_SHARED_STATE_ROOT",
     "DIRECT_VM_TRANSPORT_PROTOCOL_VERSION",
     "REVIEWED_SSH_MINI_AGENT",

@@ -634,7 +634,7 @@ class DirectKafkaConfig:
                 f"{DIRECT_ENV_PREFIX}COMMIT_ENABLED must be exactly true or false"
             )
         commit_enabled = commit_raw == "true"
-        if not commit_enabled and group_id == DIRECT_DEFAULT_GROUP_ID:
+        if enabled and not commit_enabled and group_id == DIRECT_DEFAULT_GROUP_ID:
             raise ValueError("direct shadow mode requires an isolated group id")
 
         policy = _direct_policy(source, topic)
@@ -1319,11 +1319,12 @@ class DirectHealthReporter:
         assignment: Iterable[Any] = (),
     ) -> dict[str, Any]:
         self.state = str(state)
+        business_ready = self.state not in {"error", "disabled"}
         body: dict[str, Any] = {
             "schema_version": DIRECT_HEALTH_SCHEMA_VERSION,
             "state": self.state,
             "healthy": self.state != "error",
-            "ok": self.state != "error",
+            "ok": business_ready,
             "observed_at": _utc_now(),
             "last_event_at": self.last_event_at,
             "last_commit_at": self.last_commit_at,

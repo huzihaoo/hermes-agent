@@ -384,14 +384,17 @@ def test_env_example_has_explicit_safe_off_and_no_secrets():
     )
     assert values["HERMES_RCA_DIRECT_KAFKA_SASL_USERNAME"] in {None, ""}
     assert values["HERMES_RCA_DIRECT_KAFKA_SASL_PASSWORD"] in {None, ""}
+    assert values["HERMES_RCA_DIRECT_KAFKA_ENABLED"] == "false"
     assert values["HERMES_RCA_DIRECT_KAFKA_COMMIT_ENABLED"] == "false"
+    disabled = direct_consumer.DirectKafkaConfig.from_env(values)
+    assert disabled.enabled is False
     with pytest.raises(ValueError, match="SASL credentials"):
         credential_probe = dict(values)
+        credential_probe["HERMES_RCA_DIRECT_KAFKA_ENABLED"] = "true"
         credential_probe["HERMES_RCA_DIRECT_KAFKA_COMMIT_ENABLED"] = "true"
         direct_consumer.DirectKafkaConfig.from_env(credential_probe)
-    with pytest.raises(ValueError, match="SASL credentials"):
-        direct_consumer.DirectKafkaConfig.from_env(values)
     commit_probe = dict(values)
+    commit_probe["HERMES_RCA_DIRECT_KAFKA_ENABLED"] = "true"
     commit_probe["HERMES_RCA_DIRECT_KAFKA_SASL_USERNAME"] = "example-user"
     commit_probe["HERMES_RCA_DIRECT_KAFKA_SASL_PASSWORD"] = "example-password"
     with pytest.raises(ValueError, match="shadow mode"):
