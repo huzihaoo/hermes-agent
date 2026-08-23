@@ -2119,6 +2119,12 @@ def _remote_bundle_script(submission_key: str) -> str:
                         if isinstance(report_data.get('terminal_diagnostic'), dict)
                         else None
                     ),
+                    'fault_class': report_data.get('fault_class') or (
+                        report_data.get('terminal_diagnostic', {{}}).get('fault_class')
+                        if isinstance(report_data.get('terminal_diagnostic'), dict)
+                        else None
+                    ),
+                    'terminal_diagnostic': report_data.get('terminal_diagnostic'),
                     'frame_lookup': report_data.get('frame_lookup'),
                     'marker_time': report_data.get('marker_time'),
                     'event_uuid': report_data.get('event_uuid'),
@@ -2374,6 +2380,64 @@ def _apply_gate_a_bundle_projection(bundle: Mapping[str, Any]) -> dict[str, Any]
     contract = bundle.get("delivery_contract")
     if not isinstance(contract, Mapping):
         raise DeliveryContractError("delivery_contract_missing")
+    terminal_diagnostic = source.get("terminal_diagnostic")
+    contract_diagnostic = contract.get("terminal_diagnostic")
+    if (
+        isinstance(terminal_diagnostic, Mapping)
+        and isinstance(contract_diagnostic, Mapping)
+        and source.get("input_materialized") is False
+        and source.get("materialization_attested") is True
+        and not source.get("rca_evaluators")
+        and "gate_a_projection" not in contract
+    ):
+        blocker_kind = str(terminal_diagnostic.get("blocker_kind") or "").strip()
+        stage = str(terminal_diagnostic.get("stage") or "").strip()
+        contract_blocker_kind = str(
+            contract_diagnostic.get("blocker_kind") or ""
+        ).strip()
+        contract_stage = str(contract_diagnostic.get("stage") or "").strip()
+        contract_schema = str(
+            contract_diagnostic.get("schema_version") or ""
+        ).strip()
+        fault_class = str(source.get("fault_class") or "").strip()
+        hard_defect = (
+            (
+                blocker_kind == "viz_mcap_build_failed"
+                and fault_class in {"", pnc_fault_taxonomy.HARD_DEFECT}
+            )
+            or (
+                fault_class == pnc_fault_taxonomy.HARD_DEFECT
+                and blocker_kind in pnc_fault_taxonomy.HARD_DEFECT_KINDS
+                and pnc_fault_taxonomy.is_hard_defect(
+                    {"kind": blocker_kind, "fault_class": fault_class}
+                )
+            )
+        )
+        if (
+            hard_defect
+            and blocker_kind
+            and blocker_kind == contract_blocker_kind
+            and stage
+            and stage == contract_stage
+            and terminal_diagnostic.get("attribution_status")
+            == "not_attributable"
+            and contract_schema == "g1q3_rca_terminal_diagnostic_v1"
+            and contract_diagnostic.get("attribution_status")
+            == "not_attributable"
+        ):
+            # A sealed hard-defect terminal report is already a complete,
+            # non-attributable delivery boundary. Do not reinterpret it as
+            # an unmaterialized Gate-A data abstention.
+            return {
+                **dict(bundle),
+                "terminal_diagnostic_projection": {
+                    "schema_version": "pnc_rca_terminal_hard_defect_projection_v1",
+                    "blocker_kind": blocker_kind,
+                    "fault_class": pnc_fault_taxonomy.HARD_DEFECT,
+                    "stage": stage,
+                    "attribution_status": "not_attributable",
+                },
+            }
     try:
         identifier_binding = (
             build_gate_a_identifier_binding(contract.get("consumer_capability"))

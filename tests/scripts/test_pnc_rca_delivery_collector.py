@@ -1278,6 +1278,60 @@ def test_host_gate_a_projection_rejects_missing_source_envelope():
         })
 
 
+def test_terminal_hard_defect_report_skips_unmaterialized_gate_a_projection():
+    bundle = collector._apply_gate_a_bundle_projection({
+        "delivery_contract": {
+            "schema_version": "g1q3_delivery_contract_v1",
+            "terminal_diagnostic": {
+                "schema_version": "g1q3_rca_terminal_diagnostic_v1",
+                "stage": "s6_report",
+                "blocker_kind": "viz_mcap_build_failed",
+                "attribution_status": "not_attributable",
+            },
+        },
+        "gate_a_source": {
+            "input_materialized": False,
+            "materialization_attested": True,
+            "terminal_diagnostic": {
+                "stage": "s6_report",
+                "blocker_kind": "viz_mcap_build_failed",
+                "attribution_status": "not_attributable",
+            },
+            "rca_evaluators": [],
+        },
+    })
+
+    assert "gate_a_projection" not in bundle["delivery_contract"]
+    assert bundle["terminal_diagnostic_projection"]["fault_class"] == (
+        "hard_defect"
+    )
+
+
+def test_terminal_diagnostic_bypass_rejects_non_hard_defect():
+    with pytest.raises(DeliveryContractError, match="gate_a_projection_invalid"):
+        collector._apply_gate_a_bundle_projection({
+            "delivery_contract": {
+                "schema_version": "g1q3_delivery_contract_v1",
+                "terminal_diagnostic": {
+                    "schema_version": "g1q3_rca_terminal_diagnostic_v1",
+                    "stage": "s2_remote_read",
+                    "blocker_kind": "remote_read_completeness_not_proven",
+                    "attribution_status": "not_attributable",
+                },
+            },
+            "gate_a_source": {
+                "input_materialized": False,
+                "materialization_attested": True,
+                "terminal_diagnostic": {
+                    "stage": "s2_remote_read",
+                    "blocker_kind": "remote_read_completeness_not_proven",
+                    "attribution_status": "not_attributable",
+                },
+                "rca_evaluators": [],
+            },
+        })
+
+
 def test_host_gate_a_projection_rejects_all_need_fields_source():
     with pytest.raises(DeliveryContractError, match="gate_a_projection_invalid"):
         collector._apply_gate_a_bundle_projection({
