@@ -1124,6 +1124,120 @@ def test_host_gate_a_projection_accepts_known_viz_build_abstention():
     assert projection["abstention"]["failure_class"] == "viz_mcap_build_failed"
 
 
+def test_host_gate_a_projection_accepts_evidence_not_ready_terminal():
+    bundle = collector._apply_gate_a_bundle_projection({
+        "delivery_contract": {
+            "schema_version": "g1q3_delivery_contract_v1",
+            "terminal_diagnostic": {
+                "schema_version": "g1q3_rca_terminal_diagnostic_v1",
+                "stage": "s5_evaluator",
+                "blocker_kind": "evidence_not_ready",
+                "attribution_status": "not_attributable",
+            },
+            "summary": {"short_conclusion": "stale"},
+            "report": {},
+        },
+        "gate_a_source": {
+            "input_materialized": False,
+            "materialization_attested": True,
+            "terminal_diagnostic": {
+                "schema_version": "g1q3_rca_terminal_diagnostic_v1",
+                "stage": "s5_evaluator",
+                "blocker_kind": "evidence_not_ready",
+                "attribution_status": "not_attributable",
+            },
+            "rca_evaluators": [],
+        },
+    })
+
+    projection = bundle["delivery_contract"]["gate_a_projection"]
+    assert projection["level"] == "L0_abstain"
+    assert projection["abstention"]["failure_class"] == "evidence_not_ready"
+    assert "未取得可用于归因" in projection["abstention"]["message"]
+
+
+def test_host_gate_a_projection_rejects_unknown_evidence_terminal_code():
+    with pytest.raises(DeliveryContractError, match="gate_a_projection_invalid"):
+        collector._apply_gate_a_bundle_projection({
+            "delivery_contract": {
+                "terminal_diagnostic": {
+                    "schema_version": "g1q3_rca_terminal_diagnostic_v1",
+                    "stage": "s5_evaluator",
+                    "blocker_kind": "evidence_not_ready",
+                },
+            },
+            "gate_a_source": {
+                "input_materialized": False,
+                "materialization_attested": True,
+                "failure_class": "evidence_not_ready_typo",
+                "terminal_diagnostic": {
+                    "stage": "s5_evaluator",
+                    "blocker_kind": "evidence_not_ready",
+                },
+                "rca_evaluators": [],
+            },
+        })
+
+
+def test_host_gate_a_projection_rejects_bare_evidence_failure_class():
+    with pytest.raises(DeliveryContractError, match="gate_a_projection_invalid"):
+        collector._apply_gate_a_bundle_projection({
+            "delivery_contract": {},
+            "gate_a_source": {
+                "input_materialized": False,
+                "materialization_attested": True,
+                "failure_class": "evidence_not_ready",
+                "rca_evaluators": [],
+            },
+        })
+
+
+def test_host_gate_a_projection_rejects_contradictory_evidence_terminal():
+    with pytest.raises(DeliveryContractError, match="terminal_conflict"):
+        collector._apply_gate_a_bundle_projection({
+            "delivery_contract": {
+                "terminal_diagnostic": {
+                    "schema_version": "g1q3_rca_terminal_diagnostic_v1",
+                    "stage": "s5_evaluator",
+                    "blocker_kind": "remote_event_not_found",
+                },
+            },
+            "gate_a_source": {
+                "input_materialized": False,
+                "materialization_attested": True,
+                "terminal_diagnostic": {
+                    "stage": "s5_evaluator",
+                    "blocker_kind": "evidence_not_ready",
+                    "attribution_status": "attributable",
+                },
+                "rca_evaluators": [],
+            },
+        })
+
+
+def test_host_gate_a_projection_rejects_attributable_evidence_terminal():
+    with pytest.raises(DeliveryContractError, match="terminal_conflict"):
+        collector._apply_gate_a_bundle_projection({
+            "delivery_contract": {
+                "terminal_diagnostic": {
+                    "schema_version": "g1q3_rca_terminal_diagnostic_v1",
+                    "stage": "s5_evaluator",
+                    "blocker_kind": "evidence_not_ready",
+                },
+            },
+            "gate_a_source": {
+                "input_materialized": False,
+                "materialization_attested": True,
+                "terminal_diagnostic": {
+                    "stage": "s5_evaluator",
+                    "blocker_kind": "evidence_not_ready",
+                    "attribution_status": "attributable",
+                },
+                "rca_evaluators": [],
+            },
+        })
+
+
 def test_host_keeps_only_a_trusted_v19_primary_conclusion():
     contract = _trusted_v19_contract()
 

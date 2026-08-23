@@ -2382,6 +2382,55 @@ def _apply_gate_a_bundle_projection(bundle: Mapping[str, Any]) -> dict[str, Any]
         raise DeliveryContractError("delivery_contract_missing")
     terminal_diagnostic = source.get("terminal_diagnostic")
     contract_diagnostic = contract.get("terminal_diagnostic")
+    source_failure_class = str(source.get("failure_class") or "").strip()
+    source_blocker_kind = (
+        str(terminal_diagnostic.get("blocker_kind") or "").strip()
+        if isinstance(terminal_diagnostic, Mapping)
+        else ""
+    )
+    contract_blocker_kind = (
+        str(contract_diagnostic.get("blocker_kind") or "").strip()
+        if isinstance(contract_diagnostic, Mapping)
+        else ""
+    )
+    if "evidence_not_ready" in {
+        source_failure_class,
+        source_blocker_kind,
+        contract_blocker_kind,
+    }:
+        if not isinstance(terminal_diagnostic, Mapping) or not isinstance(
+            contract_diagnostic, Mapping
+        ):
+            raise DeliveryContractError(
+                "gate_a_projection_invalid",
+                "gate_a_projection_invalid: evidence_not_ready_terminal_missing",
+            )
+        source_stage = str(terminal_diagnostic.get("stage") or "").strip()
+        contract_stage = str(contract_diagnostic.get("stage") or "").strip()
+        source_attribution = terminal_diagnostic.get("attribution_status")
+        contract_attribution = contract_diagnostic.get("attribution_status")
+        if (
+            source_failure_class not in {"", "evidence_not_ready"}
+            or source_blocker_kind != "evidence_not_ready"
+            or contract_blocker_kind != "evidence_not_ready"
+            or not source_stage
+            or source_stage != contract_stage
+            or (
+                source_attribution is not None
+                and source_attribution != "not_attributable"
+            )
+            or (
+                contract_attribution is not None
+                and contract_attribution != "not_attributable"
+            )
+        ):
+            raise DeliveryContractError(
+                "gate_a_projection_invalid",
+                "gate_a_projection_invalid: evidence_not_ready_terminal_conflict",
+            )
+        # The signed terminal diagnostic is the source of this fixed
+        # abstention class; a caller-provided failure_class is not trusted.
+        source = {**dict(source), "failure_class": "evidence_not_ready"}
     if (
         isinstance(terminal_diagnostic, Mapping)
         and isinstance(contract_diagnostic, Mapping)
