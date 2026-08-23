@@ -137,6 +137,7 @@ VM_EXECUTION_IDENTITY_EVIDENCE_SCHEMA_VERSION = (
 EXECUTION_IDENTITY_READBACK_SCHEMA_VERSION = "pnc_rca_execution_identity_readback_v1"
 REMOTE_SHARED_STATE_ROOT = "/home/mini/.hermes/shared-state"
 REMOTE_WORKER_REPO_ROOT = "/home/mini/.hermes/worker-state"
+REMOTE_PIPELINE_RUNTIME_ROOT = "/home/mini/.hermes/rca-prod-runtime"
 REMOTE_REPORT_RUNTIME_MANIFEST_PATH = (
     "/home/mini/.config/g1q3-rca/report-runtime-manifest.json"
 )
@@ -932,6 +933,7 @@ def _remote_bundle_script(submission_key: str) -> str:
             SHARED_STATE_ROOT, 'tasks', TASK_ID, 'result.md'
         )
         WORKER_REPO_ROOT = {REMOTE_WORKER_REPO_ROOT!r}
+        PIPELINE_RUNTIME_ROOT = {REMOTE_PIPELINE_RUNTIME_ROOT!r}
         WORKER_ENTRYPOINT_PATH = posixpath.join(
             WORKER_REPO_ROOT, {REMOTE_WORKER_ENTRYPOINT_RELATIVE!r}
         )
@@ -1260,6 +1262,296 @@ def _remote_bundle_script(submission_key: str) -> str:
                 raise RuntimeError(prefix + '_identity_changed_during_read')
             return {{'commit': head, 'tree': tree, 'clean': True}}
 
+        def canonical_json_bytes(value):
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(',', ':'),
+            ).encode('utf-8')
+
+        def semantic_sha256(value):
+            body = dict(value)
+            body.pop('self_seal', None)
+            return hashlib.sha256(canonical_json_bytes(body)).hexdigest()
+
+        def read_frozen_file(path, max_bytes=1024 * 1024 * 1024):
+            try:
+                before = os.lstat(path)
+            except OSError:
+                raise RuntimeError('pipeline_frozen_file_missing')
+            if (
+                stat.S_ISLNK(before.st_mode)
+                or not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_size > max_bytes
+                or not symlink_free(path, posixpath.dirname(path))
+            ):
+                raise RuntimeError('pipeline_frozen_file_invalid')
+            try:
+                fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+            except OSError:
+                raise RuntimeError('pipeline_frozen_file_open_failed')
+            digest = hashlib.sha256()
+            size = 0
+            try:
+                opened = os.fstat(fd)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_dev != before.st_dev
+                    or opened.st_ino != before.st_ino
+                    or opened.st_nlink != before.st_nlink
+                    or opened.st_size != before.st_size
+                ):
+                    raise RuntimeError('pipeline_frozen_file_changed')
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise RuntimeError('pipeline_frozen_file_size_invalid')
+                    digest.update(chunk)
+            except OSError:
+                raise RuntimeError('pipeline_frozen_file_changed')
+            finally:
+                os.close(fd)
+            try:
+                after = os.lstat(path)
+            except OSError:
+                raise RuntimeError('pipeline_frozen_file_changed')
+            if (
+                before.st_dev != after.st_dev
+                or before.st_ino != after.st_ino
+                or before.st_mode != after.st_mode
+                or before.st_uid != after.st_uid
+                or before.st_gid != after.st_gid
+                or before.st_nlink != after.st_nlink
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+                or before.st_ctime_ns != after.st_ctime_ns
+                or size != after.st_size
+            ):
+                raise RuntimeError('pipeline_frozen_file_changed')
+            return size, digest.hexdigest()
+
+        def frozen_entry_snapshot(root_path):
+            try:
+                root_info = os.lstat(root_path)
+            except OSError:
+                raise RuntimeError('pipeline_frozen_root_identity_invalid')
+            if (
+                not stat.S_ISDIR(root_info.st_mode)
+                or stat.S_ISLNK(root_info.st_mode)
+                or root_info.st_uid != os.geteuid()
+                or stat.S_IMODE(root_info.st_mode) & 0o022
+            ):
+                raise RuntimeError('pipeline_frozen_root_identity_invalid')
+            root_resolved = os.path.realpath(root_path)
+            entries = []
+
+            def visit(directory):
+                try:
+                    children = sorted(
+                        os.scandir(directory), key=lambda item: item.name
+                    )
+                except OSError:
+                    raise RuntimeError('pipeline_frozen_snapshot_invalid')
+                try:
+                    for child in children:
+                        path = child.path
+                        try:
+                            observed = os.lstat(path)
+                        except OSError:
+                            raise RuntimeError('pipeline_frozen_snapshot_invalid')
+                        relative = posixpath.relpath(path, root_path)
+                        mode = '%04o' % stat.S_IMODE(observed.st_mode)
+                        if stat.S_ISLNK(observed.st_mode):
+                            target = os.readlink(path)
+                            resolved = os.path.realpath(path)
+                            if not (
+                                resolved == root_resolved
+                                or resolved.startswith(root_resolved + '/')
+                            ):
+                                raise RuntimeError('pipeline_frozen_external_symlink')
+                            entries.append({{
+                                'path': relative,
+                                'type': 'symlink',
+                                'mode': mode,
+                                'size_bytes': 0,
+                                'sha256': None,
+                                'target': target,
+                            }})
+                        elif stat.S_ISDIR(observed.st_mode):
+                            if stat.S_IMODE(observed.st_mode) & 0o022:
+                                raise RuntimeError('pipeline_frozen_writable_directory')
+                            entries.append({{
+                                'path': relative,
+                                'type': 'directory',
+                                'mode': mode,
+                                'size_bytes': 0,
+                                'sha256': None,
+                            }})
+                            visit(path)
+                        elif stat.S_ISREG(observed.st_mode):
+                            if (
+                                observed.st_nlink != 1
+                                or stat.S_IMODE(observed.st_mode) & 0o022
+                            ):
+                                raise RuntimeError('pipeline_frozen_writable_file')
+                            file_size, file_sha256 = read_frozen_file(path)
+                            entries.append({{
+                                'path': relative,
+                                'type': 'file',
+                                'mode': '%04o' % stat.S_IMODE(observed.st_mode),
+                                'size_bytes': file_size,
+                                'sha256': file_sha256,
+                            }})
+                        else:
+                            raise RuntimeError('pipeline_frozen_special_entry')
+                finally:
+                    del children
+
+            visit(root_path)
+            return {{
+                'mode': '%04o' % stat.S_IMODE(root_info.st_mode),
+                'uid': root_info.st_uid,
+                'gid': root_info.st_gid,
+                'dev': root_info.st_dev,
+                'ino': root_info.st_ino,
+                'entries': sorted(entries, key=lambda item: item['path']),
+            }}
+
+        def frozen_pipeline_identity(repo_root, expected_commit, expected_tree,
+                                     report_manifest_sha256):
+            runtime_parent = posixpath.dirname(repo_root)
+            runtime_container = posixpath.dirname(runtime_parent)
+            if (
+                posixpath.basename(runtime_parent) != 'releases'
+                or runtime_container != PIPELINE_RUNTIME_ROOT
+                or not symlink_free(repo_root, PIPELINE_RUNTIME_ROOT)
+            ):
+                raise RuntimeError('pipeline_frozen_root_invalid')
+            receipts_root = posixpath.join(runtime_container, 'receipts')
+            try:
+                receipt_dirs = sorted(
+                    os.scandir(receipts_root), key=lambda item: item.name
+                )
+            except OSError:
+                raise RuntimeError('pipeline_frozen_receipt_root_unavailable')
+            candidates = []
+            try:
+                if len(receipt_dirs) > 256:
+                    raise RuntimeError('pipeline_frozen_receipt_ambiguous')
+                for item in receipt_dirs:
+                    if not item.is_dir(follow_symlinks=False):
+                        continue
+                    report_receipt_path = posixpath.join(
+                        item.path, 'report-runtime-manifest.json'
+                    )
+                    source_receipt_path = posixpath.join(
+                        item.path, 'source-materialization.json'
+                    )
+                    binding_receipt_path = posixpath.join(
+                        item.path, 'worker-binding.json'
+                    )
+                    try:
+                        report_raw, report_sha256 = read_stable_bytes(
+                            report_receipt_path,
+                            'pipeline_frozen_receipt_missing',
+                            receipts_root,
+                        )
+                    except RuntimeError:
+                        continue
+                    if report_sha256 != report_manifest_sha256:
+                        continue
+                    try:
+                        source_raw, _source_sha256 = read_stable_bytes(
+                            source_receipt_path,
+                            'pipeline_frozen_receipt_missing',
+                            receipts_root,
+                            MAX_FILE_BYTES,
+                        )
+                        binding_raw, _binding_sha256 = read_stable_bytes(
+                            binding_receipt_path,
+                            'pipeline_frozen_receipt_missing',
+                            receipts_root,
+                        )
+                        source = json.loads(source_raw.decode('utf-8'))
+                        binding = json.loads(binding_raw.decode('utf-8'))
+                        report = json.loads(report_raw.decode('utf-8'))
+                    except Exception:
+                        raise RuntimeError('pipeline_frozen_receipt_invalid')
+                    if (
+                        source_raw != canonical_json_bytes(source) + b'\\n'
+                        or binding_raw != canonical_json_bytes(binding) + b'\\n'
+                        or report_raw != canonical_json_bytes(report) + b'\\n'
+                        or source.get('schema_version')
+                        != 'g1q3_rca_vm_source_materialization_v1'
+                        or binding.get('schema_version')
+                        != 'g1q3_rca_vm_worker_binding_v1'
+                        or source.get('runtime_root') != repo_root
+                        or binding.get('runtime_root') != repo_root
+                        or source.get('pipeline_commit') != expected_commit
+                        or source.get('pipeline_tree') != expected_tree
+                        or binding.get('pipeline_commit') != expected_commit
+                        or binding.get('pipeline_tree') != expected_tree
+                        or binding.get('report_manifest_path') != report_receipt_path
+                        or binding.get('report_manifest_sha256') != report_sha256
+                        or semantic_sha256(source) != source.get('self_seal')
+                        or semantic_sha256(binding) != binding.get('self_seal')
+                    ):
+                        raise RuntimeError('pipeline_frozen_receipt_invalid')
+                    candidates.append((
+                        source_receipt_path,
+                        source_raw,
+                        source,
+                    ))
+            finally:
+                del receipt_dirs
+            if len(candidates) != 1:
+                raise RuntimeError('pipeline_frozen_receipt_ambiguous')
+            source_receipt_path, source_raw, source = candidates[0]
+            snapshot = frozen_entry_snapshot(repo_root)
+            expected_root = source.get('root_identity')
+            if not isinstance(expected_root, dict) or any(
+                snapshot.get(key) != expected_root.get(key)
+                for key in ('mode', 'uid', 'gid', 'dev', 'ino')
+            ):
+                raise RuntimeError('pipeline_frozen_root_identity_mismatch')
+            expected_entries = source.get('entries')
+            if (
+                not isinstance(expected_entries, list)
+                or sorted(expected_entries, key=lambda item: item.get('path', ''))
+                != snapshot['entries']
+            ):
+                raise RuntimeError('pipeline_frozen_snapshot_mismatch')
+            return {{
+                'commit': expected_commit,
+                'tree': expected_tree,
+                'clean': True,
+                'frozen_runtime': True,
+                'top_level': repo_root,
+                'receipt_path': source_receipt_path,
+                'receipt_sha256': hashlib.sha256(source_raw).hexdigest(),
+            }}
+
+        def pipeline_identity(repo_root, expected_commit, expected_tree,
+                              report_manifest_sha256):
+            git_marker = posixpath.join(repo_root, '.git')
+            try:
+                marker_info = os.lstat(git_marker)
+            except FileNotFoundError:
+                marker_info = None
+            if marker_info is not None and not stat.S_ISLNK(marker_info.st_mode):
+                return git_identity(repo_root, 'pipeline_git')
+            return frozen_pipeline_identity(
+                repo_root,
+                expected_commit,
+                expected_tree,
+                report_manifest_sha256,
+            )
+
         def execution_identity_evidence(delivery_manifest_sha256):
             worker_result, worker_result_sha256 = read_worker_result()
             service_result, service_result_sha256 = read_stable_json(
@@ -1388,8 +1680,11 @@ def _remote_bundle_script(submission_key: str) -> str:
             worker_identity_before = git_identity(
                 WORKER_REPO_ROOT, 'worker_git'
             )
-            pipeline_identity_before = git_identity(
-                pipeline_root, 'pipeline_git'
+            pipeline_identity_before = pipeline_identity(
+                pipeline_root,
+                pipeline_receipt_commit,
+                report_pipeline_tree,
+                report_manifest_sha256,
             )
             if worker_identity_before['commit'] != worker_receipt_commit:
                 raise RuntimeError('worker_git_head_receipt_mismatch')
@@ -1428,8 +1723,11 @@ def _remote_bundle_script(submission_key: str) -> str:
             worker_identity_after = git_identity(
                 WORKER_REPO_ROOT, 'worker_git'
             )
-            pipeline_identity_after = git_identity(
-                pipeline_root, 'pipeline_git'
+            pipeline_identity_after = pipeline_identity(
+                pipeline_root,
+                pipeline_receipt_commit,
+                report_pipeline_tree,
+                report_manifest_sha256,
             )
             if worker_identity_after != worker_identity_before:
                 raise RuntimeError('worker_git_identity_changed_during_read')

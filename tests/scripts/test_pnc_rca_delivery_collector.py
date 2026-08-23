@@ -504,6 +504,226 @@ def _execution_identity_reader_fixture(tmp_path, monkeypatch):
     return fixture
 
 
+def _frozen_pipeline_identity_reader_fixture(tmp_path, monkeypatch):
+    submission_key = "g1q3-rca-s1-" + "e" * 64
+    worker_root = tmp_path / "worker-state"
+    worker_entrypoint = worker_root / collector.REMOTE_WORKER_ENTRYPOINT_RELATIVE
+    worker_raw = b"#!/usr/bin/env python3\nprint('worker')\n"
+    worker_identity = _init_identity_repo(
+        worker_root,
+        {collector.REMOTE_WORKER_ENTRYPOINT_RELATIVE: worker_raw},
+    )
+
+    runtime_base = tmp_path / "hermes" / "rca-prod-runtime"
+    pipeline_root = runtime_base / "releases" / "pipeline-runtime"
+    service_entrypoint = pipeline_root.joinpath(
+        *PurePosixPath(collector.REMOTE_PIPELINE_ENTRYPOINT_RELATIVE).parts
+    )
+    report_entrypoint = pipeline_root.joinpath(
+        *PurePosixPath(collector.REMOTE_REPORT_ENTRYPOINT_RELATIVE).parts
+    )
+    service_raw = b"#!/usr/bin/env python3\nprint('service')\n"
+    report_raw = b"#!/usr/bin/env python3\nprint('report')\n"
+    service_entrypoint.parent.mkdir(parents=True, exist_ok=True)
+    service_entrypoint.write_bytes(service_raw)
+    report_entrypoint.write_bytes(report_raw)
+    for directory in sorted(
+        (path for path in pipeline_root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+    ):
+        directory.chmod(0o555)
+    pipeline_root.chmod(0o555)
+    service_entrypoint.chmod(0o444)
+    report_entrypoint.chmod(0o444)
+
+    def snapshot_entries(root):
+        entries = []
+        for path in sorted(root.rglob("*"), key=lambda value: value.as_posix()):
+            relative = path.relative_to(root).as_posix()
+            if path.is_dir():
+                entries.append(
+                    {
+                        "path": relative,
+                        "type": "directory",
+                        "mode": "%04o" % (path.stat().st_mode & 0o7777),
+                        "size_bytes": 0,
+                        "sha256": None,
+                    }
+                )
+            else:
+                raw = path.read_bytes()
+                entries.append(
+                    {
+                        "path": relative,
+                        "type": "file",
+                        "mode": "%04o" % (path.stat().st_mode & 0o7777),
+                        "size_bytes": len(raw),
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                    }
+                )
+        return entries
+
+    root_info = pipeline_root.stat()
+    expected_commit = "5" * 40
+    expected_tree = "6" * 40
+    source_receipt = {
+        "entries": snapshot_entries(pipeline_root),
+        "gitlinks": [],
+        "gitlinks_policy": "materialize_recursive_v1",
+        "max_runtime_bytes": 1024 * 1024 * 1024,
+        "pipeline_commit": expected_commit,
+        "pipeline_remote": "git@git.minieye.tech:pdcl/yj-evaluation-server.git",
+        "pipeline_tag": "rca-pipeline-fixture-1",
+        "pipeline_tree": expected_tree,
+        "release_id": "rca-pipeline-fixture-1",
+        "root_identity": {
+            "dev": root_info.st_dev,
+            "gid": root_info.st_gid,
+            "ino": root_info.st_ino,
+            "mode": "%04o" % (root_info.st_mode & 0o7777),
+            "uid": root_info.st_uid,
+        },
+        "runtime_root": str(pipeline_root),
+        "schema_version": "g1q3_rca_vm_source_materialization_v1",
+    }
+    source_receipt["self_seal"] = hashlib.sha256(
+        json.dumps(
+            source_receipt,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    receipt_dir = runtime_base / "receipts" / "fixture-1"
+    receipt_dir.mkdir(parents=True)
+    report_manifest_path = tmp_path / "config" / "report-runtime-manifest.json"
+    report_entry_raw = report_raw
+    report_manifest = {
+        "schema_version": "pnc_rca_report_manifest_v1",
+        "runtime_root": str(pipeline_root),
+        "pipeline_commit": expected_commit,
+        "pipeline_tree": expected_tree,
+        "report_script_sha256": hashlib.sha256(report_entry_raw).hexdigest(),
+    }
+    report_raw = json.dumps(
+        report_manifest,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    report_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    report_manifest_path.write_bytes(report_raw)
+    (receipt_dir / "report-runtime-manifest.json").write_bytes(report_raw)
+    binding = {
+        "pipeline_commit": expected_commit,
+        "pipeline_tree": expected_tree,
+        "report_manifest_path": str(receipt_dir / "report-runtime-manifest.json"),
+        "report_manifest_sha256": hashlib.sha256(report_raw).hexdigest(),
+        "runtime_root": str(pipeline_root),
+        "schema_version": "g1q3_rca_vm_worker_binding_v1",
+    }
+    binding["self_seal"] = hashlib.sha256(
+        json.dumps(
+            binding,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    source_raw = json.dumps(
+        source_receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8") + b"\n"
+    binding_raw = json.dumps(
+        binding, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8") + b"\n"
+    (receipt_dir / "source-materialization.json").write_bytes(source_raw)
+    (receipt_dir / "worker-binding.json").write_bytes(binding_raw)
+    for path in receipt_dir.iterdir():
+        path.chmod(0o444)
+    receipt_dir.chmod(0o555)
+
+    monkeypatch.setattr(collector, "REMOTE_SHARED_STATE_ROOT", str(tmp_path / "shared-state"))
+    monkeypatch.setattr(collector, "REMOTE_WORKER_REPO_ROOT", str(worker_root))
+    monkeypatch.setattr(collector, "REMOTE_PIPELINE_RUNTIME_ROOT", str(runtime_base))
+    monkeypatch.setattr(
+        collector, "REMOTE_REPORT_RUNTIME_MANIFEST_PATH", str(report_manifest_path)
+    )
+    output_root = tmp_path / "bundle"
+    worker_result = {
+        "schema_version": "g1q3_rca_worker_result_v1",
+        "task_id": submission_key,
+        "rca_submission_key": submission_key,
+        "execution_route": "rca_direct_cli",
+        "repo_root": str(pipeline_root),
+        "execution_attestation": {
+            "schema_version": "g1q3_rca_worker_execution_attestation_v2",
+            "task_id": submission_key,
+            "available": True,
+            "agent_backend": "none",
+            "cwd": str(pipeline_root),
+            "worker_source_commit": worker_identity["commit"],
+            "worker_tree_clean": True,
+            "worker_entrypoint_path": str(worker_entrypoint),
+            "worker_entrypoint_sha256": hashlib.sha256(worker_raw).hexdigest(),
+        },
+    }
+    service_result = {
+        "schema_version": "g1q3_rca_service_result_v2",
+        "task_id": submission_key,
+        "output_dir": str(output_root),
+        "success": True,
+        "status": "completed",
+        "service_provenance": {
+            "schema_version": "g1q3_rca_service_provenance_v1",
+            "available": True,
+            "vm_source_commit": expected_commit,
+            "vm_tree_clean": True,
+            "service_entrypoint_path": str(service_entrypoint),
+            "service_entrypoint_sha256": hashlib.sha256(service_raw).hexdigest(),
+        },
+    }
+    fixture = {
+        "submission_key": submission_key,
+        "worker_root": worker_root,
+        "pipeline_root": pipeline_root,
+        "worker_entrypoint": worker_entrypoint,
+        "service_entrypoint": service_entrypoint,
+        "report_entrypoint": report_entrypoint,
+        "worker_identity": worker_identity,
+        "pipeline_identity": {"commit": expected_commit, "tree": expected_tree},
+        "worker_result": worker_result,
+        "service_result": service_result,
+        "report_manifest": report_manifest,
+        "report_manifest_path": report_manifest_path,
+        "source_receipt_path": receipt_dir / "source-materialization.json",
+        "script_mutator": lambda script: script,
+    }
+
+    def write_identity_inputs(script):
+        result_path = (
+            tmp_path / "shared-state" / "tasks" / submission_key / "result.md"
+        )
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(
+            f"# Result: {submission_key}\n\n"
+            "## Result JSON\n\n"
+            "```json\n"
+            + json.dumps(fixture["worker_result"], sort_keys=True)
+            + "\n```\n",
+            encoding="utf-8",
+        )
+        (output_root / "rca_service_result.json").parent.mkdir(
+            parents=True, exist_ok=True
+        )
+        (output_root / "rca_service_result.json").write_bytes(
+            _json_bytes(fixture["service_result"])
+        )
+        return fixture["script_mutator"](script)
+
+    fixture["script_transform"] = write_identity_inputs
+    return fixture
+
+
 def test_remote_bundle_reader_uses_formal_viz_publication_root():
     submission_key = "g1q3-rca-s1-" + "a" * 64
     formal_root = str(PurePosixPath(canonical_viz_mcap_path(submission_key)).parent)
@@ -618,6 +838,47 @@ def test_remote_bundle_reader_reads_actual_git_and_entrypoint_identity(
     assert evidence["report_service"]["manifest_sha256"] == hashlib.sha256(
         fixture["report_manifest_path"].read_bytes()
     ).hexdigest()
+
+
+def test_remote_bundle_reader_accepts_sealed_frozen_pipeline_runtime(
+    tmp_path, monkeypatch
+):
+    fixture = _frozen_pipeline_identity_reader_fixture(tmp_path, monkeypatch)
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_error"] == ""
+    evidence = payload["execution_identity_evidence"]
+    assert evidence["pipeline"]["commit"] == fixture["pipeline_identity"]["commit"]
+    assert evidence["pipeline"]["tree"] == fixture["pipeline_identity"]["tree"]
+    assert evidence["pipeline"]["clean"] is True
+
+
+def test_remote_bundle_reader_rejects_tampered_frozen_materialization_receipt(
+    tmp_path, monkeypatch
+):
+    fixture = _frozen_pipeline_identity_reader_fixture(tmp_path, monkeypatch)
+    receipt = json.loads(fixture["source_receipt_path"].read_text())
+    receipt["pipeline_tree"] = "f" * 40
+    fixture["source_receipt_path"].chmod(0o644)
+    fixture["source_receipt_path"].write_text(
+        json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == "pipeline_frozen_receipt_invalid"
 
 
 def test_remote_bundle_reader_ignores_inherited_git_environment(
