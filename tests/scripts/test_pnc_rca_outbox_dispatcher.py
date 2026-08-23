@@ -48,6 +48,34 @@ def test_storage_admission_uses_isolated_production_runtime():
     )
 
 
+def test_outbox_retry_backoff_uses_five_second_steady_interval():
+    assert dispatcher.RETRY_DELAYS_SECONDS == (
+        0,
+        2,
+        5,
+        5,
+        5,
+        5,
+        5,
+        5,
+        5,
+        5,
+    )
+    assert [dispatcher.retry_delay_seconds(attempt) for attempt in range(1, 11)] == [
+        2,
+        5,
+        5,
+        5,
+        5,
+        5,
+        5,
+        5,
+        5,
+        5,
+    ]
+    assert dispatcher.retry_delay_seconds(100) == 5
+
+
 def test_stored_unsupported_profile_is_terminal_before_preread(tmp_path):
     store = _steady_control_store(tmp_path / "control.sqlite3")
     result = store.ingest_record(

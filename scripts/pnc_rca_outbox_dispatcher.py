@@ -140,7 +140,10 @@ VM_ARTIFACT_PREFIX = "/mnt/tmp/"
 CIFS_ARTIFACT_PREFIX = (
     "//hfs1.minieye.tech/department-pnc_team-planning_algo-driving/tmp/"
 )
-RETRY_DELAYS_SECONDS = (0, 2, 5, 10, 20, 40, 120, 300, 900, 3600)
+# Keep repeated dispatch failures responsive; the durable retry horizon still
+# bounds the overall attempt window and create-once reconciliation prevents
+# duplicate remote tasks.
+RETRY_DELAYS_SECONDS = (0, 2, 5, 5, 5, 5, 5, 5, 5, 5)
 MIN_LEASE_SECONDS = 180
 MAX_SUBMIT_BOUNDARY_SECONDS = 120
 LEASE_BOUNDARY_MARGIN_SECONDS = 30
@@ -408,8 +411,8 @@ def canonical_artifact_paths(submission_key: str) -> tuple[str, str]:
 def retry_delay_seconds(attempt: int) -> int:
     """Return the delay after a failed claim attempt.
 
-    Attempt one was available at t+0. Its first retry is t+2, followed by
-    5/10/20/40 seconds and 2/5/15/60 minutes (60 minutes thereafter).
+    Attempt one was available at t+0. Its first retry is t+2; subsequent
+    retries use a five-second dispatch interval.
     """
     index = max(1, int(attempt))
     return RETRY_DELAYS_SECONDS[min(index, len(RETRY_DELAYS_SECONDS) - 1)]
