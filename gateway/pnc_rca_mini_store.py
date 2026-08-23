@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import base64
 import hashlib
 import json
@@ -20,8 +20,8 @@ from gateway.pnc_rca_kafka_contract import (
 )
 
 
-MINI_STORE_SCHEMA_VERSION = "pnc_rca_mini_store_v1"
-MINI_OUTBOX_SCHEMA_VERSION = "pnc_rca_mini_outbox_v1"
+MINI_STORE_SCHEMA_VERSION = "pnc_rca_mini_store_v2"
+MINI_OUTBOX_SCHEMA_VERSION = "pnc_rca_mini_outbox_v2"
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 MAX_ERROR_DETAIL = 500
 
@@ -53,7 +53,9 @@ SCHEMA_COLUMNS = {
     "rca_outbox": tuple(
         "outbox_id action business_key submission_key creation_rule_version generation "
         "source_event_id source_topic source_partition source_offset payload_json status "
-        "created_at updated_at".split()
+        "request_json request_sha256 result_json result_sha256 lease_owner "
+        "lease_expires_at attempt_count next_attempt_at last_error_code "
+        "last_error_detail created_at updated_at".split()
     ),
 }
 
@@ -72,6 +74,10 @@ class MiniRecordConflictError(MiniStoreError):
 
 class MiniRecordNotFoundError(MiniStoreError):
     """Raised when a processing operation names an unknown inbox row."""
+
+
+class MiniOutboxLeaseError(MiniStoreError):
+    """Raised when a claimed outbox row is no longer owned by this dispatcher."""
 
 
 @dataclass(frozen=True)
@@ -134,6 +140,25 @@ class MiniIngestResult:
     ack_safe: bool = False
 
 
+@dataclass(frozen=True)
+class MiniOutboxClaim:
+    """A leased, immutable direct-path submission request."""
+
+    outbox_id: int
+    submission_key: str
+    action: str
+    business_key: str
+    generation: int
+    source_event_id: str
+    origin_source_id: str
+    payload_json: str
+    request_json: str
+    request_sha256: str
+    lease_owner: str
+    lease_expires_at: str
+    attempt_count: int
+
+
 def _as_bytes(value: bytes | bytearray | memoryview | str) -> bytes:
     if isinstance(value, bytes):
         return value
@@ -148,8 +173,43 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _stable_source_id(
+    event_uid: str, generation: int = 1, trigger_kind: str = "issue_created"
+) -> str:
+    """Match the canonical g1q3 Kafka source identity derivation."""
+    mode = str(trigger_kind or "").strip()
+    if mode not in {"issue_created", "kafka_retrigger"}:
+        raise ValueError("unsupported Kafka source mode")
+    if mode == "issue_created" and generation != 1:
+        raise ValueError("Kafka issue-created source generation is invalid")
+    if mode == "kafka_retrigger" and generation < 2:
+        raise ValueError("Kafka retrigger source generation is invalid")
+    material: dict[str, Any] = {
+        "source_kind": "kafka_workflow_event",
+        "dedupe": event_uid,
+    }
+    if mode == "kafka_retrigger":
+        material.update({"generation": generation, "mode": mode})
+    return (
+        "g1q3-rca-source-v1-"
+        + hashlib.sha256(_canonical_json(material).encode("utf-8")).hexdigest()
+    )
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _as_iso(value: datetime | None) -> str:
+    if value is None:
+        return _now_iso()
+    if value.tzinfo is None:
+        raise ValueError("outbox clock must be timezone-aware")
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _json_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _policy(value: WorkflowEventPolicy | Mapping[str, Any]) -> WorkflowEventPolicy:
@@ -240,11 +300,15 @@ CREATE TABLE IF NOT EXISTS rca_outbox (
  source_event_id TEXT NOT NULL, source_topic TEXT NOT NULL, source_partition INTEGER NOT NULL CHECK(source_partition >= 0),
  source_offset INTEGER NOT NULL CHECK(source_offset >= 0), payload_json TEXT NOT NULL,
  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','claimed','completed','quarantined')),
- created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ request_json TEXT NOT NULL DEFAULT '', request_sha256 TEXT NOT NULL DEFAULT '',
+ result_json TEXT NOT NULL DEFAULT '', result_sha256 TEXT NOT NULL DEFAULT '',
+ lease_owner TEXT NOT NULL DEFAULT '', lease_expires_at TEXT NOT NULL DEFAULT '',
+ attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+ next_attempt_at TEXT NOT NULL DEFAULT '', last_error_code TEXT NOT NULL DEFAULT '',
+ last_error_detail TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
  FOREIGN KEY(business_key, generation) REFERENCES business_triggers(business_key, generation)
 );
 CREATE INDEX IF NOT EXISTS idx_mini_inbox_pending ON kafka_inbox(decision, received_at, topic, partition_id, offset_id);
-CREATE INDEX IF NOT EXISTS idx_mini_outbox_due ON rca_outbox(status, outbox_id);
 CREATE INDEX IF NOT EXISTS idx_mini_trigger_issue ON business_triggers(project_key, work_item_type_key, work_item_id);
 """
 
@@ -315,6 +379,10 @@ class MiniStore:
                 raise MiniStoreSchemaError(
                     f"unsupported mini store schema: {marker['value']}"
                 )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_mini_outbox_due "
+                "ON rca_outbox(status, next_attempt_at, outbox_id)"
+            )
         self._validate_schema()
 
     def _validate_schema(self) -> None:
@@ -482,8 +550,9 @@ class MiniStore:
             title=normalized.title,
         )
         normalized_json = _canonical_json(normalized.to_dict())
-        source_id, topic, partition, offset = (
+        event_uid, source_id, topic, partition, offset = (
             str(row["event_uid"]),
+            _stable_source_id(str(row["event_uid"])),
             str(row["topic"]),
             int(row["partition_id"]),
             int(row["offset_id"]),
@@ -503,7 +572,7 @@ class MiniStore:
                 normalized.project_simple_name,
                 normalized.work_item_type_key,
                 source_id,
-                source_id,
+                event_uid,
                 topic,
                 partition,
                 offset,
@@ -517,7 +586,8 @@ class MiniStore:
             "business_key": business_key,
             "submission_key": submission_key,
             "generation": generation,
-            "source_event_id": source_id,
+            "source_event_id": event_uid,
+            "origin_source_id": source_id,
             "topic": topic,
             "partition": partition,
             "offset": offset,
@@ -535,7 +605,7 @@ class MiniStore:
                 submission_key,
                 normalized.creation_rule_version,
                 generation,
-                source_id,
+                event_uid,
                 topic,
                 partition,
                 offset,
@@ -758,6 +828,195 @@ class MiniStore:
                 self._record_processing_failure(event_uid, exc)
                 raise
         return results
+
+    def claim_outbox(
+        self,
+        *,
+        lease_owner: str,
+        lease_seconds: int = 300,
+        limit: int = 1,
+        now: datetime | None = None,
+    ) -> list[MiniOutboxClaim]:
+        """Claim due requests with an expiring lease, atomically."""
+        owner = str(lease_owner or "").strip()
+        if not owner:
+            raise ValueError("lease_owner must not be empty")
+        if isinstance(lease_seconds, bool) or not 1 <= int(lease_seconds) <= 86_400:
+            raise ValueError("lease_seconds out of bounds")
+        if isinstance(limit, bool) or not 1 <= int(limit) <= 1_000:
+            raise ValueError("limit out of bounds")
+        current = now or datetime.now(timezone.utc)
+        current_iso = _as_iso(current)
+        expires = _as_iso(current + timedelta(seconds=int(lease_seconds)))
+        claimed: list[MiniOutboxClaim] = []
+        with self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT * FROM rca_outbox WHERE "
+                "(status='pending' AND (next_attempt_at='' OR next_attempt_at<=?)) "
+                "OR (status='claimed' AND lease_expires_at<=?) "
+                "ORDER BY outbox_id LIMIT ?",
+                (current_iso, current_iso, int(limit)),
+            ).fetchall()
+            for row in rows:
+                request = str(row["request_json"] or "")
+                digest = str(row["request_sha256"] or "")
+                if request and digest != _json_sha256(request):
+                    raise MiniStoreError("outbox request hash mismatch")
+                attempt = int(row["attempt_count"]) + 1
+                conn.execute(
+                    "UPDATE rca_outbox SET status='claimed',lease_owner=?,lease_expires_at=?,"
+                    "attempt_count=?,updated_at=? WHERE outbox_id=?",
+                    (owner, expires, attempt, current_iso, int(row["outbox_id"])),
+                )
+                claimed.append(
+                    MiniOutboxClaim(
+                        outbox_id=int(row["outbox_id"]),
+                        submission_key=str(row["submission_key"]),
+                        action=str(row["action"]),
+                        business_key=str(row["business_key"]),
+                        generation=int(row["generation"]),
+                        source_event_id=str(row["source_event_id"]),
+                        origin_source_id=_stable_source_id(str(row["source_event_id"])),
+                        payload_json=str(row["payload_json"]),
+                        request_json=request,
+                        request_sha256=digest,
+                        lease_owner=owner,
+                        lease_expires_at=expires,
+                        attempt_count=attempt,
+                    )
+                )
+        return claimed
+
+    def freeze_execution_request(
+        self,
+        outbox_id: int,
+        *,
+        lease_owner: str,
+        request: Mapping[str, Any] | str,
+        now: datetime | None = None,
+    ) -> tuple[str, str]:
+        """CAS-freeze the exact downstream request before the submit boundary."""
+        request_json = request if isinstance(request, str) else _canonical_json(request)
+        request_sha = _json_sha256(request_json)
+        current_iso = _as_iso(now)
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT status,lease_owner,request_json,request_sha256 FROM rca_outbox WHERE outbox_id=?",
+                (int(outbox_id),),
+            ).fetchone()
+            if row is None:
+                raise MiniRecordNotFoundError(str(outbox_id))
+            if row["status"] != "claimed" or row["lease_owner"] != lease_owner:
+                raise MiniOutboxLeaseError("outbox lease is not owned")
+            existing = str(row["request_json"] or "")
+            if existing:
+                if (
+                    existing != request_json
+                    or str(row["request_sha256"]) != request_sha
+                ):
+                    raise MiniStoreError("execution request is already frozen")
+                return existing, request_sha
+            conn.execute(
+                "UPDATE rca_outbox SET request_json=?,request_sha256=?,updated_at=? "
+                "WHERE outbox_id=? AND status='claimed' AND lease_owner=? AND request_json=''",
+                (request_json, request_sha, current_iso, int(outbox_id), lease_owner),
+            )
+            return request_json, request_sha
+
+    def renew_outbox(
+        self,
+        outbox_id: int,
+        *,
+        lease_owner: str,
+        lease_seconds: int = 300,
+        now: datetime | None = None,
+    ) -> str:
+        current = now or datetime.now(timezone.utc)
+        expires = _as_iso(current + timedelta(seconds=int(lease_seconds)))
+        with self._transaction() as conn:
+            updated = conn.execute(
+                "UPDATE rca_outbox SET lease_expires_at=?,updated_at=? WHERE outbox_id=? "
+                "AND status='claimed' AND lease_owner=?",
+                (expires, _as_iso(current), int(outbox_id), lease_owner),
+            ).rowcount
+            if updated != 1:
+                raise MiniOutboxLeaseError("outbox lease is not owned")
+        return expires
+
+    def complete_outbox(
+        self,
+        outbox_id: int,
+        *,
+        lease_owner: str,
+        result: Mapping[str, Any] | str,
+        now: datetime | None = None,
+    ) -> None:
+        result_json = result if isinstance(result, str) else _canonical_json(result)
+        current_iso = _as_iso(now)
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT lease_owner,status,business_key,generation FROM rca_outbox WHERE outbox_id=?",
+                (int(outbox_id),),
+            ).fetchone()
+            if row is None:
+                raise MiniRecordNotFoundError(str(outbox_id))
+            if row["status"] != "claimed" or row["lease_owner"] != lease_owner:
+                raise MiniOutboxLeaseError("outbox lease is not owned")
+            conn.execute(
+                "UPDATE rca_outbox SET status='completed',result_json=?,result_sha256=?,"
+                "lease_owner='',lease_expires_at='',updated_at=? WHERE outbox_id=?",
+                (result_json, _json_sha256(result_json), current_iso, int(outbox_id)),
+            )
+            conn.execute(
+                "UPDATE business_triggers SET state='completed',updated_at=? "
+                "WHERE business_key=? AND generation=?",
+                (current_iso, str(row["business_key"]), int(row["generation"])),
+            )
+
+    def fail_outbox(
+        self,
+        outbox_id: int,
+        *,
+        lease_owner: str,
+        error_code: str,
+        error_detail: str = "",
+        retry_at: datetime | None = None,
+        quarantine: bool = False,
+        now: datetime | None = None,
+    ) -> None:
+        current_iso = _as_iso(now)
+        next_iso = "" if retry_at is None else _as_iso(retry_at)
+        status = "quarantined" if quarantine else "pending"
+        with self._transaction() as conn:
+            row = conn.execute(
+                "SELECT lease_owner,status,business_key,generation FROM rca_outbox WHERE outbox_id=?",
+                (int(outbox_id),),
+            ).fetchone()
+            if row is None:
+                raise MiniRecordNotFoundError(str(outbox_id))
+            if row["status"] != "claimed" or row["lease_owner"] != lease_owner:
+                raise MiniOutboxLeaseError("outbox lease is not owned")
+            conn.execute(
+                "UPDATE rca_outbox SET status=?,lease_owner='',lease_expires_at='',"
+                "next_attempt_at=?,last_error_code=?,last_error_detail=?,updated_at=? WHERE outbox_id=?",
+                (
+                    status,
+                    next_iso,
+                    str(error_code)[:120],
+                    str(error_detail)[:MAX_ERROR_DETAIL],
+                    current_iso,
+                    int(outbox_id),
+                ),
+            )
+            conn.execute(
+                "UPDATE business_triggers SET state=?,updated_at=? WHERE business_key=? AND generation=?",
+                (
+                    "quarantined" if quarantine else "pending",
+                    current_iso,
+                    str(row["business_key"]),
+                    int(row["generation"]),
+                ),
+            )
 
     def get_inbox(self, event_uid: str) -> dict[str, Any] | None:
         conn = self._connect()
