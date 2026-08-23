@@ -116,7 +116,11 @@ _EXECUTION_REQUEST_REQUIRED_FIELDS = frozenset({
     "source_refs",
 })
 
-DirectVmObservedState = Literal["missing", "unknown", "completed", "failed"]
+# ``existing`` represents a known non-terminal shared-state task (pending,
+# claimed, or running).  It is intentionally distinct from ``unknown``:
+# known identity suppresses create, while an unreadable/ambiguous status must
+# retry without crossing the create boundary.
+DirectVmObservedState = Literal["missing", "unknown", "existing", "completed", "failed"]
 DirectVmSubmitOutcomeName = Literal[
     "deduplicated", "reconciled", "retry", "permanent_conflict"
 ]
@@ -578,7 +582,7 @@ def _validate_status(value: Mapping[str, Any]) -> DirectVmStatus:
     if not isinstance(payload, dict) or frozenset(payload) != _STATUS_FIELDS:
         raise _fail("direct_vm_status_invalid")
     state = payload.get("state")
-    if state not in {"missing", "unknown", "completed", "failed"}:
+    if state not in {"missing", "unknown", "existing", "completed", "failed"}:
         raise _fail("direct_vm_status_invalid")
     task_id = _task_id(payload.get("task_id"), "status_task_id")
     submission_key = payload.get("submission_key")
@@ -678,7 +682,7 @@ def status_first_submit(
             reason="pre_status_unknown",
             create_attempted=False,
         )
-    if initial.state in {"completed", "failed"}:
+    if initial.state in {"existing", "completed", "failed"}:
         if _matches(validated, initial):
             return _outcome(
                 validated,

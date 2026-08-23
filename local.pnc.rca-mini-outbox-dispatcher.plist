@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.pnc.rca-mini-outbox-dispatcher</string>
+  <key>ProgramArguments</key>
+  <array>
+		<string>/Users/songying/.hermes/runtime/venvs/hermes-v0.18.2-b85e919-sealed/bin/python</string>
+    <string>/Users/songying/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca_direct/pnc_rca_mini_outbox_dispatcher.py</string>
+    <string>--env-file</string>
+    <string>/Users/songying/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca_direct/direct.env</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/songying/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca_direct</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/songying</string>
+    <key>HERMES_HOME</key>
+    <string>/Users/songying/.hermes</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>PYTHONNOUSERSITE</key>
+    <string>1</string>
+    <key>PYTHONDONTWRITEBYTECODE</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ExitTimeOut</key>
+  <integer>30</integer>
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/songying/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca_direct/dispatcher.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/songying/.hermes/runtime/pnc_agent/feishu_issue_kafka_rca_direct/dispatcher.stderr.log</string>
+</dict>
+</plist>
