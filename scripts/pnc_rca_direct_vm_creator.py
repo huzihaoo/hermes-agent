@@ -24,6 +24,7 @@ DIRECT_VM_CREATOR_SCHEMA_VERSION = "g1q3_rca_direct_vm_creator_v1"
 DIRECT_VM_TRANSPORT_PROTOCOL_VERSION = "g1q3_rca_direct_vm_transport_v1"
 DIRECT_VM_SUBMIT_SCHEMA_VERSION = "g1q3_rca_direct_vm_submit_envelope_v1"
 DIRECT_VM_VALIDATOR_SCHEMA_VERSION = "g1q3_rca_direct_vm_validator_v1"
+DIRECT_VM_HUMANIZER_MODULE_NAME = "vm_feishu_humanizer"
 MAX_ENVELOPE_BYTES = 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
 MAX_JSON_DEPTH = 32
@@ -670,6 +671,7 @@ def _load_module(
     name: str,
     *,
     expected_sha256: str = "",
+    expected_mode: int | None = None,
 ) -> Any:
     path = Path(path_value)
     if not path.is_absolute() or ".." in PurePosixPath(path).parts:
@@ -690,6 +692,10 @@ def _load_module(
             or observed.st_nlink != 1
             or int(observed.st_uid) != os.geteuid()
             or stat.S_IMODE(observed.st_mode) & 0o022
+            or (
+                expected_mode is not None
+                and stat.S_IMODE(observed.st_mode) != expected_mode
+            )
             or observed.st_size > MAX_METADATA_BYTES * 16
         ):
             raise DirectVmCreatorError("direct_vm_module_permissions_invalid")
@@ -705,9 +711,26 @@ def _load_module(
             raise DirectVmCreatorError("direct_vm_module_unstable")
         after = os.fstat(descriptor)
         lexical = path.lstat()
+
+        # Reading a resident module may update atime.  Compare only the
+        # content/identity fields that can indicate replacement or mutation,
+        # rather than the complete stat_result (which includes atime).
+        def _fingerprint(info: os.stat_result) -> tuple[int, ...]:
+            return (
+                info.st_dev,
+                info.st_ino,
+                info.st_mode,
+                info.st_nlink,
+                info.st_uid,
+                info.st_gid,
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_ctime_ns,
+            )
+
         if (
             stat.S_ISLNK(lexical.st_mode)
-            or observed != after
+            or _fingerprint(observed) != _fingerprint(after)
             or (
                 lexical.st_dev,
                 lexical.st_ino,
@@ -923,6 +946,9 @@ def create_direct_vm_task(
     validator_module_path: str = "",
     shared_state_sha256: str = "",
     validator_sha256: str = "",
+    humanizer_module_path: str = "",
+    humanizer_sha256: str = "",
+    humanizer_mode: int = 0o600,
     # Backwards-compatible keyword for older Host callers.  It is treated as
     # the validator path; no legacy gateway submit module is loaded remotely.
     submit_module_path: str = "",
@@ -934,22 +960,11 @@ def create_direct_vm_task(
         raise DirectVmCreatorError("direct_vm_envelope_too_large")
     root = _safe_root(root_value)
     _validate_create_root(root)
-    try:
-        creator = _load_module(
-            shared_state_module_path,
-            "pnc_rca_shared_state_v2_direct",
-            expected_sha256=shared_state_sha256,
-        )
-    except DirectVmCreatorError as exc:
-        raise DirectVmCreatorError(
-            "direct_vm_shared_state_creator_unavailable"
-        ) from exc
     validator_path = validator_module_path or submit_module_path
     if not validator_path:
         raise DirectVmCreatorError("direct_vm_submit_contract_unavailable")
-    # Loading the self-contained validator is an explicit protocol/version
-    # check.  No Host ``gateway`` package, worker/admission module, or release
-    # machinery is imported or called on the VM.
+    # Validate the self-contained contract before loading any shared-state
+    # dependency so a missing/invalid validator has deterministic precedence.
     try:
         validator_module = _load_module(
             validator_path,
@@ -972,6 +987,35 @@ def create_direct_vm_task(
         payload = dict(validated)
     except Exception as exc:
         raise DirectVmCreatorError("direct_vm_submit_contract_invalid") from exc
+
+    if not humanizer_module_path or not humanizer_sha256:
+        raise DirectVmCreatorError("direct_vm_humanizer_unavailable")
+    # shared_state_v2 imports this module at top level.  Load the exact,
+    # content-addressed dependency under its import name before loading
+    # shared_state_v2 so Python cannot resolve an unpinned sibling or PATH
+    # module.  The loader also enforces owner, mode, regular-file, and stable
+    # descriptor identity checks.
+    try:
+        humanizer_module = _load_module(
+            humanizer_module_path,
+            DIRECT_VM_HUMANIZER_MODULE_NAME,
+            expected_sha256=humanizer_sha256,
+            expected_mode=humanizer_mode,
+        )
+    except DirectVmCreatorError as exc:
+        raise DirectVmCreatorError("direct_vm_humanizer_unavailable") from exc
+    if not callable(getattr(humanizer_module, "build_task_state_notification", None)):
+        raise DirectVmCreatorError("direct_vm_humanizer_abi_invalid")
+    try:
+        creator = _load_module(
+            shared_state_module_path,
+            "pnc_rca_shared_state_v2_direct",
+            expected_sha256=shared_state_sha256,
+        )
+    except DirectVmCreatorError as exc:
+        raise DirectVmCreatorError(
+            "direct_vm_shared_state_creator_unavailable"
+        ) from exc
 
     if not callable(getattr(creator, "create_task", None)):
         raise DirectVmCreatorError("direct_vm_shared_state_creator_abi_invalid")
@@ -1028,6 +1072,7 @@ def create_direct_vm_task(
 __all__ = [
     "DIRECT_VM_CREATOR_SCHEMA_VERSION",
     "DIRECT_VM_VALIDATOR_SCHEMA_VERSION",
+    "DIRECT_VM_HUMANIZER_MODULE_NAME",
     "DirectVmCreatorError",
     "create_direct_vm_task",
     "read_direct_vm_status",

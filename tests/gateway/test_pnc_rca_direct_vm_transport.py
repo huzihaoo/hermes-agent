@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -12,12 +13,18 @@ from gateway.pnc_rca_direct_vm_transport import (
     DEFAULT_REMOTE_CREATOR_PATH,
     DEFAULT_REMOTE_SHARED_STATE_MODULE_PATH,
     DEFAULT_REMOTE_VALIDATOR_MODULE_PATH,
+    DEFAULT_REMOTE_HUMANIZER_MODULE_PATH,
     DEFAULT_REMOTE_CREATOR_SHA256,
     DEFAULT_REMOTE_VALIDATOR_SHA256,
+    DEFAULT_REMOTE_HUMANIZER_SHA256,
+    DEFAULT_REMOTE_HUMANIZER_MODE,
+    DEFAULT_REMOTE_HUMANIZER_BASELINE_COMMIT,
+    DEFAULT_REMOTE_HUMANIZER_BASELINE_TREE,
     DirectVmTransport,
     DirectVmTransportConfig,
     DirectVmTransportError,
     REVIEWED_SSH_MINI_AGENT,
+    _remote_script,
     build_direct_vm_transport,
 )
 from tests.gateway.test_pnc_rca_direct_vm_submit import _missing, _request
@@ -74,8 +81,18 @@ def test_defaults_pin_worker_state_paths_and_creation_is_opt_in() -> None:
         == DEFAULT_REMOTE_SHARED_STATE_MODULE_PATH
     )
     assert config.remote_validator_module_path == DEFAULT_REMOTE_VALIDATOR_MODULE_PATH
+    assert config.remote_humanizer_module_path == DEFAULT_REMOTE_HUMANIZER_MODULE_PATH
     assert config.remote_creator_sha256 != "__CREATOR_SHA256__"
     assert config.remote_validator_sha256 != "__VALIDATOR_SHA256__"
+    assert config.remote_humanizer_sha256 == DEFAULT_REMOTE_HUMANIZER_SHA256
+    assert config.remote_humanizer_mode == DEFAULT_REMOTE_HUMANIZER_MODE
+    assert (
+        config.remote_humanizer_baseline_commit
+        == DEFAULT_REMOTE_HUMANIZER_BASELINE_COMMIT
+    )
+    assert (
+        config.remote_humanizer_baseline_tree == DEFAULT_REMOTE_HUMANIZER_BASELINE_TREE
+    )
     assert "release" not in json.dumps(config.public_dict(), sort_keys=True).lower()
 
 
@@ -103,6 +120,7 @@ def test_production_builder_requires_reviewed_agent_path() -> None:
         "remote_creator_path",
         "remote_shared_state_module_path",
         "remote_validator_module_path",
+        "remote_humanizer_module_path",
     ],
 )
 def test_production_builder_requires_reviewed_vm_paths(field: str) -> None:
@@ -201,6 +219,7 @@ def test_status_uses_one_bounded_agent_verb_and_keeps_paths_out_of_argv() -> Non
     script = str(kwargs["input"])
     assert DEFAULT_REMOTE_CREATOR_PATH in script
     assert DEFAULT_REMOTE_VALIDATOR_MODULE_PATH in script
+    assert DEFAULT_REMOTE_HUMANIZER_MODULE_PATH in script
     assert "/home/mini/.hermes/shared-state" in script
     assert TASK_ID in script
     assert "direct_vm_module_parent_invalid" in script
@@ -210,7 +229,12 @@ def test_status_uses_one_bounded_agent_verb_and_keeps_paths_out_of_argv() -> Non
     assert (
         "info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) & 0o002" in script
     )
-    assert "info.st_nlink != 1" in script
+    assert "before.st_nlink != 1" in script
+    assert (
+        "shared_state_raw = _stable_module_bytes(SHARED_STATE_MODULE, SHARED_STATE_SHA256)"
+        in script
+    )
+    assert "HUMANIZER_MODE = 384" in script
     assert "SUBMIT_MODULE" not in script
     assert "direct_vm_module_hash_mismatch" in script
 
@@ -218,6 +242,11 @@ def test_status_uses_one_bounded_agent_verb_and_keeps_paths_out_of_argv() -> Non
 def test_config_rejects_unbound_module_hashes() -> None:
     with pytest.raises(ValueError, match="remote_validator_sha256_invalid"):
         DirectVmTransportConfig(remote_validator_sha256="not-a-sha").normalized()
+
+    with pytest.raises(ValueError, match="remote_humanizer_mode"):
+        DirectVmTransportConfig(remote_humanizer_mode=0o644).normalized()
+    with pytest.raises(ValueError, match="remote_humanizer_baseline_commit_invalid"):
+        DirectVmTransportConfig(remote_humanizer_baseline_commit="short").normalized()
 
 
 def test_reviewed_source_hashes_bind_to_formal_files() -> None:
@@ -230,6 +259,87 @@ def test_reviewed_source_hashes_bind_to_formal_files() -> None:
     ).hexdigest()
     assert creator == DEFAULT_REMOTE_CREATOR_SHA256
     assert validator == DEFAULT_REMOTE_VALIDATOR_SHA256
+
+
+def test_generated_status_rejects_shared_state_hash_before_creator_call(
+    tmp_path: Path,
+) -> None:
+    creator_path = tmp_path / "creator.py"
+    creator_path.write_text(
+        "DIRECT_VM_CREATOR_SCHEMA_VERSION = 'g1q3_rca_direct_vm_creator_v1'\n"
+        "def read_direct_vm_status(root, task_id, validator):\n"
+        "    return {'state': 'missing', 'task_id': task_id, 'submission_key': '', 'identity_sha256': ''}\n",
+        encoding="utf-8",
+    )
+    validator_path = tmp_path / "validator.py"
+    validator_path.write_text(
+        "DIRECT_VM_VALIDATOR_SCHEMA_VERSION = 'g1q3_rca_direct_vm_validator_v1'\n"
+        "def validate_direct_vm_request(value):\n"
+        "    return value\n",
+        encoding="utf-8",
+    )
+    shared_path = tmp_path / "shared_state_v2.py"
+    shared_path.write_text("# pinned ABI bytes\n", encoding="utf-8")
+    humanizer_path = tmp_path / "humanizer.py"
+    humanizer_path.write_text(
+        "def build_task_state_notification(previous_task, task):\n    return None\n",
+        encoding="utf-8",
+    )
+    for path in (creator_path, validator_path, shared_path, humanizer_path):
+        path.chmod(0o600)
+
+    def digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    kwargs = {
+        "helper_path": str(creator_path),
+        "shared_state_root": str(tmp_path / "root"),
+        "shared_state_module_path": str(shared_path),
+        "validator_module_path": str(validator_path),
+        "humanizer_module_path": str(humanizer_path),
+        "creator_sha256": digest(creator_path),
+        "validator_sha256": digest(validator_path),
+        "humanizer_sha256": digest(humanizer_path),
+        "humanizer_mode": 0o600,
+        # Empty provenance is test-only for the isolated temporary module
+        # tree; production normalization requires the reviewed VM binding.
+        "humanizer_baseline_commit": "",
+        "humanizer_baseline_tree": "",
+        "shared_state_sha256": digest(shared_path),
+        "operation": "status",
+        "task_id": TASK_ID,
+    }
+    good = subprocess.run(
+        [sys.executable, "-I", "-c", _remote_script(**kwargs)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert good.returncode == 0, good.stderr
+    assert json.loads(good.stdout)["state"] == "missing"
+
+    kwargs["humanizer_baseline_commit"] = "f" * 40
+    kwargs["humanizer_baseline_tree"] = "e" * 40
+    provenance_blocked = subprocess.run(
+        [sys.executable, "-I", "-c", _remote_script(**kwargs)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert provenance_blocked.returncode != 0
+    assert "direct_vm_humanizer_provenance_mismatch" in provenance_blocked.stderr
+
+    kwargs["humanizer_baseline_commit"] = ""
+    kwargs["humanizer_baseline_tree"] = ""
+    kwargs["shared_state_sha256"] = "0" * 64
+    blocked = subprocess.run(
+        [sys.executable, "-I", "-c", _remote_script(**kwargs)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert blocked.returncode != 0
+    assert "direct_vm_module_hash_mismatch" in blocked.stderr
 
 
 def test_remote_helper_failure_is_unknown_not_missing() -> None:

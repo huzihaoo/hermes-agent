@@ -43,6 +43,9 @@ DEFAULT_REMOTE_SHARED_STATE_MODULE_PATH = (
 DEFAULT_REMOTE_VALIDATOR_MODULE_PATH = (
     "/home/mini/.hermes/worker-state/pnc_rca_direct_vm_validator.py"
 )
+DEFAULT_REMOTE_HUMANIZER_MODULE_PATH = (
+    "/home/mini/.hermes/worker-state/vm_feishu_humanizer.py"
+)
 # Compatibility alias for pre-validator configuration names.  The path now
 # points at the self-contained validator; no gateway submit module is loaded on
 # the VM.
@@ -51,11 +54,18 @@ DEFAULT_REMOTE_SUBMIT_MODULE_PATH = DEFAULT_REMOTE_VALIDATOR_MODULE_PATH
 # live VM shared-state ABI.  A mismatch is an unknown/retryable transport
 # result, never a proven absence.
 DEFAULT_REMOTE_CREATOR_SHA256 = (
-    "eff4ce684b7fbc66e13c02c369855624db083dc9695d809e5a85d1c0f93624e0"
+    "baf9bcaf86d0fcb50cde6856f83bc2eb4548c27e56e4e90663aef45b61aec318"
 )
 DEFAULT_REMOTE_VALIDATOR_SHA256 = (
     "4175ffb3405210e0504f9882e1f70013f5ce20791240728583d5c92070a935ef"
 )
+DEFAULT_REMOTE_HUMANIZER_SHA256 = (
+    "3f6551c1e0e36e8cee21b50983338474724963da73aa6dc0304490e65c962bee"
+)
+DEFAULT_REMOTE_HUMANIZER_MODE = 0o600
+DEFAULT_REMOTE_HUMANIZER_BASELINE_COMMIT = "fec0a86c169fc71d8dca48a2732dc1cd3b52db99"
+DEFAULT_REMOTE_HUMANIZER_BASELINE_TREE = "1c8cb3832275abf18e31d14b56501cf31080f201"
+REVIEWED_REMOTE_GIT = "/usr/bin/git"
 DEFAULT_REMOTE_SHARED_STATE_SHA256 = (
     "a6a893d3773ef4f54e44f3f0a2224f32e86de9851214a92df59baf3f18d7ec22"
 )
@@ -149,10 +159,15 @@ class DirectVmTransportConfig:
     remote_creator_path: str = DEFAULT_REMOTE_CREATOR_PATH
     remote_shared_state_module_path: str = DEFAULT_REMOTE_SHARED_STATE_MODULE_PATH
     remote_validator_module_path: str = DEFAULT_REMOTE_VALIDATOR_MODULE_PATH
+    remote_humanizer_module_path: str = DEFAULT_REMOTE_HUMANIZER_MODULE_PATH
     # Deprecated input alias retained for old callers/config files.
     remote_submit_module_path: str = ""
     remote_creator_sha256: str = DEFAULT_REMOTE_CREATOR_SHA256
     remote_validator_sha256: str = DEFAULT_REMOTE_VALIDATOR_SHA256
+    remote_humanizer_sha256: str = DEFAULT_REMOTE_HUMANIZER_SHA256
+    remote_humanizer_mode: int = DEFAULT_REMOTE_HUMANIZER_MODE
+    remote_humanizer_baseline_commit: str = DEFAULT_REMOTE_HUMANIZER_BASELINE_COMMIT
+    remote_humanizer_baseline_tree: str = DEFAULT_REMOTE_HUMANIZER_BASELINE_TREE
     remote_shared_state_sha256: str = DEFAULT_REMOTE_SHARED_STATE_SHA256
     create_enabled: bool = False
     timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS
@@ -181,14 +196,30 @@ class DirectVmTransportConfig:
             validator_value,
             "remote_validator_module_path",
         )
+        humanizer = _safe_worker_module_path(
+            self.remote_humanizer_module_path,
+            "remote_humanizer_module_path",
+        )
         hashes = {
             "remote_creator_sha256": self.remote_creator_sha256,
             "remote_validator_sha256": self.remote_validator_sha256,
+            "remote_humanizer_sha256": self.remote_humanizer_sha256,
             "remote_shared_state_sha256": self.remote_shared_state_sha256,
         }
         for field, value in hashes.items():
             if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
                 raise ValueError(f"{field}_invalid")
+        for field, value in {
+            "remote_humanizer_baseline_commit": self.remote_humanizer_baseline_commit,
+            "remote_humanizer_baseline_tree": self.remote_humanizer_baseline_tree,
+        }.items():
+            if (
+                not isinstance(value, str)
+                or re.fullmatch(r"[0-9a-f]{40}", value) is None
+            ):
+                raise ValueError(f"{field}_invalid")
+        if self.remote_humanizer_mode != DEFAULT_REMOTE_HUMANIZER_MODE:
+            raise ValueError("remote_humanizer_mode_must_be_0600")
         if isinstance(self.create_enabled, bool) is False:
             raise ValueError("create_enabled_must_be_boolean")
         try:
@@ -210,6 +241,7 @@ class DirectVmTransportConfig:
             remote_creator_path=creator,
             remote_shared_state_module_path=shared,
             remote_validator_module_path=validator,
+            remote_humanizer_module_path=humanizer,
             remote_submit_module_path="",
             timeout_seconds=timeout,
         )
@@ -224,6 +256,8 @@ class DirectVmTransportConfig:
             "shared_state_module_path": "remote_shared_state_module_path",
             "submit_module_path": "remote_validator_module_path",
             "remote_submit_module_path": "remote_validator_module_path",
+            "humanizer_module_path": "remote_humanizer_module_path",
+            "remote_humanizer_path": "remote_humanizer_module_path",
             "enabled": "create_enabled",
         }
         fields = {
@@ -233,8 +267,13 @@ class DirectVmTransportConfig:
             "remote_shared_state_module_path",
             "remote_validator_module_path",
             "remote_submit_module_path",
+            "remote_humanizer_module_path",
             "remote_creator_sha256",
             "remote_validator_sha256",
+            "remote_humanizer_sha256",
+            "remote_humanizer_mode",
+            "remote_humanizer_baseline_commit",
+            "remote_humanizer_baseline_tree",
             "remote_shared_state_sha256",
             "create_enabled",
             "timeout_seconds",
@@ -257,8 +296,13 @@ class DirectVmTransportConfig:
             "remote_shared_state_module_path": normalized.remote_shared_state_module_path,
             "remote_validator_module_path": normalized.remote_validator_module_path,
             "remote_submit_module_path": normalized.remote_validator_module_path,
+            "remote_humanizer_module_path": normalized.remote_humanizer_module_path,
             "remote_creator_sha256": normalized.remote_creator_sha256,
             "remote_validator_sha256": normalized.remote_validator_sha256,
+            "remote_humanizer_sha256": normalized.remote_humanizer_sha256,
+            "remote_humanizer_mode": normalized.remote_humanizer_mode,
+            "remote_humanizer_baseline_commit": normalized.remote_humanizer_baseline_commit,
+            "remote_humanizer_baseline_tree": normalized.remote_humanizer_baseline_tree,
             "remote_shared_state_sha256": normalized.remote_shared_state_sha256,
             "create_enabled": normalized.create_enabled,
             "timeout_seconds": normalized.timeout_seconds,
@@ -314,8 +358,13 @@ def _remote_script(
     shared_state_root: str,
     shared_state_module_path: str,
     validator_module_path: str,
+    humanizer_module_path: str,
     creator_sha256: str,
     validator_sha256: str,
+    humanizer_sha256: str,
+    humanizer_mode: int,
+    humanizer_baseline_commit: str,
+    humanizer_baseline_tree: str,
     shared_state_sha256: str,
     operation: str,
     task_id: str = "",
@@ -330,18 +379,41 @@ def _remote_script(
     # Values are literals in the generated script; no shell interpolation or
     # user-controlled argv is used by ssh-mini-agent.
     return (
-        "import hashlib, importlib.util, json, os, stat\n"
+        "import hashlib, json, os, stat, subprocess, sys, types\n"
         f"HELPER_PATH = {helper_path!r}\n"
         f"ROOT = {shared_state_root!r}\n"
         f"SHARED_STATE_MODULE = {shared_state_module_path!r}\n"
         f"VALIDATOR_MODULE = {validator_module_path!r}\n"
+        f"HUMANIZER_MODULE = {humanizer_module_path!r}\n"
         f"CREATOR_SHA256 = {creator_sha256!r}\n"
         f"VALIDATOR_SHA256 = {validator_sha256!r}\n"
+        f"HUMANIZER_SHA256 = {humanizer_sha256!r}\n"
+        f"HUMANIZER_MODE = {humanizer_mode!r}\n"
+        f"HUMANIZER_BASELINE_COMMIT = {humanizer_baseline_commit!r}\n"
+        f"HUMANIZER_BASELINE_TREE = {humanizer_baseline_tree!r}\n"
+        f"GIT_PATH = {REVIEWED_REMOTE_GIT!r}\n"
         f"SHARED_STATE_SHA256 = {shared_state_sha256!r}\n"
         f"OPERATION = {operation!r}\n"
         f"TASK_ID = {task_id!r}\n"
         f"ENVELOPE = json.loads({request_json!r})\n"
-        "def _check_pinned_module(path):\n"
+        "MAX_MODULE_BYTES = 16 * 1024 * 1024\n"
+        "def _check_worker_state_baseline(humanizer_raw):\n"
+        "    worker_state = os.path.dirname(HELPER_PATH)\n"
+        "    relative = os.path.relpath(HUMANIZER_MODULE, worker_state)\n"
+        "    if relative != 'vm_feishu_humanizer.py':\n"
+        "        raise RuntimeError('direct_vm_humanizer_provenance_mismatch')\n"
+        "    try:\n"
+        "        commit = subprocess.run([GIT_PATH, '-C', worker_state, 'rev-parse', 'HEAD'], text=True, capture_output=True, check=False, timeout=2.0)\n"
+        "        tree = subprocess.run([GIT_PATH, '-C', worker_state, 'rev-parse', 'HEAD^{tree}'], text=True, capture_output=True, check=False, timeout=2.0)\n"
+        "        tracked = subprocess.run([GIT_PATH, '-C', worker_state, 'ls-files', '--error-unmatch', relative], text=True, capture_output=True, check=False, timeout=2.0)\n"
+        "        blob = subprocess.run([GIT_PATH, '-C', worker_state, 'rev-parse', f'{HUMANIZER_BASELINE_COMMIT}:{relative}'], text=True, capture_output=True, check=False, timeout=2.0)\n"
+        "    except (OSError, subprocess.SubprocessError):\n"
+        "        raise RuntimeError('direct_vm_humanizer_provenance_mismatch')\n"
+        "    blob_material = b'blob ' + str(len(humanizer_raw)).encode('ascii') + b'\\0' + humanizer_raw\n"
+        "    expected_blob = hashlib.sha1(blob_material).hexdigest()\n"
+        "    if (commit.returncode != 0 or tree.returncode != 0 or tracked.returncode != 0 or blob.returncode != 0 or commit.stdout.strip() != HUMANIZER_BASELINE_COMMIT or tree.stdout.strip() != HUMANIZER_BASELINE_TREE or tracked.stdout.strip() != relative or blob.stdout.strip() != expected_blob):\n"
+        "        raise RuntimeError('direct_vm_humanizer_provenance_mismatch')\n"
+        "def _check_pinned_parent(path):\n"
         "    current = os.path.sep\n"
         "    parts = [part for part in path.split(os.path.sep) if part]\n"
         "    for index, part in enumerate(parts):\n"
@@ -350,41 +422,83 @@ def _remote_script(
         "        if index < len(parts) - 1:\n"
         "            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):\n"
         "                raise RuntimeError('direct_vm_module_parent_invalid')\n"
-        "            if info.st_uid not in {0, os.geteuid()} or (\n"
-        "                (info.st_uid == 0 and stat.S_IMODE(info.st_mode) & 0o022)\n"
-        "                or (info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) & 0o002)\n"
-        "            ):\n"
+        "            if info.st_uid not in {0, os.geteuid()}:\n"
         "                raise RuntimeError('direct_vm_module_parent_permissions_invalid')\n"
-        "    info = os.lstat(path)\n"
-        "    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:\n"
-        "        raise RuntimeError('direct_vm_module_not_regular')\n"
-        "    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:\n"
-        "        raise RuntimeError('direct_vm_module_permissions_invalid')\n"
-        "def _check_hash(path, expected):\n"
-        "    before = os.lstat(path)\n"
-        "    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:\n"
-        "        raise RuntimeError('direct_vm_module_not_regular')\n"
-        "    digest = hashlib.sha256(open(path, 'rb').read()).hexdigest()\n"
-        "    after = os.lstat(path)\n"
-        "    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) or digest != expected:\n"
-        "        raise RuntimeError('direct_vm_module_hash_mismatch')\n"
-        "_check_pinned_module(HELPER_PATH)\n"
-        "_check_pinned_module(SHARED_STATE_MODULE)\n"
-        "_check_pinned_module(VALIDATOR_MODULE)\n"
-        "_check_hash(HELPER_PATH, CREATOR_SHA256)\n"
-        "_check_hash(SHARED_STATE_MODULE, SHARED_STATE_SHA256)\n"
-        "_check_hash(VALIDATOR_MODULE, VALIDATOR_SHA256)\n"
-        "spec = importlib.util.spec_from_file_location('pnc_rca_direct_vm_creator_remote', HELPER_PATH)\n"
-        "if spec is None or spec.loader is None:\n"
-        "    raise RuntimeError('direct_vm_creator_helper_unloadable')\n"
-        "module = importlib.util.module_from_spec(spec)\n"
-        "spec.loader.exec_module(module)\n"
+        "            if info.st_uid == 0 and stat.S_IMODE(info.st_mode) & 0o022:\n"
+        "                raise RuntimeError('direct_vm_module_parent_permissions_invalid')\n"
+        "            if info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) & 0o002:\n"
+        "                raise RuntimeError('direct_vm_module_parent_permissions_invalid')\n"
+        "def _fingerprint(info):\n"
+        "    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid, info.st_gid, info.st_size, info.st_mtime_ns, info.st_ctime_ns)\n"
+        "def _stable_module_bytes(path, expected, required_mode=None):\n"
+        "    _check_pinned_parent(path)\n"
+        "    flags = os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_NOFOLLOW', 0)\n"
+        "    try:\n"
+        "        descriptor = os.open(path, flags)\n"
+        "    except OSError as exc:\n"
+        "        raise RuntimeError('direct_vm_module_missing') from exc\n"
+        "    try:\n"
+        "        before = os.fstat(descriptor)\n"
+        "        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_uid != os.geteuid() or stat.S_IMODE(before.st_mode) & 0o022 or (required_mode is not None and stat.S_IMODE(before.st_mode) != required_mode) or before.st_size > MAX_MODULE_BYTES):\n"
+        "            raise RuntimeError('direct_vm_module_permissions_invalid')\n"
+        "        chunks = []\n"
+        "        remaining = before.st_size\n"
+        "        while remaining:\n"
+        "            chunk = os.read(descriptor, min(1024 * 1024, remaining))\n"
+        "            if not chunk:\n"
+        "                raise RuntimeError('direct_vm_module_unstable')\n"
+        "            chunks.append(chunk)\n"
+        "            remaining -= len(chunk)\n"
+        "        if os.read(descriptor, 1):\n"
+        "            raise RuntimeError('direct_vm_module_unstable')\n"
+        "        after = os.fstat(descriptor)\n"
+        "        lexical = os.lstat(path)\n"
+        "        if (stat.S_ISLNK(lexical.st_mode) or _fingerprint(before) != _fingerprint(after) or (lexical.st_dev, lexical.st_ino, lexical.st_size, lexical.st_mtime_ns, lexical.st_ctime_ns) != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)):\n"
+        "            raise RuntimeError('direct_vm_module_unstable')\n"
+        "        raw = b''.join(chunks)\n"
+        "        if hashlib.sha256(raw).hexdigest() != expected:\n"
+        "            raise RuntimeError('direct_vm_module_hash_mismatch')\n"
+        "        return raw\n"
+        "    except OSError as exc:\n"
+        "        raise RuntimeError('direct_vm_module_unstable') from exc\n"
+        "    finally:\n"
+        "        os.close(descriptor)\n"
+        "def _module_from_bytes(name, path, raw):\n"
+        "    module = types.ModuleType(name)\n"
+        "    module.__file__ = path\n"
+        "    module.__package__ = ''\n"
+        "    previous = sys.modules.get(name)\n"
+        "    sys.modules[name] = module\n"
+        "    try:\n"
+        "        exec(compile(raw, path, 'exec'), module.__dict__)\n"
+        "    except BaseException as exc:\n"
+        "        if previous is None:\n"
+        "            sys.modules.pop(name, None)\n"
+        "        else:\n"
+        "            sys.modules[name] = previous\n"
+        "        raise RuntimeError('direct_vm_module_import_failed') from exc\n"
+        "    return module\n"
+        "creator_raw = _stable_module_bytes(HELPER_PATH, CREATOR_SHA256)\n"
+        "validator_raw = _stable_module_bytes(VALIDATOR_MODULE, VALIDATOR_SHA256)\n"
+        "shared_state_raw = _stable_module_bytes(SHARED_STATE_MODULE, SHARED_STATE_SHA256)\n"
+        "validator = _module_from_bytes('pnc_rca_direct_vm_validator_probe', VALIDATOR_MODULE, validator_raw)\n"
+        "if getattr(validator, 'DIRECT_VM_VALIDATOR_SCHEMA_VERSION', '') != 'g1q3_rca_direct_vm_validator_v1':\n"
+        "    raise RuntimeError('direct_vm_submit_contract_unavailable')\n"
+        "if not callable(getattr(validator, 'validate_direct_vm_request', None)):\n"
+        "    raise RuntimeError('direct_vm_submit_contract_unavailable')\n"
+        "module = _module_from_bytes('pnc_rca_direct_vm_creator_remote', HELPER_PATH, creator_raw)\n"
         "if getattr(module, 'DIRECT_VM_CREATOR_SCHEMA_VERSION', '') != 'g1q3_rca_direct_vm_creator_v1':\n"
         "    raise RuntimeError('direct_vm_creator_protocol_mismatch')\n"
+        "humanizer_raw = _stable_module_bytes(HUMANIZER_MODULE, HUMANIZER_SHA256, HUMANIZER_MODE)\n"
+        "if HUMANIZER_BASELINE_COMMIT or HUMANIZER_BASELINE_TREE:\n"
+        "    _check_worker_state_baseline(humanizer_raw)\n"
         "if OPERATION == 'status':\n"
         "    result = module.read_direct_vm_status(ROOT, TASK_ID, VALIDATOR_MODULE)\n"
         "else:\n"
-        "    result = module.create_direct_vm_task(ROOT, ENVELOPE, shared_state_module_path=SHARED_STATE_MODULE, validator_module_path=VALIDATOR_MODULE, shared_state_sha256=SHARED_STATE_SHA256, validator_sha256=VALIDATOR_SHA256)\n"
+        "    humanizer = _module_from_bytes('vm_feishu_humanizer', HUMANIZER_MODULE, humanizer_raw)\n"
+        "    if not callable(getattr(humanizer, 'build_task_state_notification', None)):\n"
+        "        raise RuntimeError('direct_vm_humanizer_abi_invalid')\n"
+        "    result = module.create_direct_vm_task(ROOT, ENVELOPE, shared_state_module_path=SHARED_STATE_MODULE, validator_module_path=VALIDATOR_MODULE, shared_state_sha256=SHARED_STATE_SHA256, validator_sha256=VALIDATOR_SHA256, humanizer_module_path=HUMANIZER_MODULE, humanizer_sha256=HUMANIZER_SHA256, humanizer_mode=HUMANIZER_MODE)\n"
         "print(json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(',', ':')))\n"
     )
 
@@ -427,8 +541,13 @@ class DirectVmTransport:
             shared_state_root=self.config.shared_state_root,
             shared_state_module_path=self.config.remote_shared_state_module_path,
             validator_module_path=self.config.remote_validator_module_path,
+            humanizer_module_path=self.config.remote_humanizer_module_path,
             creator_sha256=self.config.remote_creator_sha256,
             validator_sha256=self.config.remote_validator_sha256,
+            humanizer_sha256=self.config.remote_humanizer_sha256,
+            humanizer_mode=self.config.remote_humanizer_mode,
+            humanizer_baseline_commit=self.config.remote_humanizer_baseline_commit,
+            humanizer_baseline_tree=self.config.remote_humanizer_baseline_tree,
             shared_state_sha256=self.config.remote_shared_state_sha256,
             operation=operation,
             task_id=task_id,
@@ -554,8 +673,13 @@ def build_direct_vm_transport(
             "remote_creator_path": DEFAULT_REMOTE_CREATOR_PATH,
             "remote_shared_state_module_path": DEFAULT_REMOTE_SHARED_STATE_MODULE_PATH,
             "remote_validator_module_path": DEFAULT_REMOTE_VALIDATOR_MODULE_PATH,
+            "remote_humanizer_module_path": DEFAULT_REMOTE_HUMANIZER_MODULE_PATH,
             "remote_creator_sha256": DEFAULT_REMOTE_CREATOR_SHA256,
             "remote_validator_sha256": DEFAULT_REMOTE_VALIDATOR_SHA256,
+            "remote_humanizer_sha256": DEFAULT_REMOTE_HUMANIZER_SHA256,
+            "remote_humanizer_mode": DEFAULT_REMOTE_HUMANIZER_MODE,
+            "remote_humanizer_baseline_commit": DEFAULT_REMOTE_HUMANIZER_BASELINE_COMMIT,
+            "remote_humanizer_baseline_tree": DEFAULT_REMOTE_HUMANIZER_BASELINE_TREE,
             "remote_shared_state_sha256": DEFAULT_REMOTE_SHARED_STATE_SHA256,
         }
         for field, expected in reviewed_fields.items():
@@ -569,8 +693,13 @@ __all__ = [
     "DEFAULT_REMOTE_SHARED_STATE_MODULE_PATH",
     "DEFAULT_REMOTE_SUBMIT_MODULE_PATH",
     "DEFAULT_REMOTE_VALIDATOR_MODULE_PATH",
+    "DEFAULT_REMOTE_HUMANIZER_MODULE_PATH",
     "DEFAULT_REMOTE_CREATOR_SHA256",
     "DEFAULT_REMOTE_VALIDATOR_SHA256",
+    "DEFAULT_REMOTE_HUMANIZER_SHA256",
+    "DEFAULT_REMOTE_HUMANIZER_MODE",
+    "DEFAULT_REMOTE_HUMANIZER_BASELINE_COMMIT",
+    "DEFAULT_REMOTE_HUMANIZER_BASELINE_TREE",
     "DEFAULT_REMOTE_SHARED_STATE_SHA256",
     "DEFAULT_VM_SHARED_STATE_ROOT",
     "DIRECT_VM_TRANSPORT_PROTOCOL_VERSION",

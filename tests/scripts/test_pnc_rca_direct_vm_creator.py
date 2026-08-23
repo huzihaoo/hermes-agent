@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -34,7 +35,7 @@ def create_task(*, root, title, goal_text, task_id, owner, requester_session_key
         else ""
     )
     path.write_text(
-        "from pathlib import Path\nimport json\n"
+        "from pathlib import Path\nimport json\nimport vm_feishu_humanizer\n"
         "def ensure_canonical_root(root=None):\n"
         "    root = Path(root)\n"
         "    for name in ('tasks', 'dispatch/pending', 'dispatch/claimed', 'dispatch/done', 'dispatch/failed'):\n"
@@ -43,6 +44,34 @@ def create_task(*, root, title, goal_text, task_id, owner, requester_session_key
         encoding="utf-8",
     )
     return path
+
+
+def _write_humanizer_module(path: Path) -> Path:
+    path.write_text(
+        "def build_task_state_notification(previous_task, task):\n    return None\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+    return path
+
+
+def _bound_dependency_kwargs(
+    tmp_path: Path, *, validator_path: Path | None = None
+) -> dict[str, str]:
+    validator = (
+        validator_path or Path("scripts/pnc_rca_direct_vm_validator.py").resolve()
+    )
+    humanizer = _write_humanizer_module(tmp_path / "vm_feishu_humanizer.py")
+    return {
+        "validator_module_path": str(validator),
+        "validator_sha256": (
+            hashlib.sha256(validator.read_bytes()).hexdigest()
+            if validator.is_file()
+            else ""
+        ),
+        "humanizer_module_path": str(humanizer),
+        "humanizer_sha256": hashlib.sha256(humanizer.read_bytes()).hexdigest(),
+    }
 
 
 def _load_request() -> dict[str, object]:
@@ -82,7 +111,7 @@ def test_old_vm_shared_state_abi_creates_and_deduplicates(
 ) -> None:
     root = tmp_path / "shared-state"
     module_path = _write_old_abi_module(tmp_path / "shared_state_v2.py")
-    validator_path = Path("scripts/pnc_rca_direct_vm_validator.py").resolve()
+    dependencies = _bound_dependency_kwargs(tmp_path)
     monkeypatch.setattr(creator, "_safe_root", lambda _value: root)
 
     request = _load_request()
@@ -90,13 +119,13 @@ def test_old_vm_shared_state_abi_creates_and_deduplicates(
         str(root),
         request,
         shared_state_module_path=str(module_path),
-        validator_module_path=str(validator_path),
+        **dependencies,
     )
     second = creator.create_direct_vm_task(
         str(root),
         request,
         shared_state_module_path=str(module_path),
-        validator_module_path=str(validator_path),
+        **dependencies,
     )
 
     assert first["created"] is True
@@ -116,14 +145,14 @@ def test_old_vm_shared_state_abi_conflicts_on_identity_change(
 ) -> None:
     root = tmp_path / "shared-state"
     module_path = _write_old_abi_module(tmp_path / "shared_state_v2.py")
-    validator_path = Path("scripts/pnc_rca_direct_vm_validator.py").resolve()
+    dependencies = _bound_dependency_kwargs(tmp_path)
     monkeypatch.setattr(creator, "_safe_root", lambda _value: root)
     request = _load_request()
     creator.create_direct_vm_task(
         str(root),
         request,
         shared_state_module_path=str(module_path),
-        validator_module_path=str(validator_path),
+        **dependencies,
     )
     execution = dict(request["execution_request"])
     execution["request_kind"] = "issue_intake"
@@ -143,7 +172,7 @@ def test_old_vm_shared_state_abi_conflicts_on_identity_change(
         str(root),
         changed,
         shared_state_module_path=str(module_path),
-        validator_module_path=str(validator_path),
+        **dependencies,
     )
     assert result["accepted"] is False
     assert result["conflict"] is True
@@ -168,13 +197,13 @@ def test_creator_rejects_missing_submit_contract_before_write(
     assert not root.exists()
 
 
-def test_creator_rejects_group_or_world_writable_module(
+def test_creator_validator_error_precedes_unbound_humanizer(
     monkeypatch, tmp_path: Path
 ) -> None:
     root = tmp_path / "shared-state"
     module_path = _write_old_abi_module(tmp_path / "shared_state_v2.py")
-    module_path.chmod(0o666)
-    validator_path = Path("scripts/pnc_rca_direct_vm_validator.py").resolve()
+    humanizer = _write_humanizer_module(tmp_path / "vm_feishu_humanizer.py")
+    humanizer.chmod(0o644)
     monkeypatch.setattr(creator, "_safe_root", lambda _value: root)
 
     with pytest.raises(creator.DirectVmCreatorError) as raised:
@@ -182,7 +211,63 @@ def test_creator_rejects_group_or_world_writable_module(
             str(root),
             _load_request(),
             shared_state_module_path=str(module_path),
-            validator_module_path=str(validator_path),
+            validator_module_path=str(tmp_path / "missing_validator.py"),
+            humanizer_module_path=str(humanizer),
+            humanizer_sha256=hashlib.sha256(humanizer.read_bytes()).hexdigest(),
+        )
+
+    assert raised.value.code == "direct_vm_submit_contract_unavailable"
+    assert not root.exists()
+
+
+def test_creator_requires_dedicated_humanizer_mode_and_hash(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "shared-state"
+    module_path = _write_old_abi_module(tmp_path / "shared_state_v2.py")
+    dependencies = _bound_dependency_kwargs(tmp_path)
+    humanizer = Path(dependencies["humanizer_module_path"])
+    monkeypatch.setattr(creator, "_safe_root", lambda _value: root)
+
+    humanizer.chmod(0o644)
+    with pytest.raises(creator.DirectVmCreatorError) as raised:
+        creator.create_direct_vm_task(
+            str(root),
+            _load_request(),
+            shared_state_module_path=str(module_path),
+            **dependencies,
+        )
+    assert raised.value.code == "direct_vm_humanizer_unavailable"
+    assert not root.exists()
+
+    humanizer.chmod(0o600)
+    dependencies["humanizer_sha256"] = "0" * 64
+    with pytest.raises(creator.DirectVmCreatorError) as raised:
+        creator.create_direct_vm_task(
+            str(root),
+            _load_request(),
+            shared_state_module_path=str(module_path),
+            **dependencies,
+        )
+    assert raised.value.code == "direct_vm_humanizer_unavailable"
+    assert not root.exists()
+
+
+def test_creator_rejects_group_or_world_writable_module(
+    monkeypatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "shared-state"
+    module_path = _write_old_abi_module(tmp_path / "shared_state_v2.py")
+    module_path.chmod(0o666)
+    dependencies = _bound_dependency_kwargs(tmp_path)
+    monkeypatch.setattr(creator, "_safe_root", lambda _value: root)
+
+    with pytest.raises(creator.DirectVmCreatorError) as raised:
+        creator.create_direct_vm_task(
+            str(root),
+            _load_request(),
+            shared_state_module_path=str(module_path),
+            **dependencies,
         )
 
     assert raised.value.code == "direct_vm_shared_state_creator_unavailable"
@@ -196,7 +281,7 @@ def test_creator_rejects_module_parent_symlink(monkeypatch, tmp_path: Path) -> N
     module_path = _write_old_abi_module(real_dir / "shared_state_v2.py")
     linked_dir = tmp_path / "linked-modules"
     linked_dir.symlink_to(real_dir, target_is_directory=True)
-    validator_path = Path("scripts/pnc_rca_direct_vm_validator.py").resolve()
+    dependencies = _bound_dependency_kwargs(tmp_path)
     monkeypatch.setattr(creator, "_safe_root", lambda _value: root)
 
     with pytest.raises(creator.DirectVmCreatorError) as raised:
@@ -204,7 +289,7 @@ def test_creator_rejects_module_parent_symlink(monkeypatch, tmp_path: Path) -> N
             str(root),
             _load_request(),
             shared_state_module_path=str(linked_dir / module_path.name),
-            validator_module_path=str(validator_path),
+            **dependencies,
         )
 
     assert raised.value.code == "direct_vm_shared_state_creator_unavailable"
@@ -218,7 +303,7 @@ def test_creator_rejects_shared_state_abi_without_create_task(
     module_path = _write_old_abi_module(
         tmp_path / "bad_shared_state.py", with_create=False
     )
-    validator_path = Path("scripts/pnc_rca_direct_vm_validator.py").resolve()
+    dependencies = _bound_dependency_kwargs(tmp_path)
     monkeypatch.setattr(creator, "_safe_root", lambda _value: root)
 
     with pytest.raises(creator.DirectVmCreatorError) as raised:
@@ -226,7 +311,7 @@ def test_creator_rejects_shared_state_abi_without_create_task(
             str(root),
             _load_request(),
             shared_state_module_path=str(module_path),
-            validator_module_path=str(validator_path),
+            **dependencies,
         )
 
     assert raised.value.code == "direct_vm_shared_state_creator_abi_invalid"
