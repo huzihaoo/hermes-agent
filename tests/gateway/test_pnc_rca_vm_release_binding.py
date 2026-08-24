@@ -8,7 +8,7 @@ from tools import vm_task_tool
 def test_current_rca_vm_release_binding_is_shared_by_all_active_host_paths():
     assert binding.RCA_PROD_VM_RELEASE_ROOT == (
         "/home/mini/.hermes/rca-prod-runtime/releases/"
-        "rca-platform-20260822.installed-c2821d2-r15bq"
+        "rca-platform-20260824.installed-c2821d2-r15br"
     )
     assert derived.REMOTE_VM_REPO_ROOT == binding.RCA_PROD_VM_RELEASE_ROOT
     assert derived.REMOTE_DERIVED_RESERVATION_MODULE == (
