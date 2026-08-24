@@ -15,6 +15,7 @@ import re
 import signal
 import secrets
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -152,6 +153,7 @@ DEFAULT_INPUT_WAIT_MAX_AGE_SECONDS = 900
 MIN_INPUT_WAIT_MAX_AGE_SECONDS = 60
 MAX_INPUT_WAIT_MAX_AGE_SECONDS = 3_600
 HEALTH_HEARTBEAT_INTERVAL_SECONDS = 10.0
+STORE_BUSY_RETRY_DELAYS_SECONDS = (2, 5, 5)
 SUCCESSOR_READ_ONLY_MODE = "successor_read_only"
 SCHEMA_RUNTIME_CAPABILITY_KEYS = frozenset({
     "observed_control_schema_version",
@@ -365,6 +367,119 @@ def _utc_iso(value: datetime | None = None) -> str:
     if current.tzinfo is None:
         raise ValueError("datetime values must be timezone-aware")
     return current.astimezone(timezone.utc).isoformat()
+
+
+def _sqlite_busy_or_locked_error(
+    exc: BaseException,
+) -> sqlite3.OperationalError | None:
+    pending: list[BaseException | None] = [exc]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in visited:
+            continue
+        visited.add(id(current))
+        if isinstance(current, sqlite3.OperationalError):
+            code = getattr(current, "sqlite_errorcode", None)
+            code = (
+                code
+                if isinstance(code, int) and not isinstance(code, bool)
+                else None
+            )
+            if code is not None and code & 0xFF in {
+                sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED
+            }:
+                return current
+            if (
+                code is None
+                and re.fullmatch(
+                    r"database(?: (?:schema|table))? is (?:busy|locked)",
+                    str(current).strip().lower(),
+                )
+            ):
+                return current
+        pending.extend((current.__context__, current.__cause__))
+    return None
+
+
+def _is_sqlite_busy_or_locked(exc: BaseException) -> bool:
+    return _sqlite_busy_or_locked_error(exc) is not None
+
+
+def _emit_store_busy_log(
+    exc: BaseException,
+    *,
+    phase: str,
+    attempt: int,
+    delay_seconds: float,
+) -> None:
+    busy = _sqlite_busy_or_locked_error(exc)
+    code = getattr(busy, "sqlite_errorcode", None)
+    payload = dict(
+        event="rca_outbox_store_busy",
+        observed_at=_utc_iso(),
+        pid=os.getpid(),
+        phase=phase,
+        attempt=attempt,
+        delay_seconds=delay_seconds,
+        sqlite_errorcode=code or None,
+    )
+    print(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _store_busy_outcome(
+    stats: DispatchStats, exc: BaseException, *, phase: str
+) -> DispatchOutcome:
+    stats.store_busy += 1
+    _emit_store_busy_log(
+        exc, phase=phase, attempt=stats.store_busy, delay_seconds=0
+    )
+    return DispatchOutcome(status="store_busy", error_code="control_store_busy")
+
+
+def _retry_resident_store_operation(
+    operation: Callable[[], Any],
+    *,
+    phase: str,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    for attempt, delay in enumerate((*STORE_BUSY_RETRY_DELAYS_SECONDS, None), 1):
+        try:
+            return operation()
+        except Exception as exc:
+            if not _is_sqlite_busy_or_locked(exc):
+                raise
+            _emit_store_busy_log(
+                exc,
+                phase=phase,
+                attempt=attempt,
+                delay_seconds=delay or 0,
+            )
+            if delay is None:
+                raise
+            sleep(delay)
+
+
+def _open_resident_control_store(
+    path: Path,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+) -> RcaControlStore:
+    return _retry_resident_store_operation(
+        lambda: RcaControlStore(
+            path,
+            require_current=True,
+            read_only=False,
+            allow_successor_read_only=False,
+            allow_successor_write=True,
+        ),
+        phase="resident_store_startup",
+        sleep=sleep,
+    )
 
 
 def _boolean(env: Mapping[str, str], name: str, default: bool = False) -> bool:
@@ -1113,6 +1228,7 @@ class DispatchStats:
     delivery_circuit_blocked: int = 0
     delivery_backpressure_errors: int = 0
     lease_lost: int = 0
+    store_busy: int = 0
 
 
 @dataclass(frozen=True)
@@ -1249,11 +1365,32 @@ def default_submit(
         "reconcile_only": reconcile_only,
         **snapshot_requirement,
     }
+    authority_busy: list[BaseException | None] = [None]
     if control_store is not None:
-        submit_kwargs["live_write_fence_authority"] = lambda fence: (
-            _live_write_fence_binding(control_store, fence)
-        )
-    return vm_task_submit_service(**submit_kwargs)
+        def live_write_fence_authority(fence: Mapping[str, Any]) -> Mapping[str, Any]:
+            try:
+                return _live_write_fence_binding(control_store, fence)
+            except Exception as exc:
+                busy = _sqlite_busy_or_locked_error(exc)
+                if busy is not None:
+                    authority_busy[0] = busy
+                raise
+
+        submit_kwargs["live_write_fence_authority"] = live_write_fence_authority
+    result = vm_task_submit_service(**submit_kwargs)
+    if authority_busy[0] is not None:
+        if (
+            not isinstance(result, Mapping)
+            or result.get("success") is not False
+            or result.get("create_suppressed") is not True
+            or result.get("created") is True
+        ):
+            raise DispatchCircuitError(
+                "dispatcher_submit_contract_invalid",
+                "live write-fence authority BUSY did not suppress create",
+            ) from None
+        raise authority_busy[0]
+    return result
 
 
 def _remote_storage_admission_script(request: StorageAdmissionRequest) -> str:
@@ -2948,8 +3085,12 @@ class OutboxDispatcher:
         except PermanentDispatchError as exc:
             return self._quarantine(claim, exc.code, exc.detail)
         except DispatchCircuitError as exc:
+            if _is_sqlite_busy_or_locked(exc):
+                raise
             return self._handle_dispatch_error(claim, exc.code, exc.detail)
         except Exception as exc:
+            if _is_sqlite_busy_or_locked(exc):
+                raise
             if isinstance(exc, ImportError):
                 return self._open_circuit(
                     claim,
@@ -3201,7 +3342,14 @@ class OutboxDispatcher:
     def dispatch_batch(self) -> list[DispatchOutcome]:
         outcomes: list[DispatchOutcome] = []
         for _ in range(self.config.batch_size):
-            outcome = self.dispatch_one()
+            try:
+                outcome = self.dispatch_one()
+            except Exception as exc:
+                if not _is_sqlite_busy_or_locked(exc):
+                    raise
+                outcome = _store_busy_outcome(
+                    self.stats, exc, phase="dispatch_batch"
+                )
             outcomes.append(outcome)
             if outcome.status in {
                 "disabled",
@@ -3211,6 +3359,7 @@ class OutboxDispatcher:
                 "downstream_backpressure",
                 "downstream_error",
                 "lease_lost",
+                "store_busy",
             }:
                 break
         return outcomes
@@ -3380,21 +3529,37 @@ class HealthReporter:
         state: str,
         stats: DispatchStats,
         last_outcome: DispatchOutcome | None = None,
-    ) -> None:
-        circuit = self.store.dispatcher_circuit()
-        downstream = (
-            dict(self.delivery_backpressure_status())
-            if self.delivery_backpressure_status is not None
-            else {
+    ) -> DispatchOutcome | None:
+        busy_outcome = None
+        try:
+            circuit_open = self.store.dispatcher_circuit().is_open
+            downstream = (
+                dict(self.delivery_backpressure_status())
+                if self.delivery_backpressure_status is not None
+                else {
+                    "enabled": self.config.delivery_backpressure_enabled,
+                    "active": False,
+                    "high_watermark": self.config.delivery_high_watermark,
+                    "resume_watermark": self.config.delivery_resume_watermark,
+                    "last_snapshot": None,
+                    "last_error": None,
+                }
+            )
+            store_health = self.store.health()
+        except Exception as exc:
+            if not _is_sqlite_busy_or_locked(exc):
+                raise
+            busy_outcome = _store_busy_outcome(stats, exc, phase="health_write")
+            state, last_outcome, circuit_open = "store_busy", busy_outcome, True
+            downstream = {
                 "enabled": self.config.delivery_backpressure_enabled,
                 "active": False,
                 "high_watermark": self.config.delivery_high_watermark,
                 "resume_watermark": self.config.delivery_resume_watermark,
                 "last_snapshot": None,
-                "last_error": None,
+                "last_error": {"code": "control_store_busy"},
             }
-        )
-        store_health = self.store.health()
+            store_health = {"ok": False, "error": "control_store_busy"}
         activation_health = store_health.get("activation")
         activation_ready = (
             isinstance(activation_health, Mapping)
@@ -3411,8 +3576,9 @@ class HealthReporter:
                 "downstream_backpressure",
                 "downstream_error",
                 "lease_lost",
+                "store_busy",
             }
-            and not circuit.is_open
+            and not circuit_open
             and store_health.get("ok") is True
             and (not self.config.activation_required or activation_ready)
             and (
@@ -3461,6 +3627,7 @@ class HealthReporter:
             "store": store_health,
         }
         self._publish(body)
+        return busy_outcome
 
     def heartbeat(
         self,
@@ -3890,8 +4057,9 @@ def run_dispatch_loop(
 
     heartbeat_stop = threading.Event()
     processing = threading.Event()
-    latest_outcome: list[DispatchOutcome | None] = [None]
-    health.write(state="starting", stats=dispatcher.stats)
+    latest_outcome: list[DispatchOutcome | None] = [
+        health.write(state="starting", stats=dispatcher.stats)
+    ]
 
     def publish_heartbeat() -> None:
         while not heartbeat_stop.wait(float(heartbeat_interval_seconds)):
@@ -3912,35 +4080,60 @@ def run_dispatch_loop(
     heartbeat_thread.start()
     try:
         while not stop_requested():
-            workspace_guard = health.dispatch_guard_outcome()
+            try:
+                workspace_guard = health.dispatch_guard_outcome()
+            except Exception as exc:
+                if not _is_sqlite_busy_or_locked(exc):
+                    raise
+                latest_outcome[0] = _store_busy_outcome(
+                    dispatcher.stats, exc, phase="dispatch_guard"
+                )
+                health.write(
+                    state="store_busy",
+                    stats=dispatcher.stats,
+                    last_outcome=latest_outcome[0],
+                )
+                sleep(dispatcher.config.poll_interval_seconds)
+                continue
             if workspace_guard is not None:
                 latest_outcome[0] = workspace_guard
-                health.write(
+                busy = health.write(
                     state=workspace_guard.status,
                     stats=dispatcher.stats,
                     last_outcome=workspace_guard,
                 )
+                latest_outcome[0] = busy or latest_outcome[0]
                 sleep(dispatcher.config.circuit_poll_interval_seconds)
                 continue
             processing.set()
             try:
                 outcomes = dispatcher.dispatch_batch()
+            except Exception as exc:
+                if not _is_sqlite_busy_or_locked(exc):
+                    raise
+                outcomes = [
+                    _store_busy_outcome(
+                        dispatcher.stats, exc, phase="dispatch_loop"
+                    )
+                ]
             finally:
                 processing.clear()
             last = outcomes[-1]
             latest_outcome[0] = last
-            health.write(
+            busy = health.write(
                 state=last.status,
                 stats=dispatcher.stats,
                 last_outcome=last,
             )
+            last = busy or last
+            latest_outcome[0] = last
             if last.status in {
                 "circuit_open",
                 "downstream_backpressure",
                 "downstream_error",
             }:
                 sleep(dispatcher.config.circuit_poll_interval_seconds)
-            elif last.status in {"idle", "disabled", "lease_lost"}:
+            elif last.status in {"idle", "disabled", "lease_lost", "store_busy"}:
                 sleep(dispatcher.config.poll_interval_seconds)
     finally:
         heartbeat_stop.set()
@@ -4071,14 +4264,24 @@ def main(argv: list[str] | None = None) -> int:
             or args.dry_run
             or (args.clear_circuit and not args.apply)
         )
-        store = RcaControlStore(
-            config.control_db_path,
-            require_current=True,
-            read_only=read_only_operator,
-            allow_successor_read_only=read_only_operator,
-            allow_successor_write=not read_only_operator,
+        operator_mode = bool(
+            args.materialize_reset or args.dry_run or args.clear_circuit
         )
-        capability = _schema_runtime_capability(store)
+        if operator_mode:
+            store = RcaControlStore(
+                config.control_db_path,
+                require_current=True,
+                read_only=read_only_operator,
+                allow_successor_read_only=read_only_operator,
+                allow_successor_write=not read_only_operator,
+            )
+            capability = _schema_runtime_capability(store)
+        else:
+            store = _open_resident_control_store(config.control_db_path)
+            capability = _retry_resident_store_operation(
+                lambda: _schema_runtime_capability(store),
+                phase="resident_schema_capability",
+            )
         if capability["mode"] == SUCCESSOR_READ_ONLY_MODE:
             if args.dry_run:
                 print(
@@ -4224,7 +4427,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         if config.dispatch_enabled:
-            require_resident_activation_epoch(store)
+            _retry_resident_store_operation(
+                lambda: require_resident_activation_epoch(store),
+                phase="resident_activation_gate",
+            )
 
         dispatcher = OutboxDispatcher(
             store=store,
@@ -4247,7 +4453,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         dispatcher.runtime_identity = health.runtime_identity.to_dict()
         dispatcher.workspace_runtime_guard = health.dispatch_guard_outcome
-        workspace_guard = health.dispatch_guard_outcome()
+        if operator_mode:
+            workspace_guard = health.dispatch_guard_outcome()
+        else:
+            workspace_guard = _retry_resident_store_operation(
+                health.dispatch_guard_outcome,
+                phase="resident_initial_dispatch_guard",
+            )
         if workspace_guard is not None:
             health.write(
                 state=workspace_guard.status,
@@ -4262,9 +4474,23 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(asdict(outcome), indent=2))
             return 0
         if args.once:
-            outcomes = dispatcher.dispatch_batch()
+            try:
+                outcomes = dispatcher.dispatch_batch()
+            except Exception as exc:
+                if not _is_sqlite_busy_or_locked(exc):
+                    raise
+                outcomes = [
+                    _store_busy_outcome(dispatcher.stats, exc, phase="once_dispatch")
+                ]
             last = outcomes[-1]
-            health.write(state=last.status, stats=dispatcher.stats, last_outcome=last)
+            health_busy = health.write(
+                state=last.status,
+                stats=dispatcher.stats,
+                last_outcome=last,
+            )
+            if health_busy is not None:
+                outcomes.append(health_busy)
+                last = health_busy
             print(json.dumps([asdict(item) for item in outcomes], indent=2))
             return (
                 2
@@ -4273,6 +4499,7 @@ def main(argv: list[str] | None = None) -> int:
                     "circuit_open",
                     "downstream_backpressure",
                     "downstream_error",
+                    "store_busy",
                 }
                 else 0
             )

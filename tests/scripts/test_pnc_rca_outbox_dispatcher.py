@@ -76,6 +76,142 @@ def test_outbox_retry_backoff_uses_five_second_steady_interval():
     assert dispatcher.retry_delay_seconds(100) == 5
 
 
+def _sqlite_error(message: str, code: int | None = None) -> sqlite3.OperationalError:
+    exc = sqlite3.OperationalError(message)
+    if code is not None:
+        exc.sqlite_errorcode = code
+    return exc
+
+
+def test_sqlite_busy_classifier_uses_extended_code_and_wrapped_chain():
+    inner = _sqlite_error("misleading", sqlite3.SQLITE_BUSY | (2 << 8))
+    outer = RuntimeError("store construction failed")
+    outer.__cause__ = inner
+
+    assert dispatcher._is_sqlite_busy_or_locked(outer) is True
+    assert (
+        dispatcher._is_sqlite_busy_or_locked(_sqlite_error("database is locked"))
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _sqlite_error("database is locked", sqlite3.SQLITE_ERROR),
+        _sqlite_error("no such table: rca_outbox", sqlite3.SQLITE_ERROR),
+        RuntimeError("database is locked"),
+    ],
+)
+def test_sqlite_busy_classifier_rejects_nonbusy_failures(exc):
+    assert dispatcher._is_sqlite_busy_or_locked(exc) is False
+
+
+def test_resident_store_startup_retries_wrapped_busy_with_bounded_delays(
+    tmp_path, monkeypatch, capsys
+):
+    sentinel = object()
+    calls = []
+    busy = RuntimeError("wrapped")
+    busy.__cause__ = _sqlite_error("database is locked")
+
+    def store_factory(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) < 3:
+            raise busy
+        return sentinel
+
+    sleeps = []
+    monkeypatch.setattr(dispatcher, "RcaControlStore", store_factory)
+
+    result = dispatcher._open_resident_control_store(
+        tmp_path / "control.sqlite3", sleep=sleeps.append
+    )
+
+    assert result is sentinel
+    assert sleeps == [2, 5]
+    assert len(calls) == 3
+    logs = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    assert [(item["attempt"], item["delay_seconds"]) for item in logs] == [
+        (1, 2),
+        (2, 5),
+    ]
+    assert all(item["phase"] == "resident_store_startup" for item in logs)
+
+
+def test_resident_store_startup_persistent_busy_is_bounded(tmp_path, monkeypatch):
+    calls = []
+    sleeps = []
+
+    def store_factory(*_args, **_kwargs):
+        calls.append(True)
+        raise _sqlite_error("database is locked", sqlite3.SQLITE_LOCKED)
+
+    monkeypatch.setattr(dispatcher, "RcaControlStore", store_factory)
+
+    with pytest.raises(sqlite3.OperationalError):
+        dispatcher._open_resident_control_store(
+            tmp_path / "control.sqlite3", sleep=sleeps.append
+        )
+
+    assert len(calls) == 4
+    assert sleeps == [2, 5, 5]
+
+
+def test_resident_store_startup_does_not_retry_nonbusy(tmp_path, monkeypatch):
+    sleeps = []
+
+    def store_factory(*_args, **_kwargs):
+        raise sqlite3.OperationalError("no such table: rca_outbox")
+
+    monkeypatch.setattr(dispatcher, "RcaControlStore", store_factory)
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        dispatcher._open_resident_control_store(
+            tmp_path / "control.sqlite3", sleep=sleeps.append
+        )
+
+    assert sleeps == []
+
+
+def test_resident_startup_gate_retries_wrapped_busy():
+    calls = []
+    sleeps = []
+    wrapped = dispatcher.ExternalWriteFenceError("external_write_fence_epoch_not_current")
+    wrapped.__cause__ = _sqlite_error("database is locked")
+
+    def gate():
+        calls.append(True)
+        if len(calls) == 1:
+            raise wrapped
+        return "ready"
+
+    assert dispatcher._retry_resident_store_operation(
+        gate, phase="resident_activation_gate", sleep=sleeps.append
+    ) == "ready"
+    assert sleeps == [2]
+
+
+def test_resident_initial_dispatch_guard_retries_busy():
+    calls = []
+    sleeps = []
+    busy = _sqlite_error("database is locked")
+
+    def guard():
+        calls.append(True)
+        if len(calls) == 1:
+            raise busy
+        return None
+
+    assert dispatcher._retry_resident_store_operation(
+        guard,
+        phase="resident_initial_dispatch_guard",
+        sleep=sleeps.append,
+    ) is None
+    assert len(calls) == 2
+    assert sleeps == [2]
+
+
 def test_stored_unsupported_profile_is_terminal_before_preread(tmp_path):
     store = _steady_control_store(tmp_path / "control.sqlite3")
     result = store.ingest_record(
@@ -226,6 +362,169 @@ def _config_env(
         "HERMES_RCA_OUTBOX_CONTROL_DB_PATH": str(control_db_path),
         "HERMES_RCA_OUTBOX_HEALTH_PATH": str(tmp_path / "health.json"),
     }
+
+
+def _post_claim_dispatcher(tmp_path, monkeypatch, exc):
+    claim = SimpleNamespace(outbox_id=1, submission_key="submission", attempt=1)
+    store = SimpleNamespace(
+        dispatcher_circuit=lambda: SimpleNamespace(is_open=False),
+        claim_outbox=lambda **_kwargs: claim,
+    )
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path, enabled=True), hermes_home=tmp_path
+    )
+    instance = dispatcher.OutboxDispatcher(
+        store=store,
+        config=config,
+        enrich=lambda _event: None,
+        storage_admission=lambda _request: {},
+        submit=lambda *_args: {},
+        derived_capacity_reservation=lambda _request: None,
+    )
+    instance._delivery_backpressure_outcome = lambda: None
+    instance._retry = lambda *_args, **_kwargs: pytest.fail(
+        "store failure must not append an outbox retry mutation"
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "_validated_claim_contract",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(exc),
+    )
+    return instance
+
+
+def test_post_claim_busy_escapes_without_retry_mutation(tmp_path, monkeypatch):
+    instance = _post_claim_dispatcher(
+        tmp_path, monkeypatch, _sqlite_error("database is locked")
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        instance.dispatch_one()
+
+
+def test_storage_renew_busy_wrapper_escapes_without_retry_mutation(
+    tmp_path, monkeypatch
+):
+    busy = _sqlite_error("database is locked")
+    instance = _post_claim_dispatcher(tmp_path, monkeypatch, busy)
+    refs = SimpleNamespace(
+        project_key="project",
+        work_item_id="issue-1",
+        work_item_type_key="issue",
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "_validated_claim_contract",
+        lambda *_args, **_kwargs: (SimpleNamespace(source_refs=refs), {}),
+    )
+    monkeypatch.setattr(
+        dispatcher, "_stored_profile_terminal_error", lambda **_kwargs: None
+    )
+    instance.enrich = lambda _event: dispatcher.RcaIssueContext(
+        project_key=refs.project_key,
+        work_item_id=refs.work_item_id,
+        work_item_type=refs.work_item_type_key,
+    )
+    renew_calls = []
+
+    def renew(_claim):
+        renew_calls.append(True)
+        if len(renew_calls) == 2:
+            raise busy
+
+    instance._renew = renew
+    instance.storage_admission = lambda _request: pytest.fail(
+        "storage boundary must not run after renew BUSY"
+    )
+    instance._handle_dispatch_error = lambda *_args: pytest.fail(
+        "wrapped store BUSY must not be converted to durable retry"
+    )
+
+    with pytest.raises(dispatcher.DispatchCircuitError) as raised:
+        instance.dispatch_one()
+
+    assert raised.value.code == "storage_admission_call_failed"
+    assert raised.value.__cause__ is busy
+
+
+def test_dispatch_loop_continues_after_store_busy_in_same_process():
+    attempts = []
+
+    def dispatch_batch():
+        attempts.append(True)
+        if len(attempts) == 1:
+            raise _sqlite_error("database is locked")
+        return [dispatcher.DispatchOutcome(status="idle")]
+
+    instance = SimpleNamespace(
+        stats=dispatcher.DispatchStats(),
+        config=SimpleNamespace(
+            poll_interval_seconds=0.01,
+            circuit_poll_interval_seconds=0.02,
+        ),
+        dispatch_batch=dispatch_batch,
+    )
+    health_writes = []
+
+    def health_write(**kwargs):
+        health_writes.append(kwargs)
+        first_idle = kwargs["state"] == "idle" and sum(
+            item["state"] == "idle" for item in health_writes
+        ) == 1
+        if kwargs["state"] == "starting" or first_idle:
+            return dispatcher.DispatchOutcome(
+                status="store_busy", error_code="control_store_busy"
+            )
+        return None
+
+    health = SimpleNamespace(
+        write=health_write,
+        heartbeat=lambda **_kwargs: True,
+        dispatch_guard_outcome=lambda: None,
+    )
+
+    dispatcher.run_dispatch_loop(
+        instance,
+        health,
+        stop_requested=lambda: len(attempts) >= 3,
+        sleep=lambda _seconds: None,
+        heartbeat_interval_seconds=60,
+    )
+
+    assert len(attempts) == 3
+    assert instance.stats.store_busy == 1
+    assert [item["state"] for item in health_writes] == [
+        "starting",
+        "store_busy",
+        "idle",
+        "idle",
+    ]
+
+
+def test_dispatch_loop_raises_nonbusy_operational_error():
+    instance = SimpleNamespace(
+        stats=dispatcher.DispatchStats(),
+        config=SimpleNamespace(
+            poll_interval_seconds=0.01,
+            circuit_poll_interval_seconds=0.02,
+        ),
+        dispatch_batch=lambda: (_ for _ in ()).throw(
+            _sqlite_error("no such table: rca_outbox")
+        ),
+    )
+    health = SimpleNamespace(
+        write=lambda **_kwargs: None,
+        heartbeat=lambda **_kwargs: True,
+        dispatch_guard_outcome=lambda: None,
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        dispatcher.run_dispatch_loop(
+            instance,
+            health,
+            stop_requested=lambda: False,
+            heartbeat_interval_seconds=60,
+        )
 
 
 def test_submission_receipt_binds_preread_work_item_title():
@@ -539,6 +838,43 @@ def test_enabled_startup_uses_live_current_store_with_active_wal(
     ]
 
 
+def test_once_returns_rc2_for_store_busy_outcome(tmp_path, monkeypatch, capsys):
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path, enabled=True), hermes_home=tmp_path
+    )
+    store = _v15_control_store(config.control_db_path)
+    store_busy = dispatcher.DispatchOutcome(
+        status="store_busy", error_code="control_store_busy"
+    )
+    fake_dispatcher = SimpleNamespace(
+        stats=dispatcher.DispatchStats(),
+        delivery_backpressure_health=lambda: {},
+        dispatch_batch=lambda: [dispatcher.DispatchOutcome(status="idle")],
+    )
+    fake_health = SimpleNamespace(
+        runtime_identity=SimpleNamespace(to_dict=lambda: {}),
+        dispatch_guard_outcome=lambda: None,
+        write=lambda **_kwargs: store_busy,
+    )
+    monkeypatch.setattr(dispatcher, "load_dispatcher_environment", lambda _path: None)
+    monkeypatch.setattr(
+        dispatcher.DispatcherConfig,
+        "from_env",
+        classmethod(lambda _cls: config),
+    )
+    monkeypatch.setattr(dispatcher, "_open_resident_control_store", lambda _path: store)
+    monkeypatch.setattr(
+        dispatcher, "OutboxDispatcher", lambda **_kwargs: fake_dispatcher
+    )
+    monkeypatch.setattr(
+        dispatcher, "HealthReporter", lambda *_args, **_kwargs: fake_health
+    )
+
+    assert dispatcher.main(["--once"]) == 2
+    outcomes = json.loads(capsys.readouterr().out)
+    assert [item["status"] for item in outcomes] == ["idle", "store_busy"]
+
+
 def _successor_read_only_capability() -> dict[str, object]:
     return {
         "observed_control_schema_version": "pnc_rca_control_store_v15",
@@ -702,6 +1038,11 @@ def test_successor_read_only_operator_modes_are_structured_red_without_work(
         classmethod(lambda _cls: config),
     )
     monkeypatch.setattr(dispatcher, "RcaControlStore", store_factory)
+    monkeypatch.setattr(
+        dispatcher,
+        "_open_resident_control_store",
+        lambda *_args, **_kwargs: pytest.fail("operator mode used resident retries"),
+    )
 
     flag = "--check-config" if mode == "check_config" else "--dry-run"
     assert dispatcher.main([flag]) == 2
@@ -1090,6 +1431,150 @@ def test_default_submit_defers_live_store_check_to_service_create_guard(
     assert authority({"state": "issued"}) == live_binding
 
 
+def test_default_submit_re_raises_live_fence_busy_after_guard_suppresses_create(
+    monkeypatch, tmp_path
+):
+    busy = _sqlite_error("database is locked")
+
+    def submit_service(**kwargs):
+        try:
+            kwargs["live_write_fence_authority"]({"state": "issued"})
+        except Exception:
+            return {
+                "success": False,
+                "created": False,
+                "create_suppressed": True,
+                "error_code": "vm_task_service_request_identity_mismatch",
+            }
+        raise AssertionError("authority BUSY was not raised")
+
+    monkeypatch.setattr(
+        "tools.vm_task_tool.vm_task_submit_service",
+        submit_service,
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "validate_snapshot_execution_bundle",
+        lambda _value: SimpleNamespace(snapshot="immutable-bundle"),
+    )
+    monkeypatch.setattr(
+        dispatcher,
+        "_validate_vm_submit_fence",
+        lambda **_kwargs: None,
+    )
+    config = replace(
+        dispatcher.DispatcherConfig.from_env(
+            _config_env(tmp_path), hermes_home=tmp_path
+        ),
+        w3_snapshot_read_mode="snapshot_required",
+    )
+    store = SimpleNamespace(
+        validate_external_write_fence_binding=lambda _fence: (_ for _ in ()).throw(
+            busy
+        )
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        dispatcher.default_submit(
+            object(),
+            SimpleNamespace(toolchain={"w3_execution_snapshot": {"fixture": True}}),
+            config=config,
+            control_store=store,
+        )
+
+
+def test_default_submit_fails_contract_if_fence_busy_did_not_suppress_create(
+    monkeypatch, tmp_path
+):
+    busy = _sqlite_error("database is locked")
+
+    def submit_service(**kwargs):
+        try:
+            kwargs["live_write_fence_authority"]({"state": "issued"})
+        except Exception:
+            return {"success": False, "created": False}
+        raise AssertionError("authority BUSY was not raised")
+
+    monkeypatch.setattr("tools.vm_task_tool.vm_task_submit_service", submit_service)
+    monkeypatch.setattr(
+        dispatcher,
+        "validate_snapshot_execution_bundle",
+        lambda _value: SimpleNamespace(snapshot="immutable-bundle"),
+    )
+    monkeypatch.setattr(dispatcher, "_validate_vm_submit_fence", lambda **_kwargs: None)
+    config = replace(
+        dispatcher.DispatcherConfig.from_env(
+            _config_env(tmp_path), hermes_home=tmp_path
+        ),
+        w3_snapshot_read_mode="snapshot_required",
+    )
+    store = SimpleNamespace(
+        validate_external_write_fence_binding=lambda _fence: (_ for _ in ()).throw(
+            busy
+        )
+    )
+
+    with pytest.raises(
+        dispatcher.DispatchCircuitError, match="did not suppress create"
+    ) as raised:
+        dispatcher.default_submit(
+            object(),
+            SimpleNamespace(toolchain={"w3_execution_snapshot": {"fixture": True}}),
+            config=config,
+            control_store=store,
+        )
+
+    assert dispatcher._is_sqlite_busy_or_locked(raised.value) is False
+
+
+def test_default_submit_rejects_contradictory_fence_busy_result(
+    monkeypatch, tmp_path
+):
+    busy = _sqlite_error("database is locked")
+
+    def submit_service(**kwargs):
+        try:
+            kwargs["live_write_fence_authority"]({"state": "issued"})
+        except Exception:
+            return {
+                "success": True,
+                "created": True,
+                "create_suppressed": True,
+            }
+        raise AssertionError("authority BUSY was not raised")
+
+    monkeypatch.setattr("tools.vm_task_tool.vm_task_submit_service", submit_service)
+    monkeypatch.setattr(
+        dispatcher,
+        "validate_snapshot_execution_bundle",
+        lambda _value: SimpleNamespace(snapshot="immutable-bundle"),
+    )
+    monkeypatch.setattr(dispatcher, "_validate_vm_submit_fence", lambda **_kwargs: None)
+    config = replace(
+        dispatcher.DispatcherConfig.from_env(
+            _config_env(tmp_path), hermes_home=tmp_path
+        ),
+        w3_snapshot_read_mode="snapshot_required",
+    )
+    store = SimpleNamespace(
+        validate_external_write_fence_binding=lambda _fence: (_ for _ in ()).throw(
+            busy
+        )
+    )
+
+    with pytest.raises(
+        dispatcher.DispatchCircuitError, match="did not suppress create"
+    ) as raised:
+        dispatcher.default_submit(
+            object(),
+            SimpleNamespace(toolchain={"w3_execution_snapshot": {"fixture": True}}),
+            config=config,
+            control_store=store,
+        )
+
+    assert dispatcher._is_sqlite_busy_or_locked(raised.value) is False
+
+
 def test_steady_health_requires_hmac_and_has_no_expiring_authorization(tmp_path):
     config = dispatcher.DispatcherConfig.from_env(
         _config_env(tmp_path, enabled=True), hermes_home=tmp_path
@@ -1141,6 +1626,60 @@ def test_activation_required_health_is_red_without_current_epoch(tmp_path):
     assert payload["ok"] is False
     assert payload["healthy"] is False
     assert payload["readiness"]["ready_for_dispatch"] is False
+
+
+def test_health_write_store_busy_keeps_liveness_and_fails_readiness_closed(
+    tmp_path,
+):
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path, enabled=True), hermes_home=tmp_path
+    )
+    reporter = object.__new__(dispatcher.HealthReporter)
+    reporter.config = config
+    reporter.store = SimpleNamespace(
+        dispatcher_circuit=lambda: (_ for _ in ()).throw(
+            _sqlite_error("database is locked")
+        )
+    )
+    reporter.delivery_backpressure_status = None
+    reporter.started_at = dispatcher._utc_iso()
+    reporter.public_config = config.runtime_public_dict()
+    reporter.runtime_identity = SimpleNamespace(to_dict=lambda: {})
+    reporter.workspace_runtime_status = lambda: {"required": True, "ready": True}
+    reporter.capacity_admission_status = lambda: {"required": True, "ready": True}
+    published = []
+    reporter._publish = published.append
+    stats = dispatcher.DispatchStats()
+
+    outcome = reporter.write(state="idle", stats=stats)
+
+    assert outcome == dispatcher.DispatchOutcome(
+        status="store_busy", error_code="control_store_busy"
+    )
+    assert stats.store_busy == 1
+    [body] = published
+    assert body["state"] == "store_busy"
+    assert body["ok"] is False
+    assert body["healthy"] is False
+    assert body["readiness"]["ready_for_dispatch"] is False
+    assert body["store"] == {"ok": False, "error": "control_store_busy"}
+
+
+def test_health_write_nonbusy_error_remains_fail_closed(tmp_path):
+    config = dispatcher.DispatcherConfig.from_env(
+        _config_env(tmp_path, enabled=True), hermes_home=tmp_path
+    )
+    reporter = object.__new__(dispatcher.HealthReporter)
+    reporter.config = config
+    reporter.store = SimpleNamespace(
+        dispatcher_circuit=lambda: (_ for _ in ()).throw(
+            sqlite3.OperationalError("no such table: control_meta")
+        )
+    )
+    reporter.delivery_backpressure_status = None
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        reporter.write(state="idle", stats=dispatcher.DispatchStats())
 
 
 def test_capacity_guard_fails_before_claim_when_admission_key_is_invalid(tmp_path):
