@@ -4216,6 +4216,19 @@ class DeliveryDispatcher:
     ) -> dict[str, Any]:
         """Revalidate the immutable W5 fence immediately before a provider call."""
         self._validate_runtime_release()
+        scope_check = getattr(
+            self.store,
+            "kafka_profile_scope_error_for_lineage",
+            None,
+        )
+        if callable(scope_check):
+            scope_error = scope_check(
+                business_key=claim.business_key,
+                generation=claim.generation,
+                submission_key=claim.submission_key,
+            )
+            if scope_error:
+                raise ExternalWriteFenceError(str(scope_error))
         try:
             self.store.validate_learning_lane_external_operation(
                 business_key=claim.business_key,

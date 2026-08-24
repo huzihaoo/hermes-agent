@@ -3675,52 +3675,107 @@ def test_profile_readiness_terminal_validates_with_explicit_detail(tmp_path):
     assert validated.field_updates == ()
 
 
-def test_current_profile_terminal_without_w3_dispatches_comment_only_with_scoped_claim(
+def _canonicalize_profile_terminal_lineage(store, *, option_id: str) -> None:
+    with sqlite3.connect(store.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT source_event_id, normalized_json FROM business_triggers"
+        ).fetchone()
+        normalized = json.loads(row["normalized_json"])
+        normalized["creation_rule_version"] = "feishu-state-open-issue-v1"
+        normalized["business_profile_resolution"].update({
+            "status": "matched",
+            "profile_id": "g1q3",
+            "execution_readiness": "ready",
+            "routing_field_key": "field_052f23",
+            "project_key": normalized["project_key"],
+            "work_item_type_key": normalized["work_item_type_key"],
+            "project_option_ids": [option_id],
+        })
+        normalized_json = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        conn.execute(
+            "UPDATE business_triggers SET creation_rule_version=?, normalized_json=?",
+            ("feishu-state-open-issue-v1", normalized_json),
+        )
+        conn.execute(
+            "UPDATE kafka_inbox SET creation_rule_version=?, normalized_json=? "
+            "WHERE event_uid=?",
+            (
+                "feishu-state-open-issue-v1",
+                normalized_json,
+                row["source_event_id"],
+            ),
+        )
+
+
+def test_non_g1q3_profile_terminal_does_not_dispatch_comment(
     tmp_path,
-    monkeypatch,
 ):
     store = _seed_profile_terminal(tmp_path, split_project_identity=True)
-    captured_claims = []
-    original_builder = dispatcher_module.build_profile_terminal_provider_claim
-
-    def capture_claim(**kwargs):
-        claim = original_builder(**kwargs)
-        captured_claims.append(claim)
-        return claim
-
-    monkeypatch.setattr(
-        dispatcher_module,
-        "build_profile_terminal_provider_claim",
-        capture_claim,
-    )
+    [materialized] = store.list_rows("rca_delivery_effects")
+    assert materialized["status"] == "pending"
+    _canonicalize_profile_terminal_lineage(store, option_id="7019637554")
     remote = Remote(project_key=REAL_G1Q3_PROJECT_KEY)
     dispatcher, remote, _clock = _dispatcher(tmp_path, remote=remote)
 
     outcome = dispatcher.dispatch_one()
 
-    assert outcome.status == "succeeded"
-    assert remote.add_calls == 1
+    assert outcome.status == "quarantined"
+    assert outcome.error_code == "business_profile_project_option_not_allowed"
+    assert remote.add_calls == 0
     assert remote.update_field_calls == 0
-    assert len(captured_claims) == 1
-    claim_payload = captured_claims[0].payload()
-    assert claim_payload["authority_kind"] == "profile_terminal"
-    assert claim_payload["authority"]["operation"] == "feishu_issue_comment"
-    assert claim_payload["authority"]["project_key"] == REAL_G1Q3_PROJECT_KEY
-    assert (
-        claim_payload["authority"]["project_simple_name"]
-        == REAL_G1Q3_PROJECT_SIMPLE_NAME
-    )
     [effect] = store.list_rows("rca_delivery_effects")
-    [job] = store.list_rows("rca_delivery_jobs")
-    assert effect["status"] == "succeeded"
-    assert effect["target_key"].startswith(
-        f"feishu_project:{REAL_G1Q3_PROJECT_KEY}:"
-    )
-    assert job["status"] == "delivered"
-    assert job["project_key"] == REAL_G1Q3_PROJECT_KEY
-    assert job["issue_url"].startswith(
-        f"https://project.feishu.cn/{REAL_G1Q3_PROJECT_SIMPLE_NAME}/"
-    )
+    assert effect["status"] == "quarantined"
+    assert store.delivery_dispatcher_circuit().is_open is False
+    assert store.permanent_failure_circuit_state()["consecutive_failures"] == 0
+
+
+def test_g1q3_profile_scope_requires_source_raw_hash_binding(tmp_path):
+    store = _seed_profile_terminal(tmp_path, split_project_identity=True)
+    _canonicalize_profile_terminal_lineage(store, option_id="6670325063")
+    with sqlite3.connect(store.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        trigger = dict(conn.execute("SELECT * FROM business_triggers").fetchone())
+
+    assert store.kafka_profile_scope_error_for_lineage(
+        business_key=trigger["business_key"],
+        generation=trigger["generation"],
+        submission_key=trigger["submission_key"],
+    ) is None
+
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE business_triggers SET creation_rule_version=?",
+            ("tampered-noncanonical-rule-v1",),
+        )
+
+    assert store.kafka_profile_scope_error_for_lineage(
+        business_key=trigger["business_key"],
+        generation=trigger["generation"],
+        submission_key=trigger["submission_key"],
+    ) == "business_profile_project_option_not_allowed"
+
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute(
+            "UPDATE business_triggers SET creation_rule_version=?",
+            ("feishu-state-open-issue-v1",),
+        )
+        conn.execute(
+            "UPDATE rca_trigger_sources SET payload_sha256=? "
+            "WHERE source_id=?",
+            ("f" * 64, trigger["origin_source_id"]),
+        )
+
+    assert store.kafka_profile_scope_error_for_lineage(
+        business_key=trigger["business_key"],
+        generation=trigger["generation"],
+        submission_key=trigger["submission_key"],
+    ) == "business_profile_project_option_not_allowed"
 
 
 def test_pre_submit_quarantine_without_w3_remains_internal_and_redacted(tmp_path):

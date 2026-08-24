@@ -25,9 +25,12 @@ from typing import Any, Final, Protocol, TypeAlias
 from dotenv import dotenv_values
 
 from gateway.pnc_rca_kafka_contract import (
+    G1Q3_KAFKA_PROJECT_OPTION_ID,
     FIXED_KAFKA_GROUP_ID,
     WorkflowEventPolicy,
     WorkflowTransition,
+    g1q3_kafka_policy_scope_is_valid,
+    policy_requires_g1q3_kafka_scope,
 )
 from gateway.pnc_rca_mini_store import (
     MiniIngestResult,
@@ -366,7 +369,23 @@ def _direct_t0_offsets(source: Mapping[str, Any]) -> dict[int, int]:
     return dict(sorted(result.items()))
 
 
-def _direct_policy(source: Mapping[str, Any], topic: str) -> WorkflowEventPolicy:
+def _direct_policy(
+    source: Mapping[str, Any],
+    topic: str,
+    *,
+    require_g1q3_scope: bool = False,
+) -> WorkflowEventPolicy:
+    def validate_scope(policy: WorkflowEventPolicy) -> WorkflowEventPolicy:
+        if (
+            require_g1q3_scope or policy_requires_g1q3_kafka_scope(policy)
+        ) and not g1q3_kafka_policy_scope_is_valid(policy):
+            raise ValueError(
+                "enabled direct policy must be snapshot-only and allow exactly "
+                "project option "
+                f"{G1Q3_KAFKA_PROJECT_OPTION_ID}"
+            )
+        return policy
+
     raw_policy = _direct_pick(source, ("POLICY_JSON",))
     if raw_policy is not None:
         value = _direct_strict_json(str(raw_policy), f"{DIRECT_ENV_PREFIX}POLICY_JSON")
@@ -375,7 +394,7 @@ def _direct_policy(source: Mapping[str, Any], topic: str) -> WorkflowEventPolicy
         policy = WorkflowEventPolicy.from_mapping(value)
         if policy.topic != topic:
             raise ValueError("direct policy topic must match direct topic")
-        return policy
+        return validate_scope(policy)
 
     policy_version = _direct_pick(source, ("POLICY_VERSION", "CREATION_RULE_VERSION"))
     if policy_version is None:
@@ -404,6 +423,9 @@ def _direct_policy(source: Mapping[str, Any], topic: str) -> WorkflowEventPolicy
     snapshot_sub_stages = str(
         _direct_pick(source, ("SNAPSHOT_SUB_STAGES",), default="")
     )
+    allowed_project_option_ids = str(
+        _direct_pick(source, ("ALLOWED_PROJECT_OPTION_IDS",), default="")
+    )
     policy = WorkflowEventPolicy(
         topic=topic,
         policy_version=str(policy_version),
@@ -428,8 +450,13 @@ def _direct_policy(source: Mapping[str, Any], topic: str) -> WorkflowEventPolicy
         snapshot_sub_stages=frozenset(
             item.strip() for item in snapshot_sub_stages.split(",") if item.strip()
         ),
+        allowed_project_option_ids=frozenset(
+            item.strip()
+            for item in allowed_project_option_ids.split(",")
+            if item.strip()
+        ),
     )
-    return policy
+    return validate_scope(policy)
 
 
 @dataclass(frozen=True, slots=True)
@@ -637,7 +664,7 @@ class DirectKafkaConfig:
         if enabled and not commit_enabled and group_id == DIRECT_DEFAULT_GROUP_ID:
             raise ValueError("direct shadow mode requires an isolated group id")
 
-        policy = _direct_policy(source, topic)
+        policy = _direct_policy(source, topic, require_g1q3_scope=enabled)
         return cls(
             bootstrap_servers=bootstrap_servers,
             topic=topic,

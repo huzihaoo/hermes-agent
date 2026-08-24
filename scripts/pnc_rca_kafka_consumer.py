@@ -28,8 +28,11 @@ from gateway.pnc_rca_control_store import (
 )
 from gateway.pnc_rca_kafka_contract import (
     FIXED_KAFKA_GROUP_ID,
+    G1Q3_KAFKA_PROJECT_OPTION_ID,
     MAX_WORKFLOW_EVENT_BYTES,
     WorkflowEventPolicy,
+    g1q3_kafka_policy_scope_is_valid,
+    policy_requires_g1q3_kafka_scope,
 )
 from gateway.pnc_rca_policy_config import (
     W3SnapshotAuthority,
@@ -337,9 +340,18 @@ class ConsumerConfig:
         if outbox_resume_watermark >= outbox_high_watermark:
             raise ValueError("outbox resume watermark must be below high watermark")
 
+        submit_enabled = _boolean(source, f"{ENV_PREFIX}SUBMIT_ENABLED", False)
         policy = workflow_policy_from_env(source)
         if policy.topic != topic:
             raise ValueError("workflow policy topic must match consumer topic")
+        if (
+            submit_enabled or policy_requires_g1q3_kafka_scope(policy)
+        ) and not g1q3_kafka_policy_scope_is_valid(policy):
+            raise ValueError(
+                "production Kafka policy must be snapshot-only and allow exactly "
+                "project option "
+                f"{G1Q3_KAFKA_PROJECT_OPTION_ID}"
+            )
         w3_snapshot_authority = w3_snapshot_authority_from_env(
             source,
             active_policy=policy,
@@ -399,7 +411,7 @@ class ConsumerConfig:
                     / "health.json",
                 )
             ).expanduser(),
-            submit_enabled=_boolean(source, f"{ENV_PREFIX}SUBMIT_ENABLED", False),
+            submit_enabled=submit_enabled,
             activation_required=_strict_boolean(
                 source,
                 f"{ENV_PREFIX}ACTIVATION_REQUIRED",

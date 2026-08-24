@@ -13,6 +13,8 @@ from typing import Any, Literal, Mapping
 
 BUSINESS_PROFILE_REGISTRY_VERSION = "rca_business_profiles_v1"
 PROJECT_FIELD_KEY = "field_052f23"
+G1Q3_KAFKA_PROJECT_OPTION_ID = "6670325063"
+G1Q3_KAFKA_SCOPE_ERROR_CODE = "business_profile_project_option_not_allowed"
 
 ProfileResolutionStatus = Literal[
     "matched",
@@ -114,6 +116,28 @@ MDRIVE4_PROFILE = RcaBusinessProfile(
 )
 
 RCA_BUSINESS_PROFILES = (G1Q3_PROFILE, MDRIVE4_PROFILE)
+
+
+def is_g1q3_kafka_profile_resolution(value: Mapping[str, Any]) -> bool:
+    """Return whether an observed official profile is executable by G1Q3 Kafka RCA.
+
+    Kafka ingress is a single-business line even though the shared registry has
+    multiple profiles.  Keep this check on stable IDs and readiness; labels and
+    free-form issue text are deliberately ignored.
+    """
+    if not isinstance(value, Mapping):
+        return False
+    option_ids = value.get("project_option_ids")
+    return (
+        value.get("status") == "matched"
+        and value.get("profile_id") == G1Q3_PROFILE.profile_id
+        and value.get("execution_readiness") == G1Q3_PROFILE.execution_readiness
+        and value.get("routing_field_key") == PROJECT_FIELD_KEY
+        and option_ids == [G1Q3_KAFKA_PROJECT_OPTION_ID]
+        and str(value.get("project_key") or "") in G1Q3_PROFILE.project_keys
+        and str(value.get("work_item_type_key") or "")
+        in G1Q3_PROFILE.work_item_type_keys
+    )
 
 
 def _stable_option_ids(value: Any) -> tuple[str, ...]:

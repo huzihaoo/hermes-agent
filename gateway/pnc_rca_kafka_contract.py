@@ -7,11 +7,17 @@ import json
 from typing import Any, Literal, Mapping
 
 from gateway.pnc_rca_admission import RcaAdmission, build_rca_admission
-from gateway.pnc_rca_business_profiles import resolve_business_profile
+from gateway.pnc_rca_business_profiles import (
+    G1Q3_KAFKA_PROJECT_OPTION_ID,
+    is_g1q3_kafka_profile_resolution,
+    resolve_business_profile,
+)
 
 
 NORMALIZED_EVENT_SCHEMA_VERSION = "pnc_rca_workflow_event_v1"
 FIXED_KAFKA_GROUP_ID = "rca_root_cause_analysis_agent"
+G1Q3_KAFKA_TOPIC = "feishu-project-workflow-event"
+G1Q3_KAFKA_POLICY_VERSION = "feishu-state-open-issue-v1"
 MAX_WORKFLOW_EVENT_BYTES = 2 * 1024 * 1024
 MAX_WORKFLOW_NODES = 100
 MAX_TITLE_LENGTH = 2_000
@@ -85,6 +91,37 @@ def _optional_string_set(value: Any) -> frozenset[str]:
     return frozenset(str(item).strip() for item in items if str(item).strip())
 
 
+def policy_requires_g1q3_kafka_scope(policy: "WorkflowEventPolicy") -> bool:
+    """Identify the canonical production Kafka policy namespace.
+
+    Topic and policy version are the immutable namespace.  Other fields are
+    validated separately so malformed canonical policies fail closed instead
+    of falling back to the shared multi-profile test policy.
+    """
+    return (
+        policy.topic == G1Q3_KAFKA_TOPIC
+        and policy.policy_version == G1Q3_KAFKA_POLICY_VERSION
+    )
+
+
+def g1q3_kafka_policy_scope_is_valid(policy: "WorkflowEventPolicy") -> bool:
+    """Return whether the canonical policy is snapshot-only and G1Q3-only."""
+    return policy_requires_g1q3_kafka_scope(policy) and (
+        policy.project_simple_names == frozenset({"t03o4q"})
+        and bool(policy.project_keys)
+        and policy.project_keys.issubset(
+            frozenset({"t03o4q", "68ef617fb371dc80a10641f7"})
+        )
+        and policy.work_item_type_keys == frozenset({"issue"})
+        and policy.allowed_project_option_ids
+        == frozenset({G1Q3_KAFKA_PROJECT_OPTION_ID})
+        and not policy.status_change_types
+        and not policy.transitions
+        and policy.snapshot_patterns == frozenset({"State"})
+        and policy.snapshot_sub_stages == frozenset({"OPEN"})
+    )
+
+
 def _status_value(value: Any, field: str) -> StatusValue:
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         raise ValueError(f"{field} must be a string or integer")
@@ -134,6 +171,10 @@ class WorkflowEventPolicy:
     transitions: tuple[WorkflowTransition, ...] = ()
     snapshot_patterns: frozenset[str] = frozenset()
     snapshot_sub_stages: frozenset[str] = frozenset()
+    # Optional stable project-field allowlist.  The production G1Q3 Kafka
+    # policy binds this to exactly one option; generic/shared policy fixtures
+    # may leave it empty and retain their existing multi-profile behavior.
+    allowed_project_option_ids: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         topic = _required_text(self.topic, "topic")
@@ -177,6 +218,11 @@ class WorkflowEventPolicy:
             "snapshot_sub_stages",
             _optional_string_set(self.snapshot_sub_stages),
         )
+        object.__setattr__(
+            self,
+            "allowed_project_option_ids",
+            _optional_string_set(self.allowed_project_option_ids),
+        )
         transition_mode = bool(self.status_change_types or transitions)
         if bool(self.status_change_types) != bool(transitions):
             raise ValueError(
@@ -201,6 +247,7 @@ class WorkflowEventPolicy:
             "transitions": [asdict(item) for item in self.transitions],
             "snapshot_patterns": sorted(self.snapshot_patterns),
             "snapshot_sub_stages": sorted(self.snapshot_sub_stages),
+            "allowed_project_option_ids": sorted(self.allowed_project_option_ids),
         }
 
     @classmethod
@@ -230,6 +277,9 @@ class WorkflowEventPolicy:
             ),
             snapshot_sub_stages=_optional_string_set(
                 value.get("snapshot_sub_stages")
+            ),
+            allowed_project_option_ids=_optional_string_set(
+                value.get("allowed_project_option_ids")
             ),
         )
 
@@ -470,6 +520,22 @@ def classify_workflow_event(
             work_item_type_key=work_item_type_key,
             work_item_brief=payload,
         )
+        if policy_requires_g1q3_kafka_scope(policy) and not g1q3_kafka_policy_scope_is_valid(policy):
+            return ClassificationResult(
+                "filtered", "g1q3_kafka_scope_not_configured"
+            )
+        if policy.allowed_project_option_ids and (
+            profile_resolution.status != "matched"
+            or set(profile_resolution.project_option_ids)
+            != set(policy.allowed_project_option_ids)
+        ):
+            return ClassificationResult(
+                "filtered", "business_profile_project_option_not_allowed"
+            )
+        if policy_requires_g1q3_kafka_scope(policy) and not is_g1q3_kafka_profile_resolution(profile_resolution.to_dict()):
+            return ClassificationResult(
+                "filtered", "business_profile_project_option_not_allowed"
+            )
         normalized = NormalizedWorkflowEvent(
             schema_version=NORMALIZED_EVENT_SCHEMA_VERSION,
             creation_rule_version=policy.policy_version,
@@ -523,6 +589,9 @@ def classify_workflow_event(
     )
     if not matched:
         return ClassificationResult("filtered", "state_transition_not_allowed")
+
+    if policy_requires_g1q3_kafka_scope(policy) and not g1q3_kafka_policy_scope_is_valid(policy):
+        return ClassificationResult("filtered", "g1q3_kafka_scope_not_configured")
 
     normalized = NormalizedWorkflowEvent(
         schema_version=NORMALIZED_EVENT_SCHEMA_VERSION,

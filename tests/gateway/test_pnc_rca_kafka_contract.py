@@ -137,6 +137,102 @@ def test_snapshot_carries_stable_business_profile_option_ids():
     ]
 
 
+def _canonical_g1q3_snapshot_policy(**updates):
+    values = {
+        "topic": TOPIC,
+        "policy_version": "feishu-state-open-issue-v1",
+        "project_keys": frozenset({"68ef617fb371dc80a10641f7"}),
+        "project_simple_names": frozenset({"t03o4q"}),
+        "work_item_type_keys": frozenset({"issue"}),
+        "snapshot_patterns": frozenset({"State"}),
+        "snapshot_sub_stages": frozenset({"OPEN"}),
+        "allowed_project_option_ids": frozenset({"6670325063"}),
+    }
+    values.update(updates)
+    return WorkflowEventPolicy(**values)
+
+
+def _canonical_g1q3_snapshot_payload(**updates):
+    value = _snapshot_payload(
+        project_key="68ef617fb371dc80a10641f7",
+        project_simple_name="t03o4q",
+        work_item_type_key="issue",
+        fields=[
+            {
+                "field_key": "field_052f23",
+                "field_value": ["6670325063"],
+            }
+        ],
+    )
+    value.update(updates)
+    return value
+
+
+def test_canonical_g1q3_snapshot_accepts_only_exact_project_option():
+    result = classify_workflow_event(
+        topic=TOPIC,
+        value=_canonical_g1q3_snapshot_payload(),
+        policy=_canonical_g1q3_snapshot_policy(),
+    )
+
+    assert result.decision == "accepted"
+    assert result.normalized is not None
+    assert result.normalized.business_profile_resolution["profile_id"] == "g1q3"
+
+
+def test_canonical_g1q3_snapshot_filters_mdrive4_option():
+    payload = _canonical_g1q3_snapshot_payload(
+        fields=[
+            {
+                "field_key": "field_052f23",
+                "field_value": ["7019637554"],
+            }
+        ]
+    )
+
+    result = classify_workflow_event(
+        topic=TOPIC,
+        value=payload,
+        policy=_canonical_g1q3_snapshot_policy(),
+    )
+
+    assert result.decision == "filtered"
+    assert result.reason == "business_profile_project_option_not_allowed"
+
+
+def test_canonical_g1q3_policy_without_allowlist_fails_closed():
+    result = classify_workflow_event(
+        topic=TOPIC,
+        value=_canonical_g1q3_snapshot_payload(),
+        policy=_canonical_g1q3_snapshot_policy(allowed_project_option_ids=frozenset()),
+    )
+
+    assert result.decision == "filtered"
+    assert result.reason == "g1q3_kafka_scope_not_configured"
+
+
+def test_canonical_g1q3_transition_is_rejected_even_with_option_scope():
+    policy = _policy(
+        policy_version="feishu-state-open-issue-v1",
+        project_keys=frozenset({"68ef617fb371dc80a10641f7"}),
+        project_simple_names=frozenset({"t03o4q"}),
+        work_item_type_keys=frozenset({"issue"}),
+        allowed_project_option_ids=frozenset({"6670325063"}),
+    )
+    result = classify_workflow_event(
+        topic=TOPIC,
+        value=_payload(
+            project_key="68ef617fb371dc80a10641f7",
+            project_simple_name="t03o4q",
+            work_item_type_key="issue",
+        ),
+        policy=policy,
+    )
+
+    assert result.decision == "filtered"
+    assert result.reason == "g1q3_kafka_scope_not_configured"
+
+
 @pytest.mark.parametrize(
     ("payload_update", "reason"),
     [

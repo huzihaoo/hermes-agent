@@ -34,6 +34,19 @@ def _policy() -> WorkflowEventPolicy:
     )
 
 
+def _canonical_policy() -> WorkflowEventPolicy:
+    return WorkflowEventPolicy(
+        topic=TOPIC,
+        policy_version="feishu-state-open-issue-v1",
+        project_keys=frozenset({"68ef617fb371dc80a10641f7"}),
+        project_simple_names=frozenset({"t03o4q"}),
+        work_item_type_keys=frozenset({"issue"}),
+        snapshot_patterns=frozenset({"State"}),
+        snapshot_sub_stages=frozenset({"OPEN"}),
+        allowed_project_option_ids=frozenset({"6670325063"}),
+    )
+
+
 def _value(
     *, work_item_id: int = 7041712812, title: str = "ACC braking issue"
 ) -> bytes:
@@ -579,7 +592,9 @@ def _direct_env(tmp_path: Path, **updates: str) -> dict[str, str]:
         f"{direct.DIRECT_ENV_PREFIX}T0_OFFSETS_JSON": '{"0": 10}',
         f"{direct.DIRECT_ENV_PREFIX}DB_PATH": str(tmp_path / "direct-mini.sqlite3"),
         f"{direct.DIRECT_ENV_PREFIX}HEALTH_PATH": str(tmp_path / "direct-health.json"),
-        f"{direct.DIRECT_ENV_PREFIX}POLICY_JSON": json.dumps(_policy().to_dict()),
+        f"{direct.DIRECT_ENV_PREFIX}POLICY_JSON": json.dumps(
+            _canonical_policy().to_dict()
+        ),
         f"{direct.DIRECT_ENV_PREFIX}COMMIT_ENABLED": "true",
         f"{direct.DIRECT_ENV_PREFIX}ENABLED": "true",
     }
@@ -603,6 +618,34 @@ def test_direct_config_isolated_env_and_redacted_public_contract(tmp_path: Path)
     assert "direct-password" not in public
     assert "CONTROL_DB_PATH" not in public
     assert "activation" not in public.lower()
+
+
+def test_direct_canonical_policy_requires_g1q3_option_allowlist(tmp_path: Path):
+    policy = {
+        "policy_version": "feishu-state-open-issue-v1",
+        "project_keys": ["68ef617fb371dc80a10641f7"],
+        "project_simple_names": ["t03o4q"],
+        "work_item_type_keys": ["issue"],
+        "snapshot_patterns": ["State"],
+        "snapshot_sub_stages": ["OPEN"],
+        "status_change_types": [],
+        "transitions": [],
+        "topic": TOPIC,
+    }
+    env = _direct_env(tmp_path)
+    env[f"{direct.DIRECT_ENV_PREFIX}POLICY_JSON"] = json.dumps(policy)
+    with pytest.raises(ValueError, match="exactly project option 6670325063"):
+        direct.DirectKafkaConfig.from_env(env, hermes_home=tmp_path)
+
+    policy["allowed_project_option_ids"] = ["6670325063"]
+    env[f"{direct.DIRECT_ENV_PREFIX}POLICY_JSON"] = json.dumps(policy)
+    config = direct.DirectKafkaConfig.from_env(env, hermes_home=tmp_path)
+    assert config.policy.allowed_project_option_ids == frozenset({"6670325063"})
+
+    policy["policy_version"] = "drifted-policy-v1"
+    env[f"{direct.DIRECT_ENV_PREFIX}POLICY_JSON"] = json.dumps(policy)
+    with pytest.raises(ValueError, match="snapshot-only"):
+        direct.DirectKafkaConfig.from_env(env, hermes_home=tmp_path)
 
 
 def test_direct_config_rejects_shadow_default_group(tmp_path: Path):

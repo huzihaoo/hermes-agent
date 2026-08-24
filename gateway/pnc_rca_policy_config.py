@@ -224,6 +224,9 @@ def workflow_policy_from_env(
         snapshot_sub_stages=_optional_csv(
             source, f"{ENV_PREFIX}SNAPSHOT_SUB_STAGES"
         ),
+        allowed_project_option_ids=_optional_csv(
+            source, f"{ENV_PREFIX}ALLOWED_PROJECT_OPTION_IDS"
+        ),
     )
 
 

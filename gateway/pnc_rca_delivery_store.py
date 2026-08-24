@@ -39,6 +39,11 @@ from gateway.pnc_rca_delivery_contract import (
     validate_delivery_subscription_target,
 )
 from gateway.pnc_rca_delivery_observability import validate_delivery_observation
+from gateway.pnc_rca_business_profiles import (
+    G1Q3_KAFKA_SCOPE_ERROR_CODE,
+    is_g1q3_kafka_profile_resolution,
+)
+from gateway.pnc_rca_kafka_contract import G1Q3_KAFKA_POLICY_VERSION
 from gateway.pnc_rca_control_store import (
     CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
     CONTROL_STORE_SCHEMA_VERSION,
@@ -163,6 +168,7 @@ DELIVERY_CIRCUIT_RESET_REQUIRED_FIELDS = frozenset(
 )
 _NON_PIPELINE_QUARANTINE_CODES = frozenset({
     "feishu_work_item_not_found",
+    G1Q3_KAFKA_SCOPE_ERROR_CODE,
     *OUTBOX_SILENT_PROFILE_TERMINAL_ERROR_CODES,
 })
 LEARNING_LANE_EXTERNAL_EFFECT_ERROR = "learning_lane_external_effect_forbidden"
@@ -4873,6 +4879,91 @@ class RcaDeliveryStore:
             return True, issue_url, project_simple_name, source_error
         except (KeyError, TypeError, ValueError, OverflowError, json.JSONDecodeError):
             return True, "", "", OUTBOX_PROFILE_TERMINAL_BINDING_INVALID_CODE
+
+    def kafka_profile_scope_error_for_lineage(
+        self,
+        *,
+        business_key: str,
+        generation: int,
+        submission_key: str = "",
+    ) -> str | None:
+        """Fence historical non-G1Q3 effects at the provider boundary."""
+        conn = self._connect_read_only()
+        try:
+            row = conn.execute(
+                """
+                SELECT source.source_kind, source.payload_sha256,
+                       source.kafka_event_uid,
+                       trigger.normalized_json,
+                       trigger.creation_rule_version,
+                       trigger.source_event_id, trigger.source_topic,
+                       trigger.source_partition, trigger.source_offset,
+                       inbox.event_uid, inbox.topic,
+                       inbox.partition_id, inbox.offset_id,
+                       inbox.raw_sha256,
+                       inbox.normalized_json AS inbox_normalized_json,
+                       inbox.creation_rule_version AS inbox_rule_version
+                  FROM business_triggers AS trigger
+                  JOIN rca_trigger_sources AS source
+                    ON source.source_id = trigger.origin_source_id
+                  LEFT JOIN kafka_inbox AS inbox
+                    ON inbox.event_uid = trigger.source_event_id
+                 WHERE trigger.business_key = ?
+                   AND trigger.generation = ?
+                   AND (? = '' OR trigger.submission_key = ?)
+                 LIMIT 1
+                """,
+                (
+                    str(business_key),
+                    int(generation),
+                    str(submission_key or ""),
+                    str(submission_key or ""),
+                ),
+            ).fetchone()
+            if row is None or str(row["source_kind"] or "") != "kafka_workflow_event":
+                return None
+            try:
+                normalized = json.loads(str(row["normalized_json"] or ""))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return G1Q3_KAFKA_SCOPE_ERROR_CODE
+            if not isinstance(normalized, Mapping):
+                return G1Q3_KAFKA_SCOPE_ERROR_CODE
+            rules = (
+                str(row["creation_rule_version"] or ""),
+                str(row["inbox_rule_version"] or ""),
+                str(normalized.get("creation_rule_version") or ""),
+            )
+            binding_valid = (
+                str(row["source_event_id"] or "")
+                == str(row["event_uid"] or "")
+                and str(row["kafka_event_uid"] or "")
+                == str(row["event_uid"] or "")
+                and str(row["source_topic"] or "") == str(row["topic"] or "")
+                and row["source_partition"] == row["partition_id"]
+                and row["source_offset"] == row["offset_id"]
+                and str(row["payload_sha256"] or "")
+                == str(row["raw_sha256"] or "")
+                and str(row["normalized_json"] or "")
+                == str(row["inbox_normalized_json"] or "")
+            )
+            if G1Q3_KAFKA_POLICY_VERSION not in rules:
+                return (
+                    None
+                    if binding_valid and bool(rules[0]) and len(set(rules)) == 1
+                    else G1Q3_KAFKA_SCOPE_ERROR_CODE
+                )
+            if not binding_valid or any(
+                rule != G1Q3_KAFKA_POLICY_VERSION for rule in rules
+            ):
+                return G1Q3_KAFKA_SCOPE_ERROR_CODE
+            resolution = normalized.get("business_profile_resolution")
+            return (
+                None
+                if is_g1q3_kafka_profile_resolution(resolution)
+                else G1Q3_KAFKA_SCOPE_ERROR_CODE
+            )
+        finally:
+            conn.close()
 
     @staticmethod
     def _materialize_silent_quarantined_outbox_in_transaction(

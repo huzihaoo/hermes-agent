@@ -83,6 +83,41 @@ def _value(*, work_item_id=7041712812):
     }).encode()
 
 
+def _canonical_submit_updates(**updates):
+    values = {
+        "HERMES_RCA_KAFKA_CREATION_RULE_VERSION": "feishu-state-open-issue-v1",
+        "HERMES_RCA_KAFKA_PROJECT_KEYS": "68ef617fb371dc80a10641f7",
+        "HERMES_RCA_KAFKA_PROJECT_SIMPLE_NAMES": "t03o4q",
+        "HERMES_RCA_KAFKA_WORK_ITEM_TYPE_KEYS": "issue",
+        "HERMES_RCA_KAFKA_STATUS_CHANGE_TYPES": "",
+        "HERMES_RCA_KAFKA_STATE_TRANSITIONS_JSON": "[]",
+        "HERMES_RCA_KAFKA_SNAPSHOT_PATTERNS": "State",
+        "HERMES_RCA_KAFKA_SNAPSHOT_SUB_STAGES": "OPEN",
+        "HERMES_RCA_KAFKA_ALLOWED_PROJECT_OPTION_IDS": "6670325063",
+        "HERMES_RCA_KAFKA_SUBMIT_ENABLED": "true",
+    }
+    values.update(updates)
+    return values
+
+
+def _g1q3_snapshot_value(*, work_item_id=7041712812):
+    return json.dumps({
+        "created_at": 1783650001000,
+        "fields": [
+            {"field_key": "field_052f23", "field_value": ["6670325063"]}
+        ],
+        "id": work_item_id,
+        "name": "ACC braking issue",
+        "pattern": "State",
+        "project_key": "68ef617fb371dc80a10641f7",
+        "project_simple_name": "t03o4q",
+        "sub_stage": "OPEN",
+        "updated_at": 1783650000000,
+        "work_item_status": {"state_key": "open"},
+        "work_item_type_key": "issue",
+    }, sort_keys=True).encode()
+
+
 def _message(offset=10, value=None):
     return SimpleNamespace(
         topic=TOPIC,
@@ -344,6 +379,57 @@ def test_snapshot_only_creation_policy_is_explicit_and_valid(tmp_path):
     assert config.policy.transitions == ()
     assert config.policy.snapshot_patterns == frozenset({"State"})
     assert config.policy.snapshot_sub_stages == frozenset({"OPEN"})
+
+
+def test_canonical_g1q3_consumer_requires_exact_project_option_allowlist(tmp_path):
+    updates = {
+        "HERMES_RCA_KAFKA_CREATION_RULE_VERSION": "feishu-state-open-issue-v1",
+        "HERMES_RCA_KAFKA_PROJECT_KEYS": "68ef617fb371dc80a10641f7",
+        "HERMES_RCA_KAFKA_PROJECT_SIMPLE_NAMES": "t03o4q",
+        "HERMES_RCA_KAFKA_WORK_ITEM_TYPE_KEYS": "issue",
+        "HERMES_RCA_KAFKA_STATUS_CHANGE_TYPES": "",
+        "HERMES_RCA_KAFKA_STATE_TRANSITIONS_JSON": "[]",
+        "HERMES_RCA_KAFKA_SNAPSHOT_PATTERNS": "State",
+        "HERMES_RCA_KAFKA_SNAPSHOT_SUB_STAGES": "OPEN",
+    }
+    with pytest.raises(ValueError, match="exactly project option 6670325063"):
+        _config(tmp_path, **updates)
+
+    config = _config(
+        tmp_path,
+        **updates,
+        HERMES_RCA_KAFKA_ALLOWED_PROJECT_OPTION_IDS="6670325063",
+    )
+    assert config.policy.allowed_project_option_ids == frozenset({"6670325063"})
+
+    hybrid_updates = {
+        **updates,
+        "HERMES_RCA_KAFKA_ALLOWED_PROJECT_OPTION_IDS": "6670325063",
+        "HERMES_RCA_KAFKA_STATUS_CHANGE_TYPES": "Reached",
+        "HERMES_RCA_KAFKA_STATE_TRANSITIONS_JSON": json.dumps([
+                {
+                    "state_key": "new-problem-state",
+                    "pre_status": 1,
+                    "cur_status": 2,
+                }
+            ]),
+    }
+    with pytest.raises(ValueError, match="exactly project option 6670325063"):
+        _config(tmp_path, **hybrid_updates)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("HERMES_RCA_KAFKA_CREATION_RULE_VERSION", "drifted-policy-v1"),
+        ("HERMES_RCA_KAFKA_TOPIC", "other-workflow-topic"),
+    ],
+)
+def test_submit_enabled_rejects_noncanonical_policy_identity(tmp_path, name, value):
+    updates = _canonical_submit_updates()
+    updates[name] = value
+    with pytest.raises(ValueError, match="snapshot-only"):
+        _config(tmp_path, **updates)
 
 
 def test_offset_reset_is_fixed_fail_closed_and_rejects_broker_fallback(tmp_path):
@@ -768,11 +854,9 @@ def test_create_consumer_without_epoch_rejects_unsafe_false_flag_before_client(
     monkeypatch,
     tmp_path,
 ):
-    config = _config(
-        tmp_path,
-        HERMES_RCA_KAFKA_SUBMIT_ENABLED="true",
+    config = _config(tmp_path, **_canonical_submit_updates(
         HERMES_RCA_KAFKA_ACTIVATION_REQUIRED="false",
-    )
+    ))
     store = RcaControlStore(config.control_db_path)
     client_created = False
 
@@ -804,11 +888,9 @@ def test_resident_main_without_epoch_exits_nonzero_with_zero_writes(
     monkeypatch,
     tmp_path,
 ):
-    config = _config(
-        tmp_path,
-        HERMES_RCA_KAFKA_SUBMIT_ENABLED="true",
+    config = _config(tmp_path, **_canonical_submit_updates(
         HERMES_RCA_KAFKA_ACTIVATION_REQUIRED="false",
-    )
+    ))
     store = RcaControlStore(config.control_db_path)
     consumer_created = False
 
@@ -955,11 +1037,9 @@ def test_record_commits_exact_offset_only_after_durable_ingest(tmp_path):
 
 
 def test_submit_ingest_without_steady_epoch_fails_before_commit(tmp_path):
-    config = _config(
-        tmp_path,
-        HERMES_RCA_KAFKA_SUBMIT_ENABLED="true",
+    config = _config(tmp_path, **_canonical_submit_updates(
         HERMES_RCA_KAFKA_ACTIVATION_REQUIRED="true",
-    )
+    ))
     store = RcaControlStore(config.control_db_path)
     consumer = FakeConsumer([{"partition-0": [_message(offset=20)]}])
 
@@ -977,14 +1057,15 @@ def test_submit_ingest_without_steady_epoch_fails_before_commit(tmp_path):
 
 
 def test_steady_activation_ingest_commits_and_binds_exact_ledger(tmp_path):
-    config = _config(
-        tmp_path,
-        HERMES_RCA_KAFKA_SUBMIT_ENABLED="true",
+    config = _config(tmp_path, **_canonical_submit_updates(
         HERMES_RCA_KAFKA_ACTIVATION_REQUIRED="true",
-    )
+    ))
     store = RcaControlStore(config.control_db_path)
     epoch = _activate_direct_steady(store, start_offset=20)
-    message = _message(offset=30, value=_value(work_item_id=7041712816))
+    message = _message(
+        offset=30,
+        value=_g1q3_snapshot_value(work_item_id=7041712816),
+    )
     consumer = FakeConsumer([{"partition-0": [message]}])
 
     stats = consumer_module.run_poll_loop(
