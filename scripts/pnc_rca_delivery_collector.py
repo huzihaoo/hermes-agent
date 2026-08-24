@@ -135,6 +135,11 @@ VM_EXECUTION_IDENTITY_EVIDENCE_SCHEMA_VERSION = (
     "pnc_rca_vm_execution_identity_evidence_v1"
 )
 EXECUTION_IDENTITY_READBACK_SCHEMA_VERSION = "pnc_rca_execution_identity_readback_v1"
+IDENTITY_KIND_GIT_WORKTREE = "git_worktree"
+IDENTITY_KIND_SEALED_MATERIALIZED = "sealed_materialized"
+IDENTITY_KIND_UNKNOWN = "unknown"
+REMOTE_WORKER_IDENTITY_KIND = IDENTITY_KIND_GIT_WORKTREE
+VM_SERVICE_PROVENANCE_SCHEMA_VERSION = "g1q3_rca_service_provenance_v2"
 REMOTE_SHARED_STATE_ROOT = "/home/mini/.hermes/shared-state"
 REMOTE_WORKER_REPO_ROOT = "/home/mini/.hermes/worker-state"
 REMOTE_PIPELINE_RUNTIME_ROOT = "/home/mini/.hermes/rca-prod-runtime"
@@ -933,7 +938,37 @@ def _remote_bundle_script(submission_key: str) -> str:
             SHARED_STATE_ROOT, 'tasks', TASK_ID, 'result.md'
         )
         WORKER_REPO_ROOT = {REMOTE_WORKER_REPO_ROOT!r}
+        WORKER_IDENTITY_KIND = {REMOTE_WORKER_IDENTITY_KIND!r}
         PIPELINE_RUNTIME_ROOT = {REMOTE_PIPELINE_RUNTIME_ROOT!r}
+        IDENTITY_KIND_GIT_WORKTREE = {IDENTITY_KIND_GIT_WORKTREE!r}
+        IDENTITY_KIND_SEALED_MATERIALIZED = {IDENTITY_KIND_SEALED_MATERIALIZED!r}
+        IDENTITY_KIND_UNKNOWN = {IDENTITY_KIND_UNKNOWN!r}
+        SEALED_SOURCE_FIELDS = frozenset({{
+            'schema_version', 'pipeline_remote', 'pipeline_tag',
+            'pipeline_commit', 'pipeline_tree', 'gitlinks',
+            'gitlinks_policy', 'max_runtime_bytes', 'release_id',
+            'runtime_root', 'root_identity', 'entries', 'bootstrap',
+            'self_seal',
+        }})
+        SEALED_BINDING_FIELDS = frozenset({{
+            'schema_version', 'release_id', 'pipeline_remote',
+            'pipeline_tag', 'pipeline_commit', 'pipeline_tree', 'gitlinks',
+            'gitlinks_policy', 'max_runtime_bytes', 'runtime_root',
+            'report_manifest_path', 'report_manifest_sha256',
+            'report_manifest_semantic_sha256',
+            'materialization_manifest_path',
+            'materialization_manifest_sha256',
+            'materialization_manifest_semantic_sha256',
+            'bootstrap_install_offline_sha256', 'bootstrap_check_sha256',
+            'authority_sha256', 'binding_receipt_path', 'root_identity',
+            'self_seal',
+        }})
+        SEALED_SHARED_FIELDS = (
+            'release_id', 'pipeline_remote', 'pipeline_tag',
+            'pipeline_commit', 'pipeline_tree', 'gitlinks',
+            'gitlinks_policy', 'max_runtime_bytes', 'runtime_root',
+            'root_identity',
+        )
         WORKER_ENTRYPOINT_PATH = posixpath.join(
             WORKER_REPO_ROOT, {REMOTE_WORKER_ENTRYPOINT_RELATIVE!r}
         )
@@ -1196,7 +1231,9 @@ def _remote_bundle_script(submission_key: str) -> str:
                 raise RuntimeError(code)
             return str(process.stdout or '').strip()
 
-        def git_identity(repo_root, prefix):
+        def git_identity(repo_root, identity_kind, prefix):
+            if identity_kind != IDENTITY_KIND_GIT_WORKTREE:
+                raise RuntimeError(prefix + '_identity_kind_invalid')
             repo_root = canonical_absolute_path(
                 repo_root, prefix + '_root_invalid'
             )
@@ -1260,7 +1297,12 @@ def _remote_bundle_script(submission_key: str) -> str:
             )
             if confirmed_head != head or confirmed_tree != tree:
                 raise RuntimeError(prefix + '_identity_changed_during_read')
-            return {{'commit': head, 'tree': tree, 'clean': True}}
+            return {{
+                'commit': head,
+                'tree': tree,
+                'clean': True,
+                'identity_kind': IDENTITY_KIND_GIT_WORKTREE,
+            }}
 
         def canonical_json_bytes(value):
             return json.dumps(
@@ -1466,7 +1508,7 @@ def _remote_bundle_script(submission_key: str) -> str:
                     if report_sha256 != report_manifest_sha256:
                         continue
                     try:
-                        source_raw, _source_sha256 = read_stable_bytes(
+                        source_raw, source_sha256 = read_stable_bytes(
                             source_receipt_path,
                             'pipeline_frozen_receipt_missing',
                             receipts_root,
@@ -1486,10 +1528,15 @@ def _remote_bundle_script(submission_key: str) -> str:
                         source_raw != canonical_json_bytes(source) + b'\\n'
                         or binding_raw != canonical_json_bytes(binding) + b'\\n'
                         or report_raw != canonical_json_bytes(report) + b'\\n'
+                        or set(source) != SEALED_SOURCE_FIELDS
+                        or set(binding) != SEALED_BINDING_FIELDS
                         or source.get('schema_version')
                         != 'g1q3_rca_vm_source_materialization_v1'
                         or binding.get('schema_version')
                         != 'g1q3_rca_vm_worker_binding_v1'
+                        or binding.get('release_id') != report.get('release_id')
+                        or binding.get('authority_sha256')
+                        != report.get('authority_sha256')
                         or source.get('runtime_root') != repo_root
                         or binding.get('runtime_root') != repo_root
                         or source.get('pipeline_commit') != expected_commit
@@ -1498,6 +1545,26 @@ def _remote_bundle_script(submission_key: str) -> str:
                         or binding.get('pipeline_tree') != expected_tree
                         or binding.get('report_manifest_path') != report_receipt_path
                         or binding.get('report_manifest_sha256') != report_sha256
+                        or binding.get('report_manifest_semantic_sha256')
+                        != hashlib.sha256(
+                            canonical_json_bytes(report)
+                        ).hexdigest()
+                        or binding.get('materialization_manifest_path')
+                        != source_receipt_path
+                        or binding.get('materialization_manifest_sha256')
+                        != source_sha256
+                        or binding.get(
+                            'materialization_manifest_semantic_sha256'
+                        )
+                        != hashlib.sha256(
+                            canonical_json_bytes(source)
+                        ).hexdigest()
+                        or binding.get('binding_receipt_path')
+                        != binding_receipt_path
+                        or any(
+                            source.get(key) != binding.get(key)
+                            for key in SEALED_SHARED_FIELDS
+                        )
                         or semantic_sha256(source) != source.get('self_seal')
                         or semantic_sha256(binding) != binding.get('self_seal')
                     ):
@@ -1530,27 +1597,25 @@ def _remote_bundle_script(submission_key: str) -> str:
                 'commit': expected_commit,
                 'tree': expected_tree,
                 'clean': True,
+                'identity_kind': IDENTITY_KIND_SEALED_MATERIALIZED,
                 'frozen_runtime': True,
                 'top_level': repo_root,
                 'receipt_path': source_receipt_path,
                 'receipt_sha256': hashlib.sha256(source_raw).hexdigest(),
             }}
 
-        def pipeline_identity(repo_root, expected_commit, expected_tree,
-                              report_manifest_sha256):
-            git_marker = posixpath.join(repo_root, '.git')
-            try:
-                marker_info = os.lstat(git_marker)
-            except FileNotFoundError:
-                marker_info = None
-            if marker_info is not None and not stat.S_ISLNK(marker_info.st_mode):
-                return git_identity(repo_root, 'pipeline_git')
-            return frozen_pipeline_identity(
-                repo_root,
-                expected_commit,
-                expected_tree,
-                report_manifest_sha256,
-            )
+        def pipeline_identity(repo_root, identity_kind, expected_commit,
+                              expected_tree, report_manifest_sha256):
+            if identity_kind == IDENTITY_KIND_GIT_WORKTREE:
+                return git_identity(repo_root, identity_kind, 'pipeline_git')
+            if identity_kind == IDENTITY_KIND_SEALED_MATERIALIZED:
+                return frozen_pipeline_identity(
+                    repo_root,
+                    expected_commit,
+                    expected_tree,
+                    report_manifest_sha256,
+                )
+            raise RuntimeError('pipeline_identity_kind_unknown')
 
         def execution_identity_evidence(delivery_manifest_sha256):
             worker_result, worker_result_sha256 = read_worker_result()
@@ -1627,9 +1692,18 @@ def _remote_bundle_script(submission_key: str) -> str:
                 or service_result.get('success') is not True
                 or service_result.get('status') != 'completed'
                 or not isinstance(provenance, dict)
+                or set(provenance) != {{
+                    'schema_version', 'available', 'identity_kind',
+                    'vm_source_commit', 'vm_tree_clean',
+                    'service_entrypoint_path', 'service_entrypoint_sha256',
+                }}
                 or provenance.get('schema_version')
-                != 'g1q3_rca_service_provenance_v1'
+                != {VM_SERVICE_PROVENANCE_SCHEMA_VERSION!r}
                 or provenance.get('available') is not True
+                or provenance.get('identity_kind') not in (
+                    IDENTITY_KIND_GIT_WORKTREE,
+                    IDENTITY_KIND_SEALED_MATERIALIZED,
+                )
                 or provenance.get('vm_tree_clean') is not True
                 or pipeline_receipt_root != pipeline_root
                 or worker_cwd != pipeline_root
@@ -1655,6 +1729,7 @@ def _remote_bundle_script(submission_key: str) -> str:
                 64,
                 'service_terminal_receipt_identity_invalid',
             )
+            pipeline_identity_kind = provenance.get('identity_kind')
 
             if (
                 report_manifest.get('schema_version')
@@ -1677,14 +1752,15 @@ def _remote_bundle_script(submission_key: str) -> str:
                 'report_runtime_manifest_identity_invalid',
             )
 
-            worker_identity_before = git_identity(
-                WORKER_REPO_ROOT, 'worker_git'
-            )
             pipeline_identity_before = pipeline_identity(
                 pipeline_root,
+                pipeline_identity_kind,
                 pipeline_receipt_commit,
                 report_pipeline_tree,
                 report_manifest_sha256,
+            )
+            worker_identity_before = git_identity(
+                WORKER_REPO_ROOT, WORKER_IDENTITY_KIND, 'worker_git'
             )
             if worker_identity_before['commit'] != worker_receipt_commit:
                 raise RuntimeError('worker_git_head_receipt_mismatch')
@@ -1721,10 +1797,11 @@ def _remote_bundle_script(submission_key: str) -> str:
                 raise RuntimeError('report_script_sha256_mismatch')
 
             worker_identity_after = git_identity(
-                WORKER_REPO_ROOT, 'worker_git'
+                WORKER_REPO_ROOT, WORKER_IDENTITY_KIND, 'worker_git'
             )
             pipeline_identity_after = pipeline_identity(
                 pipeline_root,
+                pipeline_identity_kind,
                 pipeline_receipt_commit,
                 report_pipeline_tree,
                 report_manifest_sha256,

@@ -451,8 +451,9 @@ def _execution_identity_reader_fixture(tmp_path, monkeypatch):
         "success": True,
         "status": "completed",
         "service_provenance": {
-            "schema_version": "g1q3_rca_service_provenance_v1",
+            "schema_version": "g1q3_rca_service_provenance_v2",
             "available": True,
+            "identity_kind": collector.IDENTITY_KIND_GIT_WORKTREE,
             "vm_source_commit": pipeline_identity["commit"],
             "vm_tree_clean": True,
             "service_entrypoint_path": str(service_entrypoint),
@@ -566,23 +567,29 @@ def _frozen_pipeline_identity_reader_fixture(tmp_path, monkeypatch):
     root_info = pipeline_root.stat()
     expected_commit = "5" * 40
     expected_tree = "6" * 40
+    release_id = "rca-pipeline-fixture-1"
+    authority_sha256 = "7" * 64
+    pipeline_remote = "git@git.minieye.tech:pdcl/yj-evaluation-server.git"
+    pipeline_tag = "rca-pipeline-fixture-1"
+    root_identity = {
+        "dev": root_info.st_dev,
+        "gid": root_info.st_gid,
+        "ino": root_info.st_ino,
+        "mode": "%04o" % (root_info.st_mode & 0o7777),
+        "uid": root_info.st_uid,
+    }
     source_receipt = {
+        "bootstrap": {},
         "entries": snapshot_entries(pipeline_root),
         "gitlinks": [],
         "gitlinks_policy": "materialize_recursive_v1",
         "max_runtime_bytes": 1024 * 1024 * 1024,
         "pipeline_commit": expected_commit,
-        "pipeline_remote": "git@git.minieye.tech:pdcl/yj-evaluation-server.git",
-        "pipeline_tag": "rca-pipeline-fixture-1",
+        "pipeline_remote": pipeline_remote,
+        "pipeline_tag": pipeline_tag,
         "pipeline_tree": expected_tree,
-        "release_id": "rca-pipeline-fixture-1",
-        "root_identity": {
-            "dev": root_info.st_dev,
-            "gid": root_info.st_gid,
-            "ino": root_info.st_ino,
-            "mode": "%04o" % (root_info.st_mode & 0o7777),
-            "uid": root_info.st_uid,
-        },
+        "release_id": release_id,
+        "root_identity": root_identity,
         "runtime_root": str(pipeline_root),
         "schema_version": "g1q3_rca_vm_source_materialization_v1",
     }
@@ -594,12 +601,25 @@ def _frozen_pipeline_identity_reader_fixture(tmp_path, monkeypatch):
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+    source_canonical = json.dumps(
+        source_receipt,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    source_raw = source_canonical + b"\n"
     receipt_dir = runtime_base / "receipts" / "fixture-1"
     receipt_dir.mkdir(parents=True)
+    source_receipt_path = receipt_dir / "source-materialization.json"
+    binding_receipt_path = receipt_dir / "worker-binding.json"
+    receipt_report_path = receipt_dir / "report-runtime-manifest.json"
     report_manifest_path = tmp_path / "config" / "report-runtime-manifest.json"
     report_entry_raw = report_raw
     report_manifest = {
         "schema_version": "pnc_rca_report_manifest_v1",
+        "release_id": release_id,
+        "authority_sha256": authority_sha256,
+        "root": "/mnt/tmp",
         "runtime_root": str(pipeline_root),
         "pipeline_commit": expected_commit,
         "pipeline_tree": expected_tree,
@@ -613,12 +633,31 @@ def _frozen_pipeline_identity_reader_fixture(tmp_path, monkeypatch):
     ).encode("utf-8") + b"\n"
     report_manifest_path.parent.mkdir(parents=True, exist_ok=True)
     report_manifest_path.write_bytes(report_raw)
-    (receipt_dir / "report-runtime-manifest.json").write_bytes(report_raw)
+    receipt_report_path.write_bytes(report_raw)
     binding = {
+        "authority_sha256": authority_sha256,
+        "binding_receipt_path": str(binding_receipt_path),
+        "bootstrap_check_sha256": "8" * 64,
+        "bootstrap_install_offline_sha256": "9" * 64,
+        "gitlinks": [],
+        "gitlinks_policy": "materialize_recursive_v1",
+        "materialization_manifest_path": str(source_receipt_path),
+        "materialization_manifest_semantic_sha256": hashlib.sha256(
+            source_canonical
+        ).hexdigest(),
+        "materialization_manifest_sha256": hashlib.sha256(source_raw).hexdigest(),
+        "max_runtime_bytes": 1024 * 1024 * 1024,
         "pipeline_commit": expected_commit,
+        "pipeline_remote": pipeline_remote,
+        "pipeline_tag": pipeline_tag,
         "pipeline_tree": expected_tree,
-        "report_manifest_path": str(receipt_dir / "report-runtime-manifest.json"),
+        "release_id": release_id,
+        "report_manifest_path": str(receipt_report_path),
+        "report_manifest_semantic_sha256": hashlib.sha256(
+            report_raw[:-1]
+        ).hexdigest(),
         "report_manifest_sha256": hashlib.sha256(report_raw).hexdigest(),
+        "root_identity": root_identity,
         "runtime_root": str(pipeline_root),
         "schema_version": "g1q3_rca_vm_worker_binding_v1",
     }
@@ -630,14 +669,11 @@ def _frozen_pipeline_identity_reader_fixture(tmp_path, monkeypatch):
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    source_raw = json.dumps(
-        source_receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8") + b"\n"
     binding_raw = json.dumps(
         binding, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8") + b"\n"
-    (receipt_dir / "source-materialization.json").write_bytes(source_raw)
-    (receipt_dir / "worker-binding.json").write_bytes(binding_raw)
+    source_receipt_path.write_bytes(source_raw)
+    binding_receipt_path.write_bytes(binding_raw)
     for path in receipt_dir.iterdir():
         path.chmod(0o444)
     receipt_dir.chmod(0o555)
@@ -674,8 +710,9 @@ def _frozen_pipeline_identity_reader_fixture(tmp_path, monkeypatch):
         "success": True,
         "status": "completed",
         "service_provenance": {
-            "schema_version": "g1q3_rca_service_provenance_v1",
+            "schema_version": "g1q3_rca_service_provenance_v2",
             "available": True,
+            "identity_kind": collector.IDENTITY_KIND_SEALED_MATERIALIZED,
             "vm_source_commit": expected_commit,
             "vm_tree_clean": True,
             "service_entrypoint_path": str(service_entrypoint),
@@ -695,7 +732,8 @@ def _frozen_pipeline_identity_reader_fixture(tmp_path, monkeypatch):
         "service_result": service_result,
         "report_manifest": report_manifest,
         "report_manifest_path": report_manifest_path,
-        "source_receipt_path": receipt_dir / "source-materialization.json",
+        "source_receipt_path": source_receipt_path,
+        "binding_receipt_path": binding_receipt_path,
         "script_mutator": lambda script: script,
     }
 
@@ -856,6 +894,140 @@ def test_remote_bundle_reader_accepts_sealed_frozen_pipeline_runtime(
     assert evidence["pipeline"]["commit"] == fixture["pipeline_identity"]["commit"]
     assert evidence["pipeline"]["tree"] == fixture["pipeline_identity"]["tree"]
     assert evidence["pipeline"]["clean"] is True
+
+
+def _record_generated_git_calls(tmp_path, fixture):
+    calls_path = tmp_path / "generated-git-calls.jsonl"
+    wrapper = tmp_path / "record-git"
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, sys\n"
+        f"path = {str(calls_path)!r}\n"
+        "with open(path, 'a', encoding='utf-8') as handle:\n"
+        "    handle.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "os.execv('/usr/bin/git', ['/usr/bin/git', *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    fixture["script_mutator"] = lambda script: script.replace(
+        "['/usr/bin/git', '-C'", f"[{str(wrapper)!r}, '-C'"
+    )
+    return calls_path
+
+
+def test_remote_bundle_sealed_pipeline_invokes_no_git_for_pipeline_target(
+    tmp_path, monkeypatch
+):
+    fixture = _frozen_pipeline_identity_reader_fixture(tmp_path, monkeypatch)
+    calls_path = _record_generated_git_calls(tmp_path, fixture)
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_error"] == ""
+    calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
+    assert calls
+    assert all(str(fixture["pipeline_root"]) not in call for call in calls)
+    assert any(str(fixture["worker_root"]) in call for call in calls)
+
+
+def test_remote_bundle_unknown_pipeline_kind_fails_before_any_git(
+    tmp_path, monkeypatch
+):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    fixture["service_result"]["service_provenance"]["identity_kind"] = (
+        collector.IDENTITY_KIND_UNKNOWN
+    )
+    calls_path = _record_generated_git_calls(tmp_path, fixture)
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == (
+        "service_terminal_receipt_identity_invalid"
+    )
+    assert not calls_path.exists()
+
+
+@pytest.mark.parametrize(
+    "contract_drift", ["missing_kind", "v1_schema", "extra_field"]
+)
+def test_remote_bundle_legacy_or_untyped_service_provenance_fails_before_git(
+    tmp_path, monkeypatch, contract_drift
+):
+    fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
+    provenance = fixture["service_result"]["service_provenance"]
+    if contract_drift == "missing_kind":
+        provenance.pop("identity_kind")
+    elif contract_drift == "v1_schema":
+        provenance["schema_version"] = "g1q3_rca_service_provenance_v1"
+    else:
+        provenance["guessed_identity"] = "sealed"
+    calls_path = _record_generated_git_calls(tmp_path, fixture)
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == (
+        "service_terminal_receipt_identity_invalid"
+    )
+    assert not calls_path.exists()
+
+
+@pytest.mark.parametrize("contract_drift", ["extra_kind", "v2_schema"])
+@pytest.mark.parametrize("receipt_face", ["source", "binding"])
+def test_remote_bundle_nonexact_sealed_receipt_pair_fails_before_git(
+    tmp_path, monkeypatch, contract_drift, receipt_face
+):
+    fixture = _frozen_pipeline_identity_reader_fixture(tmp_path, monkeypatch)
+    receipt_path = fixture[f"{receipt_face}_receipt_path"]
+    receipt = json.loads(receipt_path.read_text())
+    receipt.pop("self_seal")
+    if contract_drift == "extra_kind":
+        receipt["identity_kind"] = collector.IDENTITY_KIND_SEALED_MATERIALIZED
+    else:
+        receipt["schema_version"] = (
+            "g1q3_rca_vm_source_materialization_v2"
+            if receipt_face == "source"
+            else "g1q3_rca_vm_worker_binding_v2"
+        )
+    receipt["self_seal"] = hashlib.sha256(
+        json.dumps(
+            receipt,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    receipt_path.chmod(0o644)
+    receipt_path.write_text(
+        json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + "\n",
+        encoding="utf-8",
+    )
+    receipt_path.chmod(0o444)
+    calls_path = _record_generated_git_calls(tmp_path, fixture)
+
+    payload = _run_remote_bundle_reader(
+        tmp_path,
+        monkeypatch,
+        script_transform=fixture["script_transform"],
+    )
+
+    assert payload["execution_identity_evidence"] is None
+    assert payload["execution_identity_error"] == "pipeline_frozen_receipt_invalid"
+    assert not calls_path.exists()
 
 
 def test_remote_bundle_reader_rejects_tampered_frozen_materialization_receipt(
@@ -1049,7 +1221,7 @@ def test_remote_bundle_reader_rejects_git_identity_toctou(tmp_path, monkeypatch)
     fixture = _execution_identity_reader_fixture(tmp_path, monkeypatch)
     needle = (
         "    worker_identity_after = git_identity(\n"
-        "        WORKER_REPO_ROOT, 'worker_git'\n"
+        "        WORKER_REPO_ROOT, WORKER_IDENTITY_KIND, 'worker_git'\n"
         "    )"
     )
 

@@ -66,6 +66,16 @@ DEFAULT_REMOTE_HUMANIZER_MODE = 0o600
 DEFAULT_REMOTE_HUMANIZER_BASELINE_COMMIT = "fec0a86c169fc71d8dca48a2732dc1cd3b52db99"
 DEFAULT_REMOTE_HUMANIZER_BASELINE_TREE = "1c8cb3832275abf18e31d14b56501cf31080f201"
 REVIEWED_REMOTE_GIT = "/usr/bin/git"
+IDENTITY_KIND_GIT_WORKTREE = "git_worktree"
+IDENTITY_KIND_SEALED_MATERIALIZED = "sealed_materialized"
+IDENTITY_KIND_UNKNOWN = "unknown"
+IDENTITY_KINDS = frozenset(
+    {
+        IDENTITY_KIND_GIT_WORKTREE,
+        IDENTITY_KIND_SEALED_MATERIALIZED,
+        IDENTITY_KIND_UNKNOWN,
+    }
+)
 DEFAULT_REMOTE_SHARED_STATE_SHA256 = (
     "a6a893d3773ef4f54e44f3f0a2224f32e86de9851214a92df59baf3f18d7ec22"
 )
@@ -168,6 +178,7 @@ class DirectVmTransportConfig:
     remote_humanizer_mode: int = DEFAULT_REMOTE_HUMANIZER_MODE
     remote_humanizer_baseline_commit: str = DEFAULT_REMOTE_HUMANIZER_BASELINE_COMMIT
     remote_humanizer_baseline_tree: str = DEFAULT_REMOTE_HUMANIZER_BASELINE_TREE
+    remote_humanizer_identity_kind: str = IDENTITY_KIND_GIT_WORKTREE
     remote_shared_state_sha256: str = DEFAULT_REMOTE_SHARED_STATE_SHA256
     create_enabled: bool = False
     timeout_seconds: float = DEFAULT_COMMAND_TIMEOUT_SECONDS
@@ -218,6 +229,8 @@ class DirectVmTransportConfig:
                 or re.fullmatch(r"[0-9a-f]{40}", value) is None
             ):
                 raise ValueError(f"{field}_invalid")
+        if self.remote_humanizer_identity_kind not in IDENTITY_KINDS:
+            raise ValueError("remote_humanizer_identity_kind_invalid")
         if self.remote_humanizer_mode != DEFAULT_REMOTE_HUMANIZER_MODE:
             raise ValueError("remote_humanizer_mode_must_be_0600")
         if isinstance(self.create_enabled, bool) is False:
@@ -258,6 +271,7 @@ class DirectVmTransportConfig:
             "remote_submit_module_path": "remote_validator_module_path",
             "humanizer_module_path": "remote_humanizer_module_path",
             "remote_humanizer_path": "remote_humanizer_module_path",
+            "humanizer_identity_kind": "remote_humanizer_identity_kind",
             "enabled": "create_enabled",
         }
         fields = {
@@ -274,6 +288,7 @@ class DirectVmTransportConfig:
             "remote_humanizer_mode",
             "remote_humanizer_baseline_commit",
             "remote_humanizer_baseline_tree",
+            "remote_humanizer_identity_kind",
             "remote_shared_state_sha256",
             "create_enabled",
             "timeout_seconds",
@@ -303,6 +318,7 @@ class DirectVmTransportConfig:
             "remote_humanizer_mode": normalized.remote_humanizer_mode,
             "remote_humanizer_baseline_commit": normalized.remote_humanizer_baseline_commit,
             "remote_humanizer_baseline_tree": normalized.remote_humanizer_baseline_tree,
+            "remote_humanizer_identity_kind": normalized.remote_humanizer_identity_kind,
             "remote_shared_state_sha256": normalized.remote_shared_state_sha256,
             "create_enabled": normalized.create_enabled,
             "timeout_seconds": normalized.timeout_seconds,
@@ -369,6 +385,7 @@ def _remote_script(
     operation: str,
     task_id: str = "",
     envelope: Mapping[str, Any] | None = None,
+    identity_kind: str = IDENTITY_KIND_GIT_WORKTREE,
 ) -> str:
     request_json = json.dumps(
         dict(envelope) if isinstance(envelope, Mapping) else {},
@@ -391,27 +408,34 @@ def _remote_script(
         f"HUMANIZER_MODE = {humanizer_mode!r}\n"
         f"HUMANIZER_BASELINE_COMMIT = {humanizer_baseline_commit!r}\n"
         f"HUMANIZER_BASELINE_TREE = {humanizer_baseline_tree!r}\n"
+        f"IDENTITY_KIND = {identity_kind!r}\n"
         f"GIT_PATH = {REVIEWED_REMOTE_GIT!r}\n"
         f"SHARED_STATE_SHA256 = {shared_state_sha256!r}\n"
         f"OPERATION = {operation!r}\n"
         f"TASK_ID = {task_id!r}\n"
         f"ENVELOPE = json.loads({request_json!r})\n"
         "MAX_MODULE_BYTES = 16 * 1024 * 1024\n"
+        "if IDENTITY_KIND == 'unknown':\n"
+        "    raise RuntimeError('direct_vm_humanizer_identity_kind_unknown')\n"
+        "if IDENTITY_KIND != 'git_worktree':\n"
+        "    raise RuntimeError('direct_vm_humanizer_identity_kind_unsupported')\n"
         "def _check_worker_state_baseline(humanizer_raw):\n"
         "    worker_state = os.path.dirname(HELPER_PATH)\n"
         "    relative = os.path.relpath(HUMANIZER_MODULE, worker_state)\n"
         "    if relative != 'vm_feishu_humanizer.py':\n"
         "        raise RuntimeError('direct_vm_humanizer_provenance_mismatch')\n"
+        "    git_env = {'HOME': '/nonexistent', 'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_SYSTEM': '/dev/null', 'GIT_OPTIONAL_LOCKS': '0', 'GIT_TERMINAL_PROMPT': '0'}\n"
         "    try:\n"
-        "        commit = subprocess.run([GIT_PATH, '-C', worker_state, 'rev-parse', 'HEAD'], text=True, capture_output=True, check=False, timeout=2.0)\n"
-        "        tree = subprocess.run([GIT_PATH, '-C', worker_state, 'rev-parse', 'HEAD^{tree}'], text=True, capture_output=True, check=False, timeout=2.0)\n"
-        "        tracked = subprocess.run([GIT_PATH, '-C', worker_state, 'ls-files', '--error-unmatch', relative], text=True, capture_output=True, check=False, timeout=2.0)\n"
-        "        blob = subprocess.run([GIT_PATH, '-C', worker_state, 'rev-parse', f'{HUMANIZER_BASELINE_COMMIT}:{relative}'], text=True, capture_output=True, check=False, timeout=2.0)\n"
+        "        commit = subprocess.run([GIT_PATH, '--no-optional-locks', '-C', worker_state, 'rev-parse', 'HEAD'], text=True, capture_output=True, check=False, timeout=2.0, env=git_env)\n"
+        "        tree = subprocess.run([GIT_PATH, '--no-optional-locks', '-C', worker_state, 'rev-parse', 'HEAD^{tree}'], text=True, capture_output=True, check=False, timeout=2.0, env=git_env)\n"
+        "        tracked = subprocess.run([GIT_PATH, '--no-optional-locks', '-C', worker_state, 'ls-files', '--error-unmatch', '--', relative], text=True, capture_output=True, check=False, timeout=2.0, env=git_env)\n"
+        "        dirty = subprocess.run([GIT_PATH, '--no-optional-locks', '-C', worker_state, 'status', '--porcelain=v1', '--untracked-files=all', '--ignore-submodules=none'], text=True, capture_output=True, check=False, timeout=2.0, env=git_env)\n"
+        "        blob = subprocess.run([GIT_PATH, '--no-optional-locks', '-C', worker_state, 'rev-parse', f'{HUMANIZER_BASELINE_COMMIT}:{relative}'], text=True, capture_output=True, check=False, timeout=2.0, env=git_env)\n"
         "    except (OSError, subprocess.SubprocessError):\n"
         "        raise RuntimeError('direct_vm_humanizer_provenance_mismatch')\n"
         "    blob_material = b'blob ' + str(len(humanizer_raw)).encode('ascii') + b'\\0' + humanizer_raw\n"
         "    expected_blob = hashlib.sha1(blob_material).hexdigest()\n"
-        "    if (commit.returncode != 0 or tree.returncode != 0 or tracked.returncode != 0 or blob.returncode != 0 or commit.stdout.strip() != HUMANIZER_BASELINE_COMMIT or tree.stdout.strip() != HUMANIZER_BASELINE_TREE or tracked.stdout.strip() != relative or blob.stdout.strip() != expected_blob):\n"
+        "    if (commit.returncode != 0 or tree.returncode != 0 or tracked.returncode != 0 or dirty.returncode != 0 or blob.returncode != 0 or commit.stdout.strip() != HUMANIZER_BASELINE_COMMIT or tree.stdout.strip() != HUMANIZER_BASELINE_TREE or tracked.stdout.strip() != relative or dirty.stdout or blob.stdout.strip() != expected_blob):\n"
         "        raise RuntimeError('direct_vm_humanizer_provenance_mismatch')\n"
         "def _check_pinned_parent(path):\n"
         "    current = os.path.sep\n"
@@ -548,6 +572,7 @@ class DirectVmTransport:
             humanizer_mode=self.config.remote_humanizer_mode,
             humanizer_baseline_commit=self.config.remote_humanizer_baseline_commit,
             humanizer_baseline_tree=self.config.remote_humanizer_baseline_tree,
+            identity_kind=self.config.remote_humanizer_identity_kind,
             shared_state_sha256=self.config.remote_shared_state_sha256,
             operation=operation,
             task_id=task_id,
@@ -680,6 +705,7 @@ def build_direct_vm_transport(
             "remote_humanizer_mode": DEFAULT_REMOTE_HUMANIZER_MODE,
             "remote_humanizer_baseline_commit": DEFAULT_REMOTE_HUMANIZER_BASELINE_COMMIT,
             "remote_humanizer_baseline_tree": DEFAULT_REMOTE_HUMANIZER_BASELINE_TREE,
+            "remote_humanizer_identity_kind": IDENTITY_KIND_GIT_WORKTREE,
             "remote_shared_state_sha256": DEFAULT_REMOTE_SHARED_STATE_SHA256,
         }
         for field, expected in reviewed_fields.items():

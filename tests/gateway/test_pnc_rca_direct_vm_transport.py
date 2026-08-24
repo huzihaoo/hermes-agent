@@ -20,6 +20,9 @@ from gateway.pnc_rca_direct_vm_transport import (
     DEFAULT_REMOTE_HUMANIZER_MODE,
     DEFAULT_REMOTE_HUMANIZER_BASELINE_COMMIT,
     DEFAULT_REMOTE_HUMANIZER_BASELINE_TREE,
+    IDENTITY_KIND_GIT_WORKTREE,
+    IDENTITY_KIND_SEALED_MATERIALIZED,
+    IDENTITY_KIND_UNKNOWN,
     DirectVmTransport,
     DirectVmTransportConfig,
     DirectVmTransportError,
@@ -93,6 +96,7 @@ def test_defaults_pin_worker_state_paths_and_creation_is_opt_in() -> None:
     assert (
         config.remote_humanizer_baseline_tree == DEFAULT_REMOTE_HUMANIZER_BASELINE_TREE
     )
+    assert config.remote_humanizer_identity_kind == IDENTITY_KIND_GIT_WORKTREE
     assert "release" not in json.dumps(config.public_dict(), sort_keys=True).lower()
 
 
@@ -247,6 +251,8 @@ def test_config_rejects_unbound_module_hashes() -> None:
         DirectVmTransportConfig(remote_humanizer_mode=0o644).normalized()
     with pytest.raises(ValueError, match="remote_humanizer_baseline_commit_invalid"):
         DirectVmTransportConfig(remote_humanizer_baseline_commit="short").normalized()
+    with pytest.raises(ValueError, match="remote_humanizer_identity_kind_invalid"):
+        DirectVmTransportConfig(remote_humanizer_identity_kind="guessed").normalized()
 
 
 def test_reviewed_source_hashes_bind_to_formal_files() -> None:
@@ -318,6 +324,36 @@ def test_generated_status_rejects_shared_state_hash_before_creator_call(
     assert good.returncode == 0, good.stderr
     assert json.loads(good.stdout)["state"] == "missing"
 
+    git_called = tmp_path / "git-called"
+    fake_git = tmp_path / "fake-git"
+    fake_git.write_text(
+        f"#!{sys.executable}\n"
+        "from pathlib import Path\n"
+        f"Path({str(git_called)!r}).write_text('called')\n"
+        "raise SystemExit(99)\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    for identity_kind, expected_error in (
+        (IDENTITY_KIND_UNKNOWN, "direct_vm_humanizer_identity_kind_unknown"),
+        (
+            IDENTITY_KIND_SEALED_MATERIALIZED,
+            "direct_vm_humanizer_identity_kind_unsupported",
+        ),
+    ):
+        script = _remote_script(**kwargs, identity_kind=identity_kind).replace(
+            "GIT_PATH = '/usr/bin/git'", f"GIT_PATH = {str(fake_git)!r}"
+        )
+        identity_blocked = subprocess.run(
+            [sys.executable, "-I", "-c", script],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert identity_blocked.returncode != 0
+        assert expected_error in identity_blocked.stderr
+        assert not git_called.exists()
+
     kwargs["humanizer_baseline_commit"] = "f" * 40
     kwargs["humanizer_baseline_tree"] = "e" * 40
     provenance_blocked = subprocess.run(
@@ -340,6 +376,99 @@ def test_generated_status_rejects_shared_state_hash_before_creator_call(
     )
     assert blocked.returncode != 0
     assert "direct_vm_module_hash_mismatch" in blocked.stderr
+
+
+@pytest.mark.parametrize("mutation", ["tracked", "untracked"])
+def test_generated_git_worktree_identity_rejects_dirty_worker_state(
+    tmp_path: Path, mutation: str
+) -> None:
+    worker_state = tmp_path / "worker-state"
+    worker_state.mkdir()
+    creator_path = worker_state / "vm_coding_worker_v2.py"
+    creator_path.write_text(
+        "DIRECT_VM_CREATOR_SCHEMA_VERSION = 'g1q3_rca_direct_vm_creator_v1'\n"
+        "def read_direct_vm_status(root, task_id, validator):\n"
+        "    return {'state': 'missing', 'task_id': task_id, "
+        "'submission_key': '', 'identity_sha256': ''}\n",
+        encoding="utf-8",
+    )
+    validator_path = worker_state / "pnc_rca_direct_vm_validator.py"
+    validator_path.write_text(
+        "DIRECT_VM_VALIDATOR_SCHEMA_VERSION = 'g1q3_rca_direct_vm_validator_v1'\n"
+        "def validate_direct_vm_request(value):\n"
+        "    return value\n",
+        encoding="utf-8",
+    )
+    shared_path = worker_state / "shared_state_v2.py"
+    shared_path.write_text("# pinned ABI bytes\n", encoding="utf-8")
+    humanizer_path = worker_state / "vm_feishu_humanizer.py"
+    humanizer_path.write_text(
+        "def build_task_state_notification(previous_task, task):\n"
+        "    return None\n",
+        encoding="utf-8",
+    )
+    tracked_path = worker_state / "reviewed_runtime.txt"
+    tracked_path.write_text("reviewed\n", encoding="utf-8")
+    for path in (creator_path, validator_path, shared_path, humanizer_path):
+        path.chmod(0o600)
+
+    def git(*arguments: str) -> str:
+        completed = subprocess.run(
+            ["/usr/bin/git", "-C", str(worker_state), *arguments],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        return completed.stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "direct-transport@example.invalid")
+    git("config", "user.name", "Direct Transport Test")
+    git("add", ".")
+    git("commit", "-qm", "reviewed worker state")
+
+    def digest(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    kwargs = {
+        "helper_path": str(creator_path),
+        "shared_state_root": str(tmp_path / "shared-state"),
+        "shared_state_module_path": str(shared_path),
+        "validator_module_path": str(validator_path),
+        "humanizer_module_path": str(humanizer_path),
+        "creator_sha256": digest(creator_path),
+        "validator_sha256": digest(validator_path),
+        "humanizer_sha256": digest(humanizer_path),
+        "humanizer_mode": 0o600,
+        "humanizer_baseline_commit": git("rev-parse", "HEAD"),
+        "humanizer_baseline_tree": git("rev-parse", "HEAD^{tree}"),
+        "shared_state_sha256": digest(shared_path),
+        "operation": "status",
+        "task_id": TASK_ID,
+    }
+    clean = subprocess.run(
+        [sys.executable, "-I", "-c", _remote_script(**kwargs)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert clean.returncode == 0, clean.stderr
+
+    if mutation == "tracked":
+        tracked_path.write_text("modified\n", encoding="utf-8")
+    else:
+        (worker_state / "untracked_runtime.py").write_text(
+            "UNTRACKED = True\n", encoding="utf-8"
+        )
+    blocked = subprocess.run(
+        [sys.executable, "-I", "-c", _remote_script(**kwargs)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert blocked.returncode != 0
+    assert "direct_vm_humanizer_provenance_mismatch" in blocked.stderr
 
 
 def test_remote_helper_failure_is_unknown_not_missing() -> None:
