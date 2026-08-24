@@ -789,6 +789,29 @@ def test_canonical_canary_readback_projects_settled_db_evidence(tmp_path):
     assert readback["required_effects"][0]["write_phase"] == "settled"
 
 
+def test_v15_successor_read_only_canonical_canary_readback_preserves_source(tmp_path):
+    data = _canonical_canary(tmp_path, successor_write=True)
+    before = _sqlite_storage_identity(data["db_path"])
+    store = RcaDeliveryStore(
+        data["db_path"],
+        read_only=True,
+        require_current=True,
+        ensure_current_rows=False,
+        allow_successor_read_only=True,
+    )
+
+    readback = store.canonical_canary_readback(
+        batch_id=data["batch_id"],
+        issue_id=data["issue_id"],
+        submission_key=data["submission_key"],
+        activation_epoch_id=data["epoch_id"],
+    )
+
+    assert readback["transport"]["status"] == "pass"
+    assert readback["transport"]["official_comment_id"] == data["remote_id"]
+    _assert_source_probe_identity(before, _sqlite_storage_identity(data["db_path"]))
+
+
 def test_terminal_rerun_provider_rejects_v15_audit_tamper_before_call(
     tmp_path,
     monkeypatch,

@@ -10970,7 +10970,7 @@ class RcaDeliveryStore:
                 invalid(detail)
             return value
 
-        conn = self._connect()
+        conn = self._connect_read_only()
         try:
             conn.execute("BEGIN")
             epochs = conn.execute(
