@@ -617,6 +617,160 @@ def _silent_batch_authority(
     )
 
 
+def _exhausted_infra_terminal_store(tmp_path):
+    from scripts import pnc_rca_delivery_collector as collector
+    from tests.scripts.test_pnc_rca_delivery_collector import _config_env
+
+    store, prior_terminal_at = _silent_deadline_terminal_store(tmp_path)
+    issue_title = "Exhausted translate service fixture"
+    batch_id = "batch-infra-exhausted"
+    request = _silent_batch_request(batch_id)
+    [prior_trigger] = store.list_rows("business_triggers")
+    predecessor = store.direct_steady_predecessor()
+    assert predecessor is not None
+    target_contract = _direct_steady_contract(
+        predecessor=predecessor,
+        epoch_id="rca-infra-exhausted-current",
+        expected_schema=CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+        target_schema=CONTROL_STORE_SCHEMA_SUCCESSOR_VERSION,
+    )
+    target_epoch = store.activate_direct_steady_epoch(
+        **target_contract,
+        operator="infra-exhausted-test",
+        reason="activate historical rerun target epoch",
+        now=prior_terminal_at + timedelta(seconds=1),
+    )
+    authority = build_historical_epoch_rerun_authority(
+        batch_id=batch_id,
+        queue_sha256="1" * 64,
+        issue_id=str(prior_trigger["work_item_id"]),
+        prior_submission_key=str(prior_trigger["submission_key"]),
+        prior_generation=int(prior_trigger["generation"]),
+        prior_activation_epoch_id=str(prior_trigger["activation_epoch_id"]),
+        prior_activation_ledger_id=int(prior_trigger["activation_ledger_id"]),
+        target_activation_epoch_id=str(target_epoch["epoch_id"]),
+        owner_receipt_path=str(tmp_path / "historical-owner-receipt.json"),
+        owner_receipt_sha256="2" * 64,
+        requester_id=request.requester_id,
+        reason=request.reason,
+    )
+    rerun = store.admit_manual_trigger(
+        request,
+        allowed_chat_ids=set(),
+        submit_enabled=True,
+        operator_authorized=True,
+        historical_epoch_rerun_authority=authority,
+        outbox_high_watermark=10_000,
+        activation_required=True,
+        now=prior_terminal_at + timedelta(seconds=1),
+    )
+    claim = store.claim_outbox(
+        lease_owner="infra-exhausted-submitter",
+        now=prior_terminal_at + timedelta(seconds=2),
+    )
+    assert claim is not None
+    assert claim.submission_key == rerun.submission_key
+    store.complete_outbox(
+        outbox_id=claim.outbox_id,
+        lease_token=claim.lease_token,
+        result={
+            "success": True,
+            "submission_key": rerun.submission_key,
+            "task_id": rerun.submission_key,
+            "task_state": "submitted",
+            "deduped": False,
+            "work_item": {
+                "title": issue_title,
+                "title_sha256": collector.issue_title_sha256(issue_title),
+            },
+        },
+        now=prior_terminal_at + timedelta(seconds=3),
+    )
+
+    clock = [prior_terminal_at + timedelta(seconds=5)]
+    error_detail = (
+        "mcap_data_translate GetMcapData/http_service unavailable during "
+        "s5 alignment prepare"
+    )
+    config = replace(
+        collector.CollectorConfig.from_env(
+            _config_env(tmp_path), hermes_home=tmp_path
+        ),
+        activation_required=True,
+    )
+    instance = collector.DeliveryCollector(
+        store=RcaDeliveryStore(
+            store.db_path,
+            require_current=True,
+            allow_successor_write=True,
+        ),
+        config=config,
+        status_reader=lambda task_id: {
+            "success": True,
+            "task_id": task_id,
+            "state": "failed",
+            "summary": "private VM failure",
+        },
+        failure_receipt_reader=lambda watch: {
+            "schema_version": collector.FAILURE_RECEIPT_SCHEMA_VERSION,
+            "task_id": watch.task_id,
+            "status": "pipeline_not_successful",
+            "pipeline_status": "blocked",
+            "pipeline_stage": "s5_alignment",
+            "blocker": {
+                "fault_class": "infra_self_healable",
+                "kind": "translate_service_unavailable",
+                "message": error_detail,
+                "retryable": True,
+            },
+        },
+        control_store=store,
+        now=lambda: clock[0],
+        lease_owner="infra-exhausted-collector",
+    )
+    assert instance.backfill() == 1
+    assert instance.collect_one().status == "failure_hold"
+    while True:
+        [route] = [
+            row
+            for row in instance.store.list_rows("rca_failure_routes")
+            if row["submission_key"] == rerun.submission_key
+        ]
+        next_retry = datetime.fromisoformat(route["next_retry_at"])
+        deadline = datetime.fromisoformat(route["deadline_at"])
+        if next_retry == deadline:
+            break
+        clock[0] = next_retry
+        assert instance.collect_one().status == "failure_hold"
+    clock[0] = deadline + timedelta(seconds=6)
+    terminal = instance.collect_one()
+    assert terminal.status == "terminal_failed"
+    assert terminal.error_code == "translate_service_unavailable"
+    [route] = [
+        row
+        for row in instance.store.list_rows("rca_failure_routes")
+        if row["submission_key"] == rerun.submission_key
+    ]
+    assert route["status"] == "remediation_held"
+    assert route["remediation_attempt_count"] == 1
+    assert route["retry_exhausted"] == 1
+    return store, rerun
+
+def _current_execution_delivery_inflight(store: RcaControlStore) -> int:
+    conn = store._connect()
+    try:
+        [epoch] = conn.execute(
+            "SELECT epoch_id FROM rca_activation_epochs WHERE is_current=1"
+        ).fetchall()
+        return int(
+            store._direct_steady_current_inflight_tx(
+                conn, epoch_id=str(epoch["epoch_id"])
+            )["execution_delivery"]
+        )
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize(
     "error_code",
     [
@@ -805,6 +959,270 @@ def test_issue_only_operator_silent_terminal_drains_activation(tmp_path):
         conn.close()
 
     assert inflight["execution_delivery"] == 0
+
+
+def test_generation_two_exhausted_translate_service_terminal_drains_activation(
+    tmp_path,
+):
+    store, _rerun = _exhausted_infra_terminal_store(tmp_path)
+
+    assert _current_execution_delivery_inflight(store) == 0
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "retry_not_exhausted",
+        "route_not_held",
+        "remediation_external_write",
+        "receipt_stage",
+        "subscription_materialized",
+        "operator_requester",
+        "task_identity",
+        "retry_before_deadline",
+        "origin_binding_deleted",
+        "delivery_binding_deleted",
+        "promotion_audit_deleted",
+        "outbox_origin_null",
+        "message_drift",
+        "zero_window_fake_elapsed",
+        "terminal_before_deadline",
+        "elapsed_mismatch",
+        "attempts_table_missing",
+        "taxonomy_extra_key",
+        "second_generation_origin",
+        "second_subscription_source",
+        "subscription_source_wrong",
+    ],
+)
+def test_generation_two_exhausted_translate_service_terminal_rejects_tamper(
+    tmp_path, tamper
+):
+    store, rerun = _exhausted_infra_terminal_store(tmp_path)
+    delivery = RcaDeliveryStore(
+        store.db_path,
+        require_current=True,
+        allow_successor_write=True,
+    )
+    [watch] = [
+        row
+        for row in delivery.list_rows("rca_execution_watch")
+        if row["submission_key"] == rerun.submission_key
+    ]
+    [route] = [
+        row
+        for row in delivery.list_rows("rca_failure_routes")
+        if row["submission_key"] == rerun.submission_key
+    ]
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if tamper == "retry_not_exhausted":
+            conn.execute(
+                "UPDATE rca_failure_routes SET retry_exhausted=0 WHERE route_key=?",
+                (route["route_key"],),
+            )
+        elif tamper == "route_not_held":
+            status = json.loads(watch["last_status_json"])
+            status["failure_taxonomy"]["durable_route"]["status"] = (
+                "remediation_succeeded"
+            )
+            conn.execute(
+                "UPDATE rca_execution_watch SET last_status_json=? "
+                "WHERE submission_key=?",
+                (
+                    control_store_module._canonical_json(status),
+                    rerun.submission_key,
+                ),
+            )
+            conn.execute(
+                "UPDATE rca_failure_routes SET status='remediation_succeeded' "
+                "WHERE route_key=?",
+                (route["route_key"],),
+            )
+        elif tamper == "remediation_external_write":
+            result = json.loads(route["remediation_result_json"])
+            result["external_writes"] = True
+            conn.execute(
+                "UPDATE rca_failure_routes SET remediation_result_json=? "
+                "WHERE route_key=?",
+                (
+                    control_store_module._canonical_json(result),
+                    route["route_key"],
+                ),
+            )
+        elif tamper == "receipt_stage":
+            status = json.loads(watch["last_status_json"])
+            status["failure_taxonomy"]["receipt"]["pipeline_stage"] = "s6_report"
+            audit = json.loads(route["audit_json"])
+            audit["receipt"]["pipeline_stage"] = "s6_report"
+            conn.execute(
+                "UPDATE rca_execution_watch SET last_status_json=? "
+                "WHERE submission_key=?",
+                (
+                    control_store_module._canonical_json(status),
+                    rerun.submission_key,
+                ),
+            )
+            conn.execute(
+                "UPDATE rca_failure_routes SET audit_json=? WHERE route_key=?",
+                (
+                    control_store_module._canonical_json(audit),
+                    route["route_key"],
+                ),
+            )
+        elif tamper == "subscription_materialized":
+            conn.execute(
+                "UPDATE rca_delivery_subscriptions SET materialized_at=? "
+                "WHERE business_key=? AND generation=2",
+                (watch["terminal_at"], rerun.business_key),
+            )
+        elif tamper == "operator_requester":
+            conn.execute(
+                "UPDATE rca_trigger_sources SET requester_id='automation:other' "
+                "WHERE source_id=(SELECT origin_source_id FROM business_triggers "
+                "WHERE business_key=? AND generation=2)",
+                (rerun.business_key,),
+            )
+        elif tamper == "task_identity":
+            other_task = "g1q3-rca-s1-" + "0" * 64
+            status = json.loads(watch["last_status_json"])
+            status["failure_taxonomy"]["receipt"]["task_id"] = other_task
+            audit = json.loads(route["audit_json"])
+            audit["receipt"]["task_id"] = other_task
+            result = json.loads(route["remediation_result_json"])
+            result["task_id"] = other_task
+            conn.execute(
+                "UPDATE rca_execution_watch SET task_id=?, last_status_json=? "
+                "WHERE submission_key=?",
+                (
+                    other_task,
+                    control_store_module._canonical_json(status),
+                    rerun.submission_key,
+                ),
+            )
+            conn.execute(
+                "UPDATE rca_failure_routes SET task_id=?, audit_json=?, "
+                "remediation_result_json=? WHERE route_key=?",
+                (
+                    other_task,
+                    control_store_module._canonical_json(audit),
+                    control_store_module._canonical_json(result),
+                    route["route_key"],
+                ),
+            )
+        elif tamper == "retry_before_deadline":
+            conn.execute(
+                "UPDATE rca_failure_routes SET next_retry_at=work_started_at "
+                "WHERE route_key=?",
+                (route["route_key"],),
+            )
+        elif tamper == "origin_binding_deleted":
+            conn.execute(
+                "DELETE FROM rca_trigger_bindings "
+                "WHERE source_id=? AND role='origin'",
+                (rerun.source_id,),
+            )
+        elif tamper == "delivery_binding_deleted":
+            conn.execute(
+                "DELETE FROM rca_trigger_delivery_bindings WHERE source_id=?",
+                (rerun.source_id,),
+            )
+        elif tamper == "promotion_audit_deleted":
+            conn.execute(
+                "DELETE FROM rca_shadow_promotion_audit WHERE submission_key=?",
+                (rerun.submission_key,),
+            )
+        elif tamper == "outbox_origin_null":
+            conn.execute(
+                "UPDATE rca_outbox SET origin_source_id=NULL "
+                "WHERE submission_key=?",
+                (rerun.submission_key,),
+            )
+        elif tamper == "message_drift":
+            conn.execute(
+                "UPDATE rca_trigger_sources SET message_id=message_id || '-drift' "
+                "WHERE source_id=?",
+                (rerun.source_id,),
+            )
+        elif tamper in {
+            "zero_window_fake_elapsed",
+            "terminal_before_deadline",
+            "elapsed_mismatch",
+        }:
+            status = json.loads(watch["last_status_json"])
+            fallback = status["failure_taxonomy"]["terminal_fallback"]
+            work_window = status["failure_taxonomy"]["work_window"]
+            if tamper == "zero_window_fake_elapsed":
+                fallback["deadline_at"] = fallback["work_started_at"]
+                work_window["deadline_at"] = fallback["work_started_at"]
+                conn.execute(
+                    "UPDATE rca_failure_routes SET deadline_at=work_started_at, "
+                    "next_retry_at=work_started_at WHERE route_key=?",
+                    (route["route_key"],),
+                )
+            elif tamper == "terminal_before_deadline":
+                terminal_at = datetime.fromisoformat(route["deadline_at"]) - timedelta(
+                    seconds=1
+                )
+                fallback["elapsed_seconds"] = 1799
+                work_window["elapsed_seconds"] = 1799
+                conn.execute(
+                    "UPDATE rca_execution_watch SET terminal_at=? "
+                    "WHERE submission_key=?",
+                    (terminal_at.isoformat(), rerun.submission_key),
+                )
+            else:
+                fallback["elapsed_seconds"] = 1800
+                work_window["elapsed_seconds"] = 1800
+            conn.execute(
+                "UPDATE rca_execution_watch SET last_status_json=? "
+                "WHERE submission_key=?",
+                (
+                    control_store_module._canonical_json(status),
+                    rerun.submission_key,
+                ),
+            )
+        elif tamper == "attempts_table_missing":
+            conn.execute("DROP TABLE rca_delivery_attempts")
+        elif tamper == "taxonomy_extra_key":
+            status = json.loads(watch["last_status_json"])
+            status["failure_taxonomy"]["provider_attempted"] = False
+            conn.execute(
+                "UPDATE rca_execution_watch SET last_status_json=? "
+                "WHERE submission_key=?",
+                (
+                    control_store_module._canonical_json(status),
+                    rerun.submission_key,
+                ),
+            )
+        elif tamper == "second_generation_origin":
+            conn.execute(
+                "UPDATE rca_trigger_bindings SET business_key=?, generation=2 "
+                "WHERE source_id=(SELECT source_id FROM rca_trigger_sources "
+                "WHERE source_id<>? ORDER BY created_at LIMIT 1)",
+                (rerun.business_key, rerun.source_id),
+            )
+        elif tamper == "second_subscription_source":
+            conn.execute(
+                "INSERT INTO rca_trigger_delivery_bindings("
+                "source_id, subscription_key, bound_at) "
+                "SELECT source_id, ?, ? FROM rca_trigger_sources "
+                "WHERE source_id<>? ORDER BY created_at LIMIT 1",
+                (rerun.subscription_key, watch["terminal_at"], rerun.source_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE rca_delivery_subscriptions SET source_id=("
+                "SELECT source_id FROM rca_trigger_sources WHERE source_id<>? "
+                "ORDER BY created_at LIMIT 1) WHERE subscription_key=?",
+                (rerun.source_id, rerun.subscription_key),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert _current_execution_delivery_inflight(store) == 1
 
 
 def test_issue_only_kafka_silent_terminal_drains_activation(tmp_path):
