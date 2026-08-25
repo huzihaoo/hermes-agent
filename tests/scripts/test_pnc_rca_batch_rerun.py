@@ -1550,6 +1550,94 @@ def test_run_creates_initial_generation_for_exact_absent_item(tmp_path, monkeypa
     assert result["summary"] == {"accepted": 1, "total": 1}
 
 
+def test_run_item_deadline_converges_to_same_generation_terminal_failure(
+    tmp_path, monkeypatch
+):
+    queue_path, owner_path = _write_run_inputs(
+        tmp_path,
+        _queue_value(current_submission_key="", current_generation=0),
+    )
+    submitted = {
+        **_snapshot(job_status="", job_outcome="", effect_status="pending"),
+        "generation": 1,
+        "submission_key": "g1q3-rca-s1-" + "c" * 64,
+        "delivery_id": None,
+        "outbox_status": "completed",
+        "watch_state": "running",
+        "watch_error_code": "",
+    }
+    terminal = {
+        **submitted,
+        "watch_state": "terminal_failed",
+        "watch_delivery_id": None,
+        "watch_error_code": "rca_work_deadline_exceeded",
+        "effects": [],
+    }
+    admission_count = 0
+    snapshot_value = submitted
+
+    class FakeStore:
+        def __init__(self, _path, *, require_current, allow_successor_write):
+            assert require_current is True
+            assert allow_successor_write is True
+
+        def admit_manual_trigger(self, _request, **_kwargs):
+            nonlocal admission_count
+            admission_count += 1
+            return SimpleNamespace(
+                outcome="created",
+                generation=1,
+                submission_key=submitted["submission_key"],
+                source_id="source-1",
+            )
+
+    def snapshot(_path, _issue_id, *, submission_key=""):
+        if not admission_count:
+            return None
+        if submission_key and submission_key != snapshot_value["submission_key"]:
+            return None
+        return snapshot_value
+
+    monkeypatch.setattr(batch_rerun, "RcaControlStore", FakeStore)
+    monkeypatch.setattr(batch_rerun, "_issue_snapshot", snapshot)
+    monkeypatch.setattr(
+        batch_rerun, "_runtime_identity", lambda: ("a" * 40, "b" * 40)
+    )
+    clock = iter((0.0, 31.0))
+    monkeypatch.setattr(batch_rerun.time, "monotonic", lambda: next(clock))
+    args = _run_args(tmp_path, queue_path, owner_path)
+
+    with pytest.raises(BatchRerunError, match="batch_item_timeout"):
+        batch_rerun.run(args)
+
+    persisted = json.loads((tmp_path / "state.json").read_bytes())
+    item = persisted["items"]["7048803418"]
+    assert persisted["status"] == "blocked_on_item_failure"
+    assert item["status"] == "failed"
+    assert item["failure"]["terminal_state"] == "batch_watch_deadline_exceeded"
+    assert item["failure"]["terminal_error_code"] == "batch_item_timeout"
+    assert item["failure"]["watch_state"] == "running"
+    assert item["failure"]["timeout_seconds"] == 30
+    assert item["failure"]["effects"] == [
+        {
+            "effect_kind": "feishu_issue_comment",
+            "status": "pending",
+            "error_code": "",
+        }
+    ]
+
+    snapshot_value = terminal
+    with pytest.raises(BatchRerunError, match="batch_item_terminal_failure"):
+        batch_rerun.run(args)
+    canonical = json.loads((tmp_path / "state.json").read_bytes())
+    canonical_failure = canonical["items"]["7048803418"]["failure"]
+    assert canonical["status"] == "blocked_on_item_failure"
+    assert canonical_failure["terminal_state"] == "watch_terminal_failed"
+    assert canonical_failure["terminal_error_code"] == "rca_work_deadline_exceeded"
+    assert args.retry_failed is False
+    assert admission_count == 1
+
+
 def test_submit_all_admits_historical_generation_without_waiting_for_delivery(
     tmp_path, monkeypatch
 ):
