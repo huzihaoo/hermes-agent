@@ -2955,8 +2955,9 @@ def test_known_production_terminal_is_not_held_for_fallback_window(
 
 
 def _exact_route_failure_status(task_id):
-    expected_entrypoint = (
-        f"{collector.RCA_PROD_VM_RELEASE_ROOT}/"
+    stale_entrypoint = (
+        "/home/mini/.hermes/rca-prod-runtime/releases/"
+        "rca-platform-stale-fixture/"
         f"{collector.RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH}"
     )
     return {
@@ -2971,10 +2972,7 @@ def _exact_route_failure_status(task_id):
         },
         "summary": f"{task_id} rca_service_route_invalid",
         "meta": {
-            "fixed_cli_entrypoint": expected_entrypoint.replace(
-                "rca-platform-20260825.installed-e9cff6e-r15c6",
-                "rca-platform-20260824.installed-c2821d2-r15br",
-            )
+            "fixed_cli_entrypoint": stale_entrypoint,
         },
         "paths": {
             "root": str(vm_task_tool._DEFAULT_VM_CANONICAL_ROOT),
