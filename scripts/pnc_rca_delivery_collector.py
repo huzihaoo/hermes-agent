@@ -69,6 +69,10 @@ from gateway.pnc_rca_runtime_identity import (
     build_runtime_identity,
     runtime_identity_is_valid,
 )
+from gateway.pnc_rca_vm_release_binding import (
+    RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH,
+    RCA_PROD_VM_RELEASE_ROOT,
+)
 from gateway.pnc_rca_snapshot import (
     AdmissionSnapshotExecutionBundle,
     snapshot_execution_inputs,
@@ -202,6 +206,7 @@ _PUBLIC_TERMINAL_ERROR_CODES = frozenset({
 })
 _PUBLIC_TERMINAL_FALLBACK_CODE = "taxonomy_gap:missing_terminal_error_code"
 _IMMEDIATE_TERMINAL_ERROR_CODES = frozenset({
+    "rca_service_route_invalid",
     "remote_evidence_domain_unsupported",
     "taxonomy_gap:remote_evidence_domain_unsupported",
     "viz_evidence_unavailable",
@@ -800,6 +805,70 @@ def default_failure_receipt_reader(
         code = str(payload.get("error_code") or "failure_receipt_unavailable")
         raise FailureReceiptReadError(code)
     return payload
+
+
+def _trusted_internal_route_failure_receipt(
+    claim: ExecutionWatchClaim,
+    status: Mapping[str, Any],
+    state: str,
+) -> dict[str, Any] | None:
+    """Derive the exact pre-service route failure from canonical VM status."""
+
+    # Import at observation time: vm_task_tool imports this collector through
+    # the resident path, so a module-level dependency would form a cycle.
+    from tools.vm_task_tool import _DEFAULT_VM_CANONICAL_ROOT
+
+    dispatch = status.get("dispatch_terminal")
+    meta = status.get("meta")
+    paths = status.get("paths")
+    expected_entrypoint = (
+        f"{RCA_PROD_VM_RELEASE_ROOT}/{RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH}"
+    )
+    observed_entrypoint = (
+        meta.get("fixed_cli_entrypoint") if isinstance(meta, Mapping) else None
+    )
+    expected_summary = f"{claim.task_id} rca_service_route_invalid"
+    expected_vm_root = str(Path(_DEFAULT_VM_CANONICAL_ROOT))
+    observed_entrypoint_prefix = (
+        "/home/mini/.hermes/rca-prod-runtime/releases/"
+    )
+    observed_entrypoint_suffix = f"/{RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH}"
+    if (
+        state != "failed"
+        or claim.task_id != claim.submission_key
+        or status.get("task_id") != claim.task_id
+        or not isinstance(paths, Mapping)
+        or paths.get("root") != expected_vm_root
+        or status.get("dispatch_queue") != "failed"
+        or not isinstance(dispatch, Mapping)
+        or dispatch.get("queue") != "failed"
+        or dispatch.get("state") != "failed"
+        or type(dispatch.get("exit_code")) is not int
+        or dispatch.get("exit_code") != 64
+        or status.get("summary") != expected_summary
+        or not isinstance(observed_entrypoint, str)
+        or not observed_entrypoint.startswith(observed_entrypoint_prefix)
+        or not observed_entrypoint.endswith(observed_entrypoint_suffix)
+        or observed_entrypoint == expected_entrypoint
+    ):
+        return None
+    return {
+        "schema_version": FAILURE_RECEIPT_SCHEMA_VERSION,
+        "task_id": claim.task_id,
+        "status": "pipeline_not_started",
+        "pipeline_status": "needs_fix",
+        "pipeline_stage": "dispatch_route_validation",
+        "receipt_origin": "trusted_vm_dispatch_terminal",
+        "blocker": {
+            "kind": "rca_service_route_invalid",
+            "fault_class": pnc_fault_taxonomy.HARD_DEFECT,
+            "retryable": False,
+            "message": "metadata_mismatch:fixed_cli_entrypoint",
+            "expected_fixed_cli_entrypoint": expected_entrypoint,
+            "observed_fixed_cli_entrypoint": observed_entrypoint,
+            "dispatch_exit_code": 64,
+        },
+    }
 
 
 def probe_remote_css_parser(
@@ -3226,7 +3295,14 @@ def _terminal_failure(
         else {}
     )
     blocker = receipt_blocker or status_blocker
-    source = "rca_service_result" if receipt_blocker else "vm_status"
+    source = (
+        "vm_status_dispatch_terminal"
+        if isinstance(failure_receipt, Mapping)
+        and failure_receipt.get("receipt_origin") == "trusted_vm_dispatch_terminal"
+        else "rca_service_result"
+        if receipt_blocker
+        else "vm_status"
+    )
     source_conflict = bool(
         receipt_blocker
         and status_blocker
@@ -3262,6 +3338,7 @@ def _terminal_failure(
                 "status",
                 "pipeline_status",
                 "pipeline_stage",
+                "receipt_origin",
             )
         }
     return decision, detail, projection, blocker
@@ -4015,14 +4092,21 @@ class DeliveryCollector:
             try:
                 failure_receipt = self.failure_receipt_reader(claim)
             except FailureReceiptReadError as exc:
-                return self._handle_observed_failure(
-                    claim,
-                    status=status,
-                    code=exc.code,
-                    detail=exc.detail,
-                    state=state,
-                    source="failure_receipt_reader",
-                )
+                if exc.code == "failure_receipt_missing":
+                    failure_receipt = _trusted_internal_route_failure_receipt(
+                        claim,
+                        status,
+                        state,
+                    )
+                if failure_receipt is None:
+                    return self._handle_observed_failure(
+                        claim,
+                        status=status,
+                        code=exc.code,
+                        detail=exc.detail,
+                        state=state,
+                        source="failure_receipt_reader",
+                    )
             except Exception as exc:
                 return self._handle_observed_failure(
                     claim,

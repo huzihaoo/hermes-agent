@@ -95,6 +95,8 @@ receipt_path_invalid,apply,false,downstream apply gate; not preflight-reachable,
 receipt_unavailable,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2182
 receipt_write_failed,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2147
 release_apply_locked,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1986
+release_lane_decision,prepare,true,validate optional lane decision and fail closed on uncertain closure,scripts/pnc_rca_minimal_release.py:4040
+release_lane_decision_invalid,prepare,false,validated lane decision rejected while embedding release note,scripts/pnc_rca_minimal_release.py:4943
 release_lock_unavailable,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2070
 release_note_activation_binding_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1315
 release_note_activation_fence_invalid,plan/apply/verify,false,downstream plan/apply/verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1277

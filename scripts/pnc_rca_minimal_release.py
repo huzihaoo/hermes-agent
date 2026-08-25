@@ -31,6 +31,10 @@ if str(REPO_ROOT) not in sys.path:
 from gateway.pnc_rca_control_store import ActivationEpochError, RcaControlStore
 from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from gateway.pnc_rca_runtime_identity import runtime_identity_is_valid
+from gateway.pnc_rca_release_lane import (
+    ReleaseLaneError,
+    validate_release_lane_decision,
+)
 from gateway.pnc_rca_workspace_runtime import (
     WorkspaceRuntimeError,
     validate_workspace_runtime,
@@ -4029,6 +4033,7 @@ def preflight_release(
     store_factory: StoreFactory = _open_store,
     workspace_runtime_resolver: WorkspaceRuntimeResolver = _workspace_runtime_projection,
     dependency_probe: DependencyProbe | None = None,
+    lane_decision: Mapping[str, Any] | None = None,
     require_canary_state: bool | None = None,
     require_control_snapshot: bool = True,
 ) -> dict[str, Any]:
@@ -4036,6 +4041,18 @@ def preflight_release(
     collector = _PreflightCollector()
     if require_canary_state is None:
         require_canary_state = True
+
+    collector.check(
+        "release_lane_decision",
+        "prepare",
+        "valid decision or legacy-compatible omission",
+        "Regenerate the lane decision; uncertain closure must use critical_full.",
+        lambda: (
+            validate_release_lane_decision(lane_decision)
+            if lane_decision is not None
+            else {"status": "legacy_compatible_omission"}
+        ),
+    )
 
     def absolute(value: Path, code: str) -> Path:
         try:
@@ -4739,6 +4756,7 @@ def prepare_release(
     store_factory: StoreFactory = _open_store,
     workspace_runtime_resolver: WorkspaceRuntimeResolver = _workspace_runtime_projection,
     dependency_probe: DependencyProbe | None = None,
+    lane_decision: Mapping[str, Any] | None = None,
 ) -> dict:
     preflight = preflight_release(
         release_id=release_id,
@@ -4772,6 +4790,7 @@ def prepare_release(
         store_factory=store_factory,
         workspace_runtime_resolver=workspace_runtime_resolver,
         dependency_probe=dependency_probe,
+        lane_decision=lane_decision,
         require_canary_state=False,
     )
     if not preflight["preflight_ok"]:
@@ -4918,6 +4937,11 @@ def prepare_release(
             "state_path": str(canary_state_path),
         },
     }
+    if lane_decision is not None:
+        try:
+            note["lane_decision"] = validate_release_lane_decision(lane_decision)
+        except ReleaseLaneError as exc:
+            raise ReleaseError("release_lane_decision_invalid") from exc
     note_raw = _pretty_json(note)
     if _gitlab_resolve_faces(specs, runner) != resolved:
         raise ReleaseError("gitlab_changed_during_prepare")
@@ -4993,7 +5017,7 @@ def build_plan(
             projection["live_manifest_sha256"],
         ),
     ]
-    return {
+    result = {
         "schema_version": SCHEMA,
         "ok": True,
         "mode": "plan",
@@ -5016,6 +5040,9 @@ def build_plan(
             "submitted_by_driver": False,
         },
     }
+    if isinstance(note.get("lane_decision"), Mapping):
+        result["lane_decision"] = dict(note["lane_decision"])
+    return result
 
 
 def _require_release_note_sha(path: Path, expected: str) -> None:
@@ -6001,6 +6028,7 @@ def _parser() -> argparse.ArgumentParser:
         target.add_argument("--control-db", type=Path, required=True)
         target.add_argument("--manifest-output", type=Path, required=True)
         target.add_argument("--env-output", type=Path, required=True)
+        target.add_argument("--lane-decision", type=Path)
 
     for name in ("preflight", "prepare", "prepare-preflight"):
         target = commands.add_parser(name)
@@ -6070,6 +6098,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "control_db": args.control_db,
                 "manifest_output": args.manifest_output,
                 "env_output": args.env_output,
+                "lane_decision": (
+                    _json(
+                        _absolute(
+                            getattr(args, "lane_decision", None),
+                            "release_lane_decision_path_invalid",
+                        ),
+                        "release_lane_decision",
+                        owner_only=True,
+                    )[1]
+                    if getattr(args, "lane_decision", None) is not None
+                    else None
+                ),
             }
             if command == "preflight":
                 result = preflight_release(**prepare_inputs)

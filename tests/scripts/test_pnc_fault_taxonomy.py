@@ -24,6 +24,7 @@ from scripts import pnc_fault_taxonomy as tax
             tax.INTERNAL_ALERT,
         ),
         ("remote_evidence_domain_unsupported", tax.HARD_DEFECT, tax.INTERNAL_ALERT),
+        ("rca_service_route_invalid", tax.HARD_DEFECT, tax.INTERNAL_ALERT),
         ("service_provenance_unavailable", tax.HARD_DEFECT, tax.INTERNAL_ALERT),
         ("delivery_lineage_unavailable", tax.HARD_DEFECT, tax.INTERNAL_ALERT),
         ("viz_mcap_build_failed", tax.HARD_DEFECT, tax.INTERNAL_ALERT),

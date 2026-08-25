@@ -104,6 +104,7 @@ HARD_DEFECT_KINDS = frozenset({
     "request_not_visible_on_vm",
     "schema_mismatch",
     "request_contract_drift",
+    "rca_service_route_invalid",
     "service_pipeline_runner_failed",
     "service_execution_request_invalid",
     "service_worker_attestation_unavailable",

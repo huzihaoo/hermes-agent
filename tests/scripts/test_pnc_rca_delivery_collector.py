@@ -23,6 +23,7 @@ from gateway.pnc_rca_control_store import RcaControlStore
 from gateway.pnc_rca_delivery_store import RcaDeliveryStore
 from scripts import pnc_rca_delivery_collector as collector
 from scripts.pnc_foxglove_delivery import canonical_viz_mcap_path
+from tools import vm_task_tool
 from tests.gateway.test_pnc_rca_delivery_store import (
     NOW,
     _bind_activation_execution,
@@ -2951,6 +2952,149 @@ def test_known_production_terminal_is_not_held_for_fallback_window(
         assert route["route_kind"] == "internal_backlog"
         assert route["owner"] == "rca-triage"
     assert instance.store.list_rows("rca_delivery_jobs") == []
+
+
+def _exact_route_failure_status(task_id):
+    expected_entrypoint = (
+        f"{collector.RCA_PROD_VM_RELEASE_ROOT}/"
+        f"{collector.RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH}"
+    )
+    return {
+        "success": True,
+        "task_id": task_id,
+        "state": "failed",
+        "dispatch_queue": "failed",
+        "dispatch_terminal": {
+            "queue": "failed",
+            "state": "failed",
+            "exit_code": 64,
+        },
+        "summary": f"{task_id} rca_service_route_invalid",
+        "meta": {
+            "fixed_cli_entrypoint": expected_entrypoint.replace(
+                "rca-platform-20260825.installed-e9cff6e-r15c6",
+                "rca-platform-20260824.installed-c2821d2-r15br",
+            )
+        },
+        "paths": {
+            "root": str(vm_task_tool._DEFAULT_VM_CANONICAL_ROOT),
+            "observed_roots": [str(vm_task_tool._DEFAULT_VM_CANONICAL_ROOT)],
+        },
+    }
+
+
+def test_exact_prefixed_vm_route_failure_is_immediately_terminal(tmp_path):
+
+    def missing_receipt(_claim):
+        raise collector.FailureReceiptReadError("failure_receipt_missing")
+
+    instance = _real_terminal_collector(
+        tmp_path,
+        clock=[NOW],
+        status_reader=_exact_route_failure_status,
+        failure_receipt_reader=missing_receipt,
+    )
+
+    outcome = instance.collect_one()
+
+    assert outcome.status == "terminal_failed"
+    assert outcome.error_code == "rca_service_route_invalid"
+    assert instance.store.list_rows("rca_delivery_jobs") == []
+    assert instance.store.list_rows("rca_delivery_effects") == []
+    [watch] = instance.store.list_rows("rca_execution_watch")
+    taxonomy = json.loads(watch["last_status_json"])["failure_taxonomy"]
+    assert taxonomy["source"] == "vm_status_dispatch_terminal"
+    assert taxonomy["receipt"] == {
+        "schema_version": collector.FAILURE_RECEIPT_SCHEMA_VERSION,
+        "task_id": watch["task_id"],
+        "status": "pipeline_not_started",
+        "pipeline_status": "needs_fix",
+        "pipeline_stage": "dispatch_route_validation",
+        "receipt_origin": "trusted_vm_dispatch_terminal",
+    }
+    assert taxonomy["terminal_fallback"]["elapsed_seconds"] == 0
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda status: status.update({"summary": "rca_service_route_invalid"}),
+        lambda status: status["paths"].update({"root": "/wrong/vm/root"}),
+        lambda status: status["paths"].update(
+            {"root": str(vm_task_tool._DEFAULT_HOST_CANONICAL_ROOT)}
+        ),
+        lambda status: status.update({"task_id": "g1q3-rca-s1-" + "f" * 64}),
+        lambda status: status["dispatch_terminal"].update({"queue": "completed"}),
+        lambda status: status["dispatch_terminal"].update({"exit_code": 65}),
+        lambda status: status["meta"].update(
+            {
+                "fixed_cli_entrypoint": (
+                    f"{collector.RCA_PROD_VM_RELEASE_ROOT}/"
+                    f"{collector.RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH}"
+                )
+            }
+        ),
+        lambda status: status["meta"].update(
+            {"fixed_cli_entrypoint": "/tmp/untrusted/run_rca_service_request.py"}
+        ),
+    ],
+    ids=(
+        "bare-summary",
+        "wrong-root",
+        "host-only-root",
+        "wrong-task-id",
+        "wrong-queue",
+        "wrong-exit-code",
+        "no-entrypoint-mismatch",
+        "untrusted-entrypoint-mismatch",
+    ),
+)
+def test_inexact_route_failure_keeps_original_fallback_window(tmp_path, mutate):
+    def missing_receipt(_claim):
+        raise collector.FailureReceiptReadError("failure_receipt_missing")
+
+    def status_reader(task_id):
+        status = _exact_route_failure_status(task_id)
+        mutate(status)
+        return status
+
+    instance = _real_terminal_collector(
+        tmp_path,
+        clock=[NOW],
+        status_reader=status_reader,
+        failure_receipt_reader=missing_receipt,
+    )
+
+    outcome = instance.collect_one()
+
+    assert outcome.status == "failure_hold"
+    assert outcome.error_code == "failure_receipt_missing"
+    assert instance.store.list_rows("rca_delivery_jobs") == []
+    assert instance.store.list_rows("rca_delivery_effects") == []
+
+
+def test_other_missing_failure_receipt_keeps_original_fallback_window(tmp_path):
+    clock = [NOW]
+
+    def missing_receipt(_claim):
+        raise collector.FailureReceiptReadError("failure_receipt_missing")
+
+    instance = _real_terminal_collector(
+        tmp_path,
+        clock=clock,
+        failure_receipt_reader=missing_receipt,
+    )
+
+    held = instance.collect_one()
+
+    assert held.status == "failure_hold"
+    assert held.error_code == "failure_receipt_missing"
+    clock[0] = NOW + timedelta(seconds=1799)
+    assert instance.collect_one().status == "failure_hold"
+    clock[0] = NOW + timedelta(seconds=1800)
+    terminal = instance.collect_one()
+    assert terminal.status == "terminal_failed"
+    assert terminal.error_code == "failure_receipt_missing"
 
 
 def test_infra_remediation_runner_executes_once_for_same_task(tmp_path):

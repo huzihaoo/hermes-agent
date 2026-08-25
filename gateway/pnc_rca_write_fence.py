@@ -17,6 +17,11 @@ import re
 import stat
 from typing import Any, Mapping
 
+from gateway.pnc_rca_release_lane import (
+    ReleaseLaneError,
+    validate_release_lane_decision,
+)
+
 
 WRITE_FENCE_SCHEMA_VERSION = "pnc_rca_write_fence_v1"
 WRITE_FENCE_ID_PREFIX = "pnc-rca-wf1-"
@@ -91,6 +96,7 @@ _MINIMAL_RELEASE_NOTE_FIELDS = frozenset({
     "resident_profile",
     "canary",
 })
+_MINIMAL_RELEASE_NOTE_OPTIONAL_FIELDS = frozenset({"lane_decision"})
 _MINIMAL_RELEASE_IDENTITY_FIELDS = frozenset({
     "host",
     "worker",
@@ -359,9 +365,14 @@ def _minimal_release_has_github_key(value: object) -> bool:
 def validate_minimal_release_note_identity(note: object) -> dict[str, Any]:
     """Validate the GitLab-only identity shared by release and resident paths."""
 
+    fields = set(note) if isinstance(note, Mapping) else set()
     if (
         not isinstance(note, Mapping)
-        or set(note) != _MINIMAL_RELEASE_NOTE_FIELDS
+        or fields
+        not in (
+            set(_MINIMAL_RELEASE_NOTE_FIELDS),
+            set(_MINIMAL_RELEASE_NOTE_FIELDS | _MINIMAL_RELEASE_NOTE_OPTIONAL_FIELDS),
+        )
         or note.get("schema_version") != MINIMAL_RELEASE_NOTE_SCHEMA_VERSION
         or note.get("production_definition") != MINIMAL_RELEASE_PRODUCTION_DEFINITION
         or _MINIMAL_RELEASE_ID_RE.fullmatch(str(note.get("release_id") or "")) is None
@@ -393,12 +404,21 @@ def validate_minimal_release_note_identity(note: object) -> dict[str, Any]:
         raise MinimalReleaseNoteIdentityError("minimal_release_note_identity_invalid")
     if _minimal_release_has_github_key(note):
         raise MinimalReleaseNoteIdentityError("minimal_release_note_contract_invalid")
+    lane_decision = note.get("lane_decision")
+    if lane_decision is not None:
+        try:
+            lane_decision = validate_release_lane_decision(lane_decision)
+        except ReleaseLaneError as exc:
+            raise MinimalReleaseNoteIdentityError(
+                "minimal_release_note_contract_invalid"
+            ) from exc
     return {
         "release_id": str(note["release_id"]),
         "release_identity": identity,
         "host": host,
         "worker": worker,
         "pipeline": pipeline,
+        "lane_decision": lane_decision,
     }
 
 
@@ -665,7 +685,7 @@ def validate_resident_release_note(
         or hashlib.sha256(env_raw).hexdigest() != expected_env
     ):
         raise ExternalWriteFenceError("resident_release_env_mismatch")
-    return {
+    result = {
         "epoch_id": str(epoch.get("epoch_id") or ""),
         "release_id": validated_identity["release_id"],
         "release_fingerprint_sha256": fingerprint,
@@ -677,6 +697,9 @@ def validate_resident_release_note(
         "live_manifest_sha256": expected_manifest,
         "live_env_sha256": expected_env,
     }
+    if isinstance(validated_identity.get("lane_decision"), Mapping):
+        result["lane_decision"] = dict(validated_identity["lane_decision"])
+    return result
 
 
 def validate_bound_resident_release(

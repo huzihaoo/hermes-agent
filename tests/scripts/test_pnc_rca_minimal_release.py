@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway import pnc_rca_release_lane as release_lane
 from scripts import pnc_rca_minimal_release as release
 
 
@@ -776,6 +777,34 @@ def test_prepare_derives_and_writes_deterministic_owner_only_outputs(release_fil
         path.unlink()
     release.prepare_release(**prepared["args"], runner=FakeRunner(release_files))
     assert {path: path.read_bytes() for path in first} == first
+
+
+def test_prepare_embeds_validated_release_lane_decision(release_files):
+    prepared = _prepare_fixture(release_files)
+    paths = [
+        "gateway/pnc_rca_vm_release_binding.py",
+        "scripts/pnc_fault_taxonomy.py",
+        "scripts/pnc_rca_delivery_collector.py",
+    ]
+    decision = release_lane.build_release_lane_decision(
+        changed_paths=paths,
+        dependency_closure=paths,
+        validation_manifest_sha256="a" * 64,
+        rollback_release_id="rca-r15c6-rollback",
+        rollback_release_note_sha256="b" * 64,
+        import_closure_complete=True,
+    )
+    prepared["args"]["lane_decision"] = decision
+
+    release.prepare_release(
+        **prepared["args"], runner=FakeRunner(release_files)
+    )
+
+    note = json.loads(prepared["note_path"].read_bytes())
+    assert note["lane_decision"] == decision
+    assert release.validate_minimal_release_note_identity(note)[
+        "lane_decision"
+    ] == decision
 
 
 def test_preflight_is_read_only_non_short_circuit_and_structured(release_files):
