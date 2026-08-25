@@ -294,6 +294,16 @@ def test_check_config_outlet_preflight_is_read_only(
         collector,
         "RcaDeliveryStore",
         lambda *_args, **_kwargs: SimpleNamespace(
+            schema_runtime_capability=lambda: {
+                "observed_control_schema_version": "pnc_rca_control_store_v14",
+                "binary_write_schema_version": "pnc_rca_control_store_v15",
+                "mode": "current_write",
+                "read_supported": True,
+                "write_enabled": True,
+                "work_admission_enabled": True,
+                "lease_acquisition_enabled": True,
+                "external_effect_enabled": True,
+            },
             health=lambda **_kwargs: {
                 "activation": {"production_ready": True},
             }

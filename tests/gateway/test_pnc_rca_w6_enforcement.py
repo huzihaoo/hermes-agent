@@ -307,7 +307,12 @@ def test_stock_member_without_admission_fails_closed_at_all_write_boundaries(tmp
 
     dispatcher = object.__new__(DeliveryDispatcher)
     dispatcher.store = delivery
-    claim = SimpleNamespace(business_key=business_key, generation=1)
+    dispatcher.config = SimpleNamespace(resident_release_enforced=False)
+    claim = SimpleNamespace(
+        business_key=business_key,
+        generation=1,
+        submission_key=submission_key,
+    )
     with pytest.raises(
         ExternalWriteFenceError, match=LEARNING_LANE_ADMISSION_MISSING_ERROR
     ):
@@ -389,7 +394,7 @@ def test_comment_budget_cannot_borrow_rerun_authority_from_another_business_key(
 def test_v11_marker_migrates_the_v12_learning_schema(tmp_path):
     db_path = tmp_path / "migration.sqlite3"
     store = RcaControlStore(db_path)
-    conn = store._connect()
+    conn = sqlite3.connect(db_path)
     try:
         conn.execute("PRAGMA foreign_keys=OFF")
         for trigger in (
@@ -411,6 +416,7 @@ def test_v11_marker_migrates_the_v12_learning_schema(tmp_path):
             "UPDATE control_meta SET value = 'pnc_rca_control_store_v11' "
             "WHERE key = 'schema_version'"
         )
+        conn.commit()
     finally:
         conn.close()
 
@@ -457,7 +463,7 @@ def test_delivery_v11_to_v12_replaces_stock_guards_atomically(tmp_path):
             "SELECT sql FROM sqlite_master WHERE type='trigger' "
             "AND name='trg_learning_lane_stock_effect_insert_forbidden'"
         ).fetchone()[0]
-    assert "terminal_rerun_delivery_authorities" in sql
+    assert "rca_owner_authorized_rerun_delivery_authorities" in sql
     assert "WHEN 0" not in sql
 
 
@@ -664,9 +670,11 @@ def test_learning_lane_quarantines_materialization_and_blocks_provider(tmp_path)
 
     dispatcher = object.__new__(DeliveryDispatcher)
     dispatcher.store = delivery
+    dispatcher.config = SimpleNamespace(resident_release_enforced=False)
     claim = SimpleNamespace(
         business_key=admission.business_key,
         generation=1,
+        submission_key=admission.submission_key,
     )
     with pytest.raises(ExternalWriteFenceError, match=LEARNING_LANE_EXTERNAL_EFFECT_ERROR):
         dispatcher._validate_external_write(

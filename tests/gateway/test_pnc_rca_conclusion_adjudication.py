@@ -160,17 +160,25 @@ def _seed_published_conclusion(
     }
     with sqlite3.connect(store.db_path) as conn:
         conn.execute("PRAGMA foreign_keys=OFF")
-        conn.execute(
-            """
-            INSERT INTO business_triggers(
-                business_key, generation, submission_key,
-                creation_rule_version, work_item_id, project_key,
-                work_item_type_key, normalized_json, state, created_at
-            ) VALUES (?, ?, ?, 'conclusion-adjudication-fixture-v1', ?,
-                      't03o4q', 'issue', '{}', 'created', ?)
-            """,
-            (business_key, generation, submission_key, ISSUE_ID, current),
-        )
+        existing_trigger = conn.execute(
+            "SELECT submission_key, work_item_id FROM business_triggers "
+            "WHERE business_key = ? AND generation = ?",
+            (business_key, generation),
+        ).fetchone()
+        if existing_trigger is None:
+            conn.execute(
+                """
+                INSERT INTO business_triggers(
+                    business_key, generation, submission_key,
+                    creation_rule_version, work_item_id, project_key,
+                    work_item_type_key, normalized_json, state, created_at
+                ) VALUES (?, ?, ?, 'conclusion-adjudication-fixture-v1', ?,
+                          't03o4q', 'issue', '{}', 'created', ?)
+                """,
+                (business_key, generation, submission_key, ISSUE_ID, current),
+            )
+        else:
+            assert tuple(existing_trigger) == (submission_key, ISSUE_ID)
         conn.execute(
             """
             INSERT INTO rca_delivery_jobs(

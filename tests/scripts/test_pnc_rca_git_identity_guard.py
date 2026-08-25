@@ -10,7 +10,7 @@ def test_current_repository_passes_git_identity_guard():
 
     assert guard.audit_repository(repo_root) == []
     assert guard.REVIEWED_LEGACY_REMOTE_PROBE_LINES == {
-        "scripts/pnc_rca_minimal_release.py": (968, 969, 970)
+        "scripts/pnc_rca_minimal_release.py": (972, 973, 974)
     }
 
 

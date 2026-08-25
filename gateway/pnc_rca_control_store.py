@@ -8259,6 +8259,7 @@ class RcaControlStore:
             == {
                 "pipeline_stage": "s5_alignment",
                 "pipeline_status": "blocked",
+                "receipt_origin": None,
                 "schema_version": "g1q3_rca_service_result_v2",
                 "status": "pipeline_not_successful",
                 "task_id": task_id,

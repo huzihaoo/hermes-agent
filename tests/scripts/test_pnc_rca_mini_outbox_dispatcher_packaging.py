@@ -389,6 +389,7 @@ def test_env_example_has_explicit_safe_off_and_no_secrets():
     policy = json.loads(values["HERMES_RCA_DIRECT_KAFKA_POLICY_JSON"])
     assert policy == {
         "policy_version": "feishu-state-open-issue-v1",
+        "allowed_project_option_ids": ["6670325063"],
         "project_keys": ["68ef617fb371dc80a10641f7"],
         "project_simple_names": ["t03o4q"],
         "snapshot_patterns": ["State"],

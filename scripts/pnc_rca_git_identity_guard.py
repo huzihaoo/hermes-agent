@@ -47,6 +47,10 @@ REVIEWED_LINE_SHA256: Mapping[str, tuple[str, ...]] = {
         "b21cc6ce9738d31b0cb34fabd08d55744f272a2ce750234a61a33249fd755a3b",
         "e0d14455baaa61796598890c00ee7b267db9bb6e3866b3d65dc5499bdc28b790",
     ),
+    "scripts/pnc_rca_fast_release.py": (
+        "e5a785ab7db6b1d3cf7180e25e882a9ab4fc43f7f73a2ac18f94694479178307",
+        "c4bdf892f34ee8a246e2deb6d38a166bd0dec41461802583c205c6389906a77a",
+    ),
     "scripts/pnc_rca_feedback_offline_replay.py": (
         "6769035f6e38d3fba7f37c1c90d50b8bee8c17a9aa1a528ad84ef40d5f428033",
     ),
@@ -83,9 +87,10 @@ REVIEWED_LINE_NUMBERS: Mapping[str, tuple[int, ...]] = {
     "scripts/pnc_l4_zero_impact_harness.py": (1660, 1661),
     "scripts/pnc_live_exec.py": (243,),
     "scripts/pnc_rca_batch_rerun.py": (403,),
-    "scripts/pnc_rca_delivery_collector.py": (1249, 1259, 1268, 1283, 1292),
+    "scripts/pnc_rca_delivery_collector.py": (1318, 1328, 1337, 1352, 1361),
+    "scripts/pnc_rca_fast_release.py": (178, 187),
     "scripts/pnc_rca_feedback_offline_replay.py": (406,),
-    "scripts/pnc_rca_minimal_release.py": (759, 832, 968, 969, 970, 3851, 3871),
+    "scripts/pnc_rca_minimal_release.py": (763, 836, 972, 973, 974, 3855, 3875),
     "scripts/pnc_rca_w4_registry_self_adjudicate.py": (323, 324, 982, 983),
     "scripts/pnc_wrapper_transaction.py": (133, 140),
     "scripts/rca_issue_workload_export.py": (461,),
@@ -95,7 +100,7 @@ REVIEWED_LINE_NUMBERS: Mapping[str, tuple[int, ...]] = {
 # reviewed legacy remote probes outside S1's collector/direct eight-call scope;
 # this allowlist must not be reported as Host-local Git identity coverage.
 REVIEWED_LEGACY_REMOTE_PROBE_LINES: Mapping[str, tuple[int, ...]] = {
-    "scripts/pnc_rca_minimal_release.py": (968, 969, 970),
+    "scripts/pnc_rca_minimal_release.py": (972, 973, 974),
 }
 
 # Filled with AST call fingerprints for reviewed command aliases whose call

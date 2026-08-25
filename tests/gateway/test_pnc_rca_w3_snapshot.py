@@ -3380,6 +3380,7 @@ def test_dispatcher_missing_w3_snapshot_stops_before_external_boundaries(tmp_pat
         activation_required=False,
         lease_seconds=180,
         max_age_seconds=86_400,
+        only_submission_key=None,
         w3_snapshot_read_mode="snapshot_required",
         w3_snapshot_authority=_runtime_authority(),
     )
