@@ -8010,7 +8010,127 @@ class RcaControlStore:
         }
 
     @staticmethod
+    def _activation_historical_epoch_rerun_lineage_tx(
+        conn: sqlite3.Connection,
+        *,
+        business_key: str,
+        submission_key: str,
+        generation: int,
+        subscription_key: str,
+    ) -> bool:
+        row = conn.execute(
+            """
+            SELECT promotion.detail, promotion.from_status, promotion.to_status,
+                   source.message_id, source.source_dedupe_key
+              FROM rca_shadow_promotion_audit AS promotion
+              JOIN rca_historical_epoch_rerun_delivery_authorities AS authority
+                ON authority.submission_key = promotion.submission_key
+               AND authority.outbox_id = promotion.outbox_id
+               AND authority.authority_json = promotion.detail
+               AND authority.authority_sha256 = json_extract(
+                   promotion.detail, '$.selection_sha256'
+               )
+              JOIN rca_trigger_sources AS source
+                ON source.source_id = authority.source_id
+               AND source.payload_sha256 = authority.source_payload_sha256
+              JOIN business_triggers AS trigger
+                ON trigger.business_key = authority.business_key
+               AND trigger.generation = authority.generation
+               AND trigger.submission_key = authority.submission_key
+               AND trigger.origin_source_id = source.source_id
+              JOIN rca_outbox AS outbox
+                ON outbox.outbox_id = authority.outbox_id
+               AND outbox.business_key = trigger.business_key
+               AND outbox.generation = trigger.generation
+               AND outbox.submission_key = trigger.submission_key
+               AND outbox.origin_source_id = source.source_id
+              JOIN rca_trigger_bindings AS origin
+                ON origin.source_id = source.source_id
+               AND origin.business_key = trigger.business_key
+               AND origin.generation = trigger.generation
+               AND origin.role = 'origin'
+              JOIN rca_trigger_delivery_bindings AS delivery
+                ON delivery.source_id = source.source_id
+               AND delivery.subscription_key = ?
+              JOIN rca_delivery_subscriptions AS subscription
+                ON subscription.subscription_key = delivery.subscription_key
+               AND (
+                    subscription.source_id IS NULL
+                    OR subscription.source_id = source.source_id
+               )
+             WHERE trigger.business_key = ? AND trigger.submission_key = ?
+               AND trigger.generation = ? AND trigger.state = 'submitted'
+               AND trigger.creation_rule_version = outbox.creation_rule_version
+               AND json_extract(
+                   trigger.normalized_json, '$.creation_rule_version'
+               ) = trigger.creation_rule_version
+               AND json_extract(
+                   outbox.payload_json, '$.creation_rule_version'
+               ) = trigger.creation_rule_version
+               AND json_extract(outbox.payload_json, '$.origin_source_id') =
+                   source.source_id
+               AND outbox.action = 'submit_rca_issue_intake'
+               AND outbox.status = 'completed'
+               AND source.source_kind = 'feishu_group_manual'
+               AND source.platform = 'operator'
+               AND source.chat_id = '' AND source.thread_id = ''
+               AND source.kafka_event_uid IS NULL
+               AND source.mode = 'rerun' AND source.outcome = 'created'
+               AND source.requester_id = authority.requester_id
+               AND promotion.event_uid = source.source_id
+               AND promotion.operator = 'manual:' || authority.requester_id
+               AND promotion.reason = 'historical_epoch_explicit_batch_rerun'
+               AND promotion.outcome =
+                   'historical_epoch_rerun_new_generation_created'
+               AND (SELECT COUNT(*) FROM rca_shadow_promotion_audit
+                    WHERE submission_key = trigger.submission_key) = 1
+               AND (SELECT COUNT(*) FROM rca_trigger_bindings
+                    WHERE business_key = trigger.business_key
+                      AND generation = trigger.generation
+                      AND role = 'origin') = 1
+               AND (SELECT COUNT(*) FROM rca_trigger_delivery_bindings
+                    WHERE subscription_key = delivery.subscription_key) = 1
+            """,
+            (subscription_key, business_key, submission_key, generation),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            authority = json.loads(str(row["detail"] or ""))
+            expected = build_historical_epoch_rerun_authority(
+                **{
+                    name: authority.get(name)
+                    for name in HISTORICAL_EPOCH_RERUN_AUTHORITY_FIELDS
+                    if name not in {"schema_version", "selection_sha256"}
+                }
+            )
+        except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        message_prefix = f"{authority['batch_id']}-{authority['issue_id']}-try-"
+        return (
+            authority == expected
+            and _canonical_json(authority) == row["detail"]
+            and row["source_dedupe_key"] == f"operator:{row['message_id']}"
+            and re.fullmatch(
+                re.escape(message_prefix) + r"[1-9][0-9]*",
+                str(row["message_id"]),
+            )
+            is not None
+            and row["from_status"]
+            == (
+                f"historical_epoch:{authority['prior_activation_epoch_id']}:"
+                f"g{authority['prior_generation']}"
+            )
+            and row["to_status"]
+            == (
+                f"current_epoch:{authority['target_activation_epoch_id']}:"
+                f"pending:g{generation}"
+            )
+        )
+
+    @classmethod
     def _activation_silent_terminal_complete_tx(
+        cls,
         conn: sqlite3.Connection,
         *,
         business_key: str,
@@ -8055,6 +8175,7 @@ class RcaControlStore:
         durable_route = taxonomy.get("durable_route")
         fallback = taxonomy.get("terminal_fallback")
         receipt = taxonomy.get("receipt")
+        work_window = taxonomy.get("work_window")
         taxonomy_gap_prefix = "taxonomy_gap:"
         taxonomy_gap_code = (
             error_code[len(taxonomy_gap_prefix) :]
@@ -8095,6 +8216,53 @@ class RcaControlStore:
             and receipt.get("pipeline_status") == "blocked"
             and receipt.get("status") == "pipeline_not_successful"
             and str(receipt.get("task_id") or "") == task_id
+        )
+        exhausted_infra_terminal = (
+            generation == 2
+            and task_id == submission_key
+            and set(taxonomy)
+            == {
+                "audit",
+                "contract_errors",
+                "durable_route",
+                "external_comment_policy",
+                "internal_route",
+                "known",
+                "lane",
+                "observed_state",
+                "raw_code",
+                "receipt",
+                "retryable",
+                "source",
+                "source_conflict",
+                "terminal_error_code",
+                "terminal_fallback",
+                "terminal_fallback_seconds",
+                "work_window",
+            }
+            and error_code == "translate_service_unavailable"
+            and taxonomy.get("raw_code") == error_code
+            and taxonomy.get("terminal_error_code") == error_code
+            and taxonomy.get("known") is True
+            and taxonomy.get("retryable") is True
+            and taxonomy.get("source") == "rca_service_result"
+            and taxonomy.get("observed_state") == "failed"
+            and taxonomy.get("source_conflict") is False
+            and taxonomy.get("external_comment_policy")
+            == "suppress_until_terminal_fallback"
+            and taxonomy.get("terminal_fallback_seconds") == 1800
+            and taxonomy.get("audit") == {}
+            and taxonomy.get("contract_errors") == []
+            and (route_kind, lane)
+            == ("infra_remediation_hold", "infra_self_healable")
+            and receipt
+            == {
+                "pipeline_stage": "s5_alignment",
+                "pipeline_status": "blocked",
+                "schema_version": "g1q3_rca_service_result_v2",
+                "status": "pipeline_not_successful",
+                "task_id": task_id,
+            }
         )
         # Older collector releases classified a completed, zero-effect Gate-A
         # verification failure as a taxonomy gap after the terminal diagnostic
@@ -8141,10 +8309,13 @@ class RcaControlStore:
                 or immediate_taxonomy_gap_terminal
                 or legacy_gate_a_terminal
                 or legacy_execution_identity_terminal
+                or exhausted_infra_terminal
             )
             or str(taxonomy.get("terminal_error_code") or "") != error_code
-            or (route_kind, lane)
-            not in _SILENT_TERMINAL_ROUTE_LANES
+            or (
+                (route_kind, lane) not in _SILENT_TERMINAL_ROUTE_LANES
+                and not exhausted_infra_terminal
+            )
             or not isinstance(durable_route, dict)
             or not isinstance(fallback, dict)
         ):
@@ -8157,7 +8328,64 @@ class RcaControlStore:
             or str(fallback.get("route_kind") or "") != route_kind
             or str(fallback.get("route_owner") or "")
             != str(durable_route.get("owner") or "")
-            or not isinstance(outlet, dict)
+        ):
+            return False
+        if exhausted_infra_terminal:
+            elapsed_seconds = fallback.get("elapsed_seconds")
+            try:
+                work_started_at, deadline_at, terminal_at = (
+                    datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+                    for value in (
+                        fallback.get("work_started_at"),
+                        fallback.get("deadline_at"),
+                        watch["terminal_at"],
+                    )
+                )
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if (
+                durable_route
+                != {
+                    "created": False,
+                    "owner": "rca-infra",
+                    "remediation_attempt_count": 1,
+                    "route_key": route_key,
+                    "status": "remediation_held",
+                }
+                or not isinstance(work_window, dict)
+                or isinstance(elapsed_seconds, bool)
+                or not isinstance(elapsed_seconds, int)
+                or fallback
+                != {
+                    "confidence_tier": "low",
+                    "deadline_at": fallback.get("deadline_at"),
+                    "elapsed_seconds": elapsed_seconds,
+                    "route_key": route_key,
+                    "route_kind": "infra_remediation_hold",
+                    "route_owner": "rca-infra",
+                    "schema_version": "pnc_rca_bounded_terminal_fallback_v1",
+                    "terminal_class": "honest_non_attribution",
+                    "work_started_at": fallback.get("work_started_at"),
+                }
+                or any(
+                    value.tzinfo is None
+                    or value.utcoffset() != timedelta(0)
+                    for value in (work_started_at, deadline_at, terminal_at)
+                )
+                or deadline_at - work_started_at != timedelta(seconds=1800)
+                or terminal_at < deadline_at
+                or elapsed_seconds
+                != int((terminal_at - work_started_at).total_seconds())
+                or work_window
+                != {
+                    "deadline_at": fallback["deadline_at"],
+                    "elapsed_seconds": elapsed_seconds,
+                    "work_started_at": fallback["work_started_at"],
+                }
+            ):
+                return False
+        elif (
+            not isinstance(outlet, dict)
             or str(outlet.get("route_key") or "") != route_key
             or outlet.get("status") != "settled"
             or outlet.get("external_effects") != 0
@@ -8226,7 +8454,11 @@ class RcaControlStore:
             """
             SELECT route_key, submission_key, business_key, generation,
                    task_id, terminal_error_code, lane, route_kind, owner,
-                   status, audit_json, route_payload_json
+                   status, work_started_at, deadline_at,
+                   remediation_attempt_count, observation_count, retry_count,
+                   remediation_attempted_at, remediation_result_json,
+                   next_retry_at, retry_exhausted, completed_at,
+                   audit_json, route_payload_json
               FROM rca_failure_routes
              WHERE route_key = ?
             """,
@@ -8259,6 +8491,85 @@ class RcaControlStore:
             != "pnc_rca_failure_route_payload_v1"
         ):
             return False
+        if exhausted_infra_terminal:
+            try:
+                remediation_result = json.loads(
+                    str(route["remediation_result_json"] or "")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return False
+            error_detail = str(watch["last_error_detail"] or "")
+            expected_decision = {
+                "audit": {},
+                "contract_errors": [],
+                "external_comment_policy": "suppress_until_terminal_fallback",
+                "internal_route": "infra_remediation_hold",
+                "known": True,
+                "lane": "infra_self_healable",
+                "raw_code": error_code,
+                "retryable": True,
+                "terminal_error_code": error_code,
+                "terminal_fallback_seconds": 1800,
+            }
+            if (
+                not error_detail
+                or _canonical_json(audit) != str(route["audit_json"])
+                or _canonical_json(payload) != str(route["route_payload_json"])
+                or _canonical_json(remediation_result)
+                != str(route["remediation_result_json"])
+                or audit
+                != {
+                    "contract_errors": [],
+                    "receipt": receipt,
+                    "schema_version": "pnc_rca_failure_route_audit_v1",
+                    "source": "rca_service_result",
+                    "taxonomy_audit": {},
+                }
+                or payload
+                != {
+                    "blocker": {
+                        "fault_class": "infra_self_healable",
+                        "kind": error_code,
+                        "message": error_detail,
+                        "retryable": True,
+                    },
+                    "decision": expected_decision,
+                    "remediation": {
+                        "detail": "wait for the bounded translate service and retry",
+                        "op": "wait_and_retry",
+                        "resume_from_stage": "s3b_translate",
+                    },
+                    "schema_version": "pnc_rca_failure_route_payload_v1",
+                }
+                or remediation_result
+                != {
+                    "blocker_kind": error_code,
+                    "business_key": business_key,
+                    "error_code": "infra_remediation_primitive_unavailable",
+                    "external_writes": False,
+                    "generation": generation,
+                    "operation": "wait_and_retry",
+                    "resumed_same_task": False,
+                    "schema_version": "pnc_rca_infra_remediation_receipt_v1",
+                    "status": "held",
+                    "submission_key": submission_key,
+                    "success": False,
+                    "task_id": task_id,
+                    "timeout_seconds": 10,
+                }
+                or str(route["work_started_at"] or "")
+                != str(fallback["work_started_at"])
+                or str(route["deadline_at"] or "") != str(fallback["deadline_at"])
+                or int(route["remediation_attempt_count"] or 0) != 1
+                or int(route["observation_count"] or 0) < 2
+                or int(route["retry_count"] or 0) < 1
+                or not str(route["remediation_attempted_at"] or "")
+                or int(route["retry_exhausted"] or 0) != 1
+                or route["completed_at"] is not None
+                or str(route["next_retry_at"] or "")
+                != str(route["deadline_at"])
+            ):
+                return False
         if immediate_taxonomy_gap_terminal:
             decision = payload.get("decision")
             blocker = payload.get("blocker")
@@ -8327,8 +8638,8 @@ class RcaControlStore:
                 return False
         subscriptions = conn.execute(
             """
-            SELECT effect_kind, required, status, delivery_id, effect_key,
-                   materialized_at
+            SELECT subscription_key, effect_kind, required, status,
+                   delivery_id, effect_key, materialized_at
               FROM rca_delivery_subscriptions
              WHERE business_key = ? AND generation = ? AND required = 1
             ORDER BY effect_kind
@@ -8370,7 +8681,27 @@ class RcaControlStore:
             and str(trigger_source["mode"] or "") == "issue_created"
             and not str(trigger_source["outcome"] or "")
         )
-        if taxonomy_gap_terminal:
+        if exhausted_infra_terminal:
+            total_subscriptions = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM rca_delivery_subscriptions "
+                    "WHERE business_key = ? AND generation = ?",
+                    (business_key, generation),
+                ).fetchone()[0]
+            )
+            valid_subscription_shape = (
+                total_subscriptions == 1
+                and len(subscriptions) == 1
+                and subscription_kinds == {"feishu_issue_comment"}
+                and cls._activation_historical_epoch_rerun_lineage_tx(
+                    conn,
+                    business_key=business_key,
+                    submission_key=submission_key,
+                    generation=generation,
+                    subscription_key=str(subscriptions[0]["subscription_key"]),
+                )
+            )
+        elif taxonomy_gap_terminal:
             valid_subscription_shape = (
                 len(subscriptions) in {1, 2}
                 and len(subscription_kinds) == len(subscriptions)
@@ -8416,7 +8747,26 @@ class RcaControlStore:
             """,
             (submission_key,),
         ).fetchone()
-        return delivery_job is None and delivery_effect is None
+        provider_attempts = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                  FROM rca_delivery_attempts AS attempt
+                  JOIN rca_delivery_effects AS effect
+                    ON effect.effect_key = attempt.effect_key
+                  JOIN rca_delivery_jobs AS job
+                    ON job.delivery_id = effect.delivery_id
+                 WHERE job.business_key = ? AND job.submission_key = ?
+                   AND job.generation = ?
+                """,
+                (business_key, submission_key, generation),
+            ).fetchone()[0]
+        )
+        return (
+            delivery_job is None
+            and delivery_effect is None
+            and provider_attempts == 0
+        )
 
     @classmethod
     def _activation_delivery_execution_complete_tx(
@@ -8429,6 +8779,7 @@ class RcaControlStore:
     ) -> bool:
         """Return whether one bound outbox row has fully settled delivery."""
         required_tables = {
+            "rca_delivery_attempts",
             "rca_execution_watch",
             "rca_delivery_jobs",
             "rca_delivery_effects",
@@ -8445,7 +8796,7 @@ class RcaControlStore:
         watch = conn.execute(
             """
             SELECT w.state, w.task_id, w.terminal_at, w.delivery_id,
-                   w.last_error_code, w.last_status_json,
+                   w.last_error_code, w.last_error_detail, w.last_status_json,
                    j.status AS job_status,
                    j.delivery_id AS job_delivery_id,
                    j.outcome AS job_outcome,

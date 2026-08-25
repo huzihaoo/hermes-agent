@@ -3686,6 +3686,78 @@ def test_quiesce_persists_profile_and_recovers_loaded_service_without_pid(
     assert not runner.loaded & set(release.DISABLED_RESIDENTS)
 
 
+def test_restart_default_allows_cold_start_readback_after_60(
+    release_files, monkeypatch
+):
+    runner = FakeRunner(release_files)
+    quiesce = release._quiesce_residents(runner)
+    residents = _synthetic_resident_profile(release_files)
+    attempts = 0
+    sleeps = []
+
+    def delayed_readback(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise release.ReleaseError("resident_health_invalid")
+        return residents
+
+    clock = iter((0.0, 61.0))
+    monkeypatch.setattr(release, "_resident_profile_readback", delayed_readback)
+    monkeypatch.setattr(release.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(release.time, "sleep", sleeps.append)
+    note = json.loads(release_files["note_path"].read_bytes())
+    note["_path"] = str(release_files["note_path"])
+
+    assert release.apply_release.__kwdefaults__["restart_timeout"] == 180
+    assert release.activate_release.__kwdefaults__["restart_timeout"] == 180
+    assert release._restart(
+        note,
+        release._sha(release_files["note_raw"]),
+        release_files["home"],
+        runner,
+        lambda _pid: None,
+        180,
+        quiesce,
+    ) == residents
+    assert attempts == 2
+    assert sleeps == [0.25]
+
+
+def test_restart_extended_wait_does_not_relax_resident_health_gate(
+    release_files, monkeypatch
+):
+    runner = FakeRunner(release_files)
+    quiesce = release._quiesce_residents(runner)
+    sleeps = []
+    attempts = 0
+
+    def unhealthy_readback(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise release.ReleaseError("resident_health_invalid")
+
+    clock = iter((0.0, 61.0, 181.0))
+    monkeypatch.setattr(release, "_resident_profile_readback", unhealthy_readback)
+    monkeypatch.setattr(release.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(release.time, "sleep", sleeps.append)
+    note = json.loads(release_files["note_path"].read_bytes())
+    note["_path"] = str(release_files["note_path"])
+
+    with pytest.raises(release.ReleaseError, match="restart_readback_timeout"):
+        release._restart(
+            note,
+            release._sha(release_files["note_raw"]),
+            release_files["home"],
+            runner,
+            lambda _pid: None,
+            180,
+            quiesce,
+        )
+    assert attempts == 2
+    assert sleeps == [0.25]
+
+
 def test_quiesce_waits_for_asynchronous_launchd_bootout(release_files, monkeypatch):
     runner = FakeRunner(release_files)
     real_assert_stopped = release._assert_all_residents_stopped

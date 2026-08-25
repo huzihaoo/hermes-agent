@@ -1014,6 +1014,40 @@ def _terminal_failure(
     return None
 
 
+def _batch_watch_timeout_failure(
+    snapshot: Mapping[str, Any],
+    *,
+    issue_title: str,
+    acceptance_axis: str,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    effects = [
+        effect
+        for effect in snapshot.get("effects", [])
+        if isinstance(effect, Mapping) and int(effect.get("required") or 0) == 1
+    ]
+    return {
+        "job_status": str(snapshot.get("job_status") or ""),
+        "job_outcome": str(snapshot.get("job_outcome") or ""),
+        "outcome_key": str(snapshot.get("outcome_key") or ""),
+        "terminal_state": "batch_watch_deadline_exceeded",
+        "terminal_error_code": "batch_item_timeout",
+        "effects": [
+            {
+                "effect_kind": str(effect.get("effect_kind") or ""),
+                "status": str(effect.get("status") or ""),
+                "error_code": str(effect.get("last_error_code") or ""),
+            }
+            for effect in effects
+        ],
+        "watch_state": str(snapshot.get("watch_state") or ""),
+        "watch_error_code": str(snapshot.get("watch_error_code") or ""),
+        "timeout_seconds": timeout_seconds,
+        "acceptance_axis": acceptance_axis,
+        "acceptance": _acceptance_axes(snapshot, issue_title=issue_title),
+    }
+
+
 def _request(
     *, batch_id: str, issue_id: str, request_index: int, requester_id: str
 ) -> ManualRcaTriggerRequest:
@@ -1742,6 +1776,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 _write_state(state_path, state)
                 completed += 1
                 continue
+            prior_failure = item.get("failure")
+            failure = (
+                _terminal_failure(
+                    failed_snapshot,
+                    issue_title=str(queue_item["title"]),
+                    acceptance_axis=acceptance_axis,
+                )
+                if failed_snapshot is not None
+                and isinstance(prior_failure, Mapping)
+                and prior_failure.get("terminal_state")
+                == "batch_watch_deadline_exceeded"
+                and prior_failure.get("terminal_error_code") == "batch_item_timeout"
+                else None
+            )
+            if failure is not None:
+                item.update({
+                    "status": "failed",
+                    "failure": failure,
+                    "updated_at": _now(),
+                })
+                state["items"][issue_id] = item
+                state["status"] = "blocked_on_item_failure"
+                state["updated_at"] = _now()
+                _write_state(state_path, state)
+                raise BatchRerunError("batch_item_terminal_failure")
         if item.get("status") == "failed" and not args.retry_failed:
             raise BatchRerunError("batch_failed_item_requires_retry_flag")
         if (
@@ -1936,9 +1995,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 _write_state(state_path, state)
                 raise BatchRerunError("batch_item_terminal_failure")
             if time.monotonic() >= deadline:
-                item.update({"status": "running", "updated_at": _now()})
+                item.update({
+                    "status": "failed",
+                    "failure": _batch_watch_timeout_failure(
+                        latest,
+                        issue_title=str(queue_item["title"]),
+                        acceptance_axis=acceptance_axis,
+                        timeout_seconds=args.item_timeout_seconds,
+                    ),
+                    "updated_at": _now(),
+                })
                 state["items"][issue_id] = item
-                state["status"] = "running"
+                state["status"] = "blocked_on_item_failure"
                 state["updated_at"] = _now()
                 _write_state(state_path, state)
                 raise BatchRerunError("batch_item_timeout")
