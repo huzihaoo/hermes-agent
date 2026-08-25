@@ -5347,7 +5347,7 @@ def apply_release(
     store_factory: StoreFactory = _open_store,
     migration_apply: Callable[..., Mapping[str, Any]] | None = None,
     outcome_probe: Callable[..., str] | None = None,
-    restart_timeout: float = 60,
+    restart_timeout: float = 180,
     _release_lock: tuple[Path, int, tuple[int, int]] | None = None,
     _prequiesce: Mapping[str, Any] | None = None,
     _plan: Mapping[str, Any] | None = None,
@@ -5725,7 +5725,7 @@ def activate_release(
     process_factory: ProcessFactory = psutil.Process,
     migration_apply: Callable[..., Mapping[str, Any]] | None = None,
     outcome_probe: Callable[..., str] | None = None,
-    restart_timeout: float = 60,
+    restart_timeout: float = 180,
 ) -> dict[str, Any]:
     """Prepare, plan, and apply in one explicit bounded quiesce window."""
 
@@ -6011,7 +6011,7 @@ def _parser() -> argparse.ArgumentParser:
     activate.add_argument("--confirm-release-id", required=True)
     activate.add_argument("--receipt", type=Path, required=True)
     activate.add_argument("--quiesce-receipt", type=Path, required=True)
-    activate.add_argument("--restart-timeout", type=float, default=60)
+    activate.add_argument("--restart-timeout", type=float, default=180)
 
     for name in ("plan", "apply"):
         target = commands.add_parser(name)
@@ -6023,7 +6023,7 @@ def _parser() -> argparse.ArgumentParser:
         if name == "apply":
             target.add_argument("--confirm-release-id", required=True)
             target.add_argument("--receipt", type=Path)
-            target.add_argument("--restart-timeout", type=float, default=60)
+            target.add_argument("--restart-timeout", type=float, default=180)
     verify = commands.add_parser("verify")
     common(verify)
     verify.add_argument("--apply-receipt", type=Path, required=True)
