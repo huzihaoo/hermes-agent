@@ -288,6 +288,7 @@ SILENT_TERMINAL_RERUN_ERROR_CODES = frozenset({
     "taxonomy_gap:derived_capacity_reservation_activate_failed",
     "taxonomy_gap:gate_a_projection_invalid",
     "taxonomy_gap:viz_evidence_unavailable",
+    "taxonomy_gap:execution_identity_readback_unavailable",
     "remote_evidence_domain_unsupported",
     "taxonomy_gap:remote_evidence_domain_unsupported",
 })

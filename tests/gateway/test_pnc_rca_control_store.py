@@ -1400,6 +1400,33 @@ def test_legacy_execution_identity_terminal_drains_activation_with_exact_route(
     assert inflight["execution_delivery"] == 0
 
 
+def test_operator_silent_terminal_rerun_accepts_legacy_execution_identity_gap(
+    tmp_path,
+):
+    """The legacy verifier gap is a bounded technical terminal, not a dead end."""
+    store, terminal_at = _silent_deadline_terminal_store(tmp_path)
+    _convert_silent_terminal_to_issue_only_operator(store)
+    _convert_silent_terminal_to_legacy_execution_identity_gap(store)
+    batch_id = "batch-legacy-execution-identity"
+    request = _silent_batch_request(batch_id=batch_id)
+    authority = _silent_batch_authority(store, request, batch_id=batch_id)
+
+    rerun = store.admit_manual_trigger(
+        request,
+        allowed_chat_ids=set(),
+        submit_enabled=True,
+        operator_authorized=True,
+        silent_terminal_rerun_authority=authority,
+        outbox_high_watermark=10_000,
+        activation_required=True,
+        now=terminal_at + timedelta(seconds=1),
+    )
+
+    assert rerun.outcome == "created"
+    assert rerun.generation == 2
+    assert rerun.submission_key != authority["prior_submission_key"]
+
+
 def _tamper_legacy_execution_identity_taxonomy(
     store: RcaControlStore,
     field: str,
