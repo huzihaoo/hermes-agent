@@ -516,6 +516,18 @@ class PollStats:
     max_dispatch_backlog: int = 0
     record_processing_blocks: int = 0
     blocked_partitions: int = 0
+    terminal_commit_waits: int = 0
+    terminal_commits_released: int = 0
+    terminal_waiting_partitions: int = 0
+    terminal_wait_revocations: int = 0
+    terminal_readiness_errors: int = 0
+
+
+@dataclass(frozen=True)
+class TerminalCommitWait:
+    event_uid: str
+    message: Any
+    resume_offset: int | None = None
 
 
 class ConsumerLoopError(RuntimeError):
@@ -915,6 +927,16 @@ def _count_decision(stats: PollStats, decision: str) -> None:
         setattr(stats, decision, getattr(stats, decision) + 1)
 
 
+def _kafka_commit_ready(store: RcaControlStore, event_uid: str) -> bool:
+    readiness = getattr(store, "kafka_commit_ready", None)
+    if not callable(readiness):
+        raise RuntimeError("kafka_terminal_commit_predicate_unavailable")
+    result = readiness(event_uid)
+    if type(result) is not bool:
+        raise RuntimeError("kafka_terminal_commit_predicate_invalid")
+    return result
+
+
 def recover_pending(
     store: RcaControlStore,
     stats: PollStats,
@@ -984,23 +1006,103 @@ def run_poll_loop(
 
     backpressure_active = False
     blocked_partitions: set[Any] = set()
+    terminal_waits: dict[Any, TerminalCommitWait] = {}
+    assignment_reader = getattr(consumer, "assignment", None)
+
+    def loop_state(*, active: bool) -> str:
+        if blocked_partitions:
+            return "partition_blocked"
+        if backpressure_active:
+            return "backpressure"
+        if terminal_waits:
+            return "terminal_wait"
+        return "running" if active else "idle"
+
+    def current_assignment() -> tuple[Any, ...]:
+        if not callable(assignment_reader):
+            return ()
+        return tuple(assignment_reader())
+
+    def reconcile_assignment(assignment: tuple[Any, ...]) -> None:
+        if not callable(assignment_reader):
+            return
+        assigned = set(assignment)
+        blocked_partitions.intersection_update(assigned)
+        for partition in tuple(terminal_waits):
+            if partition not in assigned:
+                del terminal_waits[partition]
+                stats.terminal_wait_revocations += 1
+        stats.blocked_partitions = len(blocked_partitions)
+        stats.terminal_waiting_partitions = len(terminal_waits)
+
+    def commit_message(message: Any, *, released: bool) -> None:
+        try:
+            consumer.commit(offsets=commit_payload(message))
+        except Exception as exc:
+            stats.commit_errors += 1
+            if health:
+                health.error("commit", exc)
+                health.write(state="error", stats=stats, force=True)
+            raise ConsumerLoopError("commit", stats) from exc
+        stats.records_committed += 1
+        if released:
+            stats.terminal_commits_released += 1
+        if health:
+            health.committed(clear_error=not blocked_partitions)
+
+    def release_terminal_waits() -> None:
+        for partition, waiting in tuple(terminal_waits.items()):
+            try:
+                ready = _kafka_commit_ready(store, waiting.event_uid)
+            except Exception as exc:
+                stats.terminal_readiness_errors += 1
+                if health:
+                    health.error("terminal_commit_readiness", exc)
+                    health.write(state="error", stats=stats, force=True)
+                raise ConsumerLoopError("terminal_commit_readiness", stats) from exc
+            if not ready:
+                continue
+            commit_message(waiting.message, released=True)
+            if waiting.resume_offset is not None:
+                seek = getattr(consumer, "seek", None)
+                if not callable(seek):
+                    error = RuntimeError(
+                        "consumer cannot replay an unprocessed partition tail"
+                    )
+                    if health:
+                        health.error("partition_seek", error)
+                        health.write(state="error", stats=stats, force=True)
+                    raise ConsumerLoopError("partition_seek", stats) from error
+                try:
+                    seek(partition, waiting.resume_offset)
+                except Exception as exc:
+                    if health:
+                        health.error("partition_seek", exc)
+                        health.write(state="error", stats=stats, force=True)
+                    raise ConsumerLoopError("partition_seek", stats) from exc
+            del terminal_waits[partition]
+            stats.terminal_waiting_partitions = len(terminal_waits)
+            if not backpressure_active and partition not in blocked_partitions:
+                try:
+                    consumer.resume(partition)
+                except Exception as exc:
+                    if health:
+                        health.error("partition_resume", exc)
+                        health.write(state="error", stats=stats, force=True)
+                    raise ConsumerLoopError("partition_resume", stats) from exc
+        if health:
+            health.write(state=loop_state(active=True), stats=stats)
 
     while not stop_requested():
         if max_polls is not None and stats.polls >= max_polls:
+            release_terminal_waits()
             break
-
         try:
             backlog_reader = getattr(store, "dispatch_backlog_count", lambda: 0)
             backlog = int(backlog_reader())
             stats.max_dispatch_backlog = max(stats.max_dispatch_backlog, backlog)
-            assignment = (
-                tuple(consumer.assignment())
-                if hasattr(consumer, "assignment")
-                else ()
-            )
-            if assignment:
-                blocked_partitions.intersection_update(assignment)
-                stats.blocked_partitions = len(blocked_partitions)
+            assignment = current_assignment()
+            reconcile_assignment(assignment)
             if backlog >= config.outbox_high_watermark:
                 if assignment:
                     consumer.pause(*assignment)
@@ -1012,6 +1114,7 @@ def run_poll_loop(
                     partition
                     for partition in assignment
                     if partition not in blocked_partitions
+                    and partition not in terminal_waits
                 )
                 if resumable:
                     consumer.resume(*resumable)
@@ -1025,6 +1128,8 @@ def run_poll_loop(
                 health.write(state="error", stats=stats, force=True)
             raise ConsumerLoopError("backpressure", stats) from exc
 
+        release_terminal_waits()
+
         try:
             batch = consumer.poll(
                 timeout_ms=config.poll_timeout_ms,
@@ -1037,31 +1142,36 @@ def run_poll_loop(
             raise ConsumerLoopError("poll", stats) from exc
         stats.polls += 1
 
+        try:
+            assignment = current_assignment()
+            reconcile_assignment(assignment)
+            release_terminal_waits()
+        except ConsumerLoopError:
+            raise
+        except Exception as exc:
+            if health:
+                health.error("assignment_reconcile", exc)
+                health.write(state="error", stats=stats, force=True)
+            raise ConsumerLoopError("assignment_reconcile", stats) from exc
+
         if not batch:
             stats.idle_polls += 1
             if health:
-                health.write(
-                    state=(
-                        "partition_blocked"
-                        if blocked_partitions
-                        else "backpressure"
-                        if backpressure_active
-                        else "idle"
-                    ),
-                    stats=stats,
-                )
+                health.write(state=loop_state(active=False), stats=stats)
             continue
 
         for partition, messages in batch.items():
-            if partition in blocked_partitions:
+            if partition in blocked_partitions or partition in terminal_waits:
                 continue
-            for message in tuple(messages):
+            partition_messages = tuple(messages)
+            for message_index, message in enumerate(partition_messages):
                 stats.records_seen += 1
                 if health:
                     health.event()
+                record = _record_from_message(message)
                 try:
                     result = store.ingest_record(
-                        _record_from_message(message),
+                        record,
                         policy=config.policy,
                         submit_enabled=config.submit_enabled,
                         activation_required=config.activation_required,
@@ -1111,24 +1221,40 @@ def run_poll_loop(
                         health.write(state="error", stats=stats, force=True)
                     raise ConsumerLoopError("ack_safety", stats) from error
                 try:
-                    consumer.commit(offsets=commit_payload(message))
+                    commit_ready = _kafka_commit_ready(store, record.event_uid)
                 except Exception as exc:
-                    stats.commit_errors += 1
+                    stats.terminal_readiness_errors += 1
                     if health:
-                        health.error("commit", exc)
+                        health.error("terminal_commit_readiness", exc)
                         health.write(state="error", stats=stats, force=True)
-                    raise ConsumerLoopError("commit", stats) from exc
-                stats.records_committed += 1
-                if health:
-                    health.committed(clear_error=not blocked_partitions)
-                    health.write(
-                        state=(
-                            "partition_blocked"
-                            if blocked_partitions
-                            else "running"
+                    raise ConsumerLoopError("terminal_commit_readiness", stats) from exc
+
+                if not commit_ready:
+                    terminal_waits[partition] = TerminalCommitWait(
+                        event_uid=record.event_uid,
+                        message=message,
+                        resume_offset=(
+                            int(message.offset) + 1
+                            if message_index + 1 < len(partition_messages)
+                            else None
                         ),
-                        stats=stats,
                     )
+                    stats.terminal_commit_waits += 1
+                    stats.terminal_waiting_partitions = len(terminal_waits)
+                    try:
+                        consumer.pause(partition)
+                    except Exception as exc:
+                        if health:
+                            health.error("partition_pause", exc)
+                            health.write(state="error", stats=stats, force=True)
+                        raise ConsumerLoopError("partition_pause", stats) from exc
+                    if health:
+                        health.write(state=loop_state(active=True), stats=stats)
+                    break
+
+                commit_message(message, released=False)
+                if health:
+                    health.write(state=loop_state(active=True), stats=stats)
 
     if health:
         health.write(state="stopped", stats=stats, force=True)

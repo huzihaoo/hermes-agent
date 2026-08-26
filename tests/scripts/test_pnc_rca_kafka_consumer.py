@@ -143,6 +143,31 @@ def _activate_direct_steady(store, *, start_offset=20):
     )
 
 
+def _terminalize_permanent(store, submission_key):
+    current = datetime.now(timezone.utc).isoformat()
+    conn = store._connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            UPDATE rca_outbox SET status='quarantined', quarantined_at=?,
+                   last_error_code='permanent_failure'
+             WHERE submission_key=?
+            """,
+            (current, submission_key),
+        )
+        conn.execute(
+            "UPDATE business_triggers SET state='quarantined' "
+            "WHERE submission_key=?",
+            (submission_key,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    delivery = RcaDeliveryStore(store.db_path)
+    assert delivery.backfill_completed_submissions() >= 1
+
+
 class FakeConsumer:
     def __init__(self, batches):
         self.batches = list(batches)
@@ -155,6 +180,30 @@ class FakeConsumer:
 
     def commit(self, **kwargs):
         self.commits.append(kwargs)
+
+
+class PartitionCapableConsumer(FakeConsumer):
+    def __init__(self, batches, *, partitions, on_poll=None):
+        super().__init__(batches)
+        self._assignment = set(partitions)
+        self.paused = []
+        self.resumed = []
+        self.on_poll = on_poll
+
+    def assignment(self):
+        return set(self._assignment)
+
+    def pause(self, *partitions):
+        self.paused.append(tuple(partitions))
+
+    def resume(self, *partitions):
+        self.resumed.append(tuple(partitions))
+
+    def poll(self, **kwargs):
+        batch = super().poll(**kwargs)
+        if self.on_poll is not None:
+            self.on_poll(self)
+        return batch
 
 
 FreezeTopicPartition = namedtuple("FreezeTopicPartition", "topic partition")
@@ -1015,7 +1064,7 @@ def test_dispatch_backlog_pauses_and_resumes_partitions_while_polling_heartbeats
     assert consumer.resumed == [{"partition-0", "partition-1"}]
 
 
-def test_record_commits_exact_offset_only_after_durable_ingest(tmp_path):
+def test_shadow_record_commits_at_durable_shadow_terminal(tmp_path):
     config = _config(tmp_path)
     store = RcaControlStore(config.control_db_path)
     message = _message(offset=42)
@@ -1032,8 +1081,124 @@ def test_record_commits_exact_offset_only_after_durable_ingest(tmp_path):
     assert stats.records_seen == 1
     assert stats.records_committed == 1
     assert stats.accepted == 1
+    assert stats.terminal_commit_waits == 0
     assert consumer.commits == [{"offsets": {("tp", 0): 43}}]
     assert store.get_inbox(f"{TOPIC}:0:42")["decision"] == "accepted"
+    assert store.kafka_commit_ready(f"{TOPIC}:0:42") is True
+
+
+def test_submit_record_commits_exact_offset_only_after_delivery_terminal(tmp_path):
+    config = _config(tmp_path, **_canonical_submit_updates(
+        HERMES_RCA_KAFKA_ACTIVATION_REQUIRED="true",
+    ))
+    store = RcaControlStore(config.control_db_path)
+    _activate_direct_steady(store, start_offset=20)
+    message = _message(
+        offset=42,
+        value=_g1q3_snapshot_value(work_item_id=7041712899),
+    )
+
+    def terminalize_on_second_poll(consumer):
+        if len(consumer.poll_calls) != 2:
+            return
+        assert consumer.commits == []
+        [outbox] = store.list_rows("rca_outbox")
+        assert store.kafka_commit_ready(message.topic + ":0:42") is False
+        _terminalize_permanent(store, outbox["submission_key"])
+
+    consumer = PartitionCapableConsumer(
+        [{"partition-0": [message]}, {}],
+        partitions={"partition-0"},
+        on_poll=terminalize_on_second_poll,
+    )
+
+    stats = consumer_module.run_poll_loop(
+        consumer,
+        store,
+        config,
+        max_polls=2,
+        commit_payload=lambda item: {("tp", item.partition): item.offset + 1},
+    )
+
+    assert stats.records_seen == 1
+    assert stats.records_committed == 1
+    assert stats.terminal_commit_waits == 1
+    assert stats.terminal_commits_released == 1
+    assert stats.terminal_waiting_partitions == 0
+    assert consumer.paused == [("partition-0",)]
+    assert consumer.resumed == [("partition-0",)]
+    assert consumer.commits == [{"offsets": {("tp", 0): 43}}]
+    assert store.kafka_commit_ready(f"{TOPIC}:0:42") is True
+
+
+def test_terminal_wait_seeks_before_replaying_unprocessed_partition_tail(tmp_path):
+    config = _config(tmp_path)
+    first = _message(offset=42)
+    second = _message(offset=43)
+
+    class TailReplayConsumer(PartitionCapableConsumer):
+        def __init__(self):
+            super().__init__(
+                [
+                    {"partition-0": [first, second]},
+                    {"partition-0": [second]},
+                ],
+                partitions={"partition-0"},
+            )
+            self.seek_calls = []
+
+        def seek(self, partition, offset):
+            self.seek_calls.append((partition, offset))
+
+    class TailReplayStore:
+        def __init__(self):
+            self.ingested_offsets = []
+            self.readiness_calls = []
+
+        @staticmethod
+        def process_pending(*, limit):
+            assert limit == 1000
+            return []
+
+        @staticmethod
+        def dispatch_backlog_count():
+            return 0
+
+        def ingest_record(self, record, **_kwargs):
+            self.ingested_offsets.append(record.offset)
+            return SimpleNamespace(
+                event_uid=record.event_uid,
+                decision="accepted",
+                ack_safe=True,
+            )
+
+        def kafka_commit_ready(self, event_uid):
+            self.readiness_calls.append(event_uid)
+            return len(self.readiness_calls) > 1
+
+    consumer = TailReplayConsumer()
+    store = TailReplayStore()
+
+    stats = consumer_module.run_poll_loop(
+        consumer,
+        store,
+        config,
+        max_polls=2,
+        commit_payload=lambda item: {
+            ("tp", item.partition): item.offset + 1
+        },
+    )
+
+    assert store.ingested_offsets == [42, 43]
+    assert consumer.seek_calls == [("partition-0", 43)]
+    assert consumer.commits == [
+        {"offsets": {("tp", 0): 43}},
+        {"offsets": {("tp", 0): 44}},
+    ]
+    assert stats.records_seen == 2
+    assert stats.records_committed == 2
+    assert stats.terminal_commit_waits == 1
+    assert stats.terminal_commits_released == 1
 
 
 def test_submit_ingest_without_steady_epoch_fails_before_commit(tmp_path):
@@ -1056,7 +1221,7 @@ def test_submit_ingest_without_steady_epoch_fails_before_commit(tmp_path):
     assert store.list_rows("rca_outbox") == []
 
 
-def test_steady_activation_ingest_commits_and_binds_exact_ledger(tmp_path):
+def test_steady_activation_ingest_waits_and_binds_exact_ledger(tmp_path):
     config = _config(tmp_path, **_canonical_submit_updates(
         HERMES_RCA_KAFKA_ACTIVATION_REQUIRED="true",
     ))
@@ -1066,7 +1231,10 @@ def test_steady_activation_ingest_commits_and_binds_exact_ledger(tmp_path):
         offset=30,
         value=_g1q3_snapshot_value(work_item_id=7041712816),
     )
-    consumer = FakeConsumer([{"partition-0": [message]}])
+    consumer = PartitionCapableConsumer(
+        [{"partition-0": [message]}],
+        partitions={"partition-0"},
+    )
 
     stats = consumer_module.run_poll_loop(
         consumer,
@@ -1083,14 +1251,18 @@ def test_steady_activation_ingest_commits_and_binds_exact_ledger(tmp_path):
         for row in store.list_rows("rca_activation_admission_ledger")
         if row["decision"] == "admit"
     )
-    assert stats.records_committed == 1
-    assert consumer.commits == [{"offsets": {("tp", 0): 31}}]
+    assert stats.records_committed == 0
+    assert stats.terminal_commit_waits == 1
+    assert stats.terminal_waiting_partitions == 1
+    assert consumer.commits == []
+    assert consumer.paused == [("partition-0",)]
     assert outbox["status"] == "pending"
     assert outbox["activation_epoch_id"] == epoch["epoch_id"]
     assert outbox["activation_ledger_id"] == ledger["ledger_id"]
     assert trigger["activation_epoch_id"] == epoch["epoch_id"]
     assert trigger["activation_ledger_id"] == ledger["ledger_id"]
     assert ledger["bound_at"] is not None
+    assert store.kafka_commit_ready(f"{TOPIC}:0:30") is False
 
 
 def test_historical_shadow_remains_readable_but_never_dispatchable(tmp_path):
@@ -1143,7 +1315,15 @@ def test_unknown_record_failure_pauses_only_its_partition(tmp_path):
         def ingest_record(record, **_kwargs):
             if record.partition == 0:
                 raise RecordProcessingBlockedError(f"{record.topic}:0:{record.offset}")
-            return SimpleNamespace(decision="accepted", ack_safe=True)
+            return SimpleNamespace(
+                event_uid=record.event_uid,
+                decision="accepted",
+                ack_safe=True,
+            )
+
+        @staticmethod
+        def kafka_commit_ready(_event_uid):
+            return True
 
     class RecordingHealth:
         def __init__(self):

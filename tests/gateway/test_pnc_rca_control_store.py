@@ -6581,6 +6581,36 @@ def test_invalid_message_is_durable_and_dead_lettered_before_ack(tmp_path):
     assert dead_letters[0]["error_code"] == "invalid_json"
 
 
+def test_kafka_commit_readiness_accepts_only_durable_local_terminals(tmp_path):
+    store = RcaControlStore(tmp_path / "control.sqlite3")
+    invalid = store.ingest_record(_record(value=b"not-json"), policy=_policy())
+
+    assert store.kafka_commit_ready(invalid.event_uid) is True
+    with pytest.raises(KeyError, match="unknown inbox event"):
+        store.kafka_commit_ready("missing:0:1")
+
+    shadow_record = _record(offset=2)
+    shadow = store.ingest_record(shadow_record, policy=_policy())
+    assert shadow.decision == "accepted"
+    assert store.kafka_commit_ready(shadow.event_uid) is True
+
+
+def test_kafka_commit_readiness_waits_for_exact_execution_delivery_terminal(tmp_path):
+    store = _steady_control_store(tmp_path / "control.sqlite3")
+    result = store.ingest_record(
+        _record(),
+        policy=_policy(),
+        submit_enabled=True,
+    )
+
+    assert result.decision == "accepted"
+    assert store.kafka_commit_ready(result.event_uid) is False
+
+    _terminalize_permanent(store, result.submission_key)
+
+    assert store.kafka_commit_ready(result.event_uid) is True
+
+
 def test_same_kafka_coordinate_with_changed_payload_fails_closed(tmp_path):
     store = RcaControlStore(tmp_path / "control.sqlite3")
     store.persist_raw(_record(value=b"first"), policy=_policy())

@@ -16379,7 +16379,7 @@ class RcaControlStore:
         after_raw_persisted: Callable[[RawPersistResult], None] | None = None,
         snapshot_authority: Any = None,
     ) -> IngestResult:
-        """Persist raw, then classify; callers may commit only after this returns."""
+        """Persist and classify; Kafka callers must also await commit readiness."""
         raw_result = self.persist_raw(
             record,
             policy=policy,
@@ -16395,6 +16395,65 @@ class RcaControlStore:
             snapshot_authority=snapshot_authority,
         )
         return replace(result, raw_inserted=raw_result.inserted)
+
+    def kafka_commit_ready(self, event_uid: str) -> bool:
+        """Return whether the exact Kafka event reached its reliable terminal state.
+
+        Filtered and invalid events terminate at the durable intake/dead-letter
+        boundary.  A deliberate shadow generation terminates at its durable
+        shadow outbox row.  Submit-enabled events remain uncommittable until the
+        exact execution generation and all required delivery effects settle.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT event_uid, decision, submission_mode, business_key,
+                       submission_key, generation
+                  FROM kafka_inbox
+                 WHERE event_uid = ?
+                """,
+                (event_uid,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown inbox event: {event_uid}")
+
+            decision = str(row["decision"] or "")
+            if decision == "pending":
+                return False
+            if decision in {"filtered", "invalid"}:
+                return True
+            if decision not in {"accepted", "deduped"}:
+                raise RuntimeError(f"unsupported inbox decision: {decision}")
+
+            business_key = str(row["business_key"] or "").strip()
+            submission_key = str(row["submission_key"] or "").strip()
+            generation = int(row["generation"] or 0)
+            if not business_key or not submission_key or generation < 1:
+                return False
+
+            if str(row["submission_mode"] or "") == "shadow":
+                shadow = conn.execute(
+                    """
+                    SELECT status
+                      FROM rca_outbox
+                     WHERE business_key = ? AND submission_key = ?
+                       AND generation = ?
+                     LIMIT 1
+                    """,
+                    (business_key, submission_key, generation),
+                ).fetchone()
+                if shadow is not None and str(shadow["status"] or "") == "shadow":
+                    return True
+
+            return self._activation_delivery_execution_complete_tx(
+                conn,
+                business_key=business_key,
+                submission_key=submission_key,
+                generation=generation,
+            )
+        finally:
+            conn.close()
 
     def process_event_resilient(
         self,
