@@ -3370,6 +3370,12 @@ def test_service_wrapper_keeps_missing_timeout_outcome_retryable(monkeypatch, tm
     assert result["success"] is False
     assert result["retryable"] is True
     assert result["error_code"] == "vm_task_service_submit_uncertain"
+    assert result["submit_diagnostic"] == {
+        "returncode": None,
+        "error_code": "vm_task_creation_timeout",
+        "error": "task creation timed out",
+        "stderr_last_line": "",
+    }
 
 
 def test_service_wrapper_requires_nonempty_exact_work_item_type(monkeypatch, tmp_path):

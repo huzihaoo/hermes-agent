@@ -2684,6 +2684,26 @@ def _is_definitive_precreate_failure(result: Mapping[str, Any]) -> bool:
     return error_code in _DEFINITIVE_PRECREATE_ERROR_CODES
 
 
+def _submit_failure_detail(result: Mapping[str, Any], error_code: str) -> str:
+    detail = str(result.get("error") or error_code).strip()
+    diagnostic = result.get("submit_diagnostic")
+    if not isinstance(diagnostic, Mapping):
+        return detail
+    rendered = json.dumps(
+        dict(diagnostic), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    return f"{detail}; submit_diagnostic={rendered[:1024]}"
+
+
+def _is_retryable_prod_admission_failure(
+    result: Mapping[str, Any], error_code: str
+) -> bool:
+    return (
+        error_code == "vm_task_service_rca_prod_admission_blocked"
+        and result.get("retryable") is True
+    )
+
+
 def _precreate_abort_audit(
     receipt: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -3066,8 +3086,10 @@ class OutboxDispatcher:
                 result.get("error_code") or "vm_task_submit_failed"
             ).strip()
             detail = _detail_with_precreate_abort_audit(
-                str(result.get("error") or error_code), abort_audit
+                _submit_failure_detail(result, error_code), abort_audit
             )
+            if _is_retryable_prod_admission_failure(result, error_code):
+                return self._retry(claim, error_code, detail)
             if error_code in _SERVICE_ERROR_CODES:
                 raise DispatchCircuitError(error_code, detail)
             if result.get("retryable") is True:

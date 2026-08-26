@@ -160,6 +160,10 @@ def test_resource_wrapper_failures_are_stable_and_redacted(runner, code):
     assert "secret" not in str(raised.value)
 
 
+def test_resource_preflight_timeout_covers_observed_healthy_probe_latency():
+    assert admission.DEFAULT_RESOURCE_TIMEOUT_SECONDS == 30
+
+
 def test_stale_snapshot_and_snapshot_hash_tamper_fail_closed():
     stale = report()
     stale["rca_prod_snapshot"]["observed_at"] = (

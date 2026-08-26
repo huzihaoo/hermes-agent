@@ -1821,3 +1821,34 @@ def test_prod_admission_failure_routes_to_global_circuit(monkeypatch, error_code
             "rca_prod_hmac_key_invalid",
         )
     ]
+
+
+def test_submit_failure_detail_keeps_bounded_creator_diagnostic():
+    detail = dispatcher._submit_failure_detail(
+        {
+            "error": "creation outcome uncertain",
+            "submit_diagnostic": {
+                "returncode": 1,
+                "stderr_last_line": (
+                    "sqlite3.OperationalError: unable to open database file"
+                ),
+            },
+        },
+        "vm_task_service_submit_uncertain",
+    )
+
+    assert detail.startswith("creation outcome uncertain; submit_diagnostic=")
+    assert '\"returncode\":1' in detail
+    assert "sqlite3.OperationalError" in detail
+
+
+def test_retryable_prod_admission_failure_does_not_require_global_circuit():
+    assert dispatcher._is_retryable_prod_admission_failure(
+        {"retryable": True}, "vm_task_service_rca_prod_admission_blocked"
+    )
+    assert not dispatcher._is_retryable_prod_admission_failure(
+        {"retryable": False}, "vm_task_service_rca_prod_admission_blocked"
+    )
+    assert not dispatcher._is_retryable_prod_admission_failure(
+        {"retryable": True}, "vm_task_service_rca_prod_command_invalid"
+    )

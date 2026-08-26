@@ -649,6 +649,39 @@ def _vm_task_service_denied_payload(error_code: str, error: str) -> dict[str, An
     }
 
 
+def _submit_uncertain_diagnostic(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep bounded creator failure evidence without persisting request payloads."""
+
+    def bounded(value: Any, *, limit: int = 240) -> str:
+        text = " ".join(str(value or "").split())
+        return text[:limit]
+
+    stderr_lines = [
+        line.strip() for line in str(result.get("stderr") or "").splitlines()
+    ]
+    diagnostic: dict[str, Any] = {
+        "returncode": (
+            result.get("returncode")
+            if isinstance(result.get("returncode"), int)
+            and not isinstance(result.get("returncode"), bool)
+            else None
+        ),
+        "error_code": bounded(result.get("error_code"), limit=120),
+        "error": bounded(result.get("error")),
+        "stderr_last_line": bounded(stderr_lines[-1] if stderr_lines else ""),
+    }
+    task = result.get("task")
+    if isinstance(task, Mapping):
+        task_diagnostic = {
+            key: bounded(task.get(key))
+            for key in ("status", "state", "error", "message")
+            if bounded(task.get(key))
+        }
+        if task_diagnostic:
+            diagnostic["task"] = task_diagnostic
+    return diagnostic
+
+
 def _check_vm_task_service_permission(
     service_id: str, capability: str
 ) -> dict[str, Any] | None:
@@ -2927,6 +2960,7 @@ def vm_task_submit_service(
         "retryable": True,
         "created": False,
         "deduped": False,
+        "submit_diagnostic": _submit_uncertain_diagnostic(result),
         "reconciled_status": reconciled,
         "admission": admission_payload,
         "workspace_runtime": workspace_runtime.to_dict(),
