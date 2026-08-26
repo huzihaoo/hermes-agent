@@ -79,6 +79,11 @@ REMOTE_READER_DEPENDENCY_MODULES = {
     "pdcl-dss": "pdcl_dss",
     "typer": "typer",
 }
+FROZEN_MATERIALIZATION_SCHEMA = "g1q3_rca_vm_source_materialization_v1"
+MCAP_GITLINK_PATH = "third_party/mcap_data_translate"
+MCAP_REQUIRED_BINARY_PATH = (
+    "third_party/mcap_data_translate/build/bin/mcap_topic_extract"
+)
 REPORT_MANIFEST_ROOT = PurePosixPath("/home/mini/.config/g1q3-rca")
 REPORT_MANIFEST_PATH = REPORT_MANIFEST_ROOT / "report-runtime-manifest.json"
 CONTROL_DB_RELATIVE_PATH = Path(
@@ -930,6 +935,9 @@ def _preflight_vm_dependency_probe(
         f"contract_schema = {json.dumps(REMOTE_READER_RUNTIME_CONTRACT_SCHEMA)}\n"
         f"required_dependencies = {json.dumps(REMOTE_READER_SYSTEM_DEPENDENCIES)}\n"
         f"dependency_modules = {json.dumps(REMOTE_READER_DEPENDENCY_MODULES, sort_keys=True)}\n"
+        f"materialization_schema = {json.dumps(FROZEN_MATERIALIZATION_SCHEMA)}\n"
+        f"mcap_gitlink_path = {json.dumps(MCAP_GITLINK_PATH)}\n"
+        f"mcap_required_binary_path = {json.dumps(MCAP_REQUIRED_BINARY_PATH)}\n"
         r'''
 root_path = Path(root)
 bundle_relative = "api/g1q3_rca/vendor/remote_reader_runtime_bundle.generated.json"
@@ -1228,6 +1236,7 @@ bundle_raw = None
 frozen_receipt_path = None
 frozen_receipt_raw = None
 frozen_receipt = None
+frozen_materialization = None
 contract = {}
 vendor_manifest = {}
 contract_error = None
@@ -1275,6 +1284,54 @@ try:
             "receipt_sha256": hashlib.sha256(frozen_receipt_raw).hexdigest(),
         }
         source_ok = True
+        gitlinks = frozen_receipt.get("gitlinks")
+        if not isinstance(gitlinks, list):
+            raise RuntimeError("frozen_gitlinks_invalid")
+        mcap_gitlinks = [
+            item for item in gitlinks
+            if isinstance(item, dict) and item.get("path") == mcap_gitlink_path
+        ]
+        mcap_prefix = mcap_gitlink_path + "/"
+        mcap_submodules = {
+            item["path"][len(mcap_prefix):]: dict(item)
+            for item in gitlinks
+            if (
+                isinstance(item, dict)
+                and str(item.get("path") or "").startswith(
+                    mcap_prefix + "external/"
+                )
+            )
+        }
+        required_binary = next(
+            (
+                item for item in snapshot["entries"]
+                if (
+                    item.get("path") == mcap_required_binary_path
+                    and item.get("type") == "file"
+                )
+            ),
+            None,
+        )
+        if (
+            len(mcap_gitlinks) != 1
+            or not mcap_submodules
+            or not isinstance(required_binary, dict)
+        ):
+            raise RuntimeError("frozen_mcap_materialization_invalid")
+        frozen_materialization = {
+            "kind": "frozen_materialized_runtime",
+            "schema_version": frozen_receipt.get("schema_version"),
+            "runtime_root": str(root_path),
+            "receipt_path": str(frozen_receipt_path),
+            "receipt_sha256": hashlib.sha256(frozen_receipt_raw).hexdigest(),
+            "receipt_self_seal": frozen_receipt.get("self_seal"),
+            "root_identity": frozen_receipt.get("root_identity"),
+            "pipeline_commit": frozen_receipt.get("pipeline_commit"),
+            "pipeline_tree": frozen_receipt.get("pipeline_tree"),
+            "mcap_gitlink": dict(mcap_gitlinks[0]),
+            "mcap_submodules": mcap_submodules,
+            "required_binary": dict(required_binary),
+        }
         bundle_entry = next(
             (item for item in snapshot["entries"]
              if item.get("path") == bundle_relative and item.get("type") == "file"),
@@ -1436,6 +1493,7 @@ response = {
         "error": contract_error,
     },
     "dependencies": dependency_results,
+    "materialization": frozen_materialization,
     "mismatches": mismatches,
     "bootstrap": {"status": "deferred_execution_only"},
 }
@@ -1622,17 +1680,101 @@ def _candidate_inputs(
     manifest_raw, manifest = _json(manifest_path, "candidate_manifest")
     env_raw = _read(env_path, "candidate_env")
     projection = note["runtime_projection"]
-    host = note["release_identity"]["host"]
-    face = manifest.get("face_git_bindings", {}).get("runtime_engine", {})
+    identity = note["release_identity"]
+    host = identity["host"]
+    pipeline = identity["pipeline"]
+    worker = identity["worker"]
+    faces = manifest.get("face_git_bindings")
+    production_bindings = manifest.get("production_branch_bindings")
     note_binding = manifest.get("rca_release_note", {})
+
+    def git_face_matches(
+        name: str,
+        expected: Mapping[str, Any],
+        *,
+        expected_repo: str | None = None,
+        expected_branch: str | None = None,
+    ) -> bool:
+        actual = faces.get(name) if isinstance(faces, Mapping) else None
+        if not isinstance(actual, Mapping):
+            return False
+        required = (
+            "commit",
+            "tree",
+            "remote",
+            "remote_branch",
+            "remote_tag",
+            "remote_tag_object",
+        )
+        if any(actual.get(key) != expected.get(key) for key in required):
+            return False
+        repo = str(actual.get("repo") or "")
+        if not repo.startswith("/"):
+            return False
+        if expected_repo is not None and repo != expected_repo:
+            return False
+        if expected_branch is not None and actual.get("branch") != expected_branch:
+            return False
+        return True
+
+    pipeline_branch = _manifest_branch(pipeline.get("remote_branch"))
+    worker_branch = _manifest_branch(worker.get("remote_branch"))
+    source = faces.get("g1q3_rca_source") if isinstance(faces, Mapping) else None
+    source_matches = git_face_matches(
+        "g1q3_rca_source",
+        pipeline,
+        expected_branch=pipeline_branch,
+    ) and isinstance(source, Mapping)
+    report = identity["report_service"]
+    report_binding = note_binding.get("report_service")
+    report_matches = isinstance(report_binding, Mapping) and all(
+        report_binding.get(key) == report.get(key)
+        for key in ("manifest_path", "manifest_sha256", "pipeline_commit", "pipeline_tree")
+    )
+
+    def branch_binding_matches(name: str, expected: Mapping[str, Any], branch: str) -> bool:
+        actual = production_bindings.get(name) if isinstance(production_bindings, Mapping) else None
+        return isinstance(actual, Mapping) and all(
+            actual.get(key) == value
+            for key, value in {
+                "branch": branch,
+                "commit": expected.get("commit"),
+                "tree": expected.get("tree"),
+                "remote": expected.get("remote"),
+            }.items()
+        )
+
+    projection_faces_valid = (
+        git_face_matches(
+            "runtime_engine",
+            host,
+            expected_repo=host["runtime_root"],
+        )
+        and git_face_matches(
+            "g1q3_rca_pipeline",
+            pipeline,
+            expected_repo=pipeline["runtime_root"],
+            expected_branch="DETACHED",
+        )
+        and source_matches
+        and git_face_matches(
+            "vm_worker_state",
+            worker,
+            expected_repo=worker["runtime_root"],
+            expected_branch=worker_branch,
+        )
+        and report_matches
+        and branch_binding_matches("hermes_agent", host, _manifest_branch(host.get("remote_branch")))
+        and branch_binding_matches("rca_pipeline", pipeline, pipeline_branch)
+        and branch_binding_matches("vm_worker", worker, worker_branch)
+    )
     if (
         _sha(manifest_raw) != projection["live_manifest_sha256"]
         or _sha(env_raw) != projection["env_sha256"]
         or manifest.get("runtime_root") != host["runtime_root"]
         or manifest.get("promotion_source_head") != host["commit"]
         or manifest.get("env_sha256") != projection["env_sha256"]
-        or (face.get("commit"), face.get("tree"), face.get("repo"))
-        != (host["commit"], host["tree"], host["runtime_root"])
+        or not projection_faces_valid
         or note_binding.get("path") != str(note_path)
         or note_binding.get("release_id") != note["release_id"]
         or note_binding.get("release_fingerprint_sha256")
@@ -3766,29 +3908,397 @@ def _prepare_env(live_raw: bytes, note_path: Path, control_db: Path) -> bytes:
     return "".join(f"{key}={env[key]}\n" for key in sorted(env)).encode()
 
 
+def _manifest_branch(remote_branch: object) -> str:
+    """Return a manifest-friendly branch name without relying on Python 3.9 APIs."""
+    value = str(remote_branch or "")
+    prefix = "refs/heads/"
+    return value[len(prefix) :] if value.startswith(prefix) else value
+
+
+def _manifest_active_face_metadata(existing: object) -> dict[str, Any]:
+    """Retain current policy metadata without carrying predecessor history."""
+    if not isinstance(existing, Mapping):
+        return {}
+    allowed = {
+        "dirty_allowlist",
+        "dirty_allowlist_reason",
+        "dirty_policy",
+        "host",
+        "release_role",
+        "resource_class",
+        "scope",
+        "upstream_policy",
+        "version",
+    }
+    return {key: existing[key] for key in allowed if key in existing}
+
+
+def _manifest_face_binding(
+    existing: object,
+    identity: Mapping[str, Any],
+    *,
+    repo: str | None = None,
+    branch: str | None = None,
+) -> dict[str, Any]:
+    """Project a resolved GitLab face while retaining policy metadata."""
+    required = (
+        "remote",
+        "remote_branch",
+        "remote_tag",
+        "remote_tag_object",
+        "commit",
+        "tree",
+        "runtime_root",
+    )
+    if not isinstance(identity, Mapping) or any(
+        not str(identity.get(key) or "") for key in required
+    ):
+        raise ReleaseError("release_identity_face_invalid")
+    binding = _manifest_active_face_metadata(existing)
+    binding.update({
+        "commit": identity["commit"],
+        "tree": identity["tree"],
+        "remote": identity["remote"],
+        "remote_branch": identity["remote_branch"],
+        "remote_tag": identity["remote_tag"],
+        "remote_tag_object": identity["remote_tag_object"],
+    })
+    if repo is None:
+        repo = str(identity["runtime_root"])
+    if not str(repo):
+        raise ReleaseError("release_identity_face_invalid")
+    binding["repo"] = str(repo)
+    if branch is not None:
+        binding["branch"] = branch
+    return binding
+
+
+def _manifest_branch_binding(
+    _existing: object,
+    identity: Mapping[str, Any],
+    *,
+    branch: str | None = None,
+) -> dict[str, Any]:
+    """Project the compact production-branch face from the same identity."""
+    if not isinstance(identity, Mapping):
+        raise ReleaseError("release_identity_face_invalid")
+    binding: dict[str, Any] = {}
+    binding.update({
+        "branch": branch or _manifest_branch(identity.get("remote_branch")),
+        "commit": identity.get("commit"),
+        "tree": identity.get("tree"),
+        "remote": identity.get("remote"),
+    })
+    if any(not str(binding.get(key) or "") for key in ("branch", "commit", "tree", "remote")):
+        raise ReleaseError("release_identity_face_invalid")
+    return binding
+
+
+def _manifest_dependency_faces(
+    existing_source: object,
+    existing_runtime: object,
+    *,
+    source_repo: str,
+    pipeline: Mapping[str, Any],
+    dependency_proof: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Project the MCAP Git face and its frozen installed-runtime evidence."""
+    if not isinstance(existing_source, Mapping) or not isinstance(
+        existing_runtime, Mapping
+    ):
+        raise ReleaseError("release_dependency_face_invalid")
+    materialization = dependency_proof.get("materialization")
+    if not isinstance(materialization, Mapping):
+        raise ReleaseError("release_dependency_materialization_invalid")
+
+    runtime_root = str(materialization.get("runtime_root") or "")
+    receipt_path = PurePosixPath(str(materialization.get("receipt_path") or ""))
+    receipts_root = PurePosixPath(
+        "/home/mini/.hermes/rca-prod-runtime/receipts"
+    )
+    root_identity = materialization.get("root_identity")
+    required_binary = materialization.get("required_binary")
+    gitlink = materialization.get("mcap_gitlink")
+    submodules = materialization.get("mcap_submodules")
+    if (
+        materialization.get("kind") != "frozen_materialized_runtime"
+        or materialization.get("schema_version")
+        != FROZEN_MATERIALIZATION_SCHEMA
+        or runtime_root != str(pipeline.get("runtime_root") or "")
+        or materialization.get("pipeline_commit") != pipeline.get("commit")
+        or materialization.get("pipeline_tree") != pipeline.get("tree")
+        or not receipt_path.is_absolute()
+        or ".." in receipt_path.parts
+        or receipts_root not in receipt_path.parents
+        or not HEX64.fullmatch(
+            str(materialization.get("receipt_sha256") or "")
+        )
+        or not HEX64.fullmatch(
+            str(materialization.get("receipt_self_seal") or "")
+        )
+        or not isinstance(root_identity, Mapping)
+        or any(
+            key not in root_identity
+            for key in ("mode", "uid", "gid", "dev", "ino")
+        )
+        or root_identity.get("mode") != "0555"
+        or not isinstance(required_binary, Mapping)
+        or not isinstance(gitlink, Mapping)
+        or not isinstance(submodules, Mapping)
+        or not submodules
+    ):
+        raise ReleaseError("release_dependency_materialization_invalid")
+
+    source_root = PurePosixPath(source_repo)
+    expected_remote = str(existing_source.get("remote") or "")
+    if (
+        not source_root.is_absolute()
+        or ".." in source_root.parts
+        or gitlink.get("path") != MCAP_GITLINK_PATH
+        or not HEX40.fullmatch(str(gitlink.get("commit") or ""))
+        or not HEX40.fullmatch(str(gitlink.get("tree") or ""))
+        or not expected_remote
+        or gitlink.get("remote") != expected_remote
+        or required_binary.get("path") != MCAP_REQUIRED_BINARY_PATH
+        or required_binary.get("type") != "file"
+        or required_binary.get("mode") not in {"0444", "0555"}
+        or not HEX64.fullmatch(str(required_binary.get("sha256") or ""))
+        or isinstance(required_binary.get("size_bytes"), bool)
+        or not isinstance(required_binary.get("size_bytes"), int)
+        or required_binary.get("size_bytes", 0) <= 0
+    ):
+        raise ReleaseError("release_dependency_materialization_invalid")
+
+    submodule_bindings: dict[str, str] = {}
+    submodule_identities: dict[str, dict[str, str]] = {}
+    for relative, item in sorted(submodules.items()):
+        relative_path = PurePosixPath(str(relative))
+        if (
+            not isinstance(item, Mapping)
+            or relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or not str(relative_path).startswith("external/")
+            or item.get("path") != f"{MCAP_GITLINK_PATH}/{relative_path}"
+            or not HEX40.fullmatch(str(item.get("commit") or ""))
+            or not HEX40.fullmatch(str(item.get("tree") or ""))
+            or not str(item.get("remote") or "")
+        ):
+            raise ReleaseError("release_dependency_materialization_invalid")
+        relative_text = str(relative_path)
+        submodule_bindings[relative_text] = str(item["commit"])
+        submodule_identities[relative_text] = {
+            "commit": str(item["commit"]),
+            "tree": str(item["tree"]),
+            "remote": str(item["remote"]),
+        }
+
+    source_binding = _manifest_active_face_metadata(existing_source)
+    source_binding.update({
+        "branch": "DETACHED",
+        "commit": str(gitlink["commit"]),
+        "tree": str(gitlink["tree"]),
+        "remote": str(gitlink["remote"]),
+        "repo": str(source_root / MCAP_GITLINK_PATH),
+        "submodule_bindings": submodule_bindings,
+        "source_required_binary": {
+            "relative_path": str(
+                PurePosixPath(MCAP_REQUIRED_BINARY_PATH).relative_to(
+                    MCAP_GITLINK_PATH
+                )
+            ),
+            "sha256": str(required_binary["sha256"]),
+            "size": required_binary["size_bytes"],
+        },
+    })
+    for key in ("contract_sha256", "translate_contract_sha256"):
+        value = str(existing_source.get(key) or "")
+        if HEX64.fullmatch(value):
+            source_binding[key] = value
+
+    runtime_binding = {
+        "host": str(existing_runtime.get("host") or "mini-desktop"),
+        "kind": "governed_frozen_materialized_runtime",
+        "runtime_root": runtime_root,
+        "materialization_schema_version": FROZEN_MATERIALIZATION_SCHEMA,
+        "materialization_receipt_path": str(receipt_path),
+        "materialization_receipt_sha256": str(
+            materialization["receipt_sha256"]
+        ),
+        "materialization_self_seal": str(
+            materialization["receipt_self_seal"]
+        ),
+        "root_identity": dict(root_identity),
+        "pipeline_commit": str(pipeline["commit"]),
+        "pipeline_tree": str(pipeline["tree"]),
+        "source_face": "mcap_data_translate",
+        "source_commit": str(gitlink["commit"]),
+        "source_tree": str(gitlink["tree"]),
+        "source_submodules": submodule_identities,
+        "required_binary": {
+            "relative_path": MCAP_REQUIRED_BINARY_PATH,
+            "mode": str(required_binary["mode"]),
+            "sha256": str(required_binary["sha256"]),
+            "size_bytes": required_binary["size_bytes"],
+        },
+    }
+    dependency = {
+        "face": "mcap_data_translate",
+        "commit": str(gitlink["commit"]),
+        "submodules": submodule_bindings,
+        "runtime_materialization_face": "mcap_data_translate_runtime_bins",
+    }
+    return source_binding, runtime_binding, dependency
+
+
 def _prepare_manifest(
     live: Mapping[str, Any],
     *,
     host: Mapping[str, str],
+    pipeline: Mapping[str, Any],
+    worker: Mapping[str, Any],
+    report_service: Mapping[str, Any],
     workspace_runtime: Mapping[str, str],
     env_sha256: str,
     note_path: Path,
     release_id: str,
     release_fingerprint: str,
+    canary_batch_id: str,
+    canary_issue_id: str,
+    dependency_proof: Mapping[str, Any],
 ) -> bytes:
     manifest = _decode_json(_canonical(live), "live_manifest_template")
     raw_bindings = manifest.get("face_git_bindings")
-    bindings = dict(raw_bindings) if isinstance(raw_bindings, Mapping) else {}
-    raw_engine = bindings.get("runtime_engine")
-    engine = dict(raw_engine) if isinstance(raw_engine, Mapping) else {}
-    engine.update({
-        "commit": host["commit"],
-        "tree": host["tree"],
-        "repo": host["runtime_root"],
-    })
+    raw_bindings_map = dict(raw_bindings) if isinstance(raw_bindings, Mapping) else {}
+    bindings: dict[str, Any] = {}
+    raw_engine = raw_bindings_map.get("runtime_engine")
+    engine = _manifest_face_binding(
+        raw_engine,
+        host,
+        branch=(
+            str(raw_engine.get("branch") or "DETACHED")
+            if isinstance(raw_engine, Mapping)
+            else "DETACHED"
+        ),
+    )
     bindings["runtime_engine"] = engine
+    bindings["gateway_runtime"] = _manifest_face_binding(
+        raw_bindings_map.get("gateway_runtime"),
+        host,
+        branch="DETACHED",
+    )
+
+    # The release note resolves the pipeline and worker faces independently of
+    # the Host runtime. Project every changed face from those same identities so
+    # a prepared manifest cannot silently retain the predecessor's hashes.
+    pipeline_binding = _manifest_face_binding(
+        raw_bindings_map.get("g1q3_rca_pipeline"),
+        pipeline,
+        branch="DETACHED",
+    )
+    source_existing = raw_bindings_map.get("g1q3_rca_source")
+    source_existing_map = (
+        dict(source_existing) if isinstance(source_existing, Mapping) else {}
+    )
+    source_repo = str(source_existing_map.get("repo") or "")
+    raw_pipeline = raw_bindings_map.get("g1q3_rca_pipeline")
+    nested_source = (
+        raw_pipeline.get("source_repository_binding")
+        if isinstance(raw_pipeline, Mapping)
+        else None
+    )
+    if not source_repo and isinstance(nested_source, Mapping):
+        source_repo = str(nested_source.get("repo") or "")
+    if not source_repo:
+        raise ReleaseError("source_face_binding_invalid")
+    source_branch = _manifest_branch(pipeline.get("remote_branch"))
+    source_binding = _manifest_face_binding(
+        source_existing_map,
+        pipeline,
+        repo=source_repo,
+        branch=source_branch,
+    )
+    # Keep the nested source relation and the standalone source face identical.
+    pipeline_binding["source_repository_binding"] = dict(source_binding)
+    worker_binding = _manifest_face_binding(
+        raw_bindings_map.get("vm_worker_state"),
+        worker,
+        branch=_manifest_branch(worker.get("remote_branch")),
+    )
+    bindings["g1q3_rca_pipeline"] = pipeline_binding
+    bindings["g1q3_rca_source"] = source_binding
+    bindings["vm_worker_state"] = worker_binding
+
+    mcap_binding, mcap_runtime_binding, mcap_dependency = (
+        _manifest_dependency_faces(
+            raw_bindings_map.get("mcap_data_translate"),
+            raw_bindings_map.get("mcap_data_translate_runtime_bins"),
+            source_repo=source_repo,
+            pipeline=pipeline,
+            dependency_proof=dependency_proof,
+        )
+    )
+    bindings["mcap_data_translate"] = mcap_binding
+    bindings["mcap_data_translate_runtime_bins"] = mcap_runtime_binding
+    bindings["_stacks"] = {
+        "g1q3_rca_stack": {
+            "primary_face": "g1q3_rca_pipeline",
+            "depends_on": [
+                {
+                    "face": "g1q3_rca_pipeline",
+                    "commit": pipeline["commit"],
+                },
+                mcap_dependency,
+            ],
+            "validation": {
+                "status": "validated",
+                "evidence": {
+                    "release_id": release_id,
+                    "case_id": canary_issue_id,
+                    "batch_id": canary_batch_id,
+                    "materialization_receipt_sha256": mcap_runtime_binding[
+                        "materialization_receipt_sha256"
+                    ],
+                },
+            },
+        }
+    }
+
+    report = {
+        "manifest_path": str(report_service.get("manifest_path") or ""),
+        "manifest_sha256": str(report_service.get("manifest_sha256") or ""),
+        "pipeline_commit": str(report_service.get("pipeline_commit") or ""),
+        "pipeline_tree": str(report_service.get("pipeline_tree") or ""),
+    }
+    if (
+        not report["manifest_path"]
+        or not HEX64.fullmatch(report["manifest_sha256"])
+        or report["pipeline_commit"] != str(pipeline.get("commit") or "")
+        or report["pipeline_tree"] != str(pipeline.get("tree") or "")
+    ):
+        raise ReleaseError("report_manifest_pipeline_mismatch")
+    for history_key in (
+        "activated_at",
+        "fingerprint_refreshed",
+        "gateway_activated_at",
+        "gateway_fingerprint_refreshed",
+        "gateway_previous_binding",
+        "gateway_release_date",
+        "last_governance_reviewed_at",
+        "local_consumer_migration",
+        "reconciliation_findings",
+        "runtime_release_date",
+    ):
+        manifest.pop(history_key, None)
+    host_runtime_root = str(host["runtime_root"])
+    host_release_target = Path(host_runtime_root).name
     manifest.update({
-        "runtime_root": host["runtime_root"],
+        "runtime_root": host_runtime_root,
+        "runtime_release_target": host_release_target,
+        "gateway_release_target": host_release_target,
+        "gateway_working_directory": host_runtime_root,
+        "promotion_source": host_runtime_root,
+        "promotion_source_dirty_count": 0,
+        "promotion_source_dirty_preview": [],
         "promotion_source_head": host["commit"],
         "env_sha256": env_sha256,
         "face_git_bindings": bindings,
@@ -3796,6 +4306,7 @@ def _prepare_manifest(
             "path": str(note_path),
             "release_id": release_id,
             "release_fingerprint_sha256": release_fingerprint,
+            "report_service": report,
         },
     })
     manifest.pop("rca_release_authority", None)
@@ -3807,24 +4318,53 @@ def _prepare_manifest(
         raw_production_bindings, Mapping
     ):
         raise ReleaseError("workspace_runtime_manifest_binding_invalid")
-    gateway_binding = dict(raw_gateway_binding or {})
-    production_bindings = dict(raw_production_bindings or {})
-    gateway_binding.update({
+    raw_production_map = dict(raw_production_bindings or {})
+    production_bindings: dict[str, Any] = {
+        "schema_version": "rca_stable_production_branches_v3"
+    }
+    raw_mcap_production = raw_production_map.get("mcap_data_translate")
+    production_bindings["mcap_data_translate"] = {
+        "branch": (
+            str(raw_mcap_production.get("branch") or "rca")
+            if isinstance(raw_mcap_production, Mapping)
+            else "rca"
+        ),
+        "commit": mcap_binding["commit"],
+        "tree": mcap_binding["tree"],
+        "remote": mcap_binding["remote"],
+    }
+    production_bindings["hermes_agent"] = _manifest_branch_binding(
+        raw_production_map.get("hermes_agent"), host
+    )
+    production_bindings["rca_pipeline"] = _manifest_branch_binding(
+        raw_production_map.get("rca_pipeline"), pipeline
+    )
+    production_bindings["vm_worker"] = _manifest_branch_binding(
+        raw_production_map.get("vm_worker"), worker
+    )
+    gateway_binding = {
+        "source": host_runtime_root,
+        "commit": host["commit"],
+        "tree": host["tree"],
+        "venv": manifest.get("runtime_venv"),
         "workspace_runtime_manifest_sha256": workspace_runtime["manifest_sha256"],
         "workspace_runtime_closure_sha256": workspace_runtime["closure_sha256"],
         "workspace_runtime_source_commit": workspace_runtime["source_commit"],
-    })
-    raw_production_workspace = production_bindings.get("workspace_runtime")
+    }
+    raw_production_workspace = raw_production_map.get("workspace_runtime")
     if raw_production_workspace is not None and not isinstance(
         raw_production_workspace, Mapping
     ):
         raise ReleaseError("workspace_runtime_manifest_binding_invalid")
     production_workspace = dict(raw_production_workspace or {})
+    workspace_remote = str(production_workspace.get("remote") or "")
+    if not workspace_remote:
+        raise ReleaseError("workspace_runtime_manifest_binding_invalid")
     production_bindings["workspace_runtime"] = {
-        **dict(production_workspace),
         "branch": "DETACHED",
         "commit": workspace_runtime["source_commit"],
         "tree": workspace_runtime["tree"],
+        "remote": workspace_remote,
     }
     manifest["gateway_release_binding"] = gateway_binding
     manifest["production_branch_bindings"] = production_bindings
@@ -4795,6 +5335,20 @@ def prepare_release(
     )
     if not preflight["preflight_ok"]:
         raise PreflightError(preflight)
+    dependency_rows = [
+        row
+        for row in preflight.get("checks", [])
+        if isinstance(row, Mapping)
+        and row.get("gate") == "remote_reader_dependency_unavailable"
+    ]
+    dependency_proof = (
+        dependency_rows[0].get("actual") if len(dependency_rows) == 1 else None
+    )
+    if (
+        not isinstance(dependency_proof, Mapping)
+        or dependency_proof.get("ok") is not True
+    ):
+        raise ReleaseError("release_dependency_materialization_invalid")
     home = _absolute(home, "hermes_home_invalid")
     release_note = _absolute(release_note, "release_note_path_invalid")
     manifest_output = _absolute(manifest_output, "manifest_output_path_invalid")
@@ -4882,11 +5436,17 @@ def prepare_release(
     manifest_raw = _prepare_manifest(
         live_manifest,
         host=identity["host"],
+        pipeline=identity["pipeline"],
+        worker=identity["worker"],
+        report_service=identity["report_service"],
         workspace_runtime=workspace_runtime,
         env_sha256=_sha(env_raw),
         note_path=release_note,
         release_id=release_id,
         release_fingerprint=release_fingerprint,
+        canary_batch_id=canary_batch_id,
+        canary_issue_id=canary_issue_id,
+        dependency_proof=dependency_proof,
     )
     activation = _prepare_control_binding(control_db, partition_topics, store_factory)
     activation_note = {

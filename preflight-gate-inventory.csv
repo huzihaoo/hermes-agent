@@ -95,6 +95,9 @@ receipt_path_invalid,apply,false,downstream apply gate; not preflight-reachable,
 receipt_unavailable,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2182
 receipt_write_failed,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2147
 release_apply_locked,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:1986
+release_dependency_face_invalid,prepare,false,prepare active dependency projection gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4000
+release_dependency_materialization_invalid,prepare,false,prepare frozen dependency materialization projection gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:3980
+release_identity_face_invalid,prepare,false,prepare manifest identity projection gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:3890
 release_lane_decision,prepare,true,validate optional lane decision and fail closed on uncertain closure,scripts/pnc_rca_minimal_release.py:4040
 release_lane_decision_invalid,prepare,false,validated lane decision rejected while embedding release note,scripts/pnc_rca_minimal_release.py:4943
 release_lock_unavailable,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2070
@@ -137,6 +140,7 @@ runtime_changed_during_apply,apply,false,downstream apply gate; not preflight-re
 runtime_changed_during_prepare,prepare,false,prepare closeout race check after derivation; not preflight-reachable,scripts/pnc_rca_minimal_release.py:4280
 runtime_changed_during_verify,verify,false,downstream verify gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:5103
 runtime_identity_mismatch,prepare,true,direct read-only host runtime identity collector,scripts/pnc_rca_minimal_release.py:3629
+source_face_binding_invalid,prepare,false,prepare manifest source projection gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:3970
 terminal_failure_marker_identity_invalid,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2263
 terminal_failure_marker_unavailable,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:2269
 terminal_receipt_and_marker_write_failed,apply,false,downstream apply gate; not preflight-reachable,scripts/pnc_rca_minimal_release.py:5007

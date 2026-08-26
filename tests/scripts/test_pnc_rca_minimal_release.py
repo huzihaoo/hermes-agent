@@ -415,7 +415,63 @@ def release_files(tmp_path):
                 "commit": identity["host"]["commit"],
                 "tree": identity["host"]["tree"],
                 "repo": str(runtime_root),
-            }
+                "remote": identity["host"]["remote"],
+                "remote_branch": identity["host"]["remote_branch"],
+                "remote_tag": identity["host"]["remote_tag"],
+                "remote_tag_object": identity["host"]["remote_tag_object"],
+            },
+            "g1q3_rca_pipeline": {
+                "branch": "DETACHED",
+                "commit": identity["pipeline"]["commit"],
+                "tree": identity["pipeline"]["tree"],
+                "repo": identity["pipeline"]["runtime_root"],
+                "remote": identity["pipeline"]["remote"],
+                "remote_branch": identity["pipeline"]["remote_branch"],
+                "remote_tag": identity["pipeline"]["remote_tag"],
+                "remote_tag_object": identity["pipeline"]["remote_tag_object"],
+                "source_repository_binding": {
+                    "branch": "rca",
+                    "commit": identity["pipeline"]["commit"],
+                    "tree": identity["pipeline"]["tree"],
+                    "remote": identity["pipeline"]["remote"],
+                    "repo": "/home/mini/data3/yj-evaluation-server",
+                    "remote_branch": identity["pipeline"]["remote_branch"],
+                    "remote_tag": identity["pipeline"]["remote_tag"],
+                    "remote_tag_object": identity["pipeline"]["remote_tag_object"],
+                },
+            },
+            "g1q3_rca_source": {
+                "branch": "rca",
+                "commit": identity["pipeline"]["commit"],
+                "tree": identity["pipeline"]["tree"],
+                "remote": identity["pipeline"]["remote"],
+                "repo": "/home/mini/data3/yj-evaluation-server",
+                "remote_branch": identity["pipeline"]["remote_branch"],
+                "remote_tag": identity["pipeline"]["remote_tag"],
+                "remote_tag_object": identity["pipeline"]["remote_tag_object"],
+            },
+            "vm_worker_state": {
+                "branch": "release/rca",
+                "commit": identity["worker"]["commit"],
+                "tree": identity["worker"]["tree"],
+                "remote": identity["worker"]["remote"],
+                "repo": identity["worker"]["runtime_root"],
+                "remote_branch": identity["worker"]["remote_branch"],
+                "remote_tag": identity["worker"]["remote_tag"],
+                "remote_tag_object": identity["worker"]["remote_tag_object"],
+            },
+            "mcap_data_translate": {
+                "branch": "rca",
+                "commit": "f" * 40,
+                "tree": "0" * 40,
+                "remote": "git@git.minieye.tech:foxglove/mcap_data_translate.git",
+                "repo": "/home/mini/mcap_data_translate",
+            },
+            "mcap_data_translate_runtime_bins": {
+                "host": "mini-desktop",
+                "kind": "historical_prebuilt_runtime",
+                "repo": "/home/mini/historical/mcap_data_translate",
+            },
         },
         "gateway_release_binding": {
             "workspace_runtime_manifest_sha256": "b" * 64,
@@ -423,6 +479,29 @@ def release_files(tmp_path):
             "workspace_runtime_source_commit": "d" * 40,
         },
         "production_branch_bindings": {
+            "mcap_data_translate": {
+                "branch": "rca",
+                "commit": "f" * 40,
+                "remote": "git@git.minieye.tech:foxglove/mcap_data_translate.git",
+            },
+            "hermes_agent": {
+                "branch": "production/rca",
+                "commit": identity["host"]["commit"],
+                "tree": identity["host"]["tree"],
+                "remote": identity["host"]["remote"],
+            },
+            "rca_pipeline": {
+                "branch": "rca",
+                "commit": identity["pipeline"]["commit"],
+                "tree": identity["pipeline"]["tree"],
+                "remote": identity["pipeline"]["remote"],
+            },
+            "vm_worker": {
+                "branch": "release/rca",
+                "commit": identity["worker"]["commit"],
+                "tree": identity["worker"]["tree"],
+                "remote": identity["worker"]["remote"],
+            },
             "workspace_runtime": {
                 "branch": "DETACHED",
                 "commit": "d" * 40,
@@ -434,6 +513,7 @@ def release_files(tmp_path):
             "path": str(note_path),
             "release_id": "rca-r15aw-20260817",
             "release_fingerprint_sha256": fingerprint,
+            "report_service": dict(identity["report_service"]),
         },
     }
     manifest_raw = _write_json(manifest_source, manifest)
@@ -614,6 +694,76 @@ def _prepare_fixture(data, *, store=None, partition_topics=None, report=None):
     # Prepare tests exercise projection updates against a stale but structurally
     # valid live template; apply/verify tests retain the minimal old sentinel.
     data["live_manifest"].write_bytes(data["manifest_source"].read_bytes())
+    live = json.loads(data["live_manifest"].read_bytes())
+    predecessor_root = "/Users/songying/.hermes/runtime/releases/predecessor"
+    live.update(
+        {
+            "activated_at": "2026-08-01T00:00:00Z",
+            "fingerprint_refreshed": [
+                {"previous_runtime_root": predecessor_root}
+            ],
+            "gateway_previous_binding": {
+                "gateway_working_directory": predecessor_root
+            },
+            "gateway_working_directory": predecessor_root,
+            "gateway_release_target": "predecessor",
+            "local_consumer_migration": {"runtime_root": predecessor_root},
+            "promotion_source": predecessor_root,
+            "reconciliation_findings": [{"runtime_root": predecessor_root}],
+            "runtime_release_target": "predecessor",
+        }
+    )
+    live["gateway_release_binding"]["source"] = predecessor_root
+    live["face_git_bindings"]["gateway_runtime"] = {
+        "branch": "DETACHED",
+        "commit": "b" * 40,
+        "tree": "c" * 40,
+        "repo": predecessor_root,
+        "previous_commit": "0" * 40,
+    }
+    live["face_git_bindings"]["_stacks"] = {
+        "g1q3_rca_stack": {
+            "depends_on": [
+                {
+                    "face": "g1q3_rca_pipeline",
+                    "commit": "b" * 40,
+                    "previous_commit": "0" * 40,
+                }
+            ],
+            "validation": {
+                "status": "validated",
+                "evidence": {"task_id": "historical-task"},
+            },
+        }
+    }
+    for name, commit, tree in (
+        ("g1q3_rca_pipeline", "b" * 40, "c" * 40),
+        ("g1q3_rca_source", "b" * 40, "c" * 40),
+        ("vm_worker_state", "d" * 40, "e" * 40),
+    ):
+        live["face_git_bindings"][name]["commit"] = commit
+        live["face_git_bindings"][name]["tree"] = tree
+    live["face_git_bindings"]["g1q3_rca_pipeline"][
+        "source_repository_binding"
+    ]["commit"] = "b" * 40
+    live["face_git_bindings"]["g1q3_rca_pipeline"][
+        "source_repository_binding"
+    ]["tree"] = "c" * 40
+    live["production_branch_bindings"]["hermes_agent"]["commit"] = "b" * 40
+    live["production_branch_bindings"]["hermes_agent"]["tree"] = "c" * 40
+    live["production_branch_bindings"]["rca_pipeline"]["commit"] = "b" * 40
+    live["production_branch_bindings"]["rca_pipeline"]["tree"] = "c" * 40
+    live["production_branch_bindings"]["vm_worker"]["commit"] = "d" * 40
+    live["production_branch_bindings"]["vm_worker"]["tree"] = "e" * 40
+    live["rca_release_note"]["report_service"] = {
+        **live["rca_release_note"]["report_service"],
+        "manifest_sha256": "f" * 64,
+        "pipeline_commit": "b" * 40,
+        "pipeline_tree": "c" * 40,
+    }
+    data["live_manifest"].write_bytes(
+        json.dumps(live, sort_keys=True, indent=2).encode() + b"\n"
+    )
     note_path = data["note_path"].with_name("prepared-release-note.json")
     env_output = data["note_path"].with_name("prepared.env")
     manifest_output = data["note_path"].with_name("prepared-manifest.json")
@@ -656,6 +806,64 @@ def _prepare_fixture(data, *, store=None, partition_topics=None, report=None):
         assert str(path) == data["identity"]["report_service"]["manifest_path"]
         return report_raw, json.loads(report_raw)
 
+    dependency_proof = {
+        "ok": True,
+        "status": "fixture_dependency_proof",
+        "materialization": {
+            "kind": "frozen_materialized_runtime",
+            "schema_version": release.FROZEN_MATERIALIZATION_SCHEMA,
+            "runtime_root": pipeline["runtime_root"],
+            "receipt_path": (
+                "/home/mini/.hermes/rca-prod-runtime/receipts/"
+                "fixture-release/source-materialization.json"
+            ),
+            "receipt_sha256": "5" * 64,
+            "receipt_self_seal": "6" * 64,
+            "root_identity": {
+                "dev": 2050,
+                "gid": 1000,
+                "ino": 20214733,
+                "mode": "0555",
+                "uid": 1000,
+            },
+            "pipeline_commit": pipeline["commit"],
+            "pipeline_tree": pipeline["tree"],
+            "mcap_gitlink": {
+                "commit": "f" * 40,
+                "path": release.MCAP_GITLINK_PATH,
+                "remote": (
+                    "git@git.minieye.tech:foxglove/mcap_data_translate.git"
+                ),
+                "tree": "0" * 40,
+            },
+            "mcap_submodules": {
+                "external/plugins": {
+                    "commit": "a" * 40,
+                    "path": (
+                        "third_party/mcap_data_translate/external/plugins"
+                    ),
+                    "remote": "git@git.minieye.tech:foxglove/plugins.git",
+                    "tree": "b" * 40,
+                },
+                "external/video_codec": {
+                    "commit": "c" * 40,
+                    "path": (
+                        "third_party/mcap_data_translate/external/video_codec"
+                    ),
+                    "remote": "git@git.minieye.tech:foxglove/video_codec.git",
+                    "tree": "d" * 40,
+                },
+            },
+            "required_binary": {
+                "mode": "0555",
+                "path": release.MCAP_REQUIRED_BINARY_PATH,
+                "sha256": "e" * 64,
+                "size_bytes": 7159960,
+                "type": "file",
+            },
+        },
+    }
+
     args = {
         "release_id": "rca-r15aw-prepared-20260817",
         "epoch_id": "rca-activation-r15aw-prepared-20260817",
@@ -694,10 +902,9 @@ def _prepare_fixture(data, *, store=None, partition_topics=None, report=None):
         },
         # Unit tests inject a deterministic read-only result. The CLI/default
         # path reads the candidate contract and installed VM bytes directly.
-        "dependency_probe": lambda _pipeline_root, _pipeline_identity: {
-            "ok": True,
-            "status": "fixture_dependency_proof",
-        },
+        "dependency_probe": (
+            lambda _pipeline_root, _pipeline_identity: dependency_proof
+        ),
     }
     return {
         "args": args,
@@ -708,6 +915,7 @@ def _prepare_fixture(data, *, store=None, partition_topics=None, report=None):
         "note_path": note_path,
         "env_output": env_output,
         "manifest_output": manifest_output,
+        "dependency_proof": dependency_proof,
     }
 
 
@@ -761,6 +969,176 @@ def test_prepare_derives_and_writes_deterministic_owner_only_outputs(release_fil
     assert manifest["production_branch_bindings"]["workspace_runtime"]["tree"] == (
         "4" * 40
     )
+    faces = manifest["face_git_bindings"]
+    identity = release_files["identity"]
+    for name, identity_name, expected_branch, expected_repo in (
+        ("runtime_engine", "host", "DETACHED", identity["host"]["runtime_root"]),
+        ("gateway_runtime", "host", "DETACHED", identity["host"]["runtime_root"]),
+        (
+            "g1q3_rca_pipeline",
+            "pipeline",
+            "DETACHED",
+            identity["pipeline"]["runtime_root"],
+        ),
+        (
+            "g1q3_rca_source",
+            "pipeline",
+            "rca",
+            "/home/mini/data3/yj-evaluation-server",
+        ),
+        (
+            "vm_worker_state",
+            "worker",
+            "release/rca",
+            identity["worker"]["runtime_root"],
+        ),
+    ):
+        expected = identity[identity_name]
+        actual = faces[name]
+        assert actual["branch"] == expected_branch
+        assert actual["repo"] == expected_repo
+        for key in (
+            "commit",
+            "tree",
+            "remote",
+            "remote_branch",
+            "remote_tag",
+            "remote_tag_object",
+        ):
+            assert actual[key] == expected[key]
+        assert "previous_commit" not in actual
+    assert faces["g1q3_rca_pipeline"]["source_repository_binding"] == faces[
+        "g1q3_rca_source"
+    ]
+    materialization = prepared["dependency_proof"]["materialization"]
+    submodule_commits = {
+        name: item["commit"]
+        for name, item in materialization["mcap_submodules"].items()
+    }
+    assert faces["_stacks"] == {
+        "g1q3_rca_stack": {
+            "primary_face": "g1q3_rca_pipeline",
+            "depends_on": [
+                {
+                    "face": "g1q3_rca_pipeline",
+                    "commit": identity["pipeline"]["commit"],
+                },
+                {
+                    "face": "mcap_data_translate",
+                    "commit": "f" * 40,
+                    "submodules": submodule_commits,
+                    "runtime_materialization_face": (
+                        "mcap_data_translate_runtime_bins"
+                    ),
+                },
+            ],
+            "validation": {
+                "status": "validated",
+                "evidence": {
+                    "release_id": prepared["args"]["release_id"],
+                    "case_id": prepared["args"]["canary_issue_id"],
+                    "batch_id": prepared["args"]["canary_batch_id"],
+                    "materialization_receipt_sha256": "5" * 64,
+                },
+            },
+        }
+    }
+    # MCAP source identity comes from the sealed pipeline materialization, not
+    # a predecessor runtime checkout.
+    assert faces["mcap_data_translate"] == {
+        "branch": "DETACHED",
+        "commit": "f" * 40,
+        "tree": "0" * 40,
+        "remote": "git@git.minieye.tech:foxglove/mcap_data_translate.git",
+        "repo": (
+            "/home/mini/data3/yj-evaluation-server/"
+            "third_party/mcap_data_translate"
+        ),
+        "submodule_bindings": submodule_commits,
+        "source_required_binary": {
+            "relative_path": "build/bin/mcap_topic_extract",
+            "sha256": "e" * 64,
+            "size": 7159960,
+        },
+    }
+    assert faces["mcap_data_translate_runtime_bins"] == {
+        "host": "mini-desktop",
+        "kind": "governed_frozen_materialized_runtime",
+        "runtime_root": identity["pipeline"]["runtime_root"],
+        "materialization_schema_version": (
+            release.FROZEN_MATERIALIZATION_SCHEMA
+        ),
+        "materialization_receipt_path": materialization["receipt_path"],
+        "materialization_receipt_sha256": "5" * 64,
+        "materialization_self_seal": "6" * 64,
+        "root_identity": materialization["root_identity"],
+        "pipeline_commit": identity["pipeline"]["commit"],
+        "pipeline_tree": identity["pipeline"]["tree"],
+        "source_face": "mcap_data_translate",
+        "source_commit": "f" * 40,
+        "source_tree": "0" * 40,
+        "source_submodules": {
+            name: {
+                "commit": item["commit"],
+                "tree": item["tree"],
+                "remote": item["remote"],
+            }
+            for name, item in materialization["mcap_submodules"].items()
+        },
+        "required_binary": {
+            "relative_path": release.MCAP_REQUIRED_BINARY_PATH,
+            "mode": "0555",
+            "sha256": "e" * 64,
+            "size_bytes": 7159960,
+        },
+    }
+    report_binding = manifest["rca_release_note"]["report_service"]
+    assert report_binding == {
+        **identity["report_service"],
+        "manifest_sha256": release._sha(prepared["report_raw"]),
+    }
+    host_root = identity["host"]["runtime_root"]
+    assert manifest["runtime_root"] == host_root
+    assert manifest["runtime_release_target"] == Path(host_root).name
+    assert manifest["gateway_release_target"] == Path(host_root).name
+    assert manifest["gateway_working_directory"] == host_root
+    assert manifest["promotion_source"] == host_root
+    assert manifest["promotion_source_dirty_count"] == 0
+    assert manifest["promotion_source_dirty_preview"] == []
+    assert manifest["gateway_release_binding"]["source"] == host_root
+    assert manifest["gateway_release_binding"]["commit"] == identity["host"]["commit"]
+    assert manifest["gateway_release_binding"]["tree"] == identity["host"]["tree"]
+    for historical_key in (
+        "activated_at",
+        "fingerprint_refreshed",
+        "gateway_previous_binding",
+        "local_consumer_migration",
+        "reconciliation_findings",
+    ):
+        assert historical_key not in manifest
+    assert "predecessor" not in json.dumps(manifest, sort_keys=True)
+    assert "/home/mini/historical" not in json.dumps(manifest, sort_keys=True)
+    assert "/home/mini/mcap_data_translate" not in json.dumps(
+        manifest, sort_keys=True
+    )
+    for name, identity_name, branch in (
+        ("hermes_agent", "host", "production/rca"),
+        ("rca_pipeline", "pipeline", "rca"),
+        ("vm_worker", "worker", "release/rca"),
+    ):
+        expected = identity[identity_name]
+        assert manifest["production_branch_bindings"][name] == {
+            "branch": branch,
+            "commit": expected["commit"],
+            "tree": expected["tree"],
+            "remote": expected["remote"],
+        }
+    assert manifest["production_branch_bindings"]["mcap_data_translate"] == {
+        "branch": "rca",
+        "commit": "f" * 40,
+        "tree": "0" * 40,
+        "remote": "git@git.minieye.tech:foxglove/mcap_data_translate.git",
+    }
     env = release._parse_env(prepared["env_output"].read_bytes())
     assert {key: env[key] for key in release.CONTROL_DB_ENV_KEYS} == {
         key: str(release_files["control_db"]) for key in release.CONTROL_DB_ENV_KEYS
@@ -777,6 +1155,60 @@ def test_prepare_derives_and_writes_deterministic_owner_only_outputs(release_fil
         path.unlink()
     release.prepare_release(**prepared["args"], runner=FakeRunner(release_files))
     assert {path: path.read_bytes() for path in first} == first
+
+
+def test_prepare_rejects_missing_active_dependency_face(release_files):
+    prepared = _prepare_fixture(release_files)
+    live = json.loads(release_files["live_manifest"].read_bytes())
+    live["face_git_bindings"].pop("mcap_data_translate")
+    release_files["live_manifest"].write_bytes(
+        json.dumps(live, sort_keys=True, indent=2).encode() + b"\n"
+    )
+
+    with pytest.raises(release.ReleaseError) as exc:
+        release.prepare_release(
+            **prepared["args"], runner=FakeRunner(release_files)
+        )
+
+    assert exc.value.code == "release_dependency_face_invalid"
+    assert not prepared["note_path"].exists()
+    assert not prepared["env_output"].exists()
+    assert not prepared["manifest_output"].exists()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing", "runtime", "receipt", "gitlink", "binary"),
+)
+def test_prepare_rejects_invalid_frozen_dependency_materialization(
+    release_files, mutation
+):
+    prepared = _prepare_fixture(release_files)
+    proof = json.loads(json.dumps(prepared["dependency_proof"]))
+    materialization = proof["materialization"]
+    if mutation == "missing":
+        proof.pop("materialization")
+    elif mutation == "runtime":
+        materialization["runtime_root"] = "/home/mini/stale-runtime"
+    elif mutation == "receipt":
+        materialization["receipt_sha256"] = "invalid"
+    elif mutation == "gitlink":
+        materialization["mcap_gitlink"]["commit"] = "invalid"
+    else:
+        materialization["required_binary"]["sha256"] = "invalid"
+    prepared["args"]["dependency_probe"] = (
+        lambda _pipeline_root, _pipeline_identity: proof
+    )
+
+    with pytest.raises(release.ReleaseError) as exc:
+        release.prepare_release(
+            **prepared["args"], runner=FakeRunner(release_files)
+        )
+
+    assert exc.value.code == "release_dependency_materialization_invalid"
+    assert not prepared["note_path"].exists()
+    assert not prepared["env_output"].exists()
+    assert not prepared["manifest_output"].exists()
 
 
 def test_prepare_embeds_validated_release_lane_decision(release_files):
@@ -1038,6 +1470,10 @@ def test_default_dependency_probe_reports_vm_fingerprint_without_install(release
         assert "source-materialization.json" in input_text
         assert "frozen_runtime" in input_text
         assert "frozen_materialization_receipt_ambiguous" in input_text
+        assert "frozen_materialization" in input_text
+        assert release.MCAP_GITLINK_PATH in input_text
+        assert release.MCAP_REQUIRED_BINARY_PATH in input_text
+        assert '"materialization": frozen_materialization' in input_text
         assert "bootstrap_remote_reader_runtime.py" not in input_text
         assert "--install-offline" not in input_text
         assert release.REMOTE_READER_RUNTIME_BUNDLE_SCHEMA in input_text
