@@ -110,7 +110,7 @@ def test_authorized_resume_uses_one_preflight_and_one_apply():
     request = calls[1][1]
     assert request["task_id"] == resume.AUTHORIZED_TASK_ID
     assert request["generation"] == 7
-    assert request["target_runtime_root"].endswith("r15c13b")
+    assert request["target_runtime_root"] == resume.RCA_PROD_VM_RELEASE_ROOT
     assert len(issuer_calls) == 1
     assert issuer_calls[0]["submission_key"] == resume.AUTHORIZED_TASK_ID
 
