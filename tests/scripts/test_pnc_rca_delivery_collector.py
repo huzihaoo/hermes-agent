@@ -3141,6 +3141,41 @@ def test_infra_remediation_runner_executes_once_for_same_task(tmp_path):
     assert result["generation"] == 1
 
 
+def test_default_infra_remediation_delegates_to_scoped_same_task_resume(monkeypatch):
+    claim = SimpleNamespace(
+        submission_key="submission",
+        business_key="business",
+        generation=7,
+        task_id="task",
+    )
+    observed = {}
+
+    def delegated(actual_claim, blocker, remediation, timeout_seconds):
+        observed.update(
+            {
+                "claim": actual_claim,
+                "blocker": blocker,
+                "remediation": remediation,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return {"delegated": True}
+
+    monkeypatch.setattr(collector, "resume_same_task", delegated)
+
+    result = collector.default_infra_remediation_runner(
+        claim,
+        {"kind": "remote_reader_timeout", "retryable": True},
+        {"op": "bounded_retry"},
+        collector.MAX_INFRA_REMEDIATION_SECONDS,
+    )
+
+    assert result == {"delegated": True}
+    assert observed["claim"] is claim
+    assert observed["blocker"]["kind"] == "remote_reader_timeout"
+    assert observed["timeout_seconds"] == 90
+
+
 def test_infra_remediation_crossing_deadline_falls_back_without_extra_hold(tmp_path):
     clock = [NOW]
 

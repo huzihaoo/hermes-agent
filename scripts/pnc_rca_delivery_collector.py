@@ -73,6 +73,7 @@ from gateway.pnc_rca_vm_release_binding import (
     RCA_PROD_VM_FIXED_CLI_RELATIVE_PATH,
     RCA_PROD_VM_RELEASE_ROOT,
 )
+from gateway.pnc_rca_same_task_resume import resume_same_task
 from gateway.pnc_rca_snapshot import (
     AdmissionSnapshotExecutionBundle,
     snapshot_execution_inputs,
@@ -156,7 +157,7 @@ REMOTE_PIPELINE_ENTRYPOINT_RELATIVE = (
 )
 REMOTE_REPORT_ENTRYPOINT_RELATIVE = "api/g1q3_rca/scripts/serve_rca_reports.py"
 INFRA_REMEDIATION_SCHEMA_VERSION = "pnc_rca_infra_remediation_receipt_v1"
-MAX_INFRA_REMEDIATION_SECONDS = 10
+MAX_INFRA_REMEDIATION_SECONDS = 90
 _EVENTUAL_ARTIFACT_CODES = frozenset({
     "delivery_contract_missing",
     "delivery_manifest_missing",
@@ -277,28 +278,14 @@ def default_infra_remediation_runner(
     remediation: Mapping[str, Any],
     timeout_seconds: int,
 ) -> Mapping[str, Any]:
-    """Fail closed when no post-terminal same-task resume primitive exists.
+    """Run the release-scoped, same-task VM resume primitive."""
 
-    The active pipeline already performs its bounded in-process remediation
-    before declaring terminal.  The host must not replay a raw stage command or
-    pretend polling is remediation; it records this held result exactly once.
-    """
-
-    return {
-        "schema_version": INFRA_REMEDIATION_SCHEMA_VERSION,
-        "success": False,
-        "status": "held",
-        "submission_key": claim.submission_key,
-        "business_key": claim.business_key,
-        "generation": claim.generation,
-        "task_id": claim.task_id,
-        "operation": str(remediation.get("op") or "") or "unavailable",
-        "blocker_kind": pnc_fault_taxonomy.blocker_kind(blocker),
-        "resumed_same_task": False,
-        "external_writes": False,
-        "timeout_seconds": timeout_seconds,
-        "error_code": "infra_remediation_primitive_unavailable",
-    }
+    return resume_same_task(
+        claim,
+        {**dict(blocker), "kind": pnc_fault_taxonomy.blocker_kind(blocker)},
+        remediation,
+        timeout_seconds,
+    )
 
 
 def _validated_remediation_result(
