@@ -1,5 +1,7 @@
 import hashlib
 import json
+import subprocess
+import sys
 from types import SimpleNamespace
 
 from gateway import pnc_rca_same_task_resume as resume
@@ -173,3 +175,35 @@ def test_remote_call_does_not_forward_host_admission_secret(monkeypatch):
     assert observed["command"][-1] == "run_py_json"
     assert "HERMES_RCA_PROD_ADMISSION_HMAC_KEY" not in observed["env"]
     assert str(resume.VM_TOOL_PATH) in observed["input"]
+
+
+def test_remote_script_imports_vm_tool_sibling_modules(tmp_path, monkeypatch):
+    sibling = tmp_path / "worker_sibling.py"
+    sibling.write_text("VALUE = 'sibling-loaded'\n", encoding="utf-8")
+    tool = tmp_path / "vm_resume.py"
+    tool.write_text(
+        "import worker_sibling\n"
+        "def preflight(**payload):\n"
+        "    return {'value': worker_sibling.VALUE, 'payload': payload}\n"
+        "def apply_request(payload):\n"
+        "    return {'value': worker_sibling.VALUE, 'payload': payload}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(resume, "VM_TOOL_PATH", tool)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            resume._remote_script("preflight", {"task_id": "same-task"}),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "payload": {"task_id": "same-task"},
+        "value": "sibling-loaded",
+    }

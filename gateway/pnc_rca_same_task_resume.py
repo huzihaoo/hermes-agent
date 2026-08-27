@@ -83,9 +83,13 @@ def _remote_script(action: str, payload: Mapping[str, Any]) -> str:
     return f'''import base64
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 module_path = Path({str(VM_TOOL_PATH)!r})
+module_dir = str(module_path.parent)
+if module_dir not in sys.path:
+    sys.path.insert(0, module_dir)
 spec = importlib.util.spec_from_file_location("vm_rca_same_task_resume_remote", module_path)
 if spec is None or spec.loader is None:
     raise RuntimeError("same_task_resume_module_unavailable")
