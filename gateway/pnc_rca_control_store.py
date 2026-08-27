@@ -282,6 +282,7 @@ SILENT_TERMINAL_RERUN_ERROR_CODES = frozenset({
     "delivery_lineage_unavailable",
     "failure_receipt_missing",
     "rca_work_deadline_exceeded",
+    "remote_reader_timeout",
     "report_public_origin_invalid",
     "service_provenance_unavailable",
     "taxonomy_gap:derived_capacity_hfs_target_identity_mismatch",
